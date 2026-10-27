@@ -1,0 +1,18 @@
+{
+  "greeting": "欢迎回来，{name}",
+  "guest": "旅人",
+  "status": "系统运行正常，媒体引擎已就绪。",
+  "entries": {
+    "files": { "title": "文件管理", "desc": "挂载点 · 在线编辑 · WebDAV" },
+    "photos": { "title": "媒体画廊", "desc": "时间线 · 相册 · 沉浸式预览" },
+    "terminal": { "title": "系统终端", "desc": "PTY 联动 · 多标签会话" }
+  },
+  "services": {
+    "title": "外部服务",
+    "empty": "还没有配置外部服务。在 config.toml 里加一段 [[services]]，保存后刷新即可看到卡片。",
+    "count": "{count} 个",
+    "openNewWindow": "新窗口打开",
+    "close": "关闭",
+    "note": "服务通过内置反代透传，无需额外 Nginx；跨域与 iframe 限制已自动处理"
+  }
+}

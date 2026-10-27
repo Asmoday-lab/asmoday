@@ -1,0 +1,30 @@
+{
+  "list": {
+    "intro": "由文件右键「分享…」或「复制图床直链」创建的链接都列在这里。撤销后链接立即失效；配置 [shares].referer_allowlist 可开启图床直链防盗链。",
+    "password": "口令",
+    "noDownload": "禁下载",
+    "copy": "复制链接",
+    "revoke": "撤销分享",
+    "empty": "还没有创建任何分享。到「文件管理」里右键文件试试。",
+    "revoked": "分享已撤销",
+    "loadFailed": "分享加载失败",
+    "revokeFailed": "撤销失败"
+  },
+  "public": {
+    "protected": "该分享受口令保护",
+    "missing": "分享不存在或已过期",
+    "passwordPlaceholder": "访问口令",
+    "unlock": "解锁",
+    "passwordProtected": "口令保护",
+    "noDownload": "禁止下载",
+    "download": "下载文件",
+    "previewOnly": "该分享仅限在线预览",
+    "parent": "上一级",
+    "count": "{count} 项",
+    "emptyDir": "此目录为空",
+    "footer": "由 Asmoday 提供分享服务",
+    "loadFailed": "加载失败",
+    "dirFailed": "目录加载失败",
+    "shareDir": "分享目录"
+  }
+}

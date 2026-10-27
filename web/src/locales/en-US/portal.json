@@ -1,0 +1,18 @@
+{
+  "greeting": "Welcome back, {name}",
+  "guest": "traveler",
+  "status": "All systems operational, media engine ready.",
+  "entries": {
+    "files": { "title": "Files", "desc": "Mounts · Editing · WebDAV" },
+    "photos": { "title": "Media gallery", "desc": "Timeline · Albums · Lightbox" },
+    "terminal": { "title": "Terminal", "desc": "PTY sessions · Multiple tabs" }
+  },
+  "services": {
+    "title": "External services",
+    "empty": "No external service configured yet. Add a [[services]] block to config.toml, save and refresh to see the card.",
+    "count": "{count}",
+    "openNewWindow": "Open in new window",
+    "close": "Close",
+    "note": "Services are proxied by the built-in gateway — no extra Nginx needed; CORS and iframe restrictions are handled automatically"
+  }
+}

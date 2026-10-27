@@ -1,0 +1,103 @@
+{
+  "roots": {
+    "title": "Mounts",
+    "implicit": "Working directory",
+    "implicitHint": "No [[system.mounts]] configured; the process working directory is used as a fallback root",
+    "refresh": "Refresh mounts",
+    "browse": "Browse files",
+    "unavailable": "Path unavailable",
+    "enter": "Open this mount",
+    "forbidden": "No access to this mount",
+    "failed": "Failed to load mounts",
+    "empty": "No mount available yet",
+    "emptyHint": "Add [[system.mounts]] under Settings → Advanced, or edit config.toml directly",
+    "missingToast": "This mount path is unavailable, please check config.toml"
+  },
+  "toolbar": {
+    "refresh": "Refresh",
+    "home": "Back to mounts",
+    "searchPlaceholder": "Search this folder…",
+    "searching": "Searching…",
+    "clearSearch": "Clear search",
+    "grid": "Grid view",
+    "list": "List view",
+    "upload": "Upload",
+    "uploadHint": "Upload to the current folder (drag and drop supported)"
+  },
+  "list": {
+    "forbidden": "No access to this path",
+    "failed": "Cannot open this folder",
+    "backToRoots": "Back to mounts",
+    "empty": "This folder is empty",
+    "emptyHint": "Drop files here, or use the Upload button",
+    "noResults": "No matching files",
+    "noResultsHint": "Try another keyword, or press Esc to clear the search",
+    "total": "{count} items",
+    "shown": "{shown} shown",
+    "found": "{count} results",
+    "escToClear": "Press Esc to clear",
+    "uploadFirst": "Open a mount before uploading",
+    "searchFailed": "Search failed"
+  },
+  "editor": {
+    "back": "Back",
+    "unsaved": "Unsaved changes",
+    "switchLanguage": "Switch language",
+    "save": "Save",
+    "saving": "Saving",
+    "saved": "Saved",
+    "confirmClose": "You have unsaved changes. Close anyway?"
+  },
+  "menu": {
+    "openDir": "Open folder",
+    "edit": "Edit",
+    "open": "Open",
+    "terminal": "Open in terminal",
+    "copyPath": "Copy path",
+    "download": "Download",
+    "share": "Share…",
+    "directLink": "Copy image URL",
+    "delete": "Delete…",
+    "pathCopied": "Path copied",
+    "directLinkCopied": "Image URL copied",
+    "directLinkFailed": "Failed to create the direct URL"
+  },
+  "delete": {
+    "titleDir": "Delete folder",
+    "titleFile": "Delete file",
+    "warningDir": "This folder and everything inside will be permanently deleted. It cannot be restored from a recycle bin.",
+    "warningFile": "This file will be permanently deleted. It cannot be restored from a recycle bin.",
+    "confirm": "Delete",
+    "doneDir": "Folder deleted",
+    "doneFile": "File deleted",
+    "failed": "Delete failed"
+  },
+  "share": {
+    "create": "Create share",
+    "created": "Share created",
+    "password": "Access password (leave empty for none)",
+    "passwordPlaceholder": "Optional",
+    "expiry": "Expires in",
+    "days1": "1 day",
+    "days7": "7 days",
+    "days30": "30 days",
+    "permanent": "Never",
+    "allowDownload": "Allow download",
+    "submit": "Create share",
+    "creating": "Creating…",
+    "copyLink": "Copy link",
+    "hint": "Folder shares can be browsed and downloaded in the browser; revoke the link on the Shares page.",
+    "failed": "Failed to create the share"
+  },
+  "upload": {
+    "dropTitle": "Drop to upload into this folder",
+    "queue": "Uploads ({count})",
+    "failed": "Failed",
+    "done": "Done",
+    "error": "Upload failed",
+    "network": "Network error"
+  },
+  "language": {
+    "plain": "Plain text"
+  }
+}

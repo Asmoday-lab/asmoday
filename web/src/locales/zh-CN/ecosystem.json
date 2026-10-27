@@ -1,0 +1,22 @@
+{
+  "title": "生态推荐",
+  "intro": "Asmoday 只做文件、媒体与终端。下面这些能力交给成熟工具，通过 WebDAV / 目录映射对接。",
+  "categories": {
+    "sync": "极速同步与备份",
+    "download": "远程下载",
+    "tunnel": "公网与穿透",
+    "writing": "写作与图床"
+  },
+  "items": {
+    "syncthing": "点对点极速增量同步。把手机或办公电脑的文件夹，无缝同步至 Asmoday 挂载的目录中。",
+    "photosync": "通过 Asmoday 提供的 WebDAV 接口，实现手机相册后台上传备份。",
+    "foldersync": "强大的 Android 文件夹同步工具，支持定时通过 WebDAV 同步特定目录。",
+    "qbittorrent": "老牌且强大的 BT 下载器。把下载路径设为 Asmoday 的影视目录，下完即可在 Web 端直接播放。",
+    "aria2": "轻量级的多协议命令行下载工具，适合极客搭配 AriaNg 使用。",
+    "caddy": "想在公网访问？推荐搭配专业反向代理服务器。Asmoday 已原生支持 X-Forwarded-* 头。",
+    "tailscale": "不想暴露公网？用组网工具建立虚拟局域网，在外网安全访问家里的设备。",
+    "picgo": "利用图床直链把 Asmoday 配成 PicGo 默认图床，配合 Typora / Obsidian 打造 Markdown 写作流。"
+  },
+  "visit": "前往官网",
+  "footer": "Asmoday 的成长离不开上述优秀开源/商业工具的生态支持，点击卡片可访问其官方网站。"
+}

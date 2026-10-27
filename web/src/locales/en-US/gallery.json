@@ -1,0 +1,79 @@
+{
+  "photos": {
+    "albums": "Albums",
+    "timeline": "Timeline",
+    "empty": "No photos or videos yet",
+    "emptyHint": "Put media into a mount, or sync from your phone over WebDAV",
+    "albumMeta": "{count} photos · {folder}",
+    "albumItems": "{count} items",
+    "slideshow": "Slideshow",
+    "backToAlbums": "Albums",
+    "videoBadge": "Video",
+    "truncated": "Folder too large — only the first 4000 entries are indexed",
+    "rootFolder": "Root"
+  },
+  "cinema": {
+    "title": "Cinema",
+    "count": "{count} films",
+    "empty": "The cinema is empty",
+    "emptyHint": "Built purely from the folder structure, with no online scraping",
+    "resume": "Resume {time}",
+    "native": "Native player",
+    "nativeOn": "Current: native browser player (click to switch back to Video.js)",
+    "nativeOff": "Current: Video.js (click to force the native player)"
+  },
+  "music": {
+    "title": "Local music",
+    "count": "{count} tracks",
+    "empty": "The music library is empty",
+    "emptyHint": "Supports mp3 / flac / m4a / wav and more",
+    "playAll": "Play all",
+    "columnIndex": "#",
+    "columnTitle": "Title",
+    "columnSize": "Size",
+    "columnFavorite": "Favorite"
+  },
+  "toolbar": {
+    "favorites": "Favorites",
+    "onlyFavorites": "Favorites only",
+    "rescan": "Rescan",
+    "indexed": "Media indexed from mounts",
+    "loadFailed": "Failed to load the media index"
+  },
+  "favorite": {
+    "add": "Add to favorites",
+    "remove": "Remove from favorites"
+  },
+  "player": {
+    "modeLoop": "Repeat all",
+    "modeOne": "Repeat one",
+    "modeShuffle": "Shuffle",
+    "prev": "Previous",
+    "next": "Next",
+    "play": "Play",
+    "pause": "Pause",
+    "lyrics": "Lyrics",
+    "close": "Close player bar",
+    "lyricsLoading": "Loading lyrics…",
+    "noLyrics": "No .lrc file next to this track",
+    "noTimeline": "The lyrics file has no usable timeline",
+    "lyricsFailed": "Failed to load lyrics",
+    "volume": "Volume",
+    "mute": "Mute",
+    "unmute": "Unmute",
+    "playlist": "Playlist",
+    "playlistClear": "Clear playlist",
+    "playlistEmpty": "The queue is empty",
+    "playlistCount": "{count} tracks"
+  },
+  "video": {
+    "unsupportedExt": "The browser cannot decode .{ext} video. Transcode it to mp4 (H.264), or download it from Files and play locally",
+    "loadFailed": "Video failed to load: the file may have moved, or the codec is unsupported",
+    "playerUnsupported": "The browser cannot decode .{ext} video. Transcode it to mp4 (H.264), or open it with a desktop player",
+    "playerLoadFailed": "Video failed to load: the file may have moved, be damaged, or use an unsupported codec",
+    "fallbackLink": "This video cannot be played — open it in a new window",
+    "subtitleLabel": "Subtitles",
+    "openOriginal": "Open the original file",
+    "close": "Close"
+  }
+}

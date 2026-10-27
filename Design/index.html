@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Lumine - 全量原型 (完美移动端)</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/css/css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
+
+    <link rel="stylesheet" href="style.css">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'theme-bg': 'var(--bg-base)', 'theme-panel': 'var(--bg-panel)',
+                        'theme-text': 'var(--text-main)', 'theme-muted': 'var(--text-muted)',
+                        'theme-border': 'var(--border-color)', 'theme-accent': 'var(--accent)',
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="select-none text-sm antialiased">
+
+<div id="app" class="flex h-screen w-screen relative overflow-hidden" @click="closeContextMenu">
+
+    <!-- 移动端侧边栏遮罩 -->
+    <div v-if="isMobileMenuOpen" @click="isMobileMenuOpen = false" class="fixed inset-0 bg-black/50 z-40 md:hidden backdrop-blur-sm transition-opacity"></div>
+
+    <!-- 侧边栏 -->
+    <aside :class="[
+        'border-r border-theme-border bg-theme-panel flex flex-col flex-shrink-0 z-50 fixed md:relative h-full transition-transform duration-300 md:transform-none',
+        isSidebarCollapsed ? 'md:w-16' : 'md:w-56',
+        isMobileMenuOpen ? 'translate-x-0 w-64' : '-translate-x-full w-64'
+    ]">
+        <div class="h-16 flex items-center border-b border-theme-border px-4 justify-between cursor-pointer" @click="navTo('portal')">
+            <div class="flex items-center overflow-hidden">
+                <div class="w-6 h-6 bg-theme-accent rounded-md flex-shrink-0 shadow-[0_0_15px_var(--accent)]"></div>
+                <span class="font-bold text-lg tracking-wide ml-3 whitespace-nowrap">Lumine</span>
+            </div>
+            <button v-show="!isSidebarCollapsed" @click.stop="isSidebarCollapsed = true" class="hidden md:block text-theme-muted hover:text-theme-text"><i class="fa-solid fa-angles-left"></i></button>
+            <button @click.stop="isMobileMenuOpen = false" class="md:hidden text-theme-muted hover:text-theme-text"><i class="fa-solid fa-xmark text-lg"></i></button>
+        </div>
+
+        <nav class="flex-1 py-4 px-2 space-y-1 overflow-y-auto no-scrollbar">
+            <a href="#" @click.prevent="navTo('portal')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'portal' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-house w-6 text-center"></i><span class="ml-2">聚合主页</span>
+            </a>
+            <a href="#" @click.prevent="navTo('files')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'files' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-folder-tree w-6 text-center"></i><span class="ml-2">文件管理</span>
+            </a>
+            <a href="#" @click.prevent="navTo('terminal')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'terminal' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-terminal w-6 text-center"></i><span class="ml-2">系统终端</span>
+            </a>
+            
+            <div class="px-2 text-xs font-bold text-theme-muted mt-4 mb-2">媒体库</div>
+            <a href="#" @click.prevent="navTo('photos')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'photos' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-images w-6 text-center"></i><span class="ml-2">照片相册</span>
+            </a>
+            <a href="#" @click.prevent="navTo('cinema')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'cinema' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-film w-6 text-center"></i><span class="ml-2">影视库</span>
+            </a>
+            <a href="#" @click.prevent="navTo('music')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'music' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-music w-6 text-center"></i><span class="ml-2">音乐库</span>
+            </a>
+
+            <div class="px-2 text-xs font-bold text-theme-muted mt-4 mb-2">系统</div>
+            <a href="#" @click.prevent="navTo('shares')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'shares' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-share-nodes w-6 text-center"></i><span class="ml-2">分享与图床</span>
+            </a>
+            <a href="#" @click.prevent="navTo('settings')" :class="['flex items-center px-3 py-3 md:py-2.5 rounded-lg transition-colors', currentView === 'settings' ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']">
+                <i class="fa-solid fa-gear w-6 text-center"></i><span class="ml-2">系统设置</span>
+            </a>
+        </nav>
+        
+        <div class="p-3 border-t border-theme-border">
+            <button @click="toggleTheme" class="flex items-center justify-center w-full py-2.5 bg-theme-border/30 hover:bg-theme-border/60 rounded-lg transition-colors text-theme-muted hover:text-theme-text">
+                <i :class="[themeIcon, 'mr-2']"></i><span>{{ themeText }}</span>
+            </button>
+        </div>
+    </aside>
+
+    <!-- 主工作区 -->
+    <main class="flex-1 flex flex-col relative overflow-hidden bg-theme-bg pb-[72px] w-full">
+        
+        <!-- 顶部栏 -->
+        <header class="h-14 flex items-center justify-between px-4 md:px-6 border-b border-theme-border bg-theme-panel flex-shrink-0 z-20">
+            <div class="flex items-center">
+                <button @click="isMobileMenuOpen = true" class="md:hidden mr-3 text-theme-text text-lg"><i class="fa-solid fa-bars"></i></button>
+                <div class="hidden md:flex items-center text-sm text-theme-muted">
+                    <span class="hover:text-theme-text cursor-pointer" @click="navTo('portal')">Home</span>
+                    <i class="fa-solid fa-chevron-right text-[10px] mx-2"></i>
+                    <span class="text-theme-text capitalize">{{ currentView }}</span>
+                </div>
+                <span class="md:hidden font-bold text-base capitalize text-theme-text">{{ currentView }}</span>
+            </div>
+            
+            <div v-if="currentView === 'files'" class="flex-1 max-w-[150px] md:max-w-md ml-4 md:ml-8">
+                <div class="relative">
+                    <i class="fa-solid fa-magnifying-glass absolute left-3 top-1/2 transform -translate-y-1/2 text-theme-muted text-xs"></i>
+                    <input type="text" placeholder="搜索..." class="w-full bg-[var(--search-bg)] text-theme-text pl-8 pr-3 py-1.5 rounded-full outline-none border border-transparent focus:border-theme-accent text-xs">
+                </div>
+            </div>
+            <div class="flex items-center ml-auto">
+                <div class="w-7 h-7 rounded-full bg-theme-accent text-white flex items-center justify-center text-xs font-bold">A</div>
+            </div>
+        </header>
+
+        <!-- 终端视图 -->
+        <div v-if="currentView === 'terminal'" class="flex-1 flex flex-col overflow-hidden bg-[#1e1e1e] relative">
+            <header class="h-10 flex items-center bg-[#252526] border-b border-gray-700 flex-shrink-0 px-2 space-x-1 text-white">
+                <div v-for="tab in terminalTabs" :key="tab.id" @click="activeTerminalId = tab.id" :class="['group flex items-center px-3 py-1.5 rounded-t text-xs cursor-pointer border-t-2 whitespace-nowrap', activeTerminalId === tab.id ? 'bg-[#1e1e1e] border-theme-accent' : 'bg-[#2d2d2d] border-transparent text-gray-400']">
+                    <i class="fa-solid fa-terminal mr-2"></i><span>{{ tab.name }}</span>
+                    <button class="ml-3 hover:text-red-400" @click.stop="closeTerminalTab(tab.id)"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <button @click="createTerminalTab('/')" class="ml-2 w-8 h-8 flex items-center justify-center rounded text-gray-400 hover:text-white flex-shrink-0"><i class="fa-solid fa-plus"></i></button>
+                
+                <button @click="showShortcuts = !showShortcuts" class="ml-auto w-8 h-8 flex items-center justify-center rounded text-gray-400 hover:text-white flex-shrink-0 md:hidden" title="切换快捷键栏">
+                    <i class="fa-solid fa-keyboard"></i>
+                </button>
+            </header>
+            
+            <!-- xterm 容器 (移动端根据快捷键状态留出底部空间) -->
+            <div class="flex-1 relative" :class="{ 'pb-[72px] md:pb-0': showShortcuts }"> 
+                <div v-if="terminalTabs.length === 0" class="absolute inset-0 flex flex-col items-center justify-center text-gray-500">
+                    <p>没有活动的终端会话</p>
+                    <button @click="createTerminalTab('/')" class="mt-4 px-4 py-2 bg-theme-accent text-white rounded text-xs">新建会话</button>
+                </div>
+                <div v-for="tab in terminalTabs" :key="tab.id" v-show="activeTerminalId === tab.id" :id="'xterm-' + tab.id" class="absolute inset-0 text-white"></div>
+            </div>
+
+            <!-- 📱 移动端专属：完美复刻 Termux 两行布局 (PC端自动隐藏) -->
+            <div v-if="showShortcuts" class="absolute bottom-0 left-0 right-0 h-[72px] bg-[#1e1e1e] flex flex-col z-30 md:hidden border-t border-[#333]">
+                <!-- 第一行 -->
+                <div class="flex-1 grid grid-cols-7 bg-[#252526]">
+                    <button @click="sendTermKey('\x1b')" class="term-shortcut-key">ESC</button>
+                    <button @click="sendTermKey('/')" class="term-shortcut-key">/</button>
+                    <button @click="sendTermKey('-')" class="term-shortcut-key">-</button>
+                    <button @click="sendTermKey('\x1b[H')" class="term-shortcut-key">HOME</button>
+                    <button @click="sendTermKey('\x1b[A')" class="term-shortcut-key"><i class="fa-solid fa-arrow-up"></i></button>
+                    <button @click="sendTermKey('\x1b[F')" class="term-shortcut-key">END</button>
+                    <button @click="sendTermKey('\x1b[5~')" class="term-shortcut-key">PGUP</button>
+                </div>
+                <!-- 第二行 -->
+                <div class="flex-1 grid grid-cols-7 bg-[#1a1a1a]">
+                    <button @click="sendTermKey('\t')" class="term-shortcut-key">TAB</button>
+                    <button @click="toggleStickyKey('ctrl')" :class="['term-shortcut-key', isCtrlActive ? 'sticky-active' : '']">CTRL</button>
+                    <button @click="toggleStickyKey('alt')" :class="['term-shortcut-key', isAltActive ? 'sticky-active' : '']">ALT</button>
+                    <button @click="sendTermKey('\x1b[D')" class="term-shortcut-key"><i class="fa-solid fa-arrow-left"></i></button>
+                    <button @click="sendTermKey('\x1b[B')" class="term-shortcut-key"><i class="fa-solid fa-arrow-down"></i></button>
+                    <button @click="sendTermKey('\x1b[C')" class="term-shortcut-key"><i class="fa-solid fa-arrow-right"></i></button>
+                    <button @click="sendTermKey('\x1b[6~')" class="term-shortcut-key">PGDN</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 文件管理视图 -->
+        <div v-if="currentView === 'files'" class="flex-1 flex overflow-hidden">
+            <div v-if="isEditingFile" class="flex-1 flex flex-col bg-[#1e1e1e]">
+                <header class="h-12 flex items-center justify-between px-4 border-b border-gray-700 bg-[#252526] flex-shrink-0 text-white">
+                    <div class="flex items-center text-sm">
+                        <button @click="closeEditor" class="mr-4 text-gray-400 hover:text-white transition-colors"><i class="fa-solid fa-arrow-left mr-2"></i> 返回</button>
+                        <span class="truncate max-w-[120px] md:max-w-none">{{ editingFile?.name }}</span>
+                    </div>
+                    <button class="bg-theme-accent hover:opacity-90 px-3 py-1.5 rounded text-xs text-white" @click="saveFile">保存</button>
+                </header>
+                <div class="flex-1 overflow-hidden relative p-1 md:p-2">
+                    <textarea id="code-editor" v-model="editingContent"></textarea>
+                </div>
+            </div>
+            
+            <div v-else class="flex-1 flex overflow-hidden">
+                <div class="w-56 border-r border-theme-border bg-theme-panel py-3 flex-shrink-0 overflow-y-auto hidden md:block">
+                    <div class="px-4 text-xs font-bold text-theme-muted mb-2">目录树</div>
+                    <div v-for="dir in directoryTree" :key="dir.id" @click="currentPath = dir.path"
+                        :class="['px-4 py-2 cursor-pointer flex items-center text-sm transition-colors', currentPath === dir.path ? 'bg-theme-accent/10 text-theme-accent' : 'text-theme-muted hover:bg-theme-border/50']"
+                        :style="{ paddingLeft: (dir.level * 16 + 16) + 'px' }">
+                        <i :class="[dir.icon, 'mr-2 w-4 text-center']"></i> {{ dir.name }}
+                    </div>
+                </div>
+                
+                <div class="flex-1 flex flex-col relative w-full">
+                    <header class="h-12 flex items-center justify-between px-4 border-b border-theme-border bg-theme-panel">
+                        <div class="text-xs text-theme-muted truncate max-w-[150px] md:max-w-none"><span class="text-theme-text font-medium">{{ currentPath }}</span></div>
+                        <button class="bg-theme-accent text-white px-3 py-1.5 rounded-lg text-xs"><i class="fa-solid fa-cloud-arrow-up mr-1"></i> 上传</button>
+                    </header>
+                    <div class="flex-1 overflow-y-auto p-3 md:p-4">
+                        <div class="file-grid">
+                            <div v-for="file in currentFiles" :key="file.id"
+                                class="group relative flex flex-col items-center p-2 md:p-3 rounded-xl border border-transparent hover:bg-theme-panel hover:border-theme-border cursor-pointer transition-colors"
+                                :class="{ 'bg-theme-panel border-theme-border': selectedFile && selectedFile.id === file.id }"
+                                @click.stop="selectedFile = file" @dblclick="handleFileDoubleClick(file)">
+                                <div class="w-12 h-12 md:w-14 md:h-14 mb-2 flex items-center justify-center">
+                                    <img v-if="file.type === 'image'" :src="file.url" class="w-full h-full object-cover rounded-lg">
+                                    <i v-else :class="[file.icon, 'text-3xl md:text-4xl']"></i>
+                                </div>
+                                <span class="text-xs text-center w-full truncate text-theme-text">{{ file.name }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 照片相册视图 -->
+        <div v-if="currentView === 'photos'" class="flex-1 flex flex-col overflow-hidden">
+            <div class="flex items-center justify-between px-4 md:px-8 pt-4 pb-2 border-b border-theme-border">
+                <div class="flex items-center space-x-6 text-sm font-medium">
+                    <span @click="photoTab = 'albums'" :class="['cursor-pointer pb-2', photoTab === 'albums' ? 'text-theme-text border-b-2 border-theme-accent' : 'text-theme-muted']">相册</span>
+                    <span @click="photoTab = 'timeline'" :class="['cursor-pointer pb-2', photoTab === 'timeline' ? 'text-theme-text border-b-2 border-theme-accent' : 'text-theme-muted']">照片时间线</span>
+                </div>
+            </div>
+            <div v-if="photoTab === 'albums'" class="flex-1 overflow-y-auto px-4 md:px-8 pt-4 pb-20">
+                <div v-for="yearGroup in albumsByYear" :key="yearGroup.year" class="mb-8">
+                    <h2 class="text-lg md:text-xl font-bold mb-3 flex items-center text-theme-text">
+                        <i class="fa-solid fa-chevron-down text-xs mr-2 text-theme-muted"></i>{{ yearGroup.year }}
+                    </h2>
+                    <div class="album-grid">
+                        <div v-for="album in yearGroup.albums" :key="album.id" class="group cursor-pointer" @click="photoTab = 'timeline'">
+                            <div class="img-container aspect-[4/3] rounded-xl mb-2">
+                                <img :src="album.cover" class="img-actual loaded" alt="cover">
+                                <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center z-10 hidden md:flex">
+                                    <span class="text-white font-medium bg-black/50 px-3 py-1 rounded-full text-xs backdrop-blur-sm">{{ album.count }} 个项目</span>
+                                </div>
+                            </div>
+                            <h3 class="font-bold text-sm text-theme-text mb-0.5 truncate">{{ album.name }}</h3>
+                            <p class="text-xs text-theme-muted">{{ album.dateRange }}</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div v-if="photoTab === 'timeline'" class="flex-1 overflow-y-auto px-4 md:px-8 pb-20">
+                <div v-for="group in photosByMonth" :key="group.month" class="mb-6">
+                    <div class="timeline-header">{{ group.month }}</div>
+                    <div class="masonry-grid mt-3">
+                        <div v-for="(media, index) in group.items" :key="media.id" class="masonry-item relative group cursor-pointer">
+                            <div class="img-container rounded-lg" :style="{ backgroundColor: media.color, aspectRatio: media.aspectRatio }">
+                                <div class="img-placeholder" :style="{ backgroundColor: media.color }"></div>
+                                <img :src="media.thumb" class="img-actual" loading="lazy" @load="(e) => e.target.classList.add('loaded')">
+                            </div>
+                            <div v-if="media.type === 'video'" class="absolute bottom-1.5 right-1.5 bg-black/60 text-white text-[10px] px-1.5 py-0.5 rounded backdrop-blur">
+                                <i class="fa-solid fa-play mr-1 text-[8px]"></i>{{ media.duration }}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 影视库 -->
+        <div v-if="currentView === 'cinema'" class="flex-1 overflow-y-auto p-4 md:p-8">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl md:text-2xl font-bold">影视库</h1>
+                <div class="text-sm text-theme-muted hidden md:block">共 {{ mockVideos.length }} 部影片</div>
+            </div>
+            <div class="video-grid">
+                <div v-for="video in mockVideos" :key="video.id" class="group cursor-pointer" @click="playVideo(video)">
+                    <div class="img-container aspect-video rounded-xl mb-2 bg-black shadow-sm">
+                        <img :src="video.cover" class="img-actual loaded">
+                        <div class="absolute inset-0 bg-black/30 flex items-center justify-center z-10">
+                            <div class="w-10 h-10 md:w-12 md:h-12 rounded-full bg-black/50 backdrop-blur flex items-center justify-center text-white md:group-hover:scale-110 transition-transform">
+                                <i class="fa-solid fa-play ml-1 text-sm md:text-base"></i>
+                            </div>
+                        </div>
+                        <div class="absolute bottom-1.5 right-1.5 bg-black/70 text-white text-[10px] px-1.5 py-0.5 rounded z-10">{{ video.duration }}</div>
+                    </div>
+                    <h3 class="font-bold text-sm text-theme-text mb-0.5 truncate">{{ video.name }}</h3>
+                    <p class="text-xs text-theme-muted flex justify-between"><span>{{ video.size }}</span><span>{{ video.date }}</span></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 音乐库 -->
+        <div v-if="currentView === 'music'" class="flex-1 overflow-y-auto p-4 md:px-8 pb-20 pt-4 md:pt-6">
+            <div class="max-w-4xl">
+                <div class="flex flex-col md:flex-row items-center md:items-end mb-6 md:mb-8">
+                    <div class="w-32 h-32 md:w-40 md:h-40 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 shadow-xl flex items-center justify-center text-white mr-0 md:mr-8 mb-4 md:mb-0 flex-shrink-0">
+                        <i class="fa-solid fa-music text-4xl md:text-5xl opacity-50"></i>
+                    </div>
+                    <div class="text-center md:text-left">
+                        <p class="text-xs font-bold text-theme-muted mb-1 uppercase tracking-wide">本地音乐库</p>
+                        <h1 class="text-2xl md:text-4xl font-bold mb-2 md:mb-4">我的收藏</h1>
+                        <button class="bg-theme-accent text-white px-5 py-2 rounded-full text-sm font-medium hover:opacity-90 inline-flex items-center" @click="playMusic(mockMusic[0], mockMusic)">
+                            <i class="fa-solid fa-play mr-2"></i> 播放全部
+                        </button>
+                    </div>
+                </div>
+                <table class="w-full text-left text-sm text-theme-muted">
+                    <thead class="border-b border-theme-border">
+                        <tr><th class="py-2 px-2 md:px-4 font-normal w-10">#</th><th class="py-2 px-2 md:px-4 font-normal">标题</th><th class="py-2 px-2 md:px-4 font-normal hidden md:table-cell">时长</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="(song, index) in mockMusic" :key="song.id" class="hover:bg-theme-panel cursor-pointer transition-colors group" @dblclick="playMusic(song, mockMusic)">
+                            <td class="py-3 px-2 md:px-4"><span class="group-hover:hidden">{{ index + 1 }}</span><i class="fa-solid fa-play hidden group-hover:inline text-theme-accent"></i></td>
+                            <td class="py-3 px-2 md:px-4 flex items-center space-x-3">
+                                <img :src="song.cover" class="w-10 h-10 rounded object-cover">
+                                <div class="truncate"><div class="text-theme-text font-medium truncate">{{ song.name }}</div><div class="text-xs truncate">{{ song.artist }}</div></div>
+                            </td>
+                            <td class="py-3 px-2 md:px-4 hidden md:table-cell">{{ song.duration }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 聚合主页 -->
+        <div v-if="currentView === 'portal'" class="flex-1 relative overflow-y-auto p-4 md:p-8 flex flex-col items-center pt-10 md:pt-24">
+            <div class="absolute top-0 left-1/4 w-64 h-64 md:w-96 md:h-96 bg-theme-accent/20 rounded-full filter blur-[100px] pointer-events-none"></div>
+            <div class="w-full max-w-3xl relative z-10">
+                <div class="mb-8 md:mb-12 text-center">
+                    <h1 class="text-2xl md:text-4xl font-bold mb-2 md:mb-4 tracking-tight">欢迎回来，Aimer</h1>
+                    <p class="text-sm md:text-base text-theme-muted">系统运行正常，媒体引擎已就绪。</p>
+                </div>
+                <div class="space-y-3 md:space-y-4">
+                    <div class="glass-card rounded-xl md:rounded-2xl p-4 md:p-5 flex items-center justify-between cursor-pointer group" @click="navTo('files')">
+                        <div class="flex items-center">
+                            <div class="w-10 h-10 md:w-12 md:h-12 rounded-lg md:rounded-xl bg-theme-accent/20 flex items-center justify-center mr-3 md:mr-5"><i class="fa-solid fa-folder-open text-lg md:text-xl text-theme-accent"></i></div>
+                            <div><h2 class="text-base md:text-lg font-bold mb-0.5 md:mb-1 group-hover:text-theme-accent transition-colors">文件管理</h2><p class="text-xs md:text-sm text-theme-muted">文件浏览 · 在线编辑 · WebDAV</p></div>
+                        </div>
+                        <i class="fa-solid fa-arrow-right text-theme-muted group-hover:text-theme-accent transition-colors hidden md:block"></i>
+                    </div>
+                    <div class="glass-card rounded-xl md:rounded-2xl p-4 md:p-5 flex items-center justify-between cursor-pointer group" @click="navTo('photos')">
+                        <div class="flex items-center">
+                            <div class="w-10 h-10 md:w-12 md:h-12 rounded-lg md:rounded-xl bg-blue-500/20 flex items-center justify-center mr-3 md:mr-5"><i class="fa-solid fa-images text-lg md:text-xl text-blue-500"></i></div>
+                            <div><h2 class="text-base md:text-lg font-bold mb-0.5 md:mb-1 group-hover:text-blue-500 transition-colors">媒体画廊</h2><p class="text-xs md:text-sm text-theme-muted">时间线 · 相册 · 沉浸式预览</p></div>
+                        </div>
+                        <i class="fa-solid fa-arrow-right text-theme-muted group-hover:text-blue-500 transition-colors hidden md:block"></i>
+                    </div>
+                    <div class="glass-card rounded-xl md:rounded-2xl p-4 md:p-5 flex items-center justify-between cursor-pointer group" @click="navTo('terminal')">
+                        <div class="flex items-center">
+                            <div class="w-10 h-10 md:w-12 md:h-12 rounded-lg md:rounded-xl bg-green-500/20 flex items-center justify-center mr-3 md:mr-5"><i class="fa-solid fa-terminal text-lg md:text-xl text-green-500"></i></div>
+                            <div><h2 class="text-base md:text-lg font-bold mb-0.5 md:mb-1 group-hover:text-green-500 transition-colors">系统终端</h2><p class="text-xs md:text-sm text-theme-muted">PTY 联动 · 多标签会话</p></div>
+                        </div>
+                        <i class="fa-solid fa-arrow-right text-theme-muted group-hover:text-green-500 transition-colors hidden md:block"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 分享与设置占位 -->
+        <div v-if="currentView === 'shares'" class="flex-1 p-4 md:p-8 overflow-y-auto text-center pt-24 text-theme-muted">
+            <h2>分享与图床视图 (略)</h2>
+        </div>
+        <div v-if="currentView === 'settings'" class="flex-1 p-4 md:p-8 overflow-y-auto text-center pt-24 text-theme-muted">
+            <h2>系统设置视图 (略)</h2>
+        </div>
+
+        <!-- 底部音乐播放栏 (响应式) -->
+        <transition name="slide-up">
+            <div v-if="currentAudio" class="fixed bottom-0 left-0 right-0 h-[64px] md:h-[72px] bg-theme-panel border-t border-theme-border z-40 flex items-center justify-between px-3 md:px-6 shadow-2xl">
+                <div class="flex items-center w-3/4 md:w-1/4 truncate">
+                    <img :src="currentAudio.cover" class="w-10 h-10 md:w-12 md:h-12 rounded-lg shadow-sm mr-3 md:mr-4 object-cover">
+                    <div class="overflow-hidden"><div class="text-xs md:text-sm font-bold text-theme-text truncate">{{ currentAudio.name }}</div><div class="text-[10px] md:text-xs text-theme-muted truncate">{{ currentAudio.artist }}</div></div>
+                </div>
+                <div class="flex flex-col items-center flex-1 max-w-md hidden md:flex">
+                    <div class="flex items-center space-x-6 mb-1 text-theme-text">
+                        <button @click="playPrev" class="hover:text-theme-accent"><i class="fa-solid fa-backward-step text-lg"></i></button>
+                        <button class="w-10 h-10 rounded-full bg-theme-accent text-white flex items-center justify-center hover:scale-105" @click="toggleAudioPlayback">
+                            <i :class="isPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-1'"></i>
+                        </button>
+                        <button @click="playNext" class="hover:text-theme-accent"><i class="fa-solid fa-forward-step text-lg"></i></button>
+                    </div>
+                    <div class="w-full flex items-center space-x-2 text-[10px] text-theme-muted">
+                        <span>0:00</span><div class="flex-1 h-1 bg-theme-border rounded-full relative"><div class="absolute left-0 top-0 bottom-0 bg-theme-accent rounded-full w-1/3"></div></div><span>--:--</span>
+                    </div>
+                </div>
+                <div class="w-auto flex justify-end items-center space-x-4 text-theme-muted">
+                    <button class="w-10 h-10 rounded-full bg-theme-accent text-white flex items-center justify-center md:hidden" @click="toggleAudioPlayback">
+                        <i :class="isPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-1'"></i>
+                    </button>
+                    <i class="fa-solid fa-volume-high hidden md:block"></i>
+                </div>
+            </div>
+        </transition>
+
+        <!-- 全局媒体灯箱/视频播放遮罩 -->
+        <div v-if="currentVideo" class="fixed inset-0 z-50 bg-black/95 flex items-center justify-center p-2 md:p-10" @click="currentVideo = null">
+            <div class="w-full max-w-5xl aspect-video bg-black rounded-xl relative" @click.stop>
+                <video :src="currentVideo.url" class="w-full h-full rounded-xl" controls autoplay></video>
+                <button class="absolute -top-10 md:-top-12 right-0 text-white hover:text-red-400" @click="currentVideo = null"><i class="fa-solid fa-xmark text-xl md:text-2xl"></i></button>
+            </div>
+        </div>
+
+    </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

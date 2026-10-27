@@ -1,0 +1,79 @@
+{
+  "photos": {
+    "albums": "相册",
+    "timeline": "照片时间线",
+    "empty": "这里还没有照片或视频",
+    "emptyHint": "把媒体放进挂载点，或用 WebDAV 从手机同步过来",
+    "albumMeta": "{count} 张 · {folder}",
+    "albumItems": "{count} 项",
+    "slideshow": "幻灯片",
+    "backToAlbums": "相册",
+    "videoBadge": "视频",
+    "truncated": "目录过大，仅索引前 4000 项",
+    "rootFolder": "根目录"
+  },
+  "cinema": {
+    "title": "影视库",
+    "count": "共 {count} 部影片",
+    "empty": "影视库是空的",
+    "emptyHint": "完全按文件夹结构展示，不做任何在线刮削",
+    "resume": "续播 {time}",
+    "native": "原生播放器",
+    "nativeOn": "当前：浏览器原生播放器（点击切回 Video.js）",
+    "nativeOff": "当前：Video.js（点击强制原生播放器）"
+  },
+  "music": {
+    "title": "本地音乐库",
+    "count": "{count} 首曲目",
+    "empty": "音乐库是空的",
+    "emptyHint": "支持 mp3 / flac / m4a / wav 等常见格式",
+    "playAll": "播放全部",
+    "columnIndex": "#",
+    "columnTitle": "标题",
+    "columnSize": "大小",
+    "columnFavorite": "收藏"
+  },
+  "toolbar": {
+    "favorites": "收藏",
+    "onlyFavorites": "只看收藏",
+    "rescan": "重新扫描",
+    "indexed": "已索引挂载点媒体",
+    "loadFailed": "媒体索引加载失败"
+  },
+  "favorite": {
+    "add": "收藏",
+    "remove": "取消收藏"
+  },
+  "player": {
+    "modeLoop": "列表循环",
+    "modeOne": "单曲循环",
+    "modeShuffle": "随机播放",
+    "prev": "上一首",
+    "next": "下一首",
+    "play": "播放",
+    "pause": "暂停",
+    "lyrics": "歌词",
+    "close": "关闭播放条",
+    "lyricsLoading": "歌词加载中…",
+    "noLyrics": "未找到同目录 .lrc 歌词",
+    "noTimeline": "歌词文件没有可用时间轴",
+    "lyricsFailed": "歌词加载失败",
+    "volume": "音量",
+    "mute": "静音",
+    "unmute": "取消静音",
+    "playlist": "播放列表",
+    "playlistClear": "清空列表",
+    "playlistEmpty": "播放队列是空的",
+    "playlistCount": "共 {count} 首"
+  },
+  "video": {
+    "unsupportedExt": "浏览器无法解码 .{ext} 视频，请转码为 mp4(H.264)，或在文件管理里下载后本地播放",
+    "loadFailed": "视频加载失败：文件可能已移动，或编码不被当前浏览器支持",
+    "playerUnsupported": "浏览器无法解码 .{ext} 视频，请转码为 mp4(H.264)，或用原文件播放器打开",
+    "playerLoadFailed": "视频加载失败：文件可能已移动、损坏，或编码不被当前浏览器支持",
+    "fallbackLink": "视频无法播放，点此在新窗口打开",
+    "subtitleLabel": "中文字幕",
+    "openOriginal": "新窗口打开原文件",
+    "close": "关闭"
+  }
+}

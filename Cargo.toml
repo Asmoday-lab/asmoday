@@ -1,0 +1,56 @@
+[package]
+name = "asmoday"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "sync", "time", "io-util", "signal"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 配置格式固定 TOML（红线：禁止 YAML）
+toml = "0.8"
+# 按扩展名推断 Content-Type（本地查表，不联网）
+mime_guess = "2"
+# 单二进制：把前端产物内嵌进可执行文件
+rust-embed = "8"
+# ThumbHash：主色调模糊占位图（设计文档 3.4，纯本地计算）
+thumbhash = "0.1"
+# 本地 SQLite（bundled，无需系统依赖）
+rusqlite = { version = "0.32", features = ["bundled"] }
+# 密码哈希
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["getrandom"] }
+# TOTP / Base32
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2"
+rand = "0.9"
+# 跨平台真实伪终端（ConPTY / openpty）
+portable-pty = "0.8"
+# 跨平台主目录解析（设计文档 6.3：path 为空时必须落 dirs::home_dir()，
+# 不要自己读 USERPROFILE/HOME —— macOS/Linux 的规则并不一致）
+dirs = "6"
+# 缩略图解码/缩放（只处理静态图片；视频封面走外部可选 FFmpeg 截帧，不链接 libav*）
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+# 聚合服务反代（TLS 走系统实现：Windows SChannel，避免引入 ring 的 C 编译）
+reqwest = { version = "0.12", default-features = false, features = ["stream", "native-tls"] }
+tokio-tungstenite = "0.29"
+# config.toml 热重载（设计文档 3.5：保存后无需重启进程）
+notify = "8"
+
+# 发布体积裁剪（见设计文档 9.1）
+# Windows 下某些 MSVC 环境会在 C 依赖（SQLite / ring 等）上触发
+# cl.exe D8050「无法把命令行放入调试记录」，关闭 dev 调试信息即可绕开。
+[profile.dev]
+debug = 0
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

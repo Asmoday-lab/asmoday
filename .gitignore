@@ -1,0 +1,19 @@
+/target
+
+# 前端产物（由 vite build 输出，供 rust-embed 打包）
+/dist
+
+# 运行期截图自检产物
+/.shots
+
+# 运行期数据
+/data
+
+# 运行期在仓库根目录生成的配置（属用户数据，绝不入库）
+/config.toml
+/config.toml.*
+
+# 编辑器 / 系统杂项
+.DS_Store
+Thumbs.db
+*.tsbuildinfo

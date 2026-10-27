@@ -1,0 +1,21 @@
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "types": ["vite/client"],
+    "allowArbitraryExtensions": true,
+    /* 语言包按模块拆成 JSON 文件（设计文档 3.8） */
+    "resolveJsonModule": true,
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"],
+  /* Video.js 10 的自定义元素：模板里按原生标签处理，别当 Vue 组件解析 */
+  "vueCompilerOptions": {
+    "isCustomElement": ["video-player", "video-neutral-skin"]
+  }
+}

@@ -1,0 +1,162 @@
+/** 媒体库 API 客户端 */
+
+import { withBase } from '../lib/base'
+import { ApiError, readApiError } from '../lib/errors'
+
+export type MediaKind = 'image' | 'video' | 'audio'
+
+export interface MediaItem {
+  name: string
+  path: string
+  size: number
+  modified: number | null
+  kind: MediaKind
+  ext: string
+  folder: string
+  /** 音频内嵌 ID3 标题 / 艺术家 / 专辑（其它类型缺省） */
+  title?: string | null
+  artist?: string | null
+  album?: string | null
+  /** 音频是否有内嵌封面；true 时才值得去拉 coverUrl() */
+  cover?: boolean
+  /** ThumbHash（base64，25 字节左右），缩略图生成过才有 */
+  hash?: string | null
+  /** 由 ThumbHash 解出的平均色，用作加载占位底色 */
+  color?: string | null
+  /** 同目录同名外挂字幕（.vtt / .srt，视频才有） */
+  subtitle?: string | null
+}
+
+export interface BrowseResult {
+  root: string
+  items: MediaItem[]
+  scanned: number
+  truncated: boolean
+}
+
+export async function browseMedia(
+  path: string | undefined,
+  kind: 'media' | MediaKind = 'media',
+  depth = 2,
+): Promise<BrowseResult> {
+  const params = new URLSearchParams({ kind, depth: String(depth) })
+  if (path) params.set('path', path)
+  const res = await fetch(`/api/media/browse?${params.toString()}`)
+  if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+  return (await res.json()) as BrowseResult
+}
+
+/** 缩略图（后端信号量限流，拥塞时返回占位图） */
+export function thumbUrl(path: string, width = 320): string {
+  return withBase(`/api/files/thumb?path=${encodeURIComponent(path)}&w=${width}`)
+}
+
+/** 原图/原视频 */
+export function rawUrl(path: string): string {
+  return withBase(`/api/files/raw?path=${encodeURIComponent(path)}`)
+}
+
+/** 音频内嵌封面（ID3 APIC）；无封面时后端回 404，调用方需做兜底 */
+export function coverUrl(path: string): string {
+  return withBase(`/api/media/cover?path=${encodeURIComponent(path)}`)
+}
+
+/** 优先用后端算好的 ThumbHash 平均色，退化时用路径派生色 */
+export function placeholderFor(item: MediaItem): string {
+  return item.color ?? placeholderColor(item.path)
+}
+
+/** 由路径派生一个稳定的占位色（没有 ThumbHash 时的兜底） */
+export function placeholderColor(seed: string): string {
+  let hash = 0
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) % 360
+  }
+  return `hsl(${hash} 28% 22%)`
+}
+
+/** 同目录同名 .lrc 歌词文件 */
+export function lrcUrl(path: string): string {
+  return rawUrl(path.replace(/\.[^./]+$/, '.lrc'))
+}
+
+/**
+ * 外挂字幕（设计文档 3.4）：后端统一转成 WebVTT 再吐出来，
+ * 所以 .srt 也能被浏览器原生 <track> 识别。
+ */
+export function subtitleUrl(path: string): string {
+  return withBase(`/api/files/subtitle?path=${encodeURIComponent(path)}`)
+}
+
+// ---------------------------------------------------------------------------
+// 播放进度 / 收藏
+// ---------------------------------------------------------------------------
+
+export interface PlayHistoryItem {
+  path: string
+  last_played_at: number | null
+  progress: number | null
+}
+
+export interface FavoriteItem {
+  path: string
+  created_at: number | null
+}
+
+async function postJson(url: string, body: unknown): Promise<void> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+}
+
+export const libraryApi = {
+  async saveProgress(path: string, progress: number): Promise<void> {
+    await postJson('/api/media/progress', { path, progress: Math.round(progress) })
+  },
+
+  async history(): Promise<PlayHistoryItem[]> {
+    const res = await fetch('/api/media/history')
+    if (!res.ok) return []
+    const data = (await res.json()) as { items: PlayHistoryItem[] }
+    return data.items
+  },
+
+  async setFavorite(path: string, favorite: boolean): Promise<void> {
+    await postJson('/api/media/favorite', { path, favorite })
+  },
+
+  async favorites(): Promise<string[]> {
+    const res = await fetch('/api/media/favorites')
+    if (!res.ok) return []
+    const data = (await res.json()) as { items: FavoriteItem[] }
+    return data.items.map((item) => item.path)
+  },
+}
+
+// ---------------------------------------------------------------------------
+// 缩略图缓存管理（设计文档 3.4）
+// ---------------------------------------------------------------------------
+
+export interface CacheStats {
+  files: number
+  bytes: number
+  limit_mb: number
+  max_age_days: number
+  dir: string
+}
+
+export const cacheApi = {
+  async stats(): Promise<CacheStats> {
+    const res = await fetch('/api/media/cache')
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    return (await res.json()) as CacheStats
+  },
+  async clear(): Promise<{ files: number; bytes: number }> {
+    const res = await fetch('/api/media/cache/clear', { method: 'POST' })
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    return (await res.json()) as { files: number; bytes: number }
+  },
+}

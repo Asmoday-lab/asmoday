@@ -1,0 +1,32 @@
+{
+  "tabs": {
+    "defaultDir": "默认目录",
+    "close": "关闭标签",
+    "new": "新建终端",
+    "toggleKeys": "切换快捷键栏"
+  },
+  "empty": {
+    "title": "没有打开的终端会话",
+    "hint": "会在已授权的挂载点或用户主目录拉起真实 shell",
+    "action": "新建会话"
+  },
+  "status": {
+    "connecting": "连接中",
+    "ready": "运行中",
+    "closed": "已断开",
+    "error": "异常",
+    "session": "会话 {id}",
+    "establishing": "建立中…"
+  },
+  "reconnect": {
+    "button": "重新连接",
+    "title": "重新连接终端",
+    "banner": "[连接已断开，正在重连…]",
+    "expired": "登录已过期，请重新登录后再打开终端",
+    "serviceError": "终端服务异常（HTTP {status}）",
+    "interrupted": "终端连接中断，请点「重新连接」重试",
+    "offline": "无法连接服务，请确认 Asmoday 正在运行",
+    "generic": "终端发生错误",
+    "limit": "终端标签已达上限（{max} 个），请先关闭一个"
+  }
+}

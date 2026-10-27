@@ -1,0 +1,110 @@
+{
+  "appName": "Asmoday",
+  "home": "Home",
+  "nav": {
+    "portal": "Dashboard",
+    "files": "Files",
+    "terminal": "Terminal",
+    "photos": "Photos",
+    "cinema": "Cinema",
+    "music": "Music",
+    "shares": "Shares",
+    "settings": "Settings",
+    "login": "Sign in",
+    "share": "Share",
+    "ecosystem": "Ecosystem"
+  },
+  "subtitle": {
+    "portal": "Services and runtime overview",
+    "files": "Browse · Upload · Edit",
+    "photos": "Albums and timeline",
+    "cinema": "Local films and resume",
+    "music": "Local audio and lyrics",
+    "terminal": "Real PTY sessions with reconnect",
+    "shares": "Links and direct URLs",
+    "settings": "config.toml and security policy"
+  },
+  "group": {
+    "workspace": "Workspace",
+    "media": "Media",
+    "system": "System"
+  },
+  "action": {
+    "save": "Save",
+    "saving": "Saving",
+    "cancel": "Cancel",
+    "close": "Close",
+    "confirm": "Confirm",
+    "delete": "Delete",
+    "deleting": "Deleting…",
+    "back": "Back",
+    "open": "Open",
+    "download": "Download",
+    "upload": "Upload",
+    "refresh": "Refresh",
+    "copy": "Copy",
+    "copied": "Copied",
+    "retry": "Retry",
+    "edit": "Edit",
+    "add": "Add",
+    "test": "Test",
+    "create": "Create",
+    "creating": "Creating…",
+    "loading": "Loading…",
+    "loadMore": "Load more",
+    "loadingMore": "Loading…",
+    "newWindow": "Open in new window"
+  },
+  "state": {
+    "empty": "Nothing here yet",
+    "unknownError": "Unknown error",
+    "permanent": "Permanent",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "yes": "Yes",
+    "no": "No",
+    "never": "Never",
+    "none": "None"
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "toLight": "Switch to light",
+    "toDark": "Switch to dark"
+  },
+  "account": {
+    "logout": "Sign out",
+    "notLoggedIn": "Not signed in",
+    "label": "Account"
+  },
+  "language": {
+    "label": "Language",
+    "zh-CN": "简体中文",
+    "en-US": "English"
+  },
+  "unit": {
+    "items": "{count} items",
+    "files": "{count} files",
+    "pieces": "{count}",
+    "photos": "{count} photos",
+    "tracks": "{count} tracks",
+    "days": "{count} days"
+  },
+  "time": {
+    "permanent": "Never expires",
+    "expiresAt": "Expires {time}",
+    "yearMonth": "{year}-{month}",
+    "unknown": "Unknown date"
+  },
+  "clipboard": {
+    "copied": "Copied",
+    "linkCopied": "Link copied",
+    "denied": "Copy failed: the browser denied clipboard access"
+  },
+  "sidebar": {
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar",
+    "openMenu": "Open menu",
+    "closeMenu": "Close menu"
+  }
+}

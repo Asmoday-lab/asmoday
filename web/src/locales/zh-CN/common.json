@@ -1,0 +1,110 @@
+{
+  "appName": "Asmoday",
+  "home": "Home",
+  "nav": {
+    "portal": "聚合主页",
+    "files": "文件管理",
+    "terminal": "系统终端",
+    "photos": "照片相册",
+    "cinema": "影视库",
+    "music": "音乐库",
+    "shares": "分享与图床",
+    "settings": "系统设置",
+    "login": "登录",
+    "share": "分享",
+    "ecosystem": "生态推荐"
+  },
+  "subtitle": {
+    "portal": "服务聚合与运行概览",
+    "files": "浏览 · 上传 · 在线编辑",
+    "photos": "相册与时间线",
+    "cinema": "本地影片与续播",
+    "music": "本地音频与歌词",
+    "terminal": "真实 PTY 会话与断线保活",
+    "shares": "链接管理与直链",
+    "settings": "config.toml 与安全策略"
+  },
+  "group": {
+    "workspace": "工作区",
+    "media": "媒体库",
+    "system": "系统"
+  },
+  "action": {
+    "save": "保存",
+    "saving": "保存中",
+    "cancel": "取消",
+    "close": "关闭",
+    "confirm": "确认",
+    "delete": "删除",
+    "deleting": "删除中…",
+    "back": "返回",
+    "open": "打开",
+    "download": "下载",
+    "upload": "上传",
+    "refresh": "刷新",
+    "copy": "复制",
+    "copied": "已复制",
+    "retry": "重试",
+    "edit": "编辑",
+    "add": "添加",
+    "test": "测试",
+    "create": "创建",
+    "creating": "创建中…",
+    "loading": "加载中…",
+    "loadMore": "加载更多",
+    "loadingMore": "加载中…",
+    "newWindow": "新窗口打开"
+  },
+  "state": {
+    "empty": "暂无内容",
+    "unknownError": "未知错误",
+    "permanent": "永久",
+    "enabled": "已启用",
+    "disabled": "已禁用",
+    "yes": "是",
+    "no": "否",
+    "never": "永不",
+    "none": "无"
+  },
+  "theme": {
+    "light": "浅色",
+    "dark": "深色",
+    "toLight": "切换到浅色",
+    "toDark": "切换到深色"
+  },
+  "account": {
+    "logout": "退出登录",
+    "notLoggedIn": "未登录",
+    "label": "账号"
+  },
+  "language": {
+    "label": "语言",
+    "zh-CN": "简体中文",
+    "en-US": "English"
+  },
+  "unit": {
+    "items": "{count} 项",
+    "files": "{count} 个文件",
+    "pieces": "{count} 个",
+    "photos": "{count} 张",
+    "tracks": "{count} 首曲目",
+    "days": "{count} 天"
+  },
+  "time": {
+    "permanent": "永久有效",
+    "expiresAt": "过期于 {time}",
+    "yearMonth": "{year} 年 {month} 月",
+    "unknown": "未知时间"
+  },
+  "clipboard": {
+    "copied": "已复制",
+    "linkCopied": "链接已复制",
+    "denied": "复制失败：浏览器拒绝了剪贴板权限"
+  },
+  "sidebar": {
+    "collapse": "折叠侧边栏",
+    "expand": "展开侧边栏",
+    "openMenu": "打开菜单",
+    "closeMenu": "关闭菜单"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "list": {
+    "intro": "Every link created from the file context menu (Share… or Copy image URL) is listed here. Revoking takes effect immediately; set [shares].referer_allowlist to enable hotlink protection for direct image URLs.",
+    "password": "Password",
+    "noDownload": "No download",
+    "copy": "Copy link",
+    "revoke": "Revoke share",
+    "empty": "No share created yet. Right-click a file in Files to try.",
+    "revoked": "Share revoked",
+    "loadFailed": "Failed to load shares",
+    "revokeFailed": "Revoke failed"
+  },
+  "public": {
+    "protected": "This share is password protected",
+    "missing": "This share does not exist or has expired",
+    "passwordPlaceholder": "Access password",
+    "unlock": "Unlock",
+    "passwordProtected": "Password protected",
+    "noDownload": "Download disabled",
+    "download": "Download file",
+    "previewOnly": "This share is preview-only",
+    "parent": "Up",
+    "count": "{count} items",
+    "emptyDir": "This folder is empty",
+    "footer": "Shared with Asmoday",
+    "loadFailed": "Failed to load",
+    "dirFailed": "Failed to load the folder",
+    "shareDir": "Shared folder"
+  }
+}

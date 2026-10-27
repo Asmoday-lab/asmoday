@@ -1,0 +1,22 @@
+{
+  "title": "Ecosystem",
+  "intro": "Asmoday only does files, media and terminals. Everything below is delegated to mature tools through WebDAV or a shared directory.",
+  "categories": {
+    "sync": "Sync and backup",
+    "download": "Remote download",
+    "tunnel": "Public access and tunnels",
+    "writing": "Writing and image hosting"
+  },
+  "items": {
+    "syncthing": "Peer-to-peer incremental sync. Mirror folders from your phone or desktop straight into an Asmoday mount.",
+    "photosync": "Back up your phone camera roll in the background over the WebDAV endpoint Asmoday provides.",
+    "foldersync": "A capable Android folder sync tool that can mirror specific directories over WebDAV on a schedule.",
+    "qbittorrent": "A battle-tested BitTorrent client. Point its download path at an Asmoday cinema folder and play the result in the browser.",
+    "aria2": "A lightweight multi-protocol command-line downloader, a great fit with AriaNg.",
+    "caddy": "Exposing Asmoday to the internet? Pair it with a proper reverse proxy; X-Forwarded-* headers are supported natively.",
+    "tailscale": "Prefer not to expose anything? Build a virtual LAN and reach your devices safely from anywhere.",
+    "picgo": "Point PicGo at Asmoday's direct image URLs and combine it with Typora or Obsidian for a self-hosted Markdown workflow."
+  },
+  "visit": "Visit website",
+  "footer": "Asmoday grows thanks to the open-source and commercial tools above. Click any card to visit its official site."
+}

@@ -1,0 +1,32 @@
+{
+  "tabs": {
+    "defaultDir": "Default directory",
+    "close": "Close tab",
+    "new": "New terminal",
+    "toggleKeys": "Toggle key bar"
+  },
+  "empty": {
+    "title": "No terminal session open",
+    "hint": "A real shell starts inside an authorized mount or your home directory",
+    "action": "New session"
+  },
+  "status": {
+    "connecting": "Connecting",
+    "ready": "Running",
+    "closed": "Disconnected",
+    "error": "Error",
+    "session": "Session {id}",
+    "establishing": "Starting…"
+  },
+  "reconnect": {
+    "button": "Reconnect",
+    "title": "Reconnect terminal",
+    "banner": "[Connection lost, reconnecting…]",
+    "expired": "Your session expired — sign in again to open the terminal",
+    "serviceError": "Terminal service error (HTTP {status})",
+    "interrupted": "The terminal connection dropped — click Reconnect to retry",
+    "offline": "Cannot reach the service — make sure Asmoday is running",
+    "generic": "Terminal error",
+    "limit": "Terminal tab limit reached ({max}), close one first"
+  }
+}
