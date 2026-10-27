@@ -5,10 +5,11 @@
 //! - 公开访问走 `/api/public/share/*`，不经过登录中间件，但会校验
 //!   令牌、密码、有效期与 `[shares].referer_allowlist` 防盗链。
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -54,6 +55,9 @@ pub struct ShareAuth {
     /// 目录分享的相对子路径（限定在分享根内）
     #[serde(default)]
     pub sub: Option<String>,
+    /// `?download=1`：显式要求附件下载（设计文档 3.9）
+    #[serde(default)]
+    pub download: Option<u8>,
 }
 
 /// POST /api/shares
@@ -69,6 +73,17 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>
     };
 
     let is_folder = target.is_dir();
+
+    // 设计文档 3.9：`allow_download=false` 的单文件分享，如果该格式无法在线预览，
+    // 用户点开只会看到一个「禁止下载」的死链接 —— 直接拒绝创建，比事后解释更诚实。
+    if !is_folder && !body.allow_download && !previewable(&target) {
+        return error_code(
+            StatusCode::BAD_REQUEST,
+            "E_UNSUPPORTED_PREVIEW",
+            "This file type cannot be previewed in the browser; enable download to share it",
+        );
+    }
+
     let password_hash = match body.password.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         Some(password) => match hash_password(password) {
             Ok(hash) => Some(hash),
@@ -163,28 +178,52 @@ pub async fn delete(State(state): State<AppState>, Path(token): Path<String>) ->
     }
 }
 
-/// 分享记录（file_path, is_folder, password_hash, allow_download, expires_at）
-type ShareRow = (String, bool, Option<String>, bool, Option<i64>);
+/// 分享记录（file_path, is_folder, password_hash, allow_download, expires_at, deleted_at）
+type ShareRow = (String, bool, Option<String>, bool, Option<i64>, Option<i64>);
 
 fn load_share(state: &AppState, token: &str) -> Result<ShareRow, Response> {
     let conn = state
         .auth_connection()
         .map_err(|err| error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
-    conn.query_row(
-        "SELECT file_path, is_folder, password_hash, allow_download, expires_at FROM shares WHERE token = ?1",
-        [token],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? != 0,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)? != 0,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        },
-    )
-    .map_err(|_| error_code(StatusCode::NOT_FOUND, "SHARE_NOT_FOUND", "Share not found"))
+    let row = conn
+        .query_row(
+            "SELECT file_path, is_folder, password_hash, allow_download, expires_at, deleted_at
+             FROM shares WHERE token = ?1",
+            [token],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .map_err(|_| error_code(StatusCode::NOT_FOUND, "SHARE_NOT_FOUND", "Share not found"))?;
+
+    // 文件被删后分享进入 tombstone（设计文档 3.2.6.7）：410 而不是 404，
+    // 让用户能区分「链接从未存在」与「文件已被删除」。
+    if let Some(deleted_at) = row.5 {
+        // 超过 30 天的 tombstone 当场物理清除，语义等同于「不存在」
+        if deleted_at < now_secs() - 30 * 86_400 {
+            let _ = conn.execute("DELETE FROM shares WHERE token = ?1", [token]);
+            return Err(error_code(
+                StatusCode::NOT_FOUND,
+                "SHARE_NOT_FOUND",
+                "Share not found",
+            ));
+        }
+        return Err(error_code(
+            StatusCode::GONE,
+            "E_GONE",
+            "The shared file has been deleted",
+        ));
+    }
+
+    Ok(row)
 }
 
 fn check_expiry(expires_at: Option<i64>) -> Result<(), Response> {
@@ -241,21 +280,48 @@ async fn hotlink_denied(state: &AppState, headers: &HeaderMap) -> bool {
     })
 }
 
-/// 校验分享口令（缺省/错误都返回 401，但错误码不同，前端据此区分文案）
-fn check_password(password_hash: &Option<String>, query: &ShareAuth) -> Result<(), Response> {
-    if let Some(hash) = password_hash {
-        let provided = query.password.as_deref().unwrap_or("");
-        if !verify_password(hash, provided) {
-            // 没填 = 需要口令；填了但不匹配 = 口令错误
-            let code = if provided.is_empty() {
-                "SHARE_PASSWORD_REQUIRED"
-            } else {
-                "SHARE_PASSWORD_WRONG"
-            };
-            return Err(error_code(StatusCode::UNAUTHORIZED, code, "Share password required"));
-        }
+/// 校验分享口令。
+///
+/// 口令错误计入**独立的**分享防爆破池（维度 `IP + Token`），与登录池完全隔离：
+/// 攻击者狂刷分享链接不能把管理员 IP 封掉（设计文档 3.1.5）。
+fn check_password(
+    state: &AppState,
+    key: &str,
+    password_hash: &Option<String>,
+    query: &ShareAuth,
+) -> Result<(), Response> {
+    let Some(hash) = password_hash else {
+        return Ok(());
+    };
+
+    if let Err(remaining) = state.share_guard.check(key) {
+        return Err(error_code(
+            StatusCode::TOO_MANY_REQUESTS,
+            "SHARE_RATE_LIMITED",
+            format!("too many password attempts, retry in {remaining}s"),
+        ));
     }
-    Ok(())
+
+    let provided = query.password.as_deref().unwrap_or("");
+    if verify_password(hash, provided) {
+        state.share_guard.record_success(key);
+        return Ok(());
+    }
+
+    // 没填 = 需要口令（不计失败）；填了但不匹配 = 口令错误（计失败）
+    if provided.is_empty() {
+        return Err(error_code(
+            StatusCode::UNAUTHORIZED,
+            "SHARE_PASSWORD_REQUIRED",
+            "Share password required",
+        ));
+    }
+    state.share_guard.record_failure(key);
+    Err(error_code(
+        StatusCode::UNAUTHORIZED,
+        "SHARE_PASSWORD_WRONG",
+        "Share password incorrect",
+    ))
 }
 
 /// 解析目录分享的相对子路径：拒绝绝对路径、`..` 与反斜杠，
@@ -291,6 +357,8 @@ fn resolve_sub(root: &std::path::Path, sub: Option<&str>) -> Result<PathBuf, Res
 async fn guard(
     state: &AppState,
     headers: &HeaderMap,
+    token: &str,
+    peer: ConnectInfo<SocketAddr>,
     expires_at: Option<i64>,
     password_hash: &Option<String>,
     query: &ShareAuth,
@@ -299,7 +367,8 @@ async fn guard(
     if hotlink_denied(state, headers).await {
         return Err(error(StatusCode::FORBIDDEN, "直链来源不在防盗链白名单内"));
     }
-    check_password(password_hash, query)
+    let ip = peer.0.ip();
+    check_password(state, &format!("{ip}|{token}"), password_hash, query)
 }
 
 /// GET /api/public/share/{token}：分享元信息（公开）
@@ -308,12 +377,13 @@ pub async fn info(
     Path(token): Path<String>,
     Query(query): Query<ShareAuth>,
     headers: HeaderMap,
+    peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, allow_download, expires_at) = match load_share(&state, &token) {
+    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) = match load_share(&state, &token) {
         Ok(share) => share,
         Err(response) => return response,
     };
-    if let Err(response) = guard(&state, &headers, expires_at, &password_hash, &query).await {
+    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
         return response;
     }
 
@@ -337,16 +407,21 @@ pub async fn raw(
     Path(token): Path<String>,
     Query(query): Query<ShareAuth>,
     headers: HeaderMap,
+    peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, _, expires_at) = match load_share(&state, &token) {
+    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) = match load_share(&state, &token) {
         Ok(share) => share,
         Err(response) => return response,
     };
-    if let Err(response) = guard(&state, &headers, expires_at, &password_hash, &query).await {
+    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
         return response;
     }
     if is_folder {
         return error_code(StatusCode::BAD_REQUEST, "SHARE_NO_RAW", "Directory share has no direct link");
+    }
+    // 设计文档 3.9：allow_download=false 时，任何带 ?download=1 的 raw 请求一律 403
+    if !allow_download && query.download.unwrap_or(0) == 1 {
+        return error_code(StatusCode::FORBIDDEN, "E_FORBIDDEN", "Download is disabled for this share");
     }
 
     let roots = {
@@ -367,12 +442,13 @@ pub async fn download(
     Path(token): Path<String>,
     Query(query): Query<ShareAuth>,
     headers: HeaderMap,
+    peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, allow_download, expires_at) = match load_share(&state, &token) {
+    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) = match load_share(&state, &token) {
         Ok(share) => share,
         Err(response) => return response,
     };
-    if let Err(response) = guard(&state, &headers, expires_at, &password_hash, &query).await {
+    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
         return response;
     }
     if !allow_download {
@@ -408,12 +484,13 @@ pub async fn list_entries(
     Path(token): Path<String>,
     Query(query): Query<ShareAuth>,
     headers: HeaderMap,
+    peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, _, expires_at) = match load_share(&state, &token) {
+    let (path, is_folder, password_hash, _, expires_at, _deleted) = match load_share(&state, &token) {
         Ok(share) => share,
         Err(response) => return response,
     };
-    if let Err(response) = guard(&state, &headers, expires_at, &password_hash, &query).await {
+    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
         return response;
     }
     if !is_folder {
@@ -444,7 +521,7 @@ pub async fn list_entries(
         .to_string();
 
     // 分享页同样默认不暴露隐藏项（与文件管理口径一致）
-    match fs::list_dir(&target, 1, false).await {
+    match fs::list_dir(&target, 1, false, true).await {
         Ok(listing) => {
             let entries: Vec<_> = listing
                 .entries
@@ -557,6 +634,52 @@ async fn stream_file(target: PathBuf, headers: &HeaderMap, as_attachment: bool) 
         }
     }
     response
+}
+
+/// POST /api/public/share/{token}/verify：只校验口令，不返回内容
+///
+/// 前端用它把「口令错误」与「链接失效」区分开来，避免把口令错误页做成 404。
+#[derive(Debug, Deserialize)]
+pub struct VerifyPayload {
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+pub async fn verify(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    peer: ConnectInfo<SocketAddr>,
+    body: Option<Json<VerifyPayload>>,
+) -> Response {
+    let (_, _, password_hash, _, expires_at, _deleted) = match load_share(&state, &token) {
+        Ok(share) => share,
+        Err(response) => return response,
+    };
+    let query = ShareAuth {
+        password: body.and_then(|Json(payload)| payload.password),
+        sub: None,
+        download: None,
+    };
+    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
+        return response;
+    }
+    ok_json(json!({ "ok": true }))
+}
+
+fn ok_json(value: serde_json::Value) -> Response {
+    Json(value).into_response()
+}
+
+/// 浏览器能否在线预览（`allow_download=false` 的单文件分享据此拒绝创建）
+fn previewable(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = fs::extension_of_name(&name);
+    let (kind, _) = fs::classify_name(&name, &ext, false);
+    matches!(kind, "image" | "video" | "audio" | "text") || ext == "pdf"
 }
 
 fn percent_encode(input: &str) -> String {

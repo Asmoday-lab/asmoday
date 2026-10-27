@@ -74,7 +74,8 @@
     "fallbackLink": "视频无法播放，点此在新窗口打开",
     "subtitleLabel": "中文字幕",
     "openOriginal": "新窗口打开原文件",
-    "close": "关闭"
+    "close": "关闭",
+    "tryDownload": "尝试下载"
   },
   "viewer": {
     "prev": "上一张",

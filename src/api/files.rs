@@ -1,6 +1,7 @@
 //! 文件管理接口（设计文档 6.1）。
 //!
-//! - `GET  /api/files/roots`：可浏览的根（挂载点；未配置时退化为工作目录）
+//! - `GET  /api/files/mounts`：挂载点清单（id / name / path / readonly / online）
+//! - `GET  /api/files/roots`：同上，兼容字段（roots / implicit / default）
 //! - `GET  /api/files/list?path=&page=`：目录列表，超 1000 条强制分页并返回 has_more
 //! - `GET  /api/files/raw?path=`：流式读取，支持 HTTP Range（206 / 416）
 //! - `PUT  /api/files/raw?path=`：编辑器保存写回（仅文本类、原子替换）
@@ -17,6 +18,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::core::config::Config;
 use crate::core::fs::{self, FsError, RootSet};
+use crate::core::path_guard;
 use crate::AppState;
 
 /// 编辑器单次保存上限（8 MiB）
@@ -39,6 +41,12 @@ pub struct PathQuery {
 async fn roots_for(state: &AppState) -> RootSet {
     let config = state.config.read().await;
     fs::load_roots(&config, &state.cwd)
+}
+
+/// 挂载点集合（带 readonly / online，唯一真源在 core::path_guard）
+async fn mounts_for(state: &AppState) -> path_guard::MountSet {
+    let config = state.config.read().await;
+    path_guard::load(&config, &state.cwd)
 }
 
 fn fs_error(err: FsError) -> Response {
@@ -67,9 +75,19 @@ pub async fn roots(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// GET /api/files/mounts（设计文档 3.2.1 / 6.1）
+///
+/// 前端每次进入文件管理都必须重新拉取，禁止缓存 —— 单挂载点直接跳转的判定
+/// 依赖这份实时清单。
+pub async fn mounts(State(state): State<AppState>) -> Response {
+    let set = mounts_for(&state).await;
+    let items: Vec<_> = set.mounts.iter().map(|m| m.info.clone()).collect();
+    Json(json!({ "mounts": items, "implicit": set.implicit })).into_response()
+}
+
 /// GET /api/files/list
 pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    let set = roots_for(&state).await;
+    let set = mounts_for(&state).await;
 
     let requested = query
         .path
@@ -77,28 +95,37 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         .map(str::trim)
         .filter(|p| !p.is_empty());
 
-    let target = match requested {
-        Some(raw) => match fs::resolve_existing(raw, &set.allowed) {
-            Ok(path) => path,
-            Err(err) => return fs_error(err),
+    let mount = match requested {
+        Some(raw) => match set.find_by_path_text(raw) {
+            Some(mount) => mount,
+            None => match set.default_mount() {
+                Some(mount) => mount,
+                None => return fs_error(FsError::NotFound("没有可用的挂载点".to_string())),
+            },
         },
-        None => {
-            let Some(root) = set.default_root() else {
-                return fs_error(FsError::NotFound("没有可用的挂载点".to_string()));
-            };
-            let root_path = root.path.clone();
-            match fs::resolve_existing(&root_path, &set.allowed) {
-                Ok(path) => path,
-                Err(err) => return fs_error(err),
-            }
-        }
+        None => match set.default_mount() {
+            Some(mount) => mount,
+            None => return fs_error(FsError::NotFound("没有可用的挂载点".to_string())),
+        },
     };
 
+    let target = match path_guard::resolve_existing(mount, requested.unwrap_or("")) {
+        Ok(path) => path,
+        Err(err) => return fs_error(err),
+    };
     if !target.is_dir() {
         return fs_error(FsError::BadRequest("目标不是目录".to_string()));
     }
 
-    match fs::list_dir(&target, query.page.unwrap_or(1), query.show_hidden.unwrap_or(false)).await {
+    let readonly = mount.info.readonly;
+    match fs::list_dir(
+        &target,
+        query.page.unwrap_or(1),
+        query.show_hidden.unwrap_or(false),
+        readonly,
+    )
+    .await
+    {
         Ok(listing) => Json(listing).into_response(),
         Err(err) => fs_error(err),
     }
@@ -289,9 +316,20 @@ pub async fn upload(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    const MAX_UPLOAD: usize = 512 * 1024 * 1024;
-    if body.len() > MAX_UPLOAD {
-        return fail_code(StatusCode::PAYLOAD_TOO_LARGE, "FILE_TOO_LARGE", "File exceeds the 512 MiB limit");
+    // 单文件上限来自 `[media].upload_max_size_mb`，0 = 不限制（设计文档 3.2.3）
+    let limit = {
+        let config = state.config.read().await;
+        config.media.upload_max_size_mb
+    };
+    if limit > 0 {
+        let max_bytes = limit.saturating_mul(1024 * 1024);
+        if body.len() as u64 > max_bytes {
+            return fail_code(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "E_TOO_LARGE",
+                format!("File exceeds the configured {limit} MiB upload limit"),
+            );
+        }
     }
 
     // 文件名只允许单层：拒绝分隔符与上跳
@@ -316,13 +354,18 @@ pub async fn upload(
 
     let target = dir.join(name);
     if target.exists() && !query.overwrite {
-        return fail_code(StatusCode::CONFLICT, "CONFLICT", format!("File already exists: {name}"));
+        return fail_code(StatusCode::CONFLICT, "E_CONFLICT", format!("File already exists: {name}"));
+    }
+
+    // 上传前检查目标挂载点剩余空间（设计文档 3.2.3）
+    if let Err(err) = crate::core::fs_ops::ensure_space(&dir, body.len() as u64) {
+        return fs_error(err);
     }
 
     // 二次确认：拼接后的真实路径仍在授权根内
     if let Ok(canonical_parent) = std::fs::canonicalize(&dir) {
         if !roots.allowed.iter().any(|root| canonical_parent.starts_with(root)) {
-            return fail_code(StatusCode::FORBIDDEN, "PATH_FORBIDDEN", "Upload target is outside the allowed roots");
+            return fail_code(StatusCode::FORBIDDEN, "E_FORBIDDEN", "Upload target is outside the allowed roots");
         }
     }
 
@@ -485,7 +528,7 @@ pub async fn subtitle(
     }
 
     let raw = match tokio::fs::read(&path).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Ok(bytes) => decode_subtitle_text(&bytes),
         Err(e) => return fs_error(FsError::Io(format!("读取字幕失败：{e}"))),
     };
     let body = if ext == "srt" { srt_to_vtt(&raw) } else { ensure_vtt_header(&raw) };
@@ -499,6 +542,23 @@ pub async fn subtitle(
         body,
     )
         .into_response()
+}
+
+/// 字幕文本解码：**UTF-8 优先，失败按 GBK/GB18030 重解**（设计文档 3.4.7 第 3 条）。
+///
+/// `.srt` 在国内资源里极大概率是 GBK；直接 `from_utf8_lossy` 会得到满屏替换字符，
+/// 用户看到的是「字幕乱码」而不是「字幕编码不支持」，所以必须先探一次。
+fn decode_subtitle_text(bytes: &[u8]) -> String {
+    // UTF-8 BOM：剥掉再解，否则首行会带上 \u{feff}
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(rest).to_string();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    // encoding_rs 的 GBK 解码器同时覆盖 GB18030，够用于简体中文字幕
+    let (text, _, _) = encoding_rs::GBK.decode(bytes);
+    text.into_owned()
 }
 
 /// SRT → WebVTT：加文件头，时间行的 `,` 改成 `.`
@@ -523,5 +583,28 @@ fn ensure_vtt_header(input: &str) -> String {
         trimmed.to_string()
     } else {
         format!("WEBVTT\n\n{trimmed}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subtitle_decoding_handles_utf8_gbk_and_bom() {
+        // 纯 UTF-8：原样返回
+        assert_eq!(decode_subtitle_text("你好".as_bytes()), "你好");
+        // GBK：「你好」= C4 E3 BA C3，非法 UTF-8 → 走 GBK 兜底
+        assert_eq!(decode_subtitle_text(&[0xC4, 0xE3, 0xBA, 0xC3]), "你好");
+        // UTF-8 BOM 必须剥掉，否则首行字幕会带一个不可见字符
+        assert_eq!(decode_subtitle_text(&[0xEF, 0xBB, 0xBF, b'a']), "a");
+    }
+
+    #[test]
+    fn srt_becomes_valid_vtt() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\n你好\n";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.starts_with("WEBVTT\n\n"));
+        assert!(vtt.contains("00:00:01.000 --> 00:00:02.000"));
     }
 }

@@ -15,8 +15,17 @@ import FilePreviewPane from '../components/FilePreviewPane.vue'
 import VirtualGrid from '../components/VirtualGrid.vue'
 import VirtualList from '../components/VirtualList.vue'
 import { LANGUAGES, detectLanguage, type LanguageKey } from '../api/languages'
-import { ApiError, filesApi, type EntryInfo, type Listing, type RootEntry } from '../api/files'
-import { messageFromBody } from '../lib/errors'
+import {
+  ApiError,
+  filesApi,
+  summarizeResults,
+  type EntryInfo,
+  type FileStat,
+  type Listing,
+  type MountPoint,
+  type OnConflict,
+} from '../api/files'
+import { localizedCode, messageFromBody } from '../lib/errors'
 import { sharesApi } from '../api/shares'
 import { thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
@@ -146,36 +155,381 @@ function menuDirectLink() {
   if (entry) void copyDirectLink(entry)
 }
 
-// ---------------- 删除（设计文档 3.2「右键菜单」） ----------------
-const deleteTarget = ref<EntryInfo | null>(null)
-const deleteBusy = ref(false)
-const deleteError = ref('')
+// ---------------- 新建 / 重命名 / 移动复制（设计文档 3.2.6 / 6.2 / 8.5） ----------------
+//
+// 全部走封装好的 Modal，**禁止** confirm()/alert()/prompt()（设计文档 8.4 第 10 条）。
+const createDialog = ref<{
+  kind: 'dir' | 'file'
+  name: string
+  busy: boolean
+  error: string
+} | null>(null)
 
-function openDeleteDialog() {
+function openCreateDialog(kind: 'dir' | 'file') {
+  if (readonly.value) {
+    showToast(t('files.readonly.tooltip'))
+    return
+  }
+  createDialog.value = { kind, name: '', busy: false, error: '' }
+}
+
+async function submitCreate() {
+  const dialog = createDialog.value
+  if (!dialog || dialog.busy) return
+  const name = dialog.name.trim()
+  if (!name) {
+    dialog.error = t('files.create.placeholder')
+    return
+  }
+  dialog.busy = true
+  dialog.error = ''
+  try {
+    if (dialog.kind === 'dir') await filesApi.mkdir(currentPath.value, name)
+    else await filesApi.touch(currentPath.value, name)
+    createDialog.value = null
+    showToast(t('files.create.done'))
+    await open(currentPath.value)
+  } catch (err) {
+    dialog.error = describe(err).message
+  } finally {
+    dialog.busy = false
+  }
+}
+
+const renameDialog = ref<{
+  entry: EntryInfo
+  name: string
+  busy: boolean
+  error: string
+} | null>(null)
+
+function openRenameDialog() {
   const entry = menu.value?.entry
   menu.value = null
   if (!entry) return
-  deleteTarget.value = entry
+  renameDialog.value = { entry, name: entry.name, busy: false, error: '' }
+}
+
+async function submitRename() {
+  const dialog = renameDialog.value
+  if (!dialog || dialog.busy) return
+  const name = dialog.name.trim()
+  if (!name || name === dialog.entry.name) {
+    renameDialog.value = null
+    return
+  }
+  dialog.busy = true
+  dialog.error = ''
+  try {
+    const result = await filesApi.rename(dialog.entry.path, name)
+    if (editor.value?.path === dialog.entry.path) {
+      editor.value.path = result.new_path
+      editor.value.name = name
+    }
+    renameDialog.value = null
+    showToast(t('files.rename.done'))
+    await open(currentPath.value)
+  } catch (err) {
+    dialog.error = describe(err).message
+  } finally {
+    dialog.busy = false
+  }
+}
+
+type TransferMode = 'copy' | 'move'
+
+/** 冲突策略按固定顺序展示：overwrite 风险最高放最上面但不预选（设计文档 3.2.6.2） */
+const CONFLICT_OPTIONS: OnConflict[] = ['overwrite', 'rename', 'skip']
+
+const transferDialog = ref<{
+  mode: TransferMode
+  targets: EntryInfo[]
+  dest: string
+  busy: boolean
+  error: string
+} | null>(null)
+
+/** 冲突策略：默认「未选择」，强制用户明确表态（设计文档 3.2.6.2） */
+const conflictChoice = ref<OnConflict | 'ask'>('ask')
+
+function openTransferDialog(mode: TransferMode, targets?: EntryInfo[]) {
+  const list = targets ?? (menu.value ? [menu.value.entry] : [])
+  menu.value = null
+  if (!list.length) return
+  conflictChoice.value = 'ask'
+  transferDialog.value = {
+    mode,
+    targets: list,
+    // 默认目标 = 当前目录（用户改路径比从零输入快）
+    dest: currentPath.value,
+    busy: false,
+    error: '',
+  }
+}
+
+async function submitTransfer() {
+  const dialog = transferDialog.value
+  if (!dialog || dialog.busy) return
+  const dest = dialog.dest.trim()
+  if (!dest) {
+    dialog.error = t('files.transfer.noTarget')
+    return
+  }
+  if (conflictChoice.value === 'ask') {
+    dialog.error = t('files.transfer.conflictRequired')
+    return
+  }
+  dialog.busy = true
+  dialog.error = ''
+  try {
+    const call = dialog.mode === 'copy' ? filesApi.copy : filesApi.move
+    const paths = dialog.targets.map((entry) => entry.path)
+    const response = await call(paths, dest, conflictChoice.value)
+    const summary = summarizeResults(response)
+    transferDialog.value = null
+    exitSelect()
+    showTransferResult(dialog.mode, summary)
+    await open(currentPath.value)
+  } catch (err) {
+    dialog.error = describe(err).message
+  } finally {
+    dialog.busy = false
+  }
+}
+
+interface TransferSummary {
+  ok: number
+  failed: number
+  skipped: number
+  failures: { path: string; source?: string; error_code?: string; message?: string }[]
+}
+
+const resultDialog = ref<({ mode: TransferMode } & TransferSummary) | null>(null)
+
+function showTransferResult(mode: TransferMode, summary: TransferSummary) {
+  if (summary.failed === 0) {
+    showToast(t('files.transfer.done'))
+    return
+  }
+  resultDialog.value = { mode, ...summary }
+}
+
+function failureText(item: { error_code?: string; message?: string }) {
+  return localizedCode(item.error_code) ?? item.message ?? t('common.state.unknownError')
+}
+
+// ---------------- 多选（设计文档 3.2.6.6 / 8.6） ----------------
+//
+// 进入方式：桌面端 Ctrl/⌘ + 点击，移动端长按 500ms（位移 > 10px 判为滚动并取消）。
+// 选中后底部滑出操作栏（安全区已加），列表容器底部同时补等量 padding，避免最后一行被挡。
+const selectMode = ref(false)
+const selection = ref<string[]>([])
+
+const selectedEntries = computed(() => {
+  const picked = new Set(selection.value)
+  return displayEntries.value.filter((entry) => picked.has(entry.path))
+})
+
+function enterSelect(entry: EntryInfo) {
+  selectMode.value = true
+  if (!selection.value.includes(entry.path)) selection.value.push(entry.path)
+}
+
+function toggleSelect(entry: EntryInfo) {
+  const index = selection.value.indexOf(entry.path)
+  if (index >= 0) selection.value.splice(index, 1)
+  else selection.value.push(entry.path)
+  // 全部取消选中时自动退出多选，省掉一次「取消」点击
+  if (!selection.value.length) exitSelect()
+}
+
+function exitSelect() {
+  selectMode.value = false
+  selection.value = []
+}
+
+function isSelected(path: string) {
+  return selection.value.includes(path)
+}
+
+// ---- 长按判定 ----
+const LONG_PRESS_MS = 500
+const LONG_PRESS_SLOP = 10
+let pressTimer: number | null = null
+let pressOrigin = { x: 0, y: 0 }
+/** 长按已触发：紧随其后的 click/touchend 必须被吞掉，否则会误打开文件 */
+let pressConsumed = false
+
+function cancelPress() {
+  if (pressTimer !== null) {
+    clearTimeout(pressTimer)
+    pressTimer = null
+  }
+}
+
+function onPressStart(event: TouchEvent, entry: EntryInfo) {
+  if (selectMode.value) return
+  const touch = event.touches[0]
+  if (!touch) return
+  pressOrigin = { x: touch.clientX, y: touch.clientY }
+  pressConsumed = false
+  cancelPress()
+  pressTimer = window.setTimeout(() => {
+    pressTimer = null
+    pressConsumed = true
+    navigator.vibrate?.(50)
+    enterSelect(entry)
+  }, LONG_PRESS_MS)
+}
+
+function onPressMove(event: TouchEvent) {
+  if (pressTimer === null) return
+  const touch = event.touches[0]
+  if (!touch) return
+  const dx = Math.abs(touch.clientX - pressOrigin.x)
+  const dy = Math.abs(touch.clientY - pressOrigin.y)
+  if (dx > LONG_PRESS_SLOP || dy > LONG_PRESS_SLOP) cancelPress()
+}
+
+// ---- 批量下载（设计文档 3.2.6.6：不做服务端 ZIP，逐个触发浏览器下载） ----
+const bulkDownloadConfirm = ref<EntryInfo[] | null>(null)
+
+function triggerDownload(entry: EntryInfo) {
+  const link = document.createElement('a')
+  link.href = filesApi.rawUrl(entry.path)
+  link.rel = 'noopener'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+}
+
+function downloadSelected() {
+  const targets = selectedEntries.value.filter((entry) => !entry.is_dir)
+  if (!targets.length) {
+    showToast(t('files.select.noDownloadable'))
+    return
+  }
+  // > 10 个时浏览器多半会拦，先让用户确认
+  if (targets.length > 10) {
+    bulkDownloadConfirm.value = targets
+    return
+  }
+  for (const entry of targets) triggerDownload(entry)
+  exitSelect()
+}
+
+function confirmBulkDownload() {
+  const targets = bulkDownloadConfirm.value ?? []
+  bulkDownloadConfirm.value = null
+  for (const entry of targets) triggerDownload(entry)
+  exitSelect()
+}
+
+// ---------------- 删除（设计文档 3.2.6.5） ----------------
+const deleteTargets = ref<EntryInfo[]>([])
+const deleteBusy = ref(false)
+const deleteError = ref('')
+/** 删除目录时必须输入目录名：防误触，不是安全边界 */
+const deleteConfirmName = ref('')
+/** 删除前统计（项数 / 总大小），null = 统计中 */
+const deleteSurvey = ref<{ items: number; bytes: number; truncated: boolean } | null>(null)
+
+/** 只有「单选一个目录」才要求输入名字；批量走 60 秒一次性令牌 */
+const deleteNeedsName = computed(
+  () => deleteTargets.value.length === 1 && deleteTargets.value[0].is_dir,
+)
+const deleteTitle = computed(() => {
+  if (deleteTargets.value.length > 1) return t('files.delete.titleBatch')
+  return t(deleteTargets.value[0]?.is_dir ? 'files.delete.titleDir' : 'files.delete.titleFile')
+})
+
+const deleteNameMatches = computed(() => {
+  if (!deleteNeedsName.value) return true
+  const target = deleteTargets.value[0]
+  if (!target) return false
+  return deleteConfirmName.value.trim() === target.name.trim()
+})
+
+function openDeleteDialog(targets?: EntryInfo[]) {
+  const list = targets ?? (menu.value ? [menu.value.entry] : [])
+  menu.value = null
+  if (!list.length) return
+  deleteTargets.value = list
+  deleteConfirmName.value = ''
   deleteError.value = ''
+  deleteSurvey.value = null
+  void (async () => {
+    try {
+      const survey = await filesApi.measure(list.map((entry) => entry.path))
+      // 弹窗可能已被关掉：只在仍是同一次打开时回填
+      if (deleteTargets.value === list) deleteSurvey.value = survey
+    } catch {
+      if (deleteTargets.value === list) {
+        deleteSurvey.value = { items: list.length, bytes: 0, truncated: false }
+      }
+    }
+  })()
 }
 
 async function confirmDelete() {
-  const entry = deleteTarget.value
-  if (!entry || deleteBusy.value) return
+  const targets = deleteTargets.value
+  if (!targets.length || deleteBusy.value) return
+  if (!deleteNameMatches.value) {
+    deleteError.value = t('errors.E_NAME_MISMATCH')
+    return
+  }
   deleteBusy.value = true
   deleteError.value = ''
   try {
-    await filesApi.remove(entry.path)
-    deleteTarget.value = null
-    if (editor.value?.path === entry.path) closeEditor()
-    if (selected.value === entry.path) selected.value = null
-    showToast(t(entry.is_dir ? 'files.delete.doneDir' : 'files.delete.doneFile'))
+    const paths = targets.map((entry) => entry.path)
+    const confirmName = deleteNeedsName.value ? targets[0].name : undefined
+    await filesApi.remove(paths, confirmName)
+    deleteTargets.value = []
+    for (const entry of targets) {
+      if (editor.value?.path === entry.path) closeEditor()
+      if (selected.value === entry.path) selected.value = null
+    }
+    exitSelect()
+    showToast(t(targets.length > 1 ? 'files.delete.doneBatch' : targets[0].is_dir ? 'files.delete.doneDir' : 'files.delete.doneFile'))
     await open(currentPath.value)
   } catch (err) {
-    deleteError.value = err instanceof Error ? err.message : t('files.delete.failed')
+    deleteError.value = describe(err).message
   } finally {
     deleteBusy.value = false
   }
+}
+
+// ---------------- 属性（设计文档 3.2 右键菜单 / 3.2.6.8 只读 stat） ----------------
+const statDialog = ref<{
+  entry: EntryInfo
+  data: FileStat | null
+  busy: boolean
+  error: string
+} | null>(null)
+
+function openStatDialog() {
+  const entry = menu.value?.entry
+  menu.value = null
+  if (!entry) return
+  const dialog = { entry, data: null, busy: true, error: '' }
+  statDialog.value = dialog
+  void (async () => {
+    try {
+      const data = await filesApi.stat(entry.path)
+      // 用户可能已经关掉弹窗：只在仍是同一次打开时回填
+      if (statDialog.value === dialog) statDialog.value = { ...dialog, data, busy: false }
+    } catch (err) {
+      if (statDialog.value === dialog) {
+        statDialog.value = { ...dialog, busy: false, error: describe(err).message }
+      }
+    }
+  })()
+}
+
+/** 权限位显示成 `0644`：只用来给用户看，不参与任何判定 */
+function formatMode(mode: number | null | undefined) {
+  if (mode === null || mode === undefined) return '—'
+  return `0${(mode & 0o7777).toString(8).padStart(3, '0')}`
 }
 
 async function copyShareResult() {
@@ -188,8 +542,15 @@ async function copyShareResult() {
   }
 }
 
-const roots = ref<RootEntry[]>([])
+const roots = ref<MountPoint[]>([])
 const rootsImplicit = ref(false)
+/** 当前目录所在挂载点是否只读：只读时全部变更入口置灰（设计文档 3.2.6） */
+const readonly = computed(() => listing.value?.readonly ?? false)
+/** 在线挂载点数量：1 个时跳过卡片页直达根目录（设计文档 3.2.1） */
+const onlineMounts = computed(() => roots.value.filter((root) => root.online))
+const singleMount = computed(() => onlineMounts.value.length === 1)
+/** 工具栏「新建」下拉 */
+const newMenuOpen = ref(false)
 const currentPath = ref('')
 const listing = ref<Listing | null>(null)
 const loading = ref(true)
@@ -274,6 +635,11 @@ const fileInput = ref<HTMLInputElement | null>(null)
 let uploadSeq = 0
 
 function pickFiles() {
+  // 只读挂载点直接拦在入口，不依赖后端 403（设计文档 8.4 第 7 条）
+  if (readonly.value) {
+    showToast(t('files.readonly.tooltip'))
+    return
+  }
   fileInput.value?.click()
 }
 
@@ -381,7 +747,7 @@ const crumbs = computed(() => {
   const normalized = path.replace(/\\/g, '/')
 
   // 面包屑不暴露真实文件系统路径：优先把路径映射成「根名 + 相对段」的虚拟显示
-  let matched: RootEntry | null = null
+  let matched: MountPoint | null = null
   let matchedPrefix = ''
   for (const root of roots.value) {
     const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -397,6 +763,7 @@ const crumbs = computed(() => {
 
   const result: { label: string; path: string }[] = []
   if (matched) {
+    // 单挂载点模式下首节点就是挂载点本身，点击回根目录；多挂载点模式多点一次回卡片页
     result.push({ label: matched.name, path: matched.path })
     let acc = matchedPrefix
     const rest = normalized.slice(matchedPrefix.length).split('/').filter(Boolean)
@@ -440,11 +807,18 @@ async function boot() {
   searchTerm.value = ''
   preview.value = null
   try {
-    const data = await filesApi.roots()
-    roots.value = data.roots
+    // 每次进入都必须重新拉取，禁止本地缓存（设计文档 3.2.1）
+    const data = await filesApi.mounts()
+    roots.value = data.mounts
     rootsImplicit.value = data.implicit
-    if (!data.roots.length) {
+    const online = data.mounts.filter((mount) => mount.online)
+    if (!data.mounts.length) {
       error.value = null
+    } else if (online.length === 1) {
+      // 单挂载点：跳过卡片页直达根目录。这里用「直接打开」而不是再压一层路由，
+      // 返回卡片页由面包屑的 home 按钮处理，逻辑等价且不产生历史栈膨胀。
+      await openRoot(online[0])
+      return
     }
   } catch (err) {
     error.value = describe(err)
@@ -453,18 +827,32 @@ async function boot() {
   }
 }
 
-/** 进入某个挂载点 */
-function enterRoot(root: RootEntry) {
-  if (!root.exists) {
+/** 打开挂载点根（内部走 open，但保留 loading 态避免白屏闪烁） */
+async function openRoot(root: MountPoint) {
+  if (!root.online) {
     showToast(t('files.roots.missingToast'))
     return
   }
   if (editor.value) closeEditor()
-  void open(root.path)
+  await open(root.path)
 }
 
-/** 面包屑首段的 Home：回到挂载点入口页 */
+/** 进入某个挂载点 */
+function enterRoot(root: MountPoint) {
+  void openRoot(root)
+}
+
+/** 面包屑首段：多挂载点回卡片页，单挂载点回该挂载点根目录 */
 function goHome() {
+  if (singleMount.value) {
+    const root = onlineMounts.value[0]
+    if (root && currentPath.value !== root.path) {
+      if (editor.value) closeEditor()
+      preview.value = null
+      void open(root.path)
+      return
+    }
+  }
   if (editor.value) closeEditor()
   preview.value = null
   currentPath.value = ''
@@ -562,6 +950,11 @@ function openMediaViewer(entry: EntryInfo) {
 }
 
 async function activate(entry: EntryInfo) {
+  // 多选态下双击不打开：否则一次误触就把整个多选打断
+  if (selectMode.value) {
+    toggleSelect(entry)
+    return
+  }
   if (entry.is_dir) {
     await open(entry.path)
     return
@@ -593,7 +986,22 @@ async function activate(entry: EntryInfo) {
   preview.value = entry
 }
 
-function onEntryClick(entry: EntryInfo) {
+function onEntryClick(entry: EntryInfo, event?: MouseEvent) {
+  // 长按触发多选后，这一下 click 必须被吞掉（设计文档 8.6 第 1 条）
+  if (pressConsumed) {
+    pressConsumed = false
+    return
+  }
+  // Ctrl / ⌘ + 点击 = 进入或追加多选
+  if (event && (event.ctrlKey || event.metaKey)) {
+    if (!selectMode.value) selectMode.value = true
+    toggleSelect(entry)
+    return
+  }
+  if (selectMode.value) {
+    toggleSelect(entry)
+    return
+  }
   if (coarsePointer) {
     void activate(entry)
   } else {
@@ -694,9 +1102,22 @@ function toneFor(entry: EntryInfo) {
   }
 }
 
-// 分享弹窗 / 编辑器 / 预览面板是模态层，打开时锁住列表滚动
+// 分享 / 编辑器 / 预览 / 各类变更弹窗都是模态层，打开时锁住列表滚动
 useScrollLock(
-  computed(() => Boolean(shareDialog.value || editor.value || preview.value || deleteTarget.value)),
+  computed(() =>
+    Boolean(
+      shareDialog.value ||
+        editor.value ||
+        preview.value ||
+        deleteTargets.value.length ||
+        createDialog.value ||
+        renameDialog.value ||
+        transferDialog.value ||
+        resultDialog.value ||
+        statDialog.value ||
+        bulkDownloadConfirm.value,
+    ),
+  ),
 )
 
 onMounted(boot)
@@ -837,8 +1258,8 @@ onMounted(boot)
               v-for="root in roots"
               :key="root.path"
               class="glass-card flex items-start gap-3 rounded-xl p-4 text-left"
-              :class="root.exists ? '' : 'opacity-60'"
-              :title="root.exists ? t('files.roots.enter') : t('files.roots.unavailable')"
+              :class="root.online ? '' : 'opacity-60'"
+              :title="root.online ? t('files.roots.enter') : t('files.roots.unavailable')"
               :data-root="root.name"
               @click="enterRoot(root)"
             >
@@ -847,8 +1268,17 @@ onMounted(boot)
               </span>
               <span class="min-w-0 flex-1">
                 <span class="block truncate text-sm font-medium text-ink">{{ root.name }}</span>
-                <span class="mt-0.5 block truncate text-[11px] text-muted">
-                  {{ root.exists ? t('files.roots.browse') : t('files.roots.unavailable') }}
+                <span class="mt-0.5 flex items-center gap-1.5">
+                  <span
+                    v-if="root.readonly"
+                    class="shrink-0 rounded bg-elevated px-1 py-px text-[10px] text-muted"
+                    :title="t('files.readonly.tooltip')"
+                  >
+                    {{ t('files.readonly.badge') }}
+                  </span>
+                  <span class="truncate text-[11px] text-muted">
+                    {{ root.online ? t('files.roots.browse') : t('files.roots.unavailable') }}
+                  </span>
                 </span>
               </span>
               <AppIcon name="arrowRight" :size="14" class="mt-1 shrink-0 text-muted" />
@@ -894,6 +1324,17 @@ onMounted(boot)
             </button>
           </template>
         </nav>
+
+        <!-- 只读挂载点：全部变更入口置灰并带 Tooltip（设计文档 8.4 第 7 条） -->
+        <span
+          v-if="readonly"
+          class="hidden shrink-0 items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted sm:flex"
+          :title="t('files.readonly.tooltip')"
+          data-testid="readonly-badge"
+        >
+          <AppIcon name="lock" :size="10" />
+          {{ t('files.readonly.badge') }}
+        </span>
 
         <div class="relative hidden w-40 shrink-0 sm:block md:w-56">
           <span class="absolute left-2 top-1/2 -translate-y-1/2 text-muted">
@@ -946,9 +1387,39 @@ onMounted(boot)
           </button>
         </div>
 
+        <!-- 新建（设计文档 3.2 工具栏 / 3.2.6.1） -->
+        <div class="relative shrink-0">
+          <button
+            class="flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
+            :disabled="readonly"
+            :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
+            data-testid="new-entry"
+            :aria-expanded="newMenuOpen"
+            @click="newMenuOpen = !newMenuOpen"
+          >
+            <AppIcon name="plus" :size="13" />
+            <span class="hidden sm:inline">{{ t('files.toolbar.new') }}</span>
+          </button>
+          <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
+          <div
+            v-if="newMenuOpen"
+            class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+          >
+            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
+              <AppIcon name="folder" :size="14" />
+              {{ t('files.toolbar.newFolder') }}
+            </button>
+            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
+              <AppIcon name="file" :size="14" />
+              {{ t('files.toolbar.newFile') }}
+            </button>
+          </div>
+        </div>
+
         <button
-          class="flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
-          :title="t('files.toolbar.uploadHint')"
+          class="flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+          :disabled="readonly"
+          :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
           @click="pickFiles"
         >
           <AppIcon name="upload" :size="13" />
@@ -958,7 +1429,15 @@ onMounted(boot)
       </header>
 
       <!-- 内容 -->
-      <div class="relative min-h-0 flex-1 overflow-y-auto">
+      <div class="relative min-h-0 flex-1 overflow-y-auto" :class="selectMode ? 'pb-20' : ''">
+        <!-- 单目录扫描上限 10000 条（设计文档 3.2.4） -->
+        <p
+          v-if="listing?.truncated"
+          class="border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-500"
+        >
+          {{ t('files.list.truncated') }}
+        </p>
+
         <div v-if="loading" class="p-3">
           <div class="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2">
             <div v-for="i in 12" :key="i" class="flex flex-col items-center gap-2 p-3">
@@ -1014,15 +1493,34 @@ onMounted(boot)
           <template #default="{ item: entry }">
             <button
               type="button"
-              class="group flex size-full flex-col items-center gap-1.5 rounded-xl border border-transparent px-1.5 py-2.5 transition-colors hover:border-line hover:bg-panel"
-              :class="selected === entry.path ? 'border-accent/50 bg-panel' : ''"
+              class="entry-tile group relative flex size-full flex-col items-center gap-1.5 rounded-xl border border-transparent px-1.5 py-2.5 transition-colors hover:border-line hover:bg-panel"
+              :class="[
+                selected === entry.path ? 'border-accent/50 bg-panel' : '',
+                selectMode && isSelected(entry.path) ? 'border-accent bg-accent-soft' : '',
+              ]"
               :title="entry.name"
               :data-entry="entry.name"
               :data-kind="entry.kind"
-              @click="onEntryClick(entry)"
+              :data-selected="isSelected(entry.path) ? '1' : undefined"
+              @click="onEntryClick(entry, $event)"
               @dblclick="activate(entry)"
               @contextmenu.prevent="openMenu($event, entry)"
+              @touchstart.passive="onPressStart($event, entry)"
+              @touchmove.passive="onPressMove($event)"
+              @touchend="cancelPress"
+              @touchcancel="cancelPress"
             >
+              <span
+                v-if="selectMode"
+                class="absolute right-1 top-1 grid size-5 place-items-center rounded-full border transition-colors"
+                :class="
+                  isSelected(entry.path)
+                    ? 'border-accent bg-accent text-white'
+                    : 'border-line bg-panel text-transparent'
+                "
+              >
+                <AppIcon name="check" :size="11" />
+              </span>
               <span
                 class="grid size-11 place-items-center overflow-hidden rounded-lg bg-elevated/60 transition-transform group-hover:scale-105 md:size-12"
                 :class="toneFor(entry)"
@@ -1048,14 +1546,33 @@ onMounted(boot)
         <VirtualList v-else :items="displayEntries" :row-height="40">
           <template #default="{ item: entry }">
             <div
-              class="flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[12px] transition-colors hover:bg-elevated/60"
-              :class="selected === entry.path ? 'bg-accent-soft' : ''"
+              class="entry-tile flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[12px] transition-colors hover:bg-elevated/60"
+              :class="[
+                selected === entry.path ? 'bg-accent-soft' : '',
+                selectMode && isSelected(entry.path) ? 'bg-accent-soft' : '',
+              ]"
               :data-entry="entry.name"
               :data-kind="entry.kind"
-              @click="onEntryClick(entry)"
+              :data-selected="isSelected(entry.path) ? '1' : undefined"
+              @click="onEntryClick(entry, $event)"
               @dblclick="activate(entry)"
               @contextmenu.prevent="openMenu($event, entry)"
+              @touchstart.passive="onPressStart($event, entry)"
+              @touchmove.passive="onPressMove($event)"
+              @touchend="cancelPress"
+              @touchcancel="cancelPress"
             >
+              <span
+                v-if="selectMode"
+                class="grid size-4 shrink-0 place-items-center rounded-full border transition-colors"
+                :class="
+                  isSelected(entry.path)
+                    ? 'border-accent bg-accent text-white'
+                    : 'border-line text-transparent'
+                "
+              >
+                <AppIcon name="check" :size="10" />
+              </span>
               <span :class="toneFor(entry)"><AppIcon :name="iconFor(entry)" :size="15" /></span>
               <span class="min-w-0 flex-1 truncate text-ink">{{ entry.name }}</span>
               <span class="w-20 shrink-0 text-right text-muted whitespace-nowrap">
@@ -1093,6 +1610,62 @@ onMounted(boot)
           {{ loadingMore ? t('common.action.loadingMore') : t('common.action.loadMore') }}
         </button>
       </footer>
+
+      <!-- 多选操作栏（设计文档 8.6 第 2 条：安全区 + 列表底部补等量 padding） -->
+      <Transition name="fade">
+        <div
+          v-if="selectMode"
+          class="absolute inset-x-0 bottom-0 z-30 border-t border-line bg-panel/95 backdrop-blur"
+          style="padding-bottom: env(safe-area-inset-bottom)"
+          data-testid="select-bar"
+        >
+          <div class="flex items-center gap-1.5 px-3 py-2">
+            <span class="min-w-0 flex-1 truncate text-[11px] text-muted">
+              {{ t('files.select.count', { count: selection.length }) }}
+            </span>
+            <button
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50"
+              @click="downloadSelected"
+            >
+              <AppIcon name="download" :size="12" />
+              <span class="hidden sm:inline">{{ t('files.select.download') }}</span>
+            </button>
+            <button
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
+              :disabled="readonly"
+              :title="readonly ? t('files.readonly.tooltip') : ''"
+              @click="openTransferDialog('move', selectedEntries)"
+            >
+              <AppIcon name="arrowRight" :size="12" />
+              <span class="hidden sm:inline">{{ t('files.select.move') }}</span>
+            </button>
+            <button
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
+              :disabled="readonly"
+              :title="readonly ? t('files.readonly.tooltip') : ''"
+              @click="openTransferDialog('copy', selectedEntries)"
+            >
+              <AppIcon name="gallery" :size="12" />
+              <span class="hidden sm:inline">{{ t('files.select.copy') }}</span>
+            </button>
+            <button
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-red-400 transition-colors hover:border-red-400/50 disabled:cursor-not-allowed disabled:opacity-40"
+              :disabled="readonly"
+              :title="readonly ? t('files.readonly.tooltip') : ''"
+              @click="openDeleteDialog(selectedEntries)"
+            >
+              <AppIcon name="trash" :size="12" />
+              <span class="hidden sm:inline">{{ t('files.select.delete') }}</span>
+            </button>
+            <button
+              class="rounded-md bg-elevated px-2 py-1 text-[11px] text-ink transition-colors hover:bg-line"
+              @click="exitSelect"
+            >
+              {{ t('files.select.cancel') }}
+            </button>
+          </div>
+        </div>
+      </Transition>
       </template>
     </div>
 
@@ -1113,7 +1686,7 @@ onMounted(boot)
               : t('files.menu.open')
         }}
       </button>
-      <button class="menu-item" @click="menuOpenTerminal">
+      <button v-if="menu.entry.is_dir" class="menu-item" @click="menuOpenTerminal">
         <AppIcon name="terminal" :size="14" />
         {{ t('files.menu.terminal') }}
       </button>
@@ -1138,40 +1711,464 @@ onMounted(boot)
         {{ t('files.menu.directLink') }}
       </button>
       <div class="my-1 border-t border-line" />
-      <button class="menu-item menu-item--danger" @click="openDeleteDialog">
+      <button
+        class="menu-item"
+        :class="readonly ? 'menu-item--off' : ''"
+        :disabled="readonly"
+        :title="readonly ? t('files.readonly.tooltip') : ''"
+        @click="openRenameDialog"
+      >
+        <AppIcon name="edit" :size="14" />
+        {{ t('files.menu.rename') }}
+      </button>
+      <button
+        class="menu-item"
+        :class="readonly ? 'menu-item--off' : ''"
+        :disabled="readonly"
+        :title="readonly ? t('files.readonly.tooltip') : ''"
+        @click="openTransferDialog('move')"
+      >
+        <AppIcon name="arrowRight" :size="14" />
+        {{ t('files.menu.moveTo') }}
+      </button>
+      <button
+        class="menu-item"
+        :class="readonly ? 'menu-item--off' : ''"
+        :disabled="readonly"
+        :title="readonly ? t('files.readonly.tooltip') : ''"
+        @click="openTransferDialog('copy')"
+      >
+        <AppIcon name="gallery" :size="14" />
+        {{ t('files.menu.copyTo') }}
+      </button>
+      <div class="my-1 border-t border-line" />
+      <button class="menu-item" @click="openStatDialog">
+        <AppIcon name="chip" :size="14" />
+        {{ t('files.menu.properties') }}
+      </button>
+      <button
+        class="menu-item menu-item--danger"
+        :class="readonly ? 'menu-item--off' : ''"
+        :disabled="readonly"
+        :title="readonly ? t('files.readonly.tooltip') : ''"
+        @click="openDeleteDialog()"
+      >
         <AppIcon name="trash" :size="14" />
         {{ t('files.menu.delete') }}
       </button>
+      <!-- 置灰项在部分浏览器上不弹原生 Tooltip，这里再给一条常驻说明 -->
+      <p v-if="readonly" class="px-3 pt-1 pb-1.5 text-[10px] leading-snug text-muted">
+        {{ t('files.readonly.tooltip') }}
+      </p>
     </div>
 
     <!-- 删除确认 -->
     <div
-      v-if="deleteTarget"
+      v-if="deleteTargets.length"
       class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
-      @click.self="deleteTarget = null"
+      @click.self="deleteTargets = []"
     >
       <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <p class="text-sm font-medium text-ink">
-          {{ t(deleteTarget.is_dir ? 'files.delete.titleDir' : 'files.delete.titleFile') }}
+        <p class="text-sm font-medium text-ink">{{ deleteTitle }}</p>
+        <p
+          v-if="deleteTargets.length === 1"
+          class="mt-2 break-all text-[11px] text-muted"
+        >
+          {{ deleteTargets[0].name }}
         </p>
-        <p class="mt-2 break-all text-[11px] text-muted">{{ deleteTarget.name }}</p>
+        <ul v-else class="mt-2 max-h-32 space-y-0.5 overflow-y-auto">
+          <li
+            v-for="entry in deleteTargets"
+            :key="entry.path"
+            class="truncate text-[11px] text-muted"
+          >
+            {{ entry.name }}
+          </li>
+        </ul>
+
+        <!-- 删除前统计（设计文档 3.2.6.5） -->
+        <p class="mt-2 text-[11px] text-muted">
+          <template v-if="!deleteSurvey">{{ t('files.delete.measuring') }}</template>
+          <template v-else-if="deleteSurvey.truncated">
+            {{ t('files.delete.summaryMore', { count: deleteSurvey.items }) }}
+          </template>
+          <template v-else>
+            {{
+              t('files.delete.summary', {
+                count: deleteSurvey.items,
+                size: formatSize(deleteSurvey.bytes),
+              })
+            }}
+          </template>
+        </p>
+        <p
+          v-if="deleteSurvey?.truncated || (deleteSurvey?.items ?? 0) > 1000"
+          class="mt-1 text-[11px] text-amber-500"
+        >
+          {{ t('files.delete.large') }}
+        </p>
+
         <p class="mt-3 text-xs leading-relaxed text-red-400">
-          {{ t(deleteTarget.is_dir ? 'files.delete.warningDir' : 'files.delete.warningFile') }}
+          {{
+            t(
+              deleteNeedsName
+                ? 'files.delete.warningDir'
+                : deleteTargets.length > 1
+                  ? 'files.delete.warningDir'
+                  : 'files.delete.warningFile',
+            )
+          }}
         </p>
+        <!-- 删除单个目录必须输入目录名（设计文档 3.2.6.5：防误触，不是安全边界） -->
+        <label v-if="deleteNeedsName" class="mt-3 block text-[11px] text-muted">
+          {{ t('files.delete.confirmNameLabel') }}
+          <input
+            v-model="deleteConfirmName"
+            type="text"
+            :placeholder="deleteTargets[0].name"
+            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+            data-testid="delete-confirm-name"
+            @keydown.enter="confirmDelete"
+          />
+          <span class="mt-1 block text-[10px] text-muted">{{ t('files.delete.confirmNameHint') }}</span>
+        </label>
         <p v-if="deleteError" class="mt-3 text-xs text-red-400">{{ deleteError }}</p>
         <div class="mt-5 flex justify-end gap-2">
           <button
             class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-            @click="deleteTarget = null"
+            @click="deleteTargets = []"
           >
             {{ t('common.action.cancel') }}
           </button>
           <button
             class="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-            :disabled="deleteBusy"
+            :disabled="deleteBusy || !deleteNameMatches"
             @click="confirmDelete"
           >
             {{ deleteBusy ? t('common.action.deleting') : t('files.delete.confirm') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 多选下载确认（设计文档 3.2.6.6：> 10 个先提示会被浏览器拦截） -->
+    <div
+      v-if="bulkDownloadConfirm"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="bulkDownloadConfirm = null"
+    >
+      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <p class="text-sm font-medium text-ink">
+          {{ t('files.select.downloadConfirm', { count: bulkDownloadConfirm.length }) }}
+        </p>
+        <p class="mt-2 text-xs leading-relaxed text-muted">{{ t('files.select.downloadHint') }}</p>
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
+            @click="bulkDownloadConfirm = null"
+          >
+            {{ t('common.action.cancel') }}
+          </button>
+          <button
+            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+            @click="confirmBulkDownload"
+          >
+            {{ t('files.select.download') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新建文件夹 / 空文件（设计文档 3.2.6.1） -->
+    <div
+      v-if="createDialog"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="createDialog = null"
+    >
+      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <p class="text-sm font-medium text-ink">
+          {{
+            t(
+              createDialog.kind === 'dir'
+                ? 'files.create.titleFolder'
+                : 'files.create.titleFile',
+            )
+          }}
+        </p>
+        <p class="mt-0.5 truncate text-[11px] text-muted">{{ currentPath }}</p>
+        <label class="mt-4 block text-[11px] text-muted">
+          {{ t('files.create.placeholder') }}
+          <input
+            v-model="createDialog.name"
+            type="text"
+            :placeholder="t('files.create.placeholder')"
+            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+            data-testid="create-name"
+            @keydown.enter="submitCreate"
+          />
+        </label>
+        <p v-if="createDialog.error" class="mt-3 text-xs text-red-400">{{ createDialog.error }}</p>
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
+            @click="createDialog = null"
+          >
+            {{ t('common.action.cancel') }}
+          </button>
+          <button
+            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            :disabled="createDialog.busy"
+            @click="submitCreate"
+          >
+            {{ t('files.create.submit') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 重命名（设计文档 3.2.6.1） -->
+    <div
+      v-if="renameDialog"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="renameDialog = null"
+    >
+      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <p class="text-sm font-medium text-ink">{{ t('files.rename.title') }}</p>
+        <p class="mt-0.5 break-all text-[11px] text-muted">{{ renameDialog.entry.name }}</p>
+        <label class="mt-4 block text-[11px] text-muted">
+          {{ t('files.rename.label') }}
+          <input
+            v-model="renameDialog.name"
+            type="text"
+            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+            data-testid="rename-name"
+            @keydown.enter="submitRename"
+          />
+        </label>
+        <p v-if="renameDialog.error" class="mt-3 text-xs text-red-400">{{ renameDialog.error }}</p>
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
+            @click="renameDialog = null"
+          >
+            {{ t('common.action.cancel') }}
+          </button>
+          <button
+            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            :disabled="renameDialog.busy"
+            @click="submitRename"
+          >
+            {{ t('files.rename.submit') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 移动 / 复制（设计文档 3.2.6.2：冲突必须由用户解析成具体策略） -->
+    <div
+      v-if="transferDialog"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="transferDialog = null"
+    >
+      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <p class="text-sm font-medium text-ink">
+          {{
+            t(
+              transferDialog.mode === 'move'
+                ? 'files.transfer.titleMove'
+                : 'files.transfer.titleCopy',
+            )
+          }}
+        </p>
+        <p class="mt-0.5 text-[11px] text-muted">
+          {{
+            transferDialog.targets.length === 1
+              ? transferDialog.targets[0].path
+              : t('files.select.count', { count: transferDialog.targets.length })
+          }}
+        </p>
+
+        <label class="mt-4 block text-[11px] text-muted">
+          {{ t('files.transfer.destination') }}
+          <input
+            v-model="transferDialog.dest"
+            type="text"
+            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[11px] text-ink outline-none focus:border-accent"
+            data-testid="transfer-dest"
+            @keydown.enter="submitTransfer"
+          />
+          <span class="mt-1 block text-[10px] text-muted">
+            {{ t('files.transfer.destinationHint') }}
+          </span>
+        </label>
+
+        <p class="mt-4 text-[11px] text-muted">{{ t('files.transfer.conflict') }}</p>
+        <div class="mt-1.5 space-y-1">
+          <label
+            v-for="option in CONFLICT_OPTIONS"
+            :key="option"
+            class="flex cursor-pointer items-center gap-2 rounded-lg border border-line px-3 py-1.5 text-xs text-ink"
+            :class="conflictChoice === option ? 'border-accent/60 bg-accent-soft' : ''"
+          >
+            <input
+              v-model="conflictChoice"
+              type="radio"
+              :value="option"
+              class="accent-[var(--accent)]"
+              :data-testid="`conflict-${option}`"
+            />
+            {{
+              t(
+                option === 'overwrite'
+                  ? 'files.transfer.overwrite'
+                  : option === 'rename'
+                    ? 'files.transfer.renamePolicy'
+                    : 'files.transfer.skip',
+              )
+            }}
+          </label>
+        </div>
+
+        <p v-if="transferDialog.error" class="mt-3 text-xs text-red-400">
+          {{ transferDialog.error }}
+        </p>
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
+            @click="transferDialog = null"
+          >
+            {{ t('common.action.cancel') }}
+          </button>
+          <button
+            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            :disabled="transferDialog.busy"
+            @click="submitTransfer"
+          >
+            {{ transferDialog.busy ? t('common.action.loading') : t('files.transfer.submit') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 批量操作进行中：同步请求，只给不确定进度 + 遮罩，不伪造百分比（设计文档 8.5 第 2 条） -->
+    <div
+      v-if="transferDialog?.busy"
+      class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4"
+    >
+      <div class="rounded-xl border border-line bg-panel px-6 py-5 text-center shadow-xl">
+        <div
+          class="mx-auto size-6 animate-spin rounded-full border-2 border-line border-t-accent"
+        />
+        <p class="mt-3 text-xs text-ink">
+          {{ t('files.transfer.busy', { count: transferDialog.targets.length }) }}
+        </p>
+      </div>
+    </div>
+
+    <!-- 批量结果汇总（设计文档 6.2：逐项 error_code 翻译，不甩英文 message） -->
+    <div
+      v-if="resultDialog"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="resultDialog = null"
+    >
+      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <p class="text-sm font-medium text-ink">{{ t('files.result.title') }}</p>
+        <p class="mt-2 text-xs text-muted">
+          {{
+            t('files.result.summary', {
+              ok: resultDialog.ok,
+              failed: resultDialog.failed,
+              skipped: resultDialog.skipped,
+            })
+          }}
+        </p>
+        <template v-if="resultDialog.failures.length">
+          <p class="mt-4 text-[11px] font-medium text-muted">{{ t('files.result.failures') }}</p>
+          <ul class="mt-1.5 max-h-48 space-y-1 overflow-y-auto">
+            <li
+              v-for="item in resultDialog.failures"
+              :key="item.path"
+              class="rounded-lg border border-line bg-elevated px-2.5 py-1.5"
+            >
+              <p class="break-all text-[11px] text-ink">{{ item.source ?? item.path }}</p>
+              <p class="mt-0.5 text-[10px] text-red-400">{{ failureText(item) }}</p>
+            </li>
+          </ul>
+        </template>
+        <div class="mt-5 flex justify-end">
+          <button
+            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+            @click="resultDialog = null"
+          >
+            {{ t('common.action.close') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 属性（设计文档 3.2 右键菜单 / 6.2 stat） -->
+    <div
+      v-if="statDialog"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="statDialog = null"
+    >
+      <div class="w-full max-w-md rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <p class="text-sm font-medium text-ink">{{ t('files.stat.title') }}</p>
+        <p class="mt-0.5 break-all text-[11px] text-muted">{{ statDialog.entry.path }}</p>
+
+        <p v-if="statDialog.busy" class="mt-4 text-xs text-muted">
+          {{ t('common.action.loading') }}
+        </p>
+        <p v-else-if="statDialog.error" class="mt-4 text-xs text-red-400">{{ statDialog.error }}</p>
+        <dl v-else-if="statDialog.data" class="mt-4 space-y-1.5 text-[11px]">
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.size') }}</dt>
+            <dd class="min-w-0 flex-1 break-all text-ink">
+              {{ statDialog.data.is_dir ? '—' : formatSize(statDialog.data.size) }}
+            </dd>
+          </div>
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.mime') }}</dt>
+            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.mime }}</dd>
+          </div>
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.modified') }}</dt>
+            <dd class="min-w-0 flex-1 text-ink">{{ formatTime(statDialog.data.mtime) }}</dd>
+          </div>
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.mode') }}</dt>
+            <dd class="min-w-0 flex-1 text-ink">{{ formatMode(statDialog.data.mode) }}</dd>
+          </div>
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.owner') }}</dt>
+            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.owner ?? '—' }}</dd>
+          </div>
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.inode') }}</dt>
+            <dd class="min-w-0 flex-1 text-ink">{{ statDialog.data.inode ?? '—' }}</dd>
+          </div>
+          <div class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.realPath') }}</dt>
+            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.real_path ?? '—' }}</dd>
+          </div>
+          <div v-if="statDialog.data.is_symlink" class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.symlink') }}</dt>
+            <dd class="min-w-0 flex-1 break-all text-amber-500">
+              {{ statDialog.data.symlink_target ?? '—' }}
+            </dd>
+          </div>
+          <div v-if="statDialog.data.readonly" class="flex gap-3">
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.readonly') }}</dt>
+            <dd class="min-w-0 flex-1 text-ink">{{ t('files.readonly.badge') }}</dd>
+          </div>
+        </dl>
+
+        <div class="mt-5 flex justify-end">
+          <button
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
+            @click="statDialog = null"
+          >
+            {{ t('common.action.close') }}
           </button>
         </div>
       </div>
@@ -1317,6 +2314,12 @@ onMounted(boot)
 </template>
 
 <style scoped>
+/* 移动端长按选中文件时，禁止系统自带的文本选择与长按菜单（设计文档 8.6 第 1 条） */
+.entry-tile {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
 .menu-item {
   display: flex;
   width: 100%;
@@ -1335,5 +2338,16 @@ onMounted(boot)
 }
 .menu-item--danger:hover {
   background: rgb(248 113 113 / 0.12);
+}
+/* 只读挂载点：置灰但仍可 hover 出 Tooltip（设计文档 8.4 第 7 条） */
+.menu-item--off,
+.menu-item--off:hover {
+  cursor: not-allowed;
+  background: transparent;
+  opacity: 0.4;
+}
+.menu-item--off.menu-item--danger,
+.menu-item--off.menu-item--danger:hover {
+  color: #f87171;
 }
 </style>

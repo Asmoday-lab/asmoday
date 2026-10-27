@@ -52,6 +52,21 @@ const truncated = ref(false)
 
 const playing = ref<MediaItem | null>(null)
 
+/** 轻提示：坏文件只提示一次，不弹阻断性弹窗（设计文档 3.4.7 第 1 条） */
+const toast = ref('')
+let toastTimer: number | null = null
+function showToast(message: string) {
+  toast.value = message
+  if (toastTimer !== null) clearTimeout(toastTimer)
+  toastTimer = window.setTimeout(() => {
+    toast.value = ''
+    toastTimer = null
+  }, 2600)
+}
+onBeforeUnmount(() => {
+  if (toastTimer !== null) clearTimeout(toastTimer)
+})
+
 // 影视库播放器是整屏遮罩，锁住底层滚动（设计文档 8.4）；灯箱自己管自己的锁
 useScrollLock(computed(() => Boolean(playing.value)))
 /** 进入某个相册后的详情列表；null = 相册列表 */
@@ -83,6 +98,20 @@ function onNativeError() {
   nativeError.value = NATIVE_UNSUPPORTED.includes(ext)
     ? t('gallery.video.unsupportedExt', { ext })
     : t('gallery.video.loadFailed')
+  // 坏文件只 Toast + 就地提示，绝不让整页崩掉（设计文档 3.4.7 第 1 条）
+  showToast(nativeError.value)
+}
+
+/** 坏文件的兜底出口：浏览器解不了就交给下载（设计文档 3.4.7 第 1 条） */
+function downloadPlaying() {
+  const item = playing.value
+  if (!item) return
+  const link = document.createElement('a')
+  link.href = rawUrl(item.path)
+  link.rel = 'noopener'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
 }
 
 // 换片时清掉上一条错误提示
@@ -161,7 +190,10 @@ const audios = computed(() =>
 
 /** 音乐展示名：优先内嵌 ID3 标题 */
 function trackTitle(item: MediaItem): string {
-  return item.title ?? item.name
+  if (item.title) return item.title
+  // 无 ID3 标签时用「去扩展名的文件名」当歌名（设计文档 3.4.7 第 2 条）
+  const stripped = item.name.replace(/\.[^.]+$/, '')
+  return stripped || item.name
 }
 
 /** 音乐副标题：歌手 · 专辑，都没有时退回所在目录 */
@@ -737,7 +769,15 @@ onBeforeUnmount(() => {
             @timeupdate="reportProgress(($event.target as HTMLVideoElement).currentTime)"
             @ended="onPlayEnded(playing.path)"
           />
-          <p v-if="nativeError" class="mt-2 text-center text-xs text-amber-300">{{ nativeError }}</p>
+          <p v-if="nativeError" class="mt-2 text-center text-xs text-amber-300">
+            {{ nativeError }}
+            <button
+              class="ml-2 rounded border border-amber-300/40 px-2 py-0.5 text-[11px] text-amber-200 transition-colors hover:bg-amber-300/10"
+              @click="downloadPlaying"
+            >
+              {{ t('gallery.video.tryDownload') }}
+            </button>
+          </p>
         </template>
         <MediaPlayer
           v-else
@@ -751,5 +791,15 @@ onBeforeUnmount(() => {
         />
       </div>
     </div>
+
+    <!-- 轻提示（坏文件 / 不支持格式） -->
+    <Transition name="fade">
+      <div
+        v-if="toast"
+        class="pointer-events-none fixed bottom-20 left-1/2 z-[60] -translate-x-1/2 rounded-full border border-line bg-panel px-4 py-2 text-xs text-ink shadow-lg"
+      >
+        {{ toast }}
+      </div>
+    </Transition>
   </section>
 </template>

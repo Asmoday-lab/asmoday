@@ -74,7 +74,8 @@
     "fallbackLink": "This video cannot be played — open it in a new window",
     "subtitleLabel": "Subtitles",
     "openOriginal": "Open the original file",
-    "close": "Close"
+    "close": "Close",
+    "tryDownload": "Try downloading"
   },
   "viewer": {
     "prev": "Previous",

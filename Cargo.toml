@@ -41,6 +41,8 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "n
 tokio-tungstenite = "0.29"
 # config.toml 热重载（设计文档 3.5：保存后无需重启进程）
 notify = "8"
+# 字幕编码探测：.srt 极大概率是 GBK，UTF-8 失败时用它兜底（设计文档 3.4.7 第 3 条）
+encoding_rs = "0.8"
 
 # 发布体积裁剪（见设计文档 9.1）
 # Windows 下某些 MSVC 环境会在 C 依赖（SQLite / ring 等）上触发

@@ -114,6 +114,7 @@ pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
 }
 
 /// 供 main 判断前端产物是否已内嵌。
+#[allow(dead_code)]
 pub fn embedded_files() -> usize {
     Assets::iter().count()
 }

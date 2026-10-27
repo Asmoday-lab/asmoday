@@ -63,6 +63,8 @@ thumb_cache_max_age_days = 90
 # 可填可执行文件，也可直接填安装目录（如 C:/ffmpeg/bin）。
 # 留空时依次读取环境变量 ASMODAY_FFMPEG_PATH，再自动探测系统 PATH。
 ffmpeg_path = ""
+# 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束。
+upload_max_size_mb = 0
 
 # ==========================================
 # 以下为可选配置，默认注释。需要时取消注释即可。
@@ -72,6 +74,7 @@ ffmpeg_path = ""
 # [[system.mounts]]
 # name = "Local Storage"
 # path = "D:/Media"
+# readonly = false
 
 # 外部聚合服务（可多个），由内置反向代理网关透传
 # [[services]]
@@ -115,6 +118,15 @@ impl Default for Config {
     }
 }
 
+/// 危险配置自检结果（设置页警告条 / 启动日志共用）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SafetyIssue {
+    /// `warn` 或 `error`
+    pub level: &'static str,
+    /// 前端 i18n key：`settings.safety.<code>`
+    pub code: &'static str,
+}
+
 /// `[media]`：缩略图缓存的容量与过期策略 + 外部 FFmpeg 位置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -126,6 +138,8 @@ pub struct MediaConfig {
     /// 外部 FFmpeg 可执行文件路径（设计文档 3.5 优先级 1）。
     /// 留空则依次读取 `ASMODAY_FFMPEG_PATH` 与系统 `PATH`。
     pub ffmpeg_path: String,
+    /// 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束（设计文档 3.2.3）
+    pub upload_max_size_mb: u64,
 }
 
 impl Default for MediaConfig {
@@ -134,6 +148,7 @@ impl Default for MediaConfig {
             thumb_cache_max_size_mb: 1024,
             thumb_cache_max_age_days: 90,
             ffmpeg_path: String::new(),
+            upload_max_size_mb: 0,
         }
     }
 }
@@ -228,6 +243,11 @@ impl Default for AuthConfig {
 pub struct ProxyTrustConfig {
     pub enabled: bool,
     pub user_header: String,
+    /// 只有来自这些地址的请求才采信 `user_header`（设计文档 3.1.8）
+    /// 留空 = 拒绝启用 proxy_trust（启动时打 ERROR 并强制关闭）
+    pub trusted_ips: Vec<String>,
+    /// 是否跳过 2FA：默认仍要求 2FA，开启后启动日志必须打 WARN
+    pub skip_2fa: bool,
 }
 
 impl Default for ProxyTrustConfig {
@@ -235,6 +255,8 @@ impl Default for ProxyTrustConfig {
         Self {
             enabled: false,
             user_header: "Remote-User".to_string(),
+            trusted_ips: vec!["127.0.0.1".to_string()],
+            skip_2fa: false,
         }
     }
 }
@@ -252,6 +274,9 @@ pub struct SystemConfig {
 pub struct MountConfig {
     pub name: String,
     pub path: String,
+    /// 只读挂载点：后端拦截一切写操作，前端置灰全部变更入口（设计文档 3.2.6）
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 /// `[[services]]`：外部聚合服务卡片 + 内置反代目标。
@@ -432,6 +457,99 @@ impl Config {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // 危险配置自检（设计文档 3.5 / 3.9 / 4.2）
+    //
+    // 只打日志 + 在设置页展示警告条，**不阻止启动**；唯一例外是
+    // `proxy_trust.enabled=true` 但白名单为空 —— 那等于任何人都能伪造 Header
+    // 冒充管理员，必须强制关掉（见 `apply_safety`）。
+    // -----------------------------------------------------------------------
+
+    /// 自检结果（`code` 供前端 i18n 翻译，`level` 决定颜色）
+    pub fn safety_issues(&self) -> Vec<SafetyIssue> {
+        let mut issues = Vec::new();
+        let proxy = &self.server.proxy;
+        let trust = &self.auth.proxy_trust;
+
+        if trust.enabled && trust.trusted_ips.iter().all(|ip| ip.trim().is_empty()) {
+            issues.push(SafetyIssue {
+                level: "error",
+                code: "PROXY_TRUST_NO_TRUSTED_IPS",
+            });
+        }
+        if proxy.trust_proxy_headers && proxy.trusted_ips.iter().all(|ip| ip.trim().is_empty()) {
+            issues.push(SafetyIssue {
+                level: "warn",
+                code: "PROXY_HEADERS_NO_TRUSTED_IPS",
+            });
+        }
+        if trust.skip_2fa {
+            issues.push(SafetyIssue {
+                level: "warn",
+                code: "PROXY_TRUST_SKIP_2FA",
+            });
+        }
+        let base = proxy.base_url.trim();
+        if !self.server.ssl.enabled && base.starts_with("https://") {
+            issues.push(SafetyIssue {
+                level: "warn",
+                code: "SSL_DISABLED_WITH_HTTPS_BASE",
+            });
+        }
+        if std::env::var("ASMODAY_RESET_PASSWORD").is_ok_and(|value| !value.trim().is_empty()) {
+            issues.push(SafetyIssue {
+                level: "warn",
+                code: "RESET_PASSWORD_ENV_PRESENT",
+            });
+        }
+        issues
+    }
+
+    /// 把自检里「必须强制修正」的项落到配置上，并逐条打日志。
+    ///
+    /// 返回自检结果，供设置页展示。
+    pub fn apply_safety(&mut self) -> Vec<SafetyIssue> {
+        let issues = self.safety_issues();
+
+        if self.auth.proxy_trust.enabled
+            && self
+                .auth
+                .proxy_trust
+                .trusted_ips
+                .iter()
+                .all(|ip| ip.trim().is_empty())
+        {
+            self.auth.proxy_trust.enabled = false;
+        }
+
+        for issue in &issues {
+            let message = match issue.code {
+                "PROXY_TRUST_NO_TRUSTED_IPS" => {
+                    "auth.proxy_trust.enabled ignored: trusted_ips is empty (config refused)"
+                }
+                "PROXY_HEADERS_NO_TRUSTED_IPS" => {
+                    "server.proxy.trust_proxy_headers is on but trusted_ips is empty: all clients share the proxy IP"
+                }
+                "PROXY_TRUST_SKIP_2FA" => {
+                    "auth.proxy_trust.skip_2fa is enabled: 2FA is bypassed for SSO logins"
+                }
+                "SSL_DISABLED_WITH_HTTPS_BASE" => {
+                    "server.ssl.enabled=false but base_url looks like an https URL"
+                }
+                "RESET_PASSWORD_ENV_PRESENT" => {
+                    "ASMODAY_RESET_PASSWORD is set: it takes effect on every start, remove it after resetting"
+                }
+                other => other,
+            };
+            if issue.level == "error" {
+                crate::log_error!("config safety check: {message}");
+            } else {
+                crate::log_warn!("config safety check: {message}");
+            }
+        }
+        issues
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,15 +580,15 @@ pub fn spawn_watcher(state: crate::AppState) {
             let mut watcher = match notify::recommended_watcher(tx) {
                 Ok(watcher) => watcher,
                 Err(err) => {
-                    crate::core::logging::warn(&format!("配置监听不可用，热重载已关闭：{err}"));
+                    crate::log_warn!("config watcher unavailable, hot reload disabled: {err}");
                     return;
                 }
             };
             if let Err(err) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
-                crate::core::logging::warn(&format!("配置监听失败，热重载已关闭：{err}"));
+                crate::log_warn!("failed to watch config file, hot reload disabled: {err}");
                 return;
             }
-            crate::core::logging::info(&format!("正在监听配置变更：{}", target.display()));
+            crate::log_info!("watching config file for changes: {}", target.display());
 
             loop {
                 let event = match rx.recv() {
@@ -492,7 +610,7 @@ pub fn spawn_watcher(state: crate::AppState) {
         });
 
     if spawned.is_err() {
-        crate::core::logging::warn("配置监视线程启动失败，热重载已关闭");
+        crate::log_warn!("failed to spawn config watcher thread, hot reload disabled");
     }
 }
 
@@ -508,15 +626,18 @@ fn reload_into(state: &crate::AppState, path: &Path) {
                 state
                     .thumbnails
                     .apply_limits(config.media.limit_bytes(), config.media.max_age_secs());
+                let mut config = config;
+                // 热重载同样要过一遍危险配置自检，不许绕过启动时的拦截
+                let _ = config.apply_safety();
                 *state.config.blocking_write() = config;
-                crate::core::logging::info(&format!("配置已热重载：{}", path.display()));
+                crate::log_info!("config hot-reloaded from {}", path.display());
             }
             Err(err) => {
-                crate::core::logging::warn(&format!("配置校验失败，保留旧配置：{err}"))
+                crate::log_warn!("config validation failed, keeping previous config: {err}")
             }
         },
         Err(err) => {
-            crate::core::logging::warn(&format!("配置热重载跳过（{err}），保留旧配置"))
+            crate::log_warn!("config hot reload skipped ({err}), keeping previous config")
         }
     }
 }

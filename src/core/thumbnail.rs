@@ -382,6 +382,11 @@ fn capabilities(cache: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>, bin: &Path)
 ///
 /// `max_age_secs == 0` 表示不做过期淘汰（仅测试用）。
 pub fn cleanup_cache(dir: &Path, limit: u64, max_age_secs: u64) -> std::io::Result<u64> {
+    // 缓存目录还没建（刚部署、还没生成过缩略图）时视为「已干净」，
+    // 不能把 404 透成 500 —— 设置页的「立即清理」必须是幂等的。
+    if !dir.exists() {
+        return Ok(0);
+    }
     let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
     let mut total: u64 = 0;
     let mut removed: u64 = 0;
@@ -549,5 +554,17 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(freed, 300);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_is_idempotent_on_missing_dir() {
+        // 目录不存在时必须返回 0 而不是 Io 错误（设置页清理按钮要幂等）
+        let missing = std::env::temp_dir().join(format!(
+            "asmoday-thumb-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(cleanup_cache(&missing, 1024, 3600).unwrap(), 0);
+        assert_eq!(clear_cache(&missing).unwrap(), (0, 0));
     }
 }

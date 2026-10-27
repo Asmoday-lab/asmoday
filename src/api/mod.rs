@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod files;
+pub mod files_mutate;
 pub mod media;
 pub mod proxy;
 pub mod shares;

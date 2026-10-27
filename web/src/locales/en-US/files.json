@@ -24,7 +24,10 @@
     "upload": "Upload",
     "uploadHint": "Upload to the current folder (drag and drop supported)",
     "showHidden": "Show hidden files",
-    "hideHidden": "Hide hidden files"
+    "hideHidden": "Hide hidden files",
+    "new": "New",
+    "newFolder": "New folder",
+    "newFile": "New file"
   },
   "list": {
     "forbidden": "No access to this path",
@@ -39,7 +42,8 @@
     "found": "{count} results",
     "escToClear": "Press Esc to clear",
     "uploadFirst": "Open a mount before uploading",
-    "searchFailed": "Search failed"
+    "searchFailed": "Search failed",
+    "truncated": "Too many entries: showing the first 10000, narrow the folder to see more"
   },
   "editor": {
     "back": "Back",
@@ -62,7 +66,11 @@
     "delete": "Delete…",
     "pathCopied": "Path copied",
     "directLinkCopied": "Image URL copied",
-    "directLinkFailed": "Failed to create the direct URL"
+    "directLinkFailed": "Failed to create the direct URL",
+    "rename": "Rename…",
+    "copyTo": "Copy to…",
+    "moveTo": "Move to…",
+    "properties": "Properties"
   },
   "delete": {
     "titleDir": "Delete folder",
@@ -72,7 +80,15 @@
     "confirm": "Delete",
     "doneDir": "Folder deleted",
     "doneFile": "File deleted",
-    "failed": "Delete failed"
+    "failed": "Delete failed",
+    "confirmNameLabel": "Type the folder name to confirm",
+    "confirmNameHint": "Deletion stays blocked until the name matches",
+    "titleBatch": "Delete selected items",
+    "doneBatch": "Selected items deleted",
+    "summary": "{count} items will be deleted, {size} in total",
+    "summaryMore": "{count}+ items will be deleted",
+    "large": "This folder is large; deletion may take a while",
+    "measuring": "Measuring…"
   },
   "share": {
     "create": "Create share",
@@ -116,5 +132,70 @@
     "csvTruncated": "Table exceeds {rows} rows and was truncated.",
     "truncatedHint": "Download the file for the complete content.",
     "csvEmpty": "No parsable rows in this file."
+  },
+  "readonly": {
+    "badge": "Read-only",
+    "tooltip": "This mount is read-only; changes are disabled"
+  },
+  "create": {
+    "titleFolder": "New folder",
+    "titleFile": "New file",
+    "placeholder": "Name",
+    "submit": "Create",
+    "done": "Created",
+    "failed": "Create failed"
+  },
+  "rename": {
+    "title": "Rename",
+    "label": "New name",
+    "submit": "Save",
+    "done": "Renamed",
+    "failed": "Rename failed"
+  },
+  "transfer": {
+    "titleCopy": "Copy to folder",
+    "titleMove": "Move to folder",
+    "destination": "Destination folder (absolute path)",
+    "destinationHint": "Must be inside a configured mount",
+    "conflict": "If a name already exists",
+    "overwrite": "Overwrite the file",
+    "renamePolicy": "Auto rename",
+    "skip": "Skip",
+    "submit": "Start",
+    "busy": "Processing {count} items, keep this page open",
+    "done": "Done",
+    "failed": "Operation failed",
+    "noTarget": "Enter a destination folder",
+    "conflictRequired": "Choose how to handle an existing name first"
+  },
+  "result": {
+    "title": "Result",
+    "summary": "{ok} succeeded · {failed} failed · {skipped} skipped",
+    "failures": "Failed items"
+  },
+  "stat": {
+    "title": "Properties",
+    "name": "Name",
+    "size": "Size",
+    "mime": "Type",
+    "modified": "Modified",
+    "mode": "Mode",
+    "owner": "Owner",
+    "inode": "inode",
+    "realPath": "Real path",
+    "symlink": "Symlink target",
+    "readonly": "Read-only",
+    "failed": "Cannot read properties"
+  },
+  "select": {
+    "count": "{count} selected",
+    "cancel": "Cancel",
+    "download": "Download",
+    "move": "Move",
+    "copy": "Copy",
+    "delete": "Delete",
+    "noDownloadable": "None of the selected items is a file",
+    "downloadConfirm": "About to download {count} files",
+    "downloadHint": "Your browser may block multiple downloads; allow them for this site"
   }
 }

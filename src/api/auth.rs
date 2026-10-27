@@ -180,6 +180,16 @@ async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr
 
 /// 拦截未登录请求：`/api/*` 与 `/proxy/*` 均需有效会话（或可信代理身份）。
 pub async fn require_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    // 初始化完成前，除初始化/登录接口外一律 503（设计文档 3.1.1）：
+    // 否则未初始化的实例会以「匿名可读」的姿态把挂载点暴露出去。
+    if state.auth.user_count().unwrap_or(0) == 0 {
+        return json_error_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "E_INIT_REQUIRED",
+            "Instance is not initialized yet",
+        );
+    }
+
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()

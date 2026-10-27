@@ -74,9 +74,9 @@ pub async fn ws_handler(
         .filter(|p| !p.is_empty())
         .map(|raw| match expand_home(raw, home.as_deref()) {
             Some(expanded) => {
-                crate::core::logging::warn(&format!(
-                    "终端 path 收到占位符「{raw}」，已按主目录解析（前端未指定目录时应传空字符串）"
-                ));
+                crate::log_warn!(
+                    "terminal path received a home placeholder '{raw}'; resolved to the system home directory"
+                );
                 warning =
                     Some("path 不要传 ~ 或 %USERPROFILE%，已按系统主目录解析".to_string());
                 expanded.to_string_lossy().into_owned()

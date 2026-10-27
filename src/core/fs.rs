@@ -21,12 +21,36 @@ pub const PAGE_SIZE: usize = 1000;
 
 #[derive(Debug)]
 pub enum FsError {
-    /// 路径越界 / 穿越
+    /// 路径越界（不在挂载点内 / 无权限）
     Forbidden(String),
+    /// 显式检测到 `../` 或软链接逃逸（设计文档 6.6 的 E_PATH_TRAVERSAL / E_SYMLINK_ESCAPE）
+    PathTraversal(String),
+    /// 软链接目标跑出了挂载点
+    SymlinkEscape(String),
     /// 不存在
     NotFound(String),
     /// 请求参数不合法
     BadRequest(String),
+    /// 只读挂载点
+    Readonly(String),
+    /// 目标已存在（原子 no-replace 失败）
+    Conflict(String),
+    /// 目录 overwrite 被拒（设计文档 3.2.6.2）
+    DirConflict(String),
+    /// 自动命名重试次数用尽
+    RetryExhausted(String),
+    /// 数量 / 体积超限（设计文档 1.3 第 7 条）
+    TooMany(String),
+    TooLarge(String),
+    /// 目标磁盘空间不足
+    NoSpace(String),
+    /// 路径被并发操作占用（per-path 锁）
+    Busy(String),
+    /// 删除确认名不匹配
+    NameMismatch(String),
+    /// 删除令牌过期 / 与 paths 不匹配
+    TokenExpired(String),
+    TokenMismatch(String),
     /// 服务端 IO 失败
     Io(String),
 }
@@ -36,9 +60,23 @@ impl FsError {
     #[allow(dead_code)]
     pub fn message(&self) -> String {
         match self {
-            FsError::Forbidden(m) | FsError::NotFound(m) | FsError::BadRequest(m) | FsError::Io(m) => {
-                m.clone()
-            }
+            FsError::Forbidden(m)
+            | FsError::PathTraversal(m)
+            | FsError::SymlinkEscape(m)
+            | FsError::NotFound(m)
+            | FsError::BadRequest(m)
+            | FsError::Readonly(m)
+            | FsError::Conflict(m)
+            | FsError::DirConflict(m)
+            | FsError::RetryExhausted(m)
+            | FsError::TooMany(m)
+            | FsError::TooLarge(m)
+            | FsError::NoSpace(m)
+            | FsError::Busy(m)
+            | FsError::NameMismatch(m)
+            | FsError::TokenExpired(m)
+            | FsError::TokenMismatch(m)
+            | FsError::Io(m) => m.clone(),
         }
     }
 }
@@ -77,54 +115,27 @@ impl RootSet {
 
 /// 依据配置构建根集合。
 ///
-/// - 配置了 `[[system.mounts]]`：只允许这些目录；
-/// - 未配置（或全部不存在）：退化到进程工作目录，标记 `implicit = true`。
+/// 真正的挂载点扫描在 `core::path_guard::load`（唯一真源，带 `readonly` 与 `online`），
+/// 这里只是把它投影成旧接口用的形状，避免两处各写一套扫描逻辑。
 pub fn load_roots(config: &Config, cwd: &Path) -> RootSet {
-    let mut roots = Vec::new();
-    let mut allowed = Vec::new();
+    let set = crate::core::path_guard::load(config, cwd);
 
-    for mount in &config.system.mounts {
-        let raw = PathBuf::from(&mount.path);
-        let display = normalize_display(&raw);
-        match std::fs::canonicalize(&raw) {
-            Ok(canon) if canon.is_dir() => {
-                allowed.push(canon);
-                roots.push(RootEntry {
-                    name: mount.name.clone(),
-                    path: display,
-                    exists: true,
-                    implicit: false,
-                });
-            }
-            _ => roots.push(RootEntry {
-                name: mount.name.clone(),
-                path: display,
-                exists: false,
-                implicit: false,
-            }),
-        }
-    }
-
-    if allowed.is_empty() {
-        let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        roots.push(RootEntry {
-            name: "工作目录".to_string(),
-            path: normalize_display(&canon),
-            exists: true,
-            implicit: true,
-        });
-        allowed.push(canon);
-        return RootSet {
-            roots,
-            allowed,
-            implicit: true,
-        };
-    }
+    let roots: Vec<RootEntry> = set
+        .mounts
+        .iter()
+        .map(|mount| RootEntry {
+            name: mount.info.name.clone(),
+            path: mount.info.path.clone(),
+            exists: mount.info.online,
+            implicit: mount.info.implicit,
+        })
+        .collect();
+    let allowed: Vec<PathBuf> = set.mounts.iter().filter_map(|m| m.root.clone()).collect();
 
     RootSet {
         roots,
         allowed,
-        implicit: false,
+        implicit: set.implicit,
     }
 }
 
@@ -193,6 +204,8 @@ pub struct EntryInfo {
     /// POSIX 风格绝对路径
     pub path: String,
     pub is_dir: bool,
+    /// 软链接按 lstat 处理，单独标记（设计文档 3.2.7）
+    pub is_symlink: bool,
     pub size: u64,
     /// Unix 时间戳（秒）
     pub modified: Option<u64>,
@@ -201,6 +214,9 @@ pub struct EntryInfo {
     pub ext: String,
     /// 是否可用内置编辑器打开
     pub editable: bool,
+    /// 单项 stat 失败：不让整页 500，标记后由前端显示占位（设计文档 3.2.4）
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stat_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,11 +227,26 @@ pub struct Listing {
     pub page_size: usize,
     pub total: usize,
     pub has_more: bool,
+    /// 扫描超过 `SCAN_LIMIT` 被强制截断（设计文档 3.2.4）
+    pub truncated: bool,
+    /// 所在挂载点是否只读：前端据此置灰全部变更入口
+    pub readonly: bool,
     pub entries: Vec<EntryInfo>,
 }
 
+/// 单目录扫描上限：超出截断并标记 `truncated`（设计文档 3.2.4）
+pub const SCAN_LIMIT: usize = 10_000;
+
 /// 读取目录第一层并分页。
-pub async fn list_dir(dir: &Path, page: usize, show_hidden: bool) -> Result<Listing, FsError> {
+///
+/// 排序固定为「目录优先 + 名称自然序（大小写不敏感）」——分页结果必须可重现，
+/// 所以不能依赖 `readdir` 的返回顺序。
+pub async fn list_dir(
+    dir: &Path,
+    page: usize,
+    show_hidden: bool,
+    readonly: bool,
+) -> Result<Listing, FsError> {
     let page = page.max(1);
 
     let mut reader = tokio::fs::read_dir(dir)
@@ -223,16 +254,25 @@ pub async fn list_dir(dir: &Path, page: usize, show_hidden: bool) -> Result<List
         .map_err(|e| FsError::Io(format!("读取目录失败：{e}")))?;
 
     let mut items: Vec<(String, bool)> = Vec::new();
+    let mut truncated = false;
     while let Some(entry) = reader
         .next_entry()
         .await
         .map_err(|e| FsError::Io(format!("遍历目录失败：{e}")))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
+        // `.asmoday-part` 临时文件任何情况下都不显示（设计文档 3.2.6.4）
+        if crate::core::path_guard::is_part_file(&name) {
+            continue;
+        }
         // 设计文档 3.2：默认隐藏以 `.` 开头的系统项（.git / .env …），
         // 开关打开时才一并返回；点数仍在分页之前过滤，total/has_more 才是准的
         if !show_hidden && name.starts_with('.') {
             continue;
+        }
+        if items.len() >= SCAN_LIMIT {
+            truncated = true;
+            break;
         }
         // file_type() 不跟随软链接，避免指向目录的链接被当作目录递归进去
         let is_dir = entry
@@ -257,10 +297,17 @@ pub async fn list_dir(dir: &Path, page: usize, show_hidden: bool) -> Result<List
     if start < total {
         for (name, is_dir) in &items[start..end] {
             let full = dir.join(name);
-            let meta = tokio::fs::metadata(&full).await.ok();
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = meta
+            // lstat：软链接只报告链接本身，不 stat 目标
+            let link_meta = tokio::fs::symlink_metadata(&full).await;
+            let stat_error = link_meta.is_err();
+            let is_symlink = link_meta
                 .as_ref()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let size = link_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = link_meta
+                .as_ref()
+                .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
@@ -271,11 +318,13 @@ pub async fn list_dir(dir: &Path, page: usize, show_hidden: bool) -> Result<List
                 name: name.clone(),
                 path: normalize_display(&full),
                 is_dir: *is_dir,
+                is_symlink,
                 size,
                 modified,
                 kind,
                 ext,
                 editable,
+                stat_error,
             });
         }
     }
@@ -292,6 +341,8 @@ pub async fn list_dir(dir: &Path, page: usize, show_hidden: bool) -> Result<List
         page_size: PAGE_SIZE,
         total,
         has_more: end < total,
+        truncated,
+        readonly,
         entries,
     })
 }
