@@ -53,7 +53,9 @@ pub async fn test_ffmpeg(State(_state): State<AppState>, body: Option<Json<TestP
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// 在阻塞线程里跑 `-version`，把结果拼成前端约定的结构。
+/// 在阻塞线程里跑 `-version` / `-encoders`，把结果拼成前端约定的结构。
+///
+/// `webp_support` 决定缩略图与视频封面能否输出 WebP（设计文档 3.4 / 3.5）。
 async fn probe(path: Option<std::path::PathBuf>, source: ffmpeg::FfmpegSource) -> serde_json::Value {
     let Some(bin) = path else {
         return json!({
@@ -61,13 +63,22 @@ async fn probe(path: Option<std::path::PathBuf>, source: ffmpeg::FfmpegSource) -
             "version": null,
             "path": null,
             "source": source.as_str(),
+            "webp_support": false,
         });
     };
 
     let probe_path = bin.clone();
-    let version = tokio::task::spawn_blocking(move || ffmpeg::probe_version(&probe_path))
-        .await
-        .unwrap_or(None);
+    let (version, caps) = tokio::task::spawn_blocking(move || {
+        let version = ffmpeg::probe_version(&probe_path);
+        // 探测不到版本就不必再跑一次 -encoders
+        let caps = match version {
+            Some(_) => ffmpeg::probe_capabilities(&probe_path),
+            None => ffmpeg::Capabilities::default(),
+        };
+        (version, caps)
+    })
+    .await
+    .unwrap_or((None, ffmpeg::Capabilities::default()));
 
     match version {
         Some(version) => json!({
@@ -75,12 +86,14 @@ async fn probe(path: Option<std::path::PathBuf>, source: ffmpeg::FfmpegSource) -
             "version": version,
             "path": bin.display().to_string(),
             "source": source.as_str(),
+            "webp_support": caps.webp,
         }),
         None => json!({
             "status": "missing",
             "version": null,
             "path": bin.display().to_string(),
             "source": source.as_str(),
+            "webp_support": false,
         }),
     }
 }

@@ -21,8 +21,8 @@ import {
 } from '../api/media'
 import { formatSize } from '../lib/format'
 import { useScrollLock } from '../composables/useScrollLock'
-import { bindVolume } from '../lib/volume'
 import { player } from '../stores/player'
+import { openLightbox } from '../stores/lightbox'
 
 const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
 const { t } = useI18n()
@@ -50,11 +50,10 @@ const loading = ref(true)
 const error = ref('')
 const truncated = ref(false)
 
-const viewer = ref<{ index: number; list: MediaItem[] } | null>(null)
 const playing = ref<MediaItem | null>(null)
 
-// 灯箱 / 播放器是整屏遮罩，锁住底层滚动（设计文档 8.4）
-useScrollLock(computed(() => Boolean(viewer.value || playing.value)))
+// 影视库播放器是整屏遮罩，锁住底层滚动（设计文档 8.4）；灯箱自己管自己的锁
+useScrollLock(computed(() => Boolean(playing.value)))
 /** 进入某个相册后的详情列表；null = 相册列表 */
 const activeAlbum = ref<{ folder: string; name: string; items: MediaItem[] } | null>(null)
 
@@ -122,7 +121,7 @@ function savePosition(path: string, seconds: number) {
 }
 
 function reportProgress(seconds: number) {
-  const video = playing.value ?? viewerItem.value
+  const video = playing.value
   if (!video) return
   // 小于 5 秒的位置没有续播价值，忽略（防止卸载/误报的 0 覆盖已有进度）
   if (seconds < 5) return
@@ -180,11 +179,6 @@ function markCoverFailed(path: string) {
 
 function showCover(item: MediaItem): boolean {
   return Boolean(item.cover) && !failedCovers.value.has(item.path)
-}
-
-/** 灯箱里的原生 <audio>：同样套用全局音量记忆 */
-function bindAudioVolume(event: Event) {
-  bindVolume(event.currentTarget as HTMLAudioElement)
 }
 
 /** 把绝对路径裁成「相对挂载根」的展示名，避免界面泄漏服务器真实路径 */
@@ -252,7 +246,31 @@ function openAlbum(album: Album) {
   activeAlbum.value = { folder: album.folder, name: album.name, items: album.items }
 }
 
-const viewerItem = computed(() => viewer.value?.list[viewer.value.index] ?? null)
+/** 点开图片/视频：交给全局灯箱（设计文档 3.2：严禁重复造轮子） */
+function openViewer(list: MediaItem[], index: number) {
+  openLightbox(
+    list.map((item) => ({
+      path: item.path,
+      name: item.name,
+      kind: item.kind,
+      subtitle: item.subtitle ?? null,
+    })),
+    index,
+    { onProgress: savePosition },
+  )
+}
+
+function onKey(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null
+  // 输入框里不抢键
+  if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return
+
+  if (playing.value) {
+    if (event.key === 'Escape') playing.value = null
+    return
+  }
+  if (event.key === 'Escape') activeAlbum.value = null
+}
 
 async function load() {
   loading.value = true
@@ -281,34 +299,6 @@ async function loadLibraryState() {
   } catch {
     /* 收藏/历史加载失败不阻塞画廊 */
   }
-}
-
-function openViewer(list: MediaItem[], index: number) {
-  viewer.value = { list, index }
-}
-
-function stepViewer(delta: number) {
-  if (!viewer.value) return
-  const length = viewer.value.list.length
-  viewer.value.index = (viewer.value.index + delta + length) % length
-}
-
-function onKey(event: KeyboardEvent) {
-  const target = event.target as HTMLElement | null
-  // 输入框里不抢键
-  if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return
-
-  if (playing.value) {
-    if (event.key === 'Escape') playing.value = null
-    return
-  }
-  if (viewer.value) {
-    if (event.key === 'Escape') viewer.value = null
-    if (event.key === 'ArrowLeft') stepViewer(-1)
-    if (event.key === 'ArrowRight') stepViewer(1)
-    return
-  }
-  if (event.key === 'Escape') activeAlbum.value = null
 }
 
 onMounted(() => {
@@ -722,68 +712,6 @@ onBeforeUnmount(() => {
             </tr>
           </tbody>
         </table>
-      </div>
-    </div>
-
-    <!-- 灯箱：图片 / 视频 / 音频按类型分流 -->
-    <div
-      v-if="viewer"
-      class="fixed inset-0 z-50 flex flex-col bg-black/95"
-      @click.self="viewer = null"
-    >
-      <div class="flex h-12 shrink-0 items-center justify-between px-4 text-white">
-        <span class="truncate text-xs text-white/70">
-          {{ viewerItem?.name }}
-          <span class="ml-2">{{ viewer.index + 1 }} / {{ viewer.list.length }}</span>
-        </span>
-        <button class="rounded px-2 py-1 text-white/70 hover:text-white" @click="viewer = null">
-          <AppIcon name="close" :size="18" />
-        </button>
-      </div>
-      <div class="flex min-h-0 flex-1 items-center justify-center px-2 pb-4">
-        <button
-          v-if="viewer.list.length > 1"
-          class="mr-2 grid size-10 shrink-0 place-items-center rounded-full bg-white/10 text-white hover:bg-white/20"
-          @click.stop="stepViewer(-1)"
-        >
-          <AppIcon name="chevronLeft" :size="18" />
-        </button>
-
-        <img
-          v-if="viewerItem?.kind === 'image'"
-          :key="viewerItem.path"
-          :src="rawUrl(viewerItem.path)"
-          class="max-h-full max-w-full rounded-lg object-contain"
-          alt=""
-        />
-        <div v-else-if="viewerItem?.kind === 'video'" :key="viewerItem.path" class="w-full max-w-4xl">
-          <MediaPlayer
-            :src="rawUrl(viewerItem.path)"
-            :subtitle="viewerItem.subtitle"
-            :autoplay="true"
-            @close="viewer = null"
-            @progress="reportProgress"
-            @ended="onPlayEnded(viewerItem.path)"
-          />
-        </div>
-        <audio
-          v-else-if="viewerItem"
-          :key="viewerItem.path"
-          :src="rawUrl(viewerItem.path)"
-          controls
-          autoplay
-          class="w-full max-w-xl px-4"
-          @loadedmetadata="bindAudioVolume"
-          @play="bindAudioVolume"
-        />
-
-        <button
-          v-if="viewer.list.length > 1"
-          class="ml-2 grid size-10 shrink-0 place-items-center rounded-full bg-white/10 text-white hover:bg-white/20"
-          @click.stop="stepViewer(1)"
-        >
-          <AppIcon name="chevronRight" :size="18" />
-        </button>
       </div>
     </div>
 

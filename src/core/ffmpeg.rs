@@ -166,10 +166,11 @@ fn parse_version(text: &str) -> Option<String> {
 
 /// 封面输出格式。
 ///
-/// 优先 JPEG（体积小）；少数「精简构建」的 FFmpeg 没编进 mjpeg 编码器，
-/// 此时退回 PNG，保证功能不因发行版差异整体失效。
+/// 优先 WebP（设计文档 3.4：体积比 JPEG 小 30% 左右），该 FFmpeg 构建没有
+/// libwebp 编码器时降级 JPEG；连 mjpeg 都没有的精简构建再退 PNG，保证功能不因发行版差异整体失效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PosterFormat {
+    Webp,
     Jpeg,
     Png,
 }
@@ -177,6 +178,7 @@ pub enum PosterFormat {
 impl PosterFormat {
     pub fn extension(self) -> &'static str {
         match self {
+            PosterFormat::Webp => "webp",
             PosterFormat::Jpeg => "jpg",
             PosterFormat::Png => "png",
         }
@@ -184,10 +186,111 @@ impl PosterFormat {
 
     pub fn mime(self) -> &'static str {
         match self {
+            PosterFormat::Webp => "image/webp",
             PosterFormat::Jpeg => "image/jpeg",
             PosterFormat::Png => "image/png",
         }
     }
+}
+
+/// 缓存查找顺序：WebP 优先，其次 JPEG，最后 PNG（历史缓存 / 换过构建的情况都兼容）
+pub const POSTER_FORMATS: [PosterFormat; 3] =
+    [PosterFormat::Webp, PosterFormat::Jpeg, PosterFormat::Png];
+
+/// 探测结果里与功能相关的编码能力。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// 是否支持 `libwebp` 编码（缩略图与首帧能否输出 WebP）
+    pub webp: bool,
+}
+
+/// 跑 `ffmpeg -encoders` 看有没有 libwebp（设置页「libwebp 支持探测」，设计文档 3.5）。
+///
+/// 同步阻塞（几十毫秒），调用方负责放到 `spawn_blocking` 里；失败一律当不支持。
+pub fn probe_capabilities(bin: &Path) -> Capabilities {
+    if !bin.is_file() {
+        return Capabilities::default();
+    }
+    let output = match command(bin).arg("-hide_banner").arg("-encoders").output() {
+        Ok(output) => output,
+        Err(_) => return Capabilities::default(),
+    };
+    if !output.status.success() {
+        return Capabilities::default();
+    }
+    // 部分构建把编码器表打到 stderr，两边都读一遍最稳
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    let webp = text.lines().any(|line| {
+        line.split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("libwebp"))
+    });
+    Capabilities { webp }
+}
+
+/// 把内存里的 RGBA 位图编码为 WebP（图片缩略图用，避免再落一份临时 PNG）。
+///
+/// 走 stdin 的 rawvideo 管道：宽高都很小（≤1024），拷一次内存远比写临时文件便宜。
+pub fn encode_webp_rgba(
+    bin: &Path,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    output: &Path,
+) -> bool {
+    use std::io::Write;
+
+    if let Some(parent) = output.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+
+    let child = command(bin)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("rgba")
+        .arg("-s")
+        .arg(format!("{width}x{height}"))
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-c:v")
+        .arg("libwebp")
+        .arg("-quality")
+        .arg(quality.to_string())
+        .arg("-f")
+        .arg("webp")
+        .arg(output)
+        .stdin(Stdio::piped())
+        .spawn();
+
+    let Ok(mut child) = child else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(rgba).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(output);
+            return false;
+        }
+    }
+    let ok = matches!(child.wait(), Ok(status) if status.success());
+    let written = ok && std::fs::metadata(output).map(|m| m.len() > 0).unwrap_or(false);
+    if !written {
+        let _ = std::fs::remove_file(output);
+    }
+    written
 }
 
 /// 截取视频首帧（设计文档 3.4：影视库封面）。
@@ -224,15 +327,21 @@ pub fn extract_poster(
         .arg(&scale);
 
     match format {
+        PosterFormat::Webp => {
+            cmd.arg("-c:v").arg("libwebp").arg("-quality").arg("80");
+            cmd.arg("-f").arg("webp");
+        }
         PosterFormat::Jpeg => {
             cmd.arg("-q:v").arg("5");
+            cmd.arg("-f").arg("image2");
         }
         PosterFormat::Png => {
             cmd.arg("-c:v").arg("png");
+            cmd.arg("-f").arg("image2");
         }
     }
 
-    let status = cmd.arg("-f").arg("image2").arg(output).status().ok();
+    let status = cmd.arg(output).status().ok();
 
     match status {
         Some(status) if status.success() => {
@@ -300,5 +409,41 @@ mod tests {
             resolved.source,
             FfmpegSource::Env | FfmpegSource::Path | FfmpegSource::None
         ));
+    }
+
+    #[test]
+    fn poster_formats_carry_matching_extension_and_mime() {
+        assert_eq!(PosterFormat::Webp.extension(), "webp");
+        assert_eq!(PosterFormat::Webp.mime(), "image/webp");
+        assert_eq!(PosterFormat::Jpeg.mime(), "image/jpeg");
+        assert_eq!(PosterFormat::Png.mime(), "image/png");
+        // 缓存查找顺序固定为 WebP → JPEG → PNG（设计文档 3.4 的降级链）
+        assert_eq!(POSTER_FORMATS[0], PosterFormat::Webp);
+        assert_eq!(POSTER_FORMATS[2], PosterFormat::Png);
+    }
+
+    #[test]
+    fn missing_binary_has_no_capabilities() {
+        let caps = probe_capabilities(Path::new("D:/definitely/not/ffmpeg.exe"));
+        assert_eq!(caps, Capabilities::default());
+        assert!(!caps.webp);
+    }
+
+    #[test]
+    fn webp_encode_rejects_missing_binary() {
+        let dir = std::env::temp_dir().join("asmoday-webp-encode-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("x.webp");
+        let ok = encode_webp_rgba(
+            Path::new("D:/definitely/not/ffmpeg.exe"),
+            &[0, 0, 0, 255],
+            1,
+            1,
+            80,
+            &out,
+        );
+        assert!(!ok);
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

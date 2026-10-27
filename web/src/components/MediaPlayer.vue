@@ -149,6 +149,13 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   detachVolume?.()
+  // 彻底销毁：只卸载 DOM 不够，浏览器可能继续缓冲下载（设计文档 8.4.9）
+  const element = mediaEl.value ?? root.value?.querySelector('video')
+  if (element) {
+    element.pause()
+    element.removeAttribute('src')
+    element.load()
+  }
   // 关闭播放器时把最后已知位置交出去（>5s 才有意义，父层会过滤小值）
   if (lastTime > 5) emit('progress', lastTime)
 })

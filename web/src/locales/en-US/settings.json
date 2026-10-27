@@ -56,10 +56,12 @@
     "testOk": "Path works: v{version}",
     "testFailed": "This path does not work",
     "testEmpty": "Enter an FFmpeg path first",
-    "note": "FFmpeg is only used to grab the first frame as a poster — never for transcoding.",
+    "note": "FFmpeg only grabs cinema posters and encodes WebP thumbnails — never for transcoding.",
     "reset": "Reset the media panel",
     "resetHint": "Only resets cache thresholds and the FFmpeg path.",
-    "resetDone": "Media panel reset to defaults"
+    "resetDone": "Media panel reset to defaults",
+    "webpOn": "WebP available",
+    "webpOff": "No libwebp (JPEG fallback)"
   },
   "security": {
     "password": "Change password",

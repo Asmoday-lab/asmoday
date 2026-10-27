@@ -22,7 +22,9 @@
     "grid": "网格视图",
     "list": "列表视图",
     "upload": "上传",
-    "uploadHint": "上传到当前目录（支持拖拽）"
+    "uploadHint": "上传到当前目录（支持拖拽）",
+    "showHidden": "显示隐藏文件",
+    "hideHidden": "不显示隐藏文件"
   },
   "list": {
     "forbidden": "无权访问该路径",
@@ -99,5 +101,20 @@
   },
   "language": {
     "plain": "纯文本"
+  },
+  "preview": {
+    "back": "返回",
+    "download": "下载",
+    "editSource": "编辑源码",
+    "loadFailed": "预览加载失败",
+    "office": "为了保证系统轻量，Office 文档不支持在线预览，下载后可用本地软件打开。",
+    "cad": "为了保证系统轻量，CAD / 3D 工程文件不支持在线预览，请下载后查看。",
+    "archive": "压缩包不支持在线解压，请下载后在本机解压。",
+    "binary": "该格式无法在线预览，请下载后查看。",
+    "unsupportedTitle": "暂不支持在线预览",
+    "csvOversized": "文件超过 {size}，仅预览前部分内容。",
+    "csvTruncated": "表格超过 {rows} 行，已截断显示。",
+    "truncatedHint": "完整内容请下载后查看。",
+    "csvEmpty": "文件里没有可解析的行。"
   }
 }

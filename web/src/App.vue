@@ -9,6 +9,7 @@ import { useI18n } from 'vue-i18n'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import AppIcon from './components/AppIcon.vue'
 import AppSidebar from './components/AppSidebar.vue'
+import MediaLightbox from './components/MediaLightbox.vue'
 import MusicBar from './components/MusicBar.vue'
 import { currentTrack } from './stores/player'
 import { authApi } from './api/auth'
@@ -167,6 +168,9 @@ async function logout() {
 
     <!-- 全局音乐播放条（跨页面常驻） -->
     <MusicBar />
+
+    <!-- 全局媒体灯箱（单实例，Teleport 到 body；文件管理与相册共用） -->
+    <MediaLightbox />
 
     <!-- 一次性密码强制改密（--init / --reset 后首登） -->
     <div v-if="mustChangePassword" class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4">

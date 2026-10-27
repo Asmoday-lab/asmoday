@@ -52,8 +52,11 @@ const encodePath = (path: string) => encodeURIComponent(path)
 export const filesApi = {
   roots: () => getJson<RootsResponse>('/api/files/roots'),
 
-  list: (path: string, page = 1) =>
-    getJson<Listing>(`/api/files/list?path=${encodePath(path)}&page=${page}`),
+  /** `showHidden` 对应后端 `show_hidden`（设计文档 3.2 / 6.1） */
+  list: (path: string, page = 1, showHidden = false) =>
+    getJson<Listing>(
+      `/api/files/list?path=${encodePath(path)}&page=${page}&show_hidden=${showHidden}`,
+    ),
 
   /** 直接给 <img>/<video> 用；同样走挂载点校验 */
   rawUrl: (path: string) => `/api/files/raw?path=${encodePath(path)}`,
@@ -62,6 +65,19 @@ export const filesApi = {
     const res = await fetch(filesApi.rawUrl(path))
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
     return res.text()
+  },
+
+  /**
+   * 只读前缀（CSV 大文件截断预览用）：走 HTTP Range，避免把几百 MB 全塞进内存。
+   * 服务端返回 200（不支持或忽略 Range）时也按 limit 截断。
+   */
+  async readTextPrefix(path: string, limit: number): Promise<string> {
+    const res = await fetch(filesApi.rawUrl(path), {
+      headers: { Range: `bytes=0-${Math.max(0, limit - 1)}` },
+    })
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    const buffer = await res.arrayBuffer()
+    return new TextDecoder('utf-8', { fatal: false }).decode(buffer.slice(0, limit))
   },
 
   async saveText(path: string, content: string): Promise<{ status: string; size: number }> {

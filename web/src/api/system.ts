@@ -12,6 +12,8 @@ export interface FfmpegInfo {
   version: string | null
   path: string | null
   source: FfmpegSource
+  /** 该构建是否带 libwebp 编码器（决定缩略图/封面能否输出 WebP） */
+  webp_support: boolean
 }
 
 export const systemApi = {

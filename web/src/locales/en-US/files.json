@@ -22,7 +22,9 @@
     "grid": "Grid view",
     "list": "List view",
     "upload": "Upload",
-    "uploadHint": "Upload to the current folder (drag and drop supported)"
+    "uploadHint": "Upload to the current folder (drag and drop supported)",
+    "showHidden": "Show hidden files",
+    "hideHidden": "Hide hidden files"
   },
   "list": {
     "forbidden": "No access to this path",
@@ -99,5 +101,20 @@
   },
   "language": {
     "plain": "Plain text"
+  },
+  "preview": {
+    "back": "Back",
+    "download": "Download",
+    "editSource": "Edit source",
+    "loadFailed": "Failed to load preview",
+    "office": "To keep the binary light, Office documents are not rendered here. Download it and open locally.",
+    "cad": "To keep the binary light, CAD / 3D files are not rendered here. Please download.",
+    "archive": "Archives are not extracted on the server. Please download and unzip locally.",
+    "binary": "This format cannot be previewed online. Please download it.",
+    "unsupportedTitle": "Preview not supported",
+    "csvOversized": "File is larger than {size}; only the beginning is shown.",
+    "csvTruncated": "Table exceeds {rows} rows and was truncated.",
+    "truncatedHint": "Download the file for the complete content.",
+    "csvEmpty": "No parsable rows in this file."
   }
 }

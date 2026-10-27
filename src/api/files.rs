@@ -26,6 +26,9 @@ const MAX_EDIT_BYTES: usize = 8 * 1024 * 1024;
 pub struct ListQuery {
     pub path: Option<String>,
     pub page: Option<usize>,
+    /// 是否返回以 `.` 开头的隐藏项（设计文档 3.2，默认关闭）
+    #[serde(default)]
+    pub show_hidden: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +98,7 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         return fs_error(FsError::BadRequest("目标不是目录".to_string()));
     }
 
-    match fs::list_dir(&target, query.page.unwrap_or(1)).await {
+    match fs::list_dir(&target, query.page.unwrap_or(1), query.show_hidden.unwrap_or(false)).await {
         Ok(listing) => Json(listing).into_response(),
         Err(err) => fs_error(err),
     }

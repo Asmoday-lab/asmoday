@@ -215,7 +215,7 @@ pub struct Listing {
 }
 
 /// 读取目录第一层并分页。
-pub async fn list_dir(dir: &Path, page: usize) -> Result<Listing, FsError> {
+pub async fn list_dir(dir: &Path, page: usize, show_hidden: bool) -> Result<Listing, FsError> {
     let page = page.max(1);
 
     let mut reader = tokio::fs::read_dir(dir)
@@ -228,13 +228,19 @@ pub async fn list_dir(dir: &Path, page: usize) -> Result<Listing, FsError> {
         .await
         .map_err(|e| FsError::Io(format!("遍历目录失败：{e}")))?
     {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 设计文档 3.2：默认隐藏以 `.` 开头的系统项（.git / .env …），
+        // 开关打开时才一并返回；点数仍在分页之前过滤，total/has_more 才是准的
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
         // file_type() 不跟随软链接，避免指向目录的链接被当作目录递归进去
         let is_dir = entry
             .file_type()
             .await
             .map(|t| t.is_dir())
             .unwrap_or(false);
-        items.push((entry.file_name().to_string_lossy().to_string(), is_dir));
+        items.push((name, is_dir));
     }
 
     // 目录在前，其余按名称不区分大小写排序

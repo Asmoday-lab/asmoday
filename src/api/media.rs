@@ -126,20 +126,30 @@ pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery
 
     let width = query.w.unwrap_or(if kind == "video" { 480 } else { 320 });
 
+    // 一次解析复用：图片缩略图用它编码 WebP（3.4），视频封面用它截首帧
+    let ffmpeg_bin = {
+        let configured = {
+            let config = state.config.read().await;
+            config.media.ffmpeg_path.clone()
+        };
+        ffmpeg::resolve(&configured)
+            .path
+            .filter(|bin| bin.is_file())
+    };
+
     let outcome = match kind {
-        "image" => state.thumbnails.get(&path, width).await,
+        "image" => {
+            state
+                .thumbnails
+                .get(&path, width, ffmpeg_bin.as_deref())
+                .await
+        }
         "video" => {
             // 影视库封面：靠外部可选 FFmpeg 截首帧（设计文档 3.4）；
             // 未配置或截帧失败一律回占位图，绝不阻塞列表渲染
-            let configured = {
-                let config = state.config.read().await;
-                config.media.ffmpeg_path.clone()
-            };
-            match ffmpeg::resolve(&configured).path {
-                Some(bin) if bin.is_file() => {
-                    state.thumbnails.video_poster(&path, &bin, width).await
-                }
-                _ => ThumbOutcome::Placeholder,
+            match ffmpeg_bin {
+                Some(bin) => state.thumbnails.video_poster(&path, &bin, width).await,
+                None => ThumbOutcome::Placeholder,
             }
         }
         // 音频/其它：没有可截的帧，统一占位（设计文档 8.3）

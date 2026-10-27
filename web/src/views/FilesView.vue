@@ -3,12 +3,15 @@
  * 文件管理（设计文档 3.2「极简无树」）：
  * - 入口页平铺展示所有挂载点卡片，不带常驻目录树，移动端也能最大化利用宽度；
  * - 进入挂载点后用面包屑（Home / 根名 / 子目录）回退与跳转；
- * - 网格/列表均虚拟化，超 1000 条按 has_more 分页续接；双击文本文件进内置编辑器。
+ * - 网格/列表均虚拟化，超 1000 条按 has_more 分页续接；
+ * - 双击按类型分流到**全局**预览：图片/音视频→MediaLightbox，Markdown/CSV/PDF→只读预览面板，
+ *   纯文本/代码→CodeMirror，Office/压缩包→提示下载（3.2 文件预览矩阵）。
  */
 import { computed, defineAsyncComponent, onMounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
+import FilePreviewPane from '../components/FilePreviewPane.vue'
 import VirtualGrid from '../components/VirtualGrid.vue'
 import VirtualList from '../components/VirtualList.vue'
 import { LANGUAGES, detectLanguage, type LanguageKey } from '../api/languages'
@@ -19,6 +22,7 @@ import { thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
 import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
+import { openLightbox, type LightboxItem } from '../stores/lightbox'
 
 // CodeMirror 内核与语言包都在这个异步 chunk 里，首次打开编辑器才下载
 const CodeEditor = defineAsyncComponent(() => import('../components/CodeEditor.vue'))
@@ -194,6 +198,11 @@ const error = ref<{ status: number; message: string } | null>(null)
 const selected = ref<string | null>(null)
 const page = ref(1)
 
+/** 隐藏文件开关（设计文档 3.2）：默认关闭，选择记在本地 */
+const showHidden = ref(localStorage.getItem('asmoday.files.hidden') === '1')
+/** 缩略图加载失败的路径：坏图/无权限时回退成类型图标（8.4.8） */
+const thumbFailed = ref(new Set<string>())
+
 type ViewMode = 'grid' | 'list'
 const viewMode = ref<ViewMode>(
   (localStorage.getItem('asmoday.files.view') as ViewMode | null) === 'list' ? 'list' : 'grid',
@@ -356,6 +365,8 @@ interface EditorState {
 }
 
 const editor = ref<EditorState | null>(null)
+/** 只读预览面板（Markdown / CSV / PDF / 不支持格式） */
+const preview = ref<EntryInfo | null>(null)
 const editorLoading = ref(false)
 const toast = ref('')
 
@@ -427,6 +438,7 @@ async function boot() {
   listing.value = null
   selected.value = null
   searchTerm.value = ''
+  preview.value = null
   try {
     const data = await filesApi.roots()
     roots.value = data.roots
@@ -454,6 +466,7 @@ function enterRoot(root: RootEntry) {
 /** 面包屑首段的 Home：回到挂载点入口页 */
 function goHome() {
   if (editor.value) closeEditor()
+  preview.value = null
   currentPath.value = ''
   listing.value = null
   selected.value = null
@@ -465,8 +478,9 @@ async function open(path: string, pageNo = 1) {
   loading.value = true
   error.value = null
   selected.value = null
+  preview.value = null
   try {
-    const data = await filesApi.list(path, pageNo)
+    const data = await filesApi.list(path, pageNo, showHidden.value)
     listing.value = data
     currentPath.value = data.path
     page.value = data.page
@@ -481,7 +495,7 @@ async function loadMore() {
   if (!hasMore.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const next = await filesApi.list(currentPath.value, page.value + 1)
+    const next = await filesApi.list(currentPath.value, page.value + 1, showHidden.value)
     if (listing.value) {
       listing.value = { ...next, entries: [...listing.value.entries, ...next.entries] }
     }
@@ -493,9 +507,58 @@ async function loadMore() {
   }
 }
 
+/** 隐藏文件开关（设计文档 3.2）：切换后重新拉当前目录/搜索结果 */
+async function toggleHidden() {
+  showHidden.value = !showHidden.value
+  localStorage.setItem('asmoday.files.hidden', showHidden.value ? '1' : '0')
+  thumbFailed.value = new Set()
+  if (currentPath.value) await open(currentPath.value)
+  if (searchTerm.value) void runSearch()
+}
+
+function markThumbFailed(path: string) {
+  thumbFailed.value = new Set(thumbFailed.value).add(path)
+}
+
+function closePreview() {
+  preview.value = null
+}
+
+/** 预览里点「编辑源码」：交给 CodeMirror（不重复实现编辑器） */
+function editFromPreview() {
+  const entry = preview.value
+  preview.value = null
+  if (entry) void openEditor(entry)
+}
+
 function setView(mode: ViewMode) {
   viewMode.value = mode
   localStorage.setItem('asmoday.files.view', mode)
+}
+
+/** 可以进灯箱的类型（设计文档 3.2：图片必须能左右切换，音视频拉起全局播放器） */
+const VIEWABLE_KINDS = new Set(['image', 'video', 'audio'])
+/** 走只读预览面板的扩展名（Markdown / CSV / PDF） */
+const PREVIEW_EXTS = new Set(['md', 'markdown', 'csv', 'tsv', 'pdf'])
+
+function toLightboxItem(entry: EntryInfo): LightboxItem {
+  return {
+    path: entry.path,
+    name: entry.name,
+    kind: entry.kind as LightboxItem['kind'],
+    subtitle: null,
+  }
+}
+
+/** 灯箱的兄弟列表：当前目录（或搜索结果）里同类型的媒体，双击即可左右切换 */
+function mediaSiblings(): EntryInfo[] {
+  return displayEntries.value.filter((item) => !item.is_dir && VIEWABLE_KINDS.has(item.kind))
+}
+
+function openMediaViewer(entry: EntryInfo) {
+  const list = mediaSiblings()
+  const index = list.findIndex((item) => item.path === entry.path)
+  openLightbox(list.map(toLightboxItem), Math.max(0, index))
 }
 
 async function activate(entry: EntryInfo) {
@@ -503,11 +566,31 @@ async function activate(entry: EntryInfo) {
     await open(entry.path)
     return
   }
+
+  const ext = (entry.ext || '').toLowerCase()
+
+  // 图片 / 视频 / 音频：交给全局灯箱，绝不自建 <img>/<video> 弹窗
+  if (VIEWABLE_KINDS.has(entry.kind)) {
+    openMediaViewer(entry)
+    return
+  }
+
+  // Markdown / CSV / PDF：只读预览面板
+  if (PREVIEW_EXTS.has(ext)) {
+    if (editor.value) closeEditor()
+    preview.value = entry
+    return
+  }
+
+  // 纯文本 / 代码：内置 CodeMirror
   if (entry.editable) {
     await openEditor(entry)
     return
   }
-  window.open(filesApi.rawUrl(entry.path), '_blank', 'noopener')
+
+  // Office / CAD / 压缩包 / 未知二进制：不引入解析库，只提示下载
+  if (editor.value) closeEditor()
+  preview.value = entry
 }
 
 function onEntryClick(entry: EntryInfo) {
@@ -519,6 +602,7 @@ function onEntryClick(entry: EntryInfo) {
 }
 
 async function openEditor(entry: EntryInfo) {
+  preview.value = null
   editorLoading.value = true
   editor.value = {
     path: entry.path,
@@ -558,7 +642,7 @@ async function saveEditor() {
     showToast(t('files.editor.saved'))
     // 目录里的体积/时间需要刷新
     if (listing.value) {
-      const data = await filesApi.list(currentPath.value, 1)
+      const data = await filesApi.list(currentPath.value, 1, showHidden.value)
       listing.value = { ...data, entries: [...data.entries] }
     }
   } catch (err) {
@@ -610,8 +694,10 @@ function toneFor(entry: EntryInfo) {
   }
 }
 
-// 分享弹窗 / 编辑器是模态层，打开时锁住列表滚动
-useScrollLock(computed(() => Boolean(shareDialog.value || editor.value || deleteTarget.value)))
+// 分享弹窗 / 编辑器 / 预览面板是模态层，打开时锁住列表滚动
+useScrollLock(
+  computed(() => Boolean(shareDialog.value || editor.value || preview.value || deleteTarget.value)),
+)
 
 onMounted(boot)
 </script>
@@ -680,6 +766,15 @@ onMounted(boot)
         />
       </div>
     </div>
+
+    <!-- 中栏：只读预览（Markdown / CSV / PDF / 不支持格式） -->
+    <FilePreviewPane
+      v-else-if="preview"
+      :key="preview.path"
+      :entry="preview"
+      @close="closePreview"
+      @edit="editFromPreview"
+    />
 
     <div v-else class="flex min-w-0 flex-1 flex-col">
       <!-- 挂载点入口（设计文档 3.2：极简无树，主区域平铺所有挂载点） -->
@@ -821,6 +916,17 @@ onMounted(boot)
           </button>
         </div>
 
+        <button
+          class="grid size-7 shrink-0 place-items-center rounded-md transition-colors"
+          :class="showHidden ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-elevated hover:text-ink'"
+          :title="showHidden ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden')"
+          data-testid="toggle-hidden"
+          :aria-pressed="showHidden"
+          @click="toggleHidden"
+        >
+          <AppIcon :name="showHidden ? 'eye' : 'eyeOff'" :size="15" />
+        </button>
+
         <div class="flex shrink-0 items-center rounded-md border border-line p-0.5">
           <button
             class="grid size-6 place-items-center rounded transition-colors"
@@ -922,11 +1028,12 @@ onMounted(boot)
                 :class="toneFor(entry)"
               >
                 <img
-                  v-if="entry.kind === 'image'"
+                  v-if="entry.kind === 'image' && !thumbFailed.has(entry.path)"
                   :src="thumbUrl(entry.path, 160)"
                   class="size-full object-cover"
                   loading="lazy"
                   alt=""
+                  @error="markThumbFailed(entry.path)"
                 />
                 <AppIcon v-else :name="iconFor(entry)" :size="22" />
               </span>

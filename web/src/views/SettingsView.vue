@@ -686,6 +686,15 @@ onMounted(() => {
           <span class="text-[10px] text-muted/70">
             {{ t('settings.media.ffmpegSource', { source: ffmpegSourceLabel }) }}
           </span>
+          <!-- libwebp 支持探测（设计文档 3.5）：决定缩略图能否输出 WebP -->
+          <span
+            v-if="ffmpeg?.status === 'ok'"
+            class="rounded-full px-2 py-0.5 text-[10px]"
+            :class="ffmpeg.webp_support ? 'bg-sky-500/15 text-sky-400' : 'bg-elevated text-muted'"
+            data-testid="webp-badge"
+          >
+            {{ ffmpeg.webp_support ? t('settings.media.webpOn') : t('settings.media.webpOff') }}
+          </span>
         </div>
 
         <label class="block">

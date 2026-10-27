@@ -56,10 +56,12 @@
     "testOk": "路径可用：v{version}",
     "testFailed": "该路径不可用",
     "testEmpty": "请先填写 FFmpeg 路径",
-    "note": "FFmpeg 仅用于为影视库截取首帧封面，绝不参与转码。",
+    "note": "FFmpeg 仅用于截取影视库首帧封面与编码 WebP 缩略图，绝不参与视频转码。",
     "reset": "恢复媒体面板默认值",
     "resetHint": "只重置缓存阈值与 FFmpeg 路径。",
-    "resetDone": "已恢复媒体面板默认值"
+    "resetDone": "已恢复媒体面板默认值",
+    "webpOn": "WebP 可用",
+    "webpOff": "无 libwebp（回退 JPEG）"
   },
   "security": {
     "password": "修改密码",

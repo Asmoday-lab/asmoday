@@ -75,5 +75,13 @@
     "subtitleLabel": "Subtitles",
     "openOriginal": "Open the original file",
     "close": "Close"
+  },
+  "viewer": {
+    "prev": "Previous",
+    "next": "Next",
+    "close": "Close",
+    "original": "Download",
+    "openOriginal": "Open original in new tab",
+    "broken": "This image can't be displayed"
   }
 }

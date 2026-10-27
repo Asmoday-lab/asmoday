@@ -75,5 +75,13 @@
     "subtitleLabel": "中文字幕",
     "openOriginal": "新窗口打开原文件",
     "close": "关闭"
+  },
+  "viewer": {
+    "prev": "上一张",
+    "next": "下一张",
+    "close": "关闭",
+    "original": "下载原文件",
+    "openOriginal": "新窗口打开原文件",
+    "broken": "这张图片打不开"
   }
 }

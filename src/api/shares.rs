@@ -443,7 +443,8 @@ pub async fn list_entries(
         .unwrap_or("")
         .to_string();
 
-    match fs::list_dir(&target, 1).await {
+    // 分享页同样默认不暴露隐藏项（与文件管理口径一致）
+    match fs::list_dir(&target, 1, false).await {
         Ok(listing) => {
             let entries: Vec<_> = listing
                 .entries
