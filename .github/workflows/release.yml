@@ -1,15 +1,3 @@
-# 多平台发版流水线（设计文档 9.3）
-#
-# 触发：推送 v* 标签（如 v3.5.2）。每个平台并行构建，产物附到 GitHub Release。
-# 约定：
-# - 先构建前端（pnpm --frozen-lockfile，等价于文档所说 `cd web && npm run build`，
-#   仓库锁文件是 pnpm-lock.yaml，CI 必须用 pnpm 保证可复现）；
-# - 再 cargo build --release --target <triple>，产物固定在
-#   target/<triple>/release/asmoday(.exe)（rust-embed 会把 web 产出的 dist/ 吸进二进制）；
-# - Windows 出 .zip，其余出 .tar.gz。
-#
-# 本地开发严禁交叉编译（文档 9.3）：本地只跑 cargo build / cargo run。
-
 name: release
 
 on:
@@ -23,8 +11,38 @@ env:
   APP_NAME: asmoday
 
 jobs:
+  # ==========================================
+  # Job 1: 独立构建前端产物（只跑一次）
+  # ==========================================
+  prepare-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: web/dist
+
+  # ==========================================
+  # Job 2: 多平台后端构建与打包
+  # ==========================================
   build:
-    name: ${{ matrix.target }}
+    needs: prepare-frontend
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,10 +52,8 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          # 低功耗设备主力目标：Ubuntu runner + cross 交叉编译
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            use_cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-latest
@@ -45,85 +61,136 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
+      
+      # 下载刚刚构建好的前端产物
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
         with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
+          name: frontend-dist
+          path: web/dist
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # musl 目标需要 musl 工具链；cross 目标由 cross 自带容器解决
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross
-        if: matrix.use_cross
+      - name: Install Zig & cargo-zigbuild
+        if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
-          tool: cross
+          tool: cargo-zigbuild
 
-      - name: Build frontend
-        working-directory: web
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm run build
+      - name: Install Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
 
-      - name: Build binary (cross)
-        if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+      - name: Build binary (Linux)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --target ${{ matrix.target }}
 
-      - name: Build binary (cargo)
-        if: ${{ !matrix.use_cross }}
+      - name: Build binary (Windows / Mac)
+        if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (unix)
+      # 打包逻辑
+      - name: Prepare artifact (Unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           DIR="${APP_NAME}-${{ matrix.target }}"
           mkdir -p "$DIR"
           cp "target/${{ matrix.target }}/release/${APP_NAME}" "$DIR/"
           cp README.md "$DIR/" 2>/dev/null || true
           tar czf "${DIR}.tar.gz" "$DIR"
-          echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Package (windows)
+      - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = "${{ env.APP_NAME }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.APP_NAME }}.exe" $dir/
-          if (Test-Path README.md) { Copy-Item README.md $dir/ }
-          Compress-Archive -Path $dir -DestinationPath "${dir}.zip"
-          "ASSET=${dir}.zip" | Add-Content $env:GITHUB_ENV
+          $DIR = "${env:APP_NAME}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $DIR
+          Copy-Item "target/${{ matrix.target }}/release/${env:APP_NAME}.exe" -Destination $DIR
+          Copy-Item "README.md" -Destination $DIR -ErrorAction SilentlyContinue
+          Compress-Archive -Path $DIR -DestinationPath "$DIR.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+          # 防止覆盖同名包，将原始 mac 包保留用于合并
+          overwrite: true
 
-  release:
+  # ==========================================
+  # Job 3: 合并 macOS Universal 2
+  # ==========================================
+  macos_universal:
     needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download Mac Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-apple-darwin'
+          merge-multiple: false
+
+      - name: Merge with lipo
+        run: |
+          # 解压两个包
+          tar xzf asmoday-aarch64-apple-darwin/asmoday-aarch64-apple-darwin.tar.gz
+          tar xzf asmoday-x86_64-apple-darwin/asmoday-x86_64-apple-darwin.tar.gz
+          
+          # 使用 lipo 合并二进制
+          lipo -create -output asmoday-universal \
+            asmoday-aarch64-apple-darwin/asmoday \
+            asmoday-x86_64-apple-darwin/asmoday
+
+      - name: Package Universal
+        run: |
+          DIR="asmoday-macos-universal"
+          mkdir -p "$DIR"
+          mv asmoday-universal "$DIR/asmoday"
+          cp README.md "$DIR/" 2>/dev/null || true
+          tar czf "${DIR}.tar.gz" "$DIR"
+
+      - name: Upload Universal Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: asmoday-macos-universal.tar.gz
+
+  # ==========================================
+  # Job 4: 精确提取产物并发布
+  # ==========================================
+  release:
+    needs: [build, macos_universal]
     runs-on: ubuntu-latest
     steps:
+      # 1. 将刚才所有构建产物拉下来
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
           path: dist
 
+      # 2. 精准提取：只拿我们要的包，多余的一概不碰
+      - name: Select release assets
+        run: |
+          mkdir -p final_release
+          
+          # 显式点名，绝不使用 find 扫全盘
+          cp dist/x86_64-pc-windows-msvc/asmoday-x86_64-pc-windows-msvc.zip final_release/
+          cp dist/x86_64-unknown-linux-musl/asmoday-x86_64-unknown-linux-musl.tar.gz final_release/
+          cp dist/aarch64-unknown-linux-musl/asmoday-aarch64-unknown-linux-musl.tar.gz final_release/
+          cp dist/macos-universal/asmoday-macos-universal.tar.gz final_release/
+
+      # 3. 发布
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: final_release/*
           generate_release_notes: true

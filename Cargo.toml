@@ -36,8 +36,12 @@ portable-pty = "0.8"
 dirs = "6"
 # 缩略图解码/缩放（只处理静态图片；视频封面走外部可选 FFmpeg 截帧，不链接 libav*）
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
-# 聚合服务反代（TLS 走系统实现：Windows SChannel，避免引入 ring 的 C 编译）
-reqwest = { version = "0.12", default-features = false, features = ["stream", "native-tls"] }
+# 聚合服务反代。TLS 按目标平台分流（见文件末尾的两个 [target] 节）：
+# - 非 Linux：native-tls → Windows 落 SChannel（保持「TLS 走系统实现」的设计）；
+# - Linux（含 musl 交叉编译，见 9.3）：rustls —— native-tls 在 Linux 落到
+#   openssl-sys，musl 环境没有 OpenSSL 可链，交叉编译直接失败。
+# 基础依赖只放双方共有的 stream，TLS 特性放 target 节，避免特性并集把两边都拉进来。
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 tokio-tungstenite = "0.29"
 # config.toml 热重载（设计文档 3.5：保存后无需重启进程）
 notify = "8"
@@ -45,6 +49,13 @@ notify = "8"
 encoding_rs = "0.8"
 # WebDAV PROPFIND 的 RFC1123 时间格式（axum 内部同款，不新增传递依赖）
 httpdate = "1"
+
+# TLS 平台分流（注释见上方 reqwest）。必须放在 [dependencies] 全部键之后。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["stream", "native-tls"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 
 # 发布体积裁剪（见设计文档 9.1）
 # Windows 下某些 MSVC 环境会在 C 依赖（SQLite / ring 等）上触发
