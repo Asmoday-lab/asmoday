@@ -1,9 +1,8 @@
 //! 文件管理接口（设计文档 6.1）。
 //!
 //! - `GET  /api/files/mounts`：挂载点清单（id / name / path / readonly / online）
-//! - `GET  /api/files/roots`：同上，兼容字段（roots / implicit / default）
-//! - `GET  /api/files/list?path=&page=`：目录列表，超 1000 条强制分页并返回 has_more
-//! - `GET  /api/files/raw?path=`：流式读取，支持 HTTP Range（206 / 416）
+//! - `GET  /api/files/list`：目录列表，固定排序 + 游标分页（超 1000 条翻页并回 next_cursor）
+//! - `GET  /api/files/raw?path=`：流式读取，支持 HTTP Range（206 / 416）、ETag / Last-Modified（304）
 //! - `PUT  /api/files/raw?path=`：编辑器保存写回（仅文本类、原子替换）
 
 use axum::body::{Body, Bytes};
@@ -28,6 +27,9 @@ const MAX_EDIT_BYTES: usize = 8 * 1024 * 1024;
 pub struct ListQuery {
     pub path: Option<String>,
     pub page: Option<usize>,
+    /// 游标分页（设计文档 3.2.4）：有它就忽略 page
+    #[serde(default)]
+    pub cursor: Option<String>,
     /// 是否返回以 `.` 开头的隐藏项（设计文档 3.2，默认关闭）
     #[serde(default)]
     pub show_hidden: Option<bool>,
@@ -149,6 +151,7 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         readonly,
         fs::ListSort::parse(query.sort.as_deref()),
         fs::ListOrder::parse(query.order.as_deref()),
+        query.cursor.as_deref().filter(|value| !value.is_empty()),
     )
     .await
     {
@@ -182,6 +185,33 @@ pub async fn raw(
     }
 
     let total = meta.len();
+    // 条件请求（设计文档 3.2.3）：ETag 用「大小 + mtime」指纹，Last-Modified 走 RFC 1123
+    let modified = meta.modified().ok();
+    let mtime_nanos = modified
+        .as_ref()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let etag = format!("\"{total:x}-{mtime_nanos:x}\"");
+    let last_modified = modified.as_ref().map(|time| httpdate::fmt_http_date(*time));
+
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag))
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response
+            .headers_mut()
+            .insert(header::ETAG, etag.parse().expect("valid etag"));
+        if let Some(value) = &last_modified {
+            if let Ok(parsed) = value.parse() {
+                response.headers_mut().insert(header::LAST_MODIFIED, parsed);
+            }
+        }
+        return response;
+    }
+
     let mime = mime_guess::from_path(&path)
         .first_or_octet_stream()
         .to_string();
@@ -215,21 +245,27 @@ pub async fn raw(
             }
             let limited = file.take(range.len());
             let stream = ReaderStream::new(limited);
-            (
-                StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_TYPE, mime),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    (
-                        header::CONTENT_RANGE,
-                        format!("bytes {}-{}/{}", range.start, range.end, total),
-                    ),
-                    (header::CONTENT_LENGTH, range.len().to_string()),
-                    (header::CACHE_CONTROL, "no-store".to_string()),
-                ],
-                Body::from_stream(stream),
-            )
-                .into_response()
+            let mut response = (StatusCode::PARTIAL_CONTENT, Body::from_stream(stream)).into_response();
+            let mut headers_out = vec![
+                (header::CONTENT_TYPE, mime),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", range.start, range.end, total),
+                ),
+                (header::CONTENT_LENGTH, range.len().to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                (header::ETAG, etag),
+            ];
+            if let Some(value) = last_modified {
+                headers_out.push((header::LAST_MODIFIED, value));
+            }
+            for (name, value) in headers_out {
+                if let Ok(parsed) = value.parse() {
+                    response.headers_mut().insert(name, parsed);
+                }
+            }
+            response
         }
         None => {
             let file = match tokio::fs::File::open(&path).await {
@@ -237,17 +273,23 @@ pub async fn raw(
                 Err(e) => return fs_error(FsError::Io(format!("打开文件失败：{e}"))),
             };
             let stream = ReaderStream::new(file);
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mime),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    (header::CONTENT_LENGTH, total.to_string()),
-                    (header::CACHE_CONTROL, "no-store".to_string()),
-                ],
-                Body::from_stream(stream),
-            )
-                .into_response()
+            let mut response = (StatusCode::OK, Body::from_stream(stream)).into_response();
+            let mut headers_out = vec![
+                (header::CONTENT_TYPE, mime),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_LENGTH, total.to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                (header::ETAG, etag),
+            ];
+            if let Some(value) = last_modified {
+                headers_out.push((header::LAST_MODIFIED, value));
+            }
+            for (name, value) in headers_out {
+                if let Ok(parsed) = value.parse() {
+                    response.headers_mut().insert(name, parsed);
+                }
+            }
+            response
         }
     }
 }

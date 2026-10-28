@@ -37,6 +37,8 @@ let term: Terminal | null = null
 let fit: FitAddon | null = null
 let socket: WebSocket | null = null
 let resizeObserver: ResizeObserver | null = null
+/** visualViewport 监听（移动端软键盘重排） */
+let viewportHandler: (() => void) | null = null
 let disposed = false
 /** 连续重连次数，握手成功后清零 */
 let attempts = 0
@@ -105,6 +107,17 @@ function wsUrl(): string {
 function sendResize() {
   if (!socket || socket.readyState !== WebSocket.OPEN || !term) return
   socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+}
+
+/** 重新适配容器尺寸（ResizeObserver 与 visualViewport 共用） */
+function refit() {
+  if (!fit || !term) return
+  try {
+    fit.fit()
+  } catch {
+    /* 容器尚未布局 */
+  }
+  sendResize()
 }
 
 /** 重连用尽后探测一次失败原因，给出可读提示（浏览器不会告诉我们握手为什么被拒） */
@@ -282,15 +295,19 @@ onMounted(() => {
   })
 
   resizeObserver = new ResizeObserver(() => {
-    if (!fit || !term) return
-    try {
-      fit.fit()
-    } catch {
-      /* 容器尚未布局 */
-    }
-    sendResize()
+    refit()
   })
   resizeObserver.observe(host.value)
+
+  // 移动端软键盘（设计文档 8.4 第 11 条）：软键盘弹出只改 `visualViewport`，
+  // 布局视口与容器尺寸都不变，ResizeObserver 收不到 —— 必须单独监听，否则
+  // 光标会被键盘顶到看不见的地方。
+  const viewport = window.visualViewport
+  if (viewport) {
+    viewportHandler = () => requestAnimationFrame(refit)
+    viewport.addEventListener('resize', viewportHandler)
+    viewport.addEventListener('scroll', viewportHandler)
+  }
 
   connect()
 })
@@ -300,6 +317,11 @@ onBeforeUnmount(() => {
   clearRetry()
   resizeObserver?.disconnect()
   resizeObserver = null
+  if (viewportHandler && window.visualViewport) {
+    window.visualViewport.removeEventListener('resize', viewportHandler)
+    window.visualViewport.removeEventListener('scroll', viewportHandler)
+  }
+  viewportHandler = null
   // 只断开连接，PTY 由后端保留 3 分钟，重连可原地恢复
   if (socket) {
     socket.onclose = null

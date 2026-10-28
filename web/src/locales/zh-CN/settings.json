@@ -112,7 +112,13 @@
     "davCopied": "已复制",
     "colName": "名称",
     "colPerm": "权限",
-    "colExpiry": "有效期"
+    "colExpiry": "有效期",
+    "recoveryTitle": "一次性恢复码（只显示这一次）",
+    "recoveryHint": "验证器丢失时，用其中一个恢复码登录。每个只能用一次，请抄到离线安全的地方。",
+    "recoveryCopy": "复制全部",
+    "recoveryDone": "我已保存",
+    "recoveryCopied": "恢复码已复制",
+    "totpDisableCodePlaceholder": "TOTP 或恢复码"
   },
   "advanced": {
     "form": "可视化表单",

@@ -209,6 +209,10 @@ const totpUri = ref('')
 const totpCode = ref('')
 const totpEnabled = computed(() => authApi.status.value.totp_enabled)
 const disablePassword = ref('')
+/** 关闭 2FA 时的「TOTP 或恢复码」（设计文档 3.1.4：只给密码不允许关） */
+const disableCode = ref('')
+/** 刚开启时下发的一次性恢复码，只在本地展示一次，绝不再次从后端取回 */
+const recoveryCodes = ref<string[]>([])
 
 // ---------------- WebDAV 令牌 ----------------
 interface AccessToken {
@@ -436,7 +440,8 @@ async function startTotp() {
 async function enableTotp() {
   securityError.value = ''
   try {
-    await authApi.totpEnable(totpCode.value.trim())
+    const codes = await authApi.totpEnable(totpCode.value.trim())
+    recoveryCodes.value = codes
     totpCode.value = ''
     totpSecret.value = ''
     showToast(t('settings.security.totpEnabled'))
@@ -445,11 +450,22 @@ async function enableTotp() {
   }
 }
 
+async function copyRecoveryCodes() {
+  try {
+    await navigator.clipboard.writeText(recoveryCodes.value.join('\n'))
+    showToast(t('settings.security.recoveryCopied'))
+  } catch {
+    showToast(t('common.clipboard.denied'))
+  }
+}
+
 async function disableTotp() {
   securityError.value = ''
   try {
-    await authApi.totpDisable(disablePassword.value)
+    await authApi.totpDisable(disablePassword.value, disableCode.value.trim())
     disablePassword.value = ''
+    disableCode.value = ''
+    recoveryCodes.value = []
     showToast(t('settings.security.totpDisabled'))
   } catch (err) {
     securityError.value = err instanceof Error ? err.message : t('settings.security.totpDisableFailed')
@@ -861,12 +877,19 @@ onMounted(() => {
         </template>
 
         <template v-else>
+          <p class="mb-2 text-[12px] text-muted">{{ t('settings.security.recoveryHint') }}</p>
           <div class="flex flex-wrap items-center gap-2">
             <input
               v-model="disablePassword"
               type="password"
               :placeholder="t('settings.security.totpDisablePlaceholder')"
               class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+            />
+            <input
+              v-model="disableCode"
+              :placeholder="t('settings.security.totpDisableCodePlaceholder')"
+              class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+              data-testid="totp-disable-code"
             />
             <button
               class="rounded-md border border-red-500/40 px-3 py-1.5 text-xs fg-danger"
@@ -876,6 +899,35 @@ onMounted(() => {
             </button>
           </div>
         </template>
+
+        <!-- 一次性恢复码：开启成功当帧展示，关掉就再也拿不回来 -->
+        <div
+          v-if="recoveryCodes.length"
+          class="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3"
+          data-testid="recovery-codes"
+        >
+          <p class="text-xs font-medium fg-warn">{{ t('settings.security.recoveryTitle') }}</p>
+          <p class="mt-1 text-[12px] leading-relaxed text-muted">
+            {{ t('settings.security.recoveryHint') }}
+          </p>
+          <div class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[12px] text-ink sm:grid-cols-3">
+            <span v-for="code in recoveryCodes" :key="code">{{ code }}</span>
+          </div>
+          <div class="mt-2 flex items-center gap-2">
+            <button
+              class="rounded-md border border-line px-2.5 py-1 text-[12px] text-ink"
+              @click="copyRecoveryCodes"
+            >
+              {{ t('settings.security.recoveryCopy') }}
+            </button>
+            <button
+              class="rounded-md px-2.5 py-1 text-[12px] text-muted hover:text-ink"
+              @click="recoveryCodes = []"
+            >
+              {{ t('settings.security.recoveryDone') }}
+            </button>
+          </div>
+        </div>
       </div>
 
       <p

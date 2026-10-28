@@ -87,10 +87,26 @@ export const authApi = {
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
     return (await res.json()) as { secret: string; uri: string }
   },
-  async totpEnable(code: string) {
-    await post('/api/auth/totp/enable', { code })
+  /** 开启 2FA：返回一次性恢复码（只在这里出现一次，设计文档 3.1.4） */
+  async totpEnable(code: string): Promise<string[]> {
+    busy.value = true
+    try {
+      const res = await fetch('/api/auth/totp/enable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      })
+      if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+      const data = (await res.json()) as { recovery_codes?: string[] }
+      await refresh()
+      inflight = Promise.resolve()
+      return data.recovery_codes ?? []
+    } finally {
+      busy.value = false
+    }
   },
-  async totpDisable(password: string) {
-    await post('/api/auth/totp/disable', { password })
+  /** 关闭 2FA：必须同时给出密码与「TOTP 或恢复码」 */
+  async totpDisable(password: string, code: string) {
+    await post('/api/auth/totp/disable', { password, code })
   },
 }

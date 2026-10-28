@@ -729,6 +729,8 @@ const loadingMore = ref(false)
 const error = ref<{ status: number; message: string } | null>(null)
 const selected = ref<string | null>(null)
 const page = ref(1)
+/** 下一页游标（设计文档 3.2.4：固定排序 + 游标分页，不再用页码偏移） */
+const nextCursor = ref<string | null>(null)
 
 /** 隐藏文件开关（设计文档 3.2）：默认关闭，选择记在本地 */
 const showHidden = ref(localStorage.getItem('asmoday.files.hidden') === '1')
@@ -1179,6 +1181,7 @@ async function open(
     listing.value = data
     currentPath.value = data.path
     page.value = data.page
+    nextCursor.value = data.next_cursor ?? null
     if (options.sync !== false) syncUrl(data.path, options.push ? 'push' : 'replace')
     return true
   } catch (err) {
@@ -1199,11 +1202,13 @@ async function loadMore() {
       showHidden.value,
       sortKey.value,
       sortDir.value,
+      nextCursor.value,
     )
     if (listing.value) {
       listing.value = { ...next, entries: [...listing.value.entries, ...next.entries] }
     }
     page.value = next.page
+    nextCursor.value = next.next_cursor ?? null
   } catch (err) {
     error.value = describe(err)
   } finally {

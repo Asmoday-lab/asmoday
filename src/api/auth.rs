@@ -62,8 +62,54 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn session_cookie(token: &str, max_age: i64) -> String {
-    format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+/// 组装会话 Cookie（设计文档 3.1.3）：`Path` 跟 `base_url`、`Secure` 只在 HTTPS 下加。
+fn session_cookie(token: &str, max_age: i64, path: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={token}; Path={path}; HttpOnly; SameSite=Lax{secure}; Max-Age={max_age}")
+}
+
+/// 当前请求下的 Cookie 作用域：`(Path, Secure)`。
+///
+/// - `Path` 必须与 `base_url` 一致（子路径部署时 Cookie 不越界到同域其他应用）；
+/// - HTTPS 判定看「自己开了 SSL」或「来自可信反代的 `X-Forwarded-Proto: https`」，
+///   未可信的转发头一律忽略，避免被人用假头把 Cookie 标成 Secure 导致登录态失效。
+async fn cookie_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> (String, bool) {
+    let (base_url, ssl_enabled, trusted) = {
+        let config = state.config.read().await;
+        (
+            config.server.proxy.base_url.clone(),
+            config.server.ssl.enabled,
+            config.server.proxy.trusted_ips.clone(),
+        )
+    };
+
+    let base = base_url.trim().trim_end_matches('/');
+    let path = if base.is_empty() {
+        "/".to_string()
+    } else if base.starts_with('/') {
+        base.to_string()
+    } else {
+        format!("/{base}")
+    };
+
+    let via_trusted_proxy = peer
+        .map(|addr| {
+            trusted
+                .iter()
+                .any(|rule| ip_matches(&addr.ip().to_string(), rule))
+        })
+        .unwrap_or(false);
+    let forwarded_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+
+    (path, ssl_enabled || (via_trusted_proxy && forwarded_https))
 }
 
 /// CSRF 第一道防线（设计文档 3.1.3）：Cookie 认证下的写操作必须与请求 Host 同源。
@@ -122,8 +168,9 @@ fn normalize_authority(value: &str) -> String {
     lowered
 }
 
-fn cleared_cookie() -> String {
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+fn cleared_cookie(path: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}=; Path={path}; HttpOnly; SameSite=Lax{secure}; Max-Age=0")
 }
 
 /// 细节型错误（4xx 参数类，消息本身带具体说明）
@@ -136,39 +183,66 @@ fn json_error_code(status: StatusCode, code: &str, message: impl Into<String>) -
     crate::api::error::api_error(status, code, message)
 }
 
-/// 限流用 IP：信任代理头时取 X-Forwarded-For 首个地址
-async fn client_key(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    let trust = {
+/// 可信来源判定 + 真实客户端 IP（设计文档 3.1.5 / 3.1.7）。
+///
+/// **只有** `trust_proxy_headers=true` **且** socket 来源命中 `trusted_ips` 时才采信
+/// `X-Forwarded-For` / `X-Real-IP`；白名单为空等于谁都不信（否则任何人都能伪造
+/// 一个 IP 把防爆破池绕过去）。未可信时一律用 socket 地址。
+async fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let (trust, trusted) = {
         let config = state.config.read().await;
-        config.server.proxy.trust_proxy_headers
+        (
+            config.server.proxy.trust_proxy_headers,
+            config.server.proxy.trusted_ips.clone(),
+        )
     };
 
-    if trust {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-        {
-            let forwarded = forwarded.trim();
-            if !forwarded.is_empty() {
-                return forwarded.to_string();
-            }
+    let peer_ip = match peer {
+        Some(addr) => addr.ip().to_string(),
+        None => return "unknown".to_string(),
+    };
+    pick_client_ip(trust, &trusted, &peer_ip, headers)
+}
+
+/// `client_ip` 的纯函数内核（方便单测，不依赖 AppState）。
+fn pick_client_ip(
+    trust_proxy_headers: bool,
+    trusted: &[String],
+    peer_ip: &str,
+    headers: &HeaderMap,
+) -> String {
+    if !trust_proxy_headers || !trusted.iter().any(|rule| ip_matches(peer_ip, rule)) {
+        return peer_ip.to_string();
+    }
+
+    if let Some(forwarded) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+    {
+        let forwarded = forwarded.trim();
+        if !forwarded.is_empty() {
+            return forwarded.to_string();
         }
-        if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            return real.trim().to_string();
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let real = real.trim();
+        if !real.is_empty() {
+            return real.to_string();
         }
     }
 
-    peer.map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    peer_ip.to_string()
 }
 
 // ---------------------------------------------------------------------------
 // 中间件
 // ---------------------------------------------------------------------------
 
-/// 判断 IP 是否命中 trusted_ips（支持精确匹配与 IPv4 CIDR）
-fn ip_matches(ip: &str, rule: &str) -> bool {
+/// 判断 IP 是否命中 trusted_ips（支持精确匹配与 IPv4 CIDR）。
+///
+/// IPv6 只支持精确字符串匹配（CIDR 写法留给反代场景，命中不了就当不可信，宁可严一点）。
+pub(crate) fn ip_matches(ip: &str, rule: &str) -> bool {
     if ip == rule {
         return true;
     }
@@ -198,22 +272,33 @@ fn ip_matches(ip: &str, rule: &str) -> bool {
     (a & mask) == (b & mask)
 }
 
-/// “座上宾”模式：信任反向代理传入的用户名 Header（需来源 IP 在白名单内）。
+/// “座上宾”模式：信任反向代理传入的用户名 Header（设计文档 3.1.8）。
+///
+/// 三道闸，缺一不可：
+/// 1. `auth.proxy_trust.enabled` 打开，且 `user_header` 非空；
+/// 2. 请求源 IP 命中 **`auth.proxy_trust.trusted_ips`**（白名单为空一律不采信）；
+/// 3. 用户**必须已存在** —— 文档明确禁止自动建号，否则任何能伪造 Header 的人都能开号。
+///
+/// 2FA 默认不跳过：用户开了 TOTP 且没有显式 `skip_2fa=true` 时返回 None，
+/// 让请求回落到本地登录把 OTP 走完（Header 直通不能成为绕过第二因子的后门）。
 async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<AuthUser> {
-    let (enabled, header_name, trusted) = {
+    let (enabled, header_name, trusted, skip_2fa) = {
         let config = state.config.read().await;
         (
             config.auth.proxy_trust.enabled,
-            config.auth.proxy_trust.user_header.to_lowercase(),
-            config.server.proxy.trusted_ips.clone(),
+            config.auth.proxy_trust.user_header.trim().to_lowercase(),
+            config.auth.proxy_trust.trusted_ips.clone(),
+            config.auth.proxy_trust.skip_2fa,
         )
     };
-    if !enabled {
+    if !enabled || header_name.is_empty() {
         return None;
     }
 
     let peer_ip = peer.map(|addr| addr.ip().to_string())?;
-    if !trusted.iter().any(|rule| ip_matches(&peer_ip, rule)) {
+    if trusted.iter().all(|rule| rule.trim().is_empty())
+        || !trusted.iter().any(|rule| ip_matches(&peer_ip, rule))
+    {
         return None;
     }
 
@@ -222,16 +307,15 @@ async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr
         return None;
     }
 
-    if let Ok(Some((user, _, _))) = state.auth.find_user(&username) {
-        return Some(AuthUser { id: user.id, username: user.username });
+    // 只认已有账号：不存在的用户直接拒绝，绝不自动建档
+    let Ok(Some((user, _, _))) = state.auth.find_user(&username) else {
+        return None;
+    };
+    if user.totp_enabled && !skip_2fa {
+        return None;
     }
 
-    // 首次出现的代理用户自动建档（随机密码，不能用于本地登录）
-    let password = crate::core::auth::random_password();
-    match state.auth.create_user(&username, &password) {
-        Ok(user) => Some(AuthUser { id: user.id, username: user.username }),
-        Err(_) => None,
-    }
+    Some(AuthUser { id: user.id, username: user.username })
 }
 
 /// 拦截未登录请求：`/api/*` 与 `/proxy/*` 均需有效会话（或可信代理身份）。
@@ -289,8 +373,36 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
         );
     }
 
+    // 滑动续期（设计文档 3.1.3）：Cookie 的 Max-Age 跟着每次请求往后刷，
+    // 服务端 expires_at 由 `session_user` 在临近过期时才写库。
+    let refreshed_cookie = if via_cookie {
+        match cookie_token(request.headers()) {
+            Some(token) => {
+                let (path, secure) = cookie_scope(&state, request.headers(), peer).await;
+                Some(session_cookie(
+                    &token,
+                    crate::core::auth::SESSION_TTL,
+                    &path,
+                    secure,
+                ))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     request.extensions_mut().insert(user);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    // 处理器自己发过 Set-Cookie（登录/改密/登出）就不要再叠一条，否则两条 Cookie 打架
+    if let Some(cookie) = refreshed_cookie {
+        if !response.headers().contains_key(header::SET_COOKIE) {
+            if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+                response.headers_mut().insert(header::SET_COOKIE, value);
+            }
+        }
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +437,9 @@ pub struct TotpEnableRequest {
 #[derive(Debug, Deserialize)]
 pub struct TotpDisableRequest {
     pub password: String,
+    /// 当前六位 TOTP 码，或一个一次性恢复码（设计文档 3.1.4）
+    #[serde(default)]
+    pub code: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +475,12 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 /// POST /api/auth/setup（公开，仅首次）
-pub async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) -> Response {
+pub async fn setup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<SetupRequest>,
+) -> Response {
     match state.auth.user_count() {
         Ok(0) => {}
         Ok(_) => return json_error_code(StatusCode::CONFLICT, "AUTH_ALREADY_INITIALIZED", "Already initialized"),
@@ -384,10 +504,28 @@ pub async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>
     }))
     .into_response();
 
-    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(&token, crate::core::auth::SESSION_TTL)) {
+    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
+    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
+        &token,
+        crate::core::auth::SESSION_TTL,
+        &path,
+        secure,
+    )) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
+}
+
+fn record_login_failure(guard: &crate::core::auth::LoginGuard, keys: &[String; 2]) {
+    for key in keys {
+        guard.record_failure(key);
+    }
+}
+
+fn clear_login_failures(guard: &crate::core::auth::LoginGuard, keys: &[String; 2]) {
+    for key in keys {
+        guard.record_success(key);
+    }
 }
 
 /// POST /api/auth/login（公开）
@@ -397,14 +535,22 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let key = client_key(&state, &headers, Some(peer)).await;
+    // 计数维度（设计文档 3.1.5）：纯 IP（防用户名枚举）+ IP|用户名（挡单账号爆破）。
+    // 两者都落在主登录池里，与分享口令、WebDAV 的独立池互不影响。
+    let ip = client_ip(&state, &headers, Some(peer)).await;
+    let keys = [
+        ip.clone(),
+        format!("{ip}|{}", body.username.trim().to_lowercase()),
+    ];
 
-    if let Err(remaining) = state.login_guard.check(&key) {
-        return json_error_code(
-            StatusCode::TOO_MANY_REQUESTS,
-            "AUTH_RATE_LIMITED",
-            format!("Too many attempts, retry in {remaining}s"),
-        );
+    for key in &keys {
+        if let Err(remaining) = state.login_guard.check(key) {
+            return json_error_code(
+                StatusCode::TOO_MANY_REQUESTS,
+                "AUTH_RATE_LIMITED",
+                format!("Too many attempts, retry in {remaining}s"),
+            );
+        }
     }
 
     let found = match state.auth.find_user(body.username.trim()) {
@@ -413,31 +559,41 @@ pub async fn login(
     };
 
     let Some((user, hash, secret)) = found else {
-        state.login_guard.record_failure(&key);
+        record_login_failure(&state.login_guard, &keys);
         return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_INVALID", "Invalid username or password");
     };
 
     if !verify_password(&hash, &body.password) {
-        state.login_guard.record_failure(&key);
+        record_login_failure(&state.login_guard, &keys);
         return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_INVALID", "Invalid username or password");
     }
 
-    // 可选双因素
+    // 可选双因素（设计文档 3.1.4）：6 位数字走 TOTP，其余当一次性恢复码
     if user.totp_enabled {
         let Some(secret) = secret else {
             return json_error_code(StatusCode::INTERNAL_SERVER_ERROR, "TOTP_CONFIG_MISSING", "TOTP secret missing");
         };
         let code = body.totp.as_deref().unwrap_or("").trim();
-        let Some(code) = code.parse::<u32>().ok() else {
+        if code.is_empty() {
             return json_error_code(StatusCode::UNAUTHORIZED, "TOTP_REQUIRED", "TOTP code required");
+        }
+        let normalized = crate::core::auth::normalize_recovery_code(code);
+        let is_totp = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit());
+        let valid = if is_totp {
+            normalized
+                .parse::<u32>()
+                .ok()
+                .is_some_and(|number| totp::verify(&secret, number, now_secs() as u64))
+        } else {
+            state.auth.consume_recovery_code(user.id, code).unwrap_or(false)
         };
-        if !totp::verify(&secret, code, now_secs() as u64) {
-            state.login_guard.record_failure(&key);
+        if !valid {
+            record_login_failure(&state.login_guard, &keys);
             return json_error_code(StatusCode::UNAUTHORIZED, "TOTP_INVALID", "Invalid TOTP code");
         }
     }
 
-    state.login_guard.record_success(&key);
+    clear_login_failures(&state.login_guard, &keys);
     let _ = state.auth.purge_expired();
 
     let token = match state.auth.create_session(user.id) {
@@ -451,19 +607,30 @@ pub async fn login(
         "must_change_password": user.must_change_password,
     }))
     .into_response();
-    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(&token, crate::core::auth::SESSION_TTL)) {
+    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
+    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
+        &token,
+        crate::core::auth::SESSION_TTL,
+        &path,
+        secure,
+    )) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
 }
 
 /// POST /api/auth/logout（公开：清 Cookie 是幂等操作）
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn logout(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(token) = cookie_token(&headers) {
         let _ = state.auth.delete_session(&token);
     }
     let mut response = Json(json!({ "status": "ok" })).into_response();
-    if let Ok(value) = header::HeaderValue::from_str(&cleared_cookie()) {
+    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
+    if let Ok(value) = header::HeaderValue::from_str(&cleared_cookie(&path, secure)) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
@@ -489,6 +656,8 @@ pub async fn me(State(state): State<AppState>, auth_user: AuthUser) -> Response 
 /// POST /api/auth/password（受保护）
 pub async fn change_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     auth_user: AuthUser,
     Json(body): Json<PasswordRequest>,
 ) -> Response {
@@ -516,7 +685,13 @@ pub async fn change_password(
     };
 
     let mut response = Json(json!({ "status": "ok" })).into_response();
-    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(&token, crate::core::auth::SESSION_TTL)) {
+    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
+    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
+        &token,
+        crate::core::auth::SESSION_TTL,
+        &path,
+        secure,
+    )) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
@@ -560,7 +735,18 @@ pub async fn totp_enable(
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
 
-    Json(json!({ "status": "ok", "totp_enabled": true })).into_response()
+    // 开启成功即发 10 个一次性恢复码：明文只在这一个响应里出现（设计文档 3.1.4）
+    let codes = crate::core::auth::generate_recovery_codes(10);
+    if let Err(err) = state.auth.set_recovery_codes(auth_user.id, &codes) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+
+    Json(json!({
+        "status": "ok",
+        "totp_enabled": true,
+        "recovery_codes": codes,
+    }))
+    .into_response()
 }
 
 /// POST /api/auth/totp/disable（受保护，需当前密码）
@@ -582,7 +768,33 @@ pub async fn totp_disable(
         return json_error_code(StatusCode::BAD_REQUEST, "PASSWORD_WRONG", "Password is incorrect");
     }
 
+    // 关闭 2FA 必须给出「有效 TOTP 或恢复码」，只凭密码不给关（设计文档 3.1.4）
+    let code = body.code.trim();
+    if code.is_empty() {
+        return json_error_code(StatusCode::BAD_REQUEST, "TOTP_REQUIRED", "TOTP code or recovery code required");
+    }
+    let normalized = crate::core::auth::normalize_recovery_code(code);
+    let is_totp = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit());
+    let valid = if is_totp {
+        match state.auth.totp_secret(user.id) {
+            Ok(Some(secret)) => normalized
+                .parse::<u32>()
+                .ok()
+                .is_some_and(|number| totp::verify(&secret, number, now_secs() as u64)),
+            _ => false,
+        }
+    } else {
+        state.auth.consume_recovery_code(user.id, code).unwrap_or(false)
+    };
+    if !valid {
+        return json_error_code(StatusCode::BAD_REQUEST, "TOTP_INVALID", "Invalid TOTP code");
+    }
+
     if let Err(err) = state.auth.set_totp(user.id, "", false) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    // 关闭后残留的恢复码必须作废，否则等于留了一把万能钥匙
+    if let Err(err) = state.auth.clear_recovery_codes(user.id) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
 
@@ -662,5 +874,51 @@ mod tests {
         assert_eq!(normalize_authority("NAS.Local:443"), "nas.local");
         assert_eq!(normalize_authority("nas.local:80"), "nas.local");
         assert_eq!(normalize_authority("nas.local:4242"), "nas.local:4242");
+    }
+
+    fn proxy_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            let value: axum::http::HeaderValue = value.parse().unwrap();
+            map.insert(axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(), value);
+        }
+        map
+    }
+
+    #[test]
+    fn forwarded_ip_ignored_when_peer_not_trusted() {
+        // 直连 + 伪造 XFF：必须只认 socket 地址（否则防爆破池一句话被绕过）
+        let map = proxy_headers(&[("x-forwarded-for", "10.9.9.9")]);
+        let ip = super::pick_client_ip(false, &["127.0.0.1".to_string()], "203.0.113.5", &map);
+        assert_eq!(ip, "203.0.113.5");
+    }
+
+    #[test]
+    fn forwarded_ip_ignored_when_whitelist_empty() {
+        let map = proxy_headers(&[("x-real-ip", "10.9.9.9")]);
+        let ip = super::pick_client_ip(true, &[], "203.0.113.5", &map);
+        assert_eq!(ip, "203.0.113.5");
+    }
+
+    #[test]
+    fn forwarded_ip_used_from_trusted_cidr() {
+        let map = proxy_headers(&[("x-forwarded-for", "198.51.100.7, 172.16.0.2")]);
+        let ip = super::pick_client_ip(true, &["172.16.0.0/12".to_string()], "172.16.5.9", &map);
+        assert_eq!(ip, "198.51.100.7");
+    }
+
+    #[test]
+    fn session_cookie_paths_follow_base_url() {
+        let root = super::session_cookie("t", 60, "/", false);
+        assert!(root.contains("Path=/;"));
+        assert!(!root.contains("Secure"));
+
+        let sub = super::session_cookie("t", 60, "/nas", true);
+        assert!(sub.contains("Path=/nas;"));
+        assert!(sub.contains("Secure"));
+
+        let cleared = super::cleared_cookie("/nas", true);
+        assert!(cleared.contains("Path=/nas;"));
+        assert!(cleared.contains("Max-Age=0"));
     }
 }

@@ -112,7 +112,13 @@
     "davCopied": "Copied",
     "colName": "Name",
     "colPerm": "Access",
-    "colExpiry": "Expires"
+    "colExpiry": "Expires",
+    "recoveryTitle": "Recovery codes (shown once)",
+    "recoveryHint": "If you lose your authenticator, sign in with one of these codes. Each code works once — store them offline.",
+    "recoveryCopy": "Copy all",
+    "recoveryDone": "I've saved them",
+    "recoveryCopied": "Recovery codes copied",
+    "totpDisableCodePlaceholder": "TOTP or recovery code"
   },
   "advanced": {
     "form": "Form",

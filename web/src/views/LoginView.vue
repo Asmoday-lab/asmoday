@@ -155,10 +155,9 @@ function changeLocale(event: Event) {
             <input
               v-model="totp"
               type="text"
-              inputmode="numeric"
-              maxlength="6"
-              class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm tracking-[0.3em] text-ink outline-none focus:border-accent"
-              placeholder="000000"
+              autocomplete="one-time-code"
+              class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm tracking-[0.2em] text-ink outline-none focus:border-accent"
+              placeholder="000000 / XXXXX-XXXXX"
             />
           </label>
         </template>

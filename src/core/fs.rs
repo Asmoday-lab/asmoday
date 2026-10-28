@@ -8,7 +8,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::config::Config;
 
@@ -227,6 +227,9 @@ pub struct Listing {
     pub page_size: usize,
     pub total: usize,
     pub has_more: bool,
+    /// 下一页游标（设计文档 3.2.4：固定排序 + 游标分页，不用 offset）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     /// 扫描超过 `SCAN_LIMIT` 被强制截断（设计文档 3.2.4）
     pub truncated: bool,
     /// 所在挂载点是否只读：前端据此置灰全部变更入口
@@ -275,10 +278,113 @@ impl ListOrder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 游标分页（设计文档 3.2.4：强制固定排序 + 游标分页，禁止 offset 分页）
+// ---------------------------------------------------------------------------
+
+/// 游标内容：上一页最后一条的 `(是否目录, 排序键, 小写名)`，外加排序口径。
+///
+/// 带上 `sort/order` 是为了「换了排序却拿旧游标」时直接退回第一页，
+/// 而不是按旧键在新排序里乱切片。游标不透明（base64url），前端只负责原样带回。
+#[derive(Debug, Serialize, Deserialize)]
+struct Cursor {
+    sort: String,
+    order: String,
+    is_dir: bool,
+    /// name 排序固定 0；size 用字节数；mtime 用 Unix 秒；拿不到元数据用 -1
+    key: i64,
+    name: String,
+}
+
+fn sort_name(sort: ListSort) -> &'static str {
+    match sort {
+        ListSort::Name => "name",
+        ListSort::Mtime => "mtime",
+        ListSort::Size => "size",
+    }
+}
+
+fn order_name(order: ListOrder) -> &'static str {
+    match order {
+        ListOrder::Asc => "asc",
+        ListOrder::Desc => "desc",
+    }
+}
+
+/// 取排序键的数值形式（与 `list_dir` 里的比较逻辑一一对应）
+fn sort_key(item: &(String, bool, Option<std::fs::Metadata>), sort: ListSort) -> i64 {
+    match sort {
+        ListSort::Name => 0,
+        ListSort::Size => item.2.as_ref().map(|meta| meta.len() as i64).unwrap_or(-1),
+        ListSort::Mtime => item
+            .2
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(-1),
+    }
+}
+
+fn encode_cursor(
+    sort: ListSort,
+    order: ListOrder,
+    item: &(String, bool, Option<std::fs::Metadata>),
+) -> String {
+    let cursor = Cursor {
+        sort: sort_name(sort).to_string(),
+        order: order_name(order).to_string(),
+        is_dir: item.1,
+        key: sort_key(item, sort),
+        name: item.0.to_lowercase(),
+    };
+    let json = serde_json::to_vec(&cursor).unwrap_or_default();
+    data_encoding::BASE64URL_NOPAD.encode(&json)
+}
+
+fn decode_cursor(raw: &str, sort: ListSort, order: ListOrder) -> Option<Cursor> {
+    let bytes = data_encoding::BASE64URL_NOPAD.decode(raw.as_bytes()).ok()?;
+    let cursor: Cursor = serde_json::from_slice(&bytes).ok()?;
+    // 排序口径变了就当游标作废（退回第一页），绝不拿旧键去比新序
+    if cursor.sort != sort_name(sort) || cursor.order != order_name(order) {
+        return None;
+    }
+    Some(cursor)
+}
+
+/// 条目相对游标的位置：`Greater` 表示它在游标之后（下一页从这里开始）
+fn cursor_cmp(
+    item: &(String, bool, Option<std::fs::Metadata>),
+    sort: ListSort,
+    order: ListOrder,
+    cursor: &Cursor,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (item.1, cursor.is_dir) {
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        _ => {}
+    }
+    let key_cmp = sort_key(item, sort).cmp(&cursor.key);
+    let key_cmp = if order == ListOrder::Desc {
+        key_cmp.reverse()
+    } else {
+        key_cmp
+    };
+    if key_cmp != Ordering::Equal {
+        return key_cmp;
+    }
+    item.0.to_lowercase().cmp(&cursor.name)
+}
+
 /// 读取目录第一层并分页。
 ///
 /// 排序固定「目录优先」，其余按指定键升降序；分页结果必须可重现，
 /// 所以不能依赖 `readdir` 的返回顺序，同键并列时以名称（大小写不敏感）兜底。
+///
+/// 分页方式（设计文档 3.2.4）：**优先用游标**，`cursor` 为空时才回落到 `page`
+/// （仅为老客户端保留；新前端一律传游标，目录内容变化也不会重复/漏项）。
+#[allow(clippy::too_many_arguments)]
 pub async fn list_dir(
     dir: &Path,
     page: usize,
@@ -286,6 +392,7 @@ pub async fn list_dir(
     readonly: bool,
     sort: ListSort,
     order: ListOrder,
+    cursor: Option<&str>,
 ) -> Result<Listing, FsError> {
     let page = page.max(1);
 
@@ -357,8 +464,23 @@ pub async fn list_dir(
     });
 
     let total = items.len();
-    let start = (page - 1).saturating_mul(PAGE_SIZE);
+    // 游标优先；游标无效（排序变了 / 手工改坏）就退回第一页，不报错
+    let start = match cursor.and_then(|raw| decode_cursor(raw, sort, order)) {
+        Some(cur) => items
+            .iter()
+            .position(|item| cursor_cmp(item, sort, order, &cur) == std::cmp::Ordering::Greater)
+            .unwrap_or(total),
+        None => (page - 1).saturating_mul(PAGE_SIZE),
+    };
     let end = (start + PAGE_SIZE).min(total);
+    let has_more = end < total;
+    let next_cursor = if has_more {
+        end.checked_sub(1)
+            .and_then(|last| items.get(last))
+            .map(|item| encode_cursor(sort, order, item))
+    } else {
+        None
+    };
 
     let mut entries = Vec::new();
     if start < total {
@@ -407,10 +529,11 @@ pub async fn list_dir(
     Ok(Listing {
         path: normalize_display(dir),
         parent,
-        page,
+        page: start / PAGE_SIZE + 1,
         page_size: PAGE_SIZE,
         total,
-        has_more: end < total,
+        has_more,
+        next_cursor,
         truncated,
         readonly,
         entries,
@@ -647,5 +770,70 @@ mod tests {
         assert_eq!(classify_name("dir", "", true), ("dir", false));
         // .ts 是 TypeScript，不是 MPEG-TS 视频
         assert_eq!(classify_name("router.ts", "ts", false), ("text", true));
+    }
+
+    fn plain(name: &str, is_dir: bool) -> (String, bool, Option<std::fs::Metadata>) {
+        (name.to_string(), is_dir, None)
+    }
+
+    #[test]
+    fn cursor_roundtrip_keeps_sort_scope() {
+        let item = plain("Photo.PNG", false);
+        let raw = encode_cursor(ListSort::Name, ListOrder::Asc, &item);
+        let decoded = decode_cursor(&raw, ListSort::Name, ListOrder::Asc).unwrap();
+        assert_eq!(decoded.name, "photo.png");
+        assert!(!decoded.is_dir);
+        // 换了排序口径 → 游标作废，退回第一页而不是乱切
+        assert!(decode_cursor(&raw, ListSort::Name, ListOrder::Desc).is_none());
+        assert!(decode_cursor(&raw, ListSort::Size, ListOrder::Asc).is_none());
+        // 乱码输入也不 panic
+        assert!(decode_cursor("not-a-cursor", ListSort::Name, ListOrder::Asc).is_none());
+    }
+
+    #[test]
+    fn cursor_orders_after_last_item() {
+        use std::cmp::Ordering;
+        let cur = Cursor {
+            sort: "name".into(),
+            order: "asc".into(),
+            is_dir: true,
+            key: 0,
+            name: "b".into(),
+        };
+        // 同为目录：按名称排在 `b` 之后的才是下一页
+        assert_eq!(
+            cursor_cmp(&plain("c", true), ListSort::Name, ListOrder::Asc, &cur),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cursor_cmp(&plain("a", true), ListSort::Name, ListOrder::Asc, &cur),
+            Ordering::Less
+        );
+        // 文件全部排在目录之后
+        assert_eq!(
+            cursor_cmp(&plain("a", false), ListSort::Name, ListOrder::Asc, &cur),
+            Ordering::Greater
+        );
+        // 反向：游标是文件时，目录都在它前面
+        let file_cur = Cursor { is_dir: false, name: "b".into(), ..cur };
+        assert_eq!(
+            cursor_cmp(&plain("a", true), ListSort::Name, ListOrder::Asc, &file_cur),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cursor_respects_desc_order() {
+        use std::cmp::Ordering;
+        let cur = Cursor {
+            sort: "size".into(),
+            order: "desc".into(),
+            is_dir: false,
+            key: 100,
+            name: "a".into(),
+        };
+        // 降序时更小的文件在游标之后
+        let item = ("b".to_string(), false, None);
+        assert_eq!(cursor_cmp(&item, ListSort::Size, ListOrder::Desc, &cur), Ordering::Greater);
     }
 }

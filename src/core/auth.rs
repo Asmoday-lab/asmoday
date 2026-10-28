@@ -18,8 +18,10 @@ use argon2::Argon2;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-/// 会话有效期：7 天
+/// 会话有效期：7 天（滑动续期的步长）
 pub const SESSION_TTL: i64 = 7 * 24 * 3600;
+/// 会话绝对上限：30 天（无论怎么续期都不能超过，设计文档 3.1.3）
+pub const SESSION_ABSOLUTE_TTL: i64 = 30 * 86_400;
 /// 连续失败次数上限
 pub const MAX_ATTEMPTS: u32 = 5;
 /// 封禁时长
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT,
     totp_secret TEXT,
     is_totp_enabled BOOLEAN DEFAULT 0,
+    totp_recovery_codes TEXT,
     must_change_password BOOLEAN NOT NULL DEFAULT 0,
     created_at DATETIME
 );
@@ -236,6 +239,8 @@ impl AuthStore {
             "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",
             [],
         );
+        // 2FA 一次性恢复码（设计文档 3.1.4）：只存 SHA-1 指纹的 JSON 数组
+        let _ = conn.execute("ALTER TABLE users ADD COLUMN totp_recovery_codes TEXT", []);
         // 分享 tombstone（设计文档 3.2.6.7 / 4.1）：文件被删后分享不连带消失，
         // 而是置 deleted_at，访问时返回 410，30 天后物理清除
         let _ = conn.execute("ALTER TABLE shares ADD COLUMN deleted_at INTEGER", []);
@@ -502,6 +507,72 @@ impl AuthStore {
         Ok(())
     }
 
+    /// 写入一组一次性恢复码（设计文档 3.1.4：库里只存哈希）
+    pub fn set_recovery_codes(&self, user_id: i64, codes: &[String]) -> Result<(), String> {
+        let hashes: Vec<String> = codes.iter().map(|code| recovery_code_hash(code)).collect();
+        let blob = serde_json::to_string(&hashes).map_err(|e| format!("序列化恢复码失败：{e}"))?;
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE users SET totp_recovery_codes = ?1 WHERE id = ?2",
+            params![blob, user_id],
+        )
+        .map_err(|e| format!("写入恢复码失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 校验并**用掉**一个恢复码（一次性）。
+    ///
+    /// 用事务做「读 → 删 → 写」，避免同一码被并发请求同时消费。
+    pub fn consume_recovery_code(&self, user_id: i64, code: &str) -> Result<bool, String> {
+        let normalized = normalize_recovery_code(code);
+        // 恢复码固定 10 位字母数字，长度不对直接当失败，别去碰数据库
+        if normalized.len() != 10 {
+            return Ok(false);
+        }
+        let target = recovery_code_hash(code);
+
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("开启事务失败：{e}"))?;
+        let blob: Option<String> = tx
+            .query_row(
+                "SELECT totp_recovery_codes FROM users WHERE id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("读取恢复码失败：{e}"))?
+            .flatten();
+        let Some(blob) = blob else {
+            return Ok(false);
+        };
+        let mut hashes: Vec<String> = serde_json::from_str(&blob).unwrap_or_default();
+        let Some(index) = hashes.iter().position(|hash| *hash == target) else {
+            return Ok(false);
+        };
+        hashes.remove(index);
+        let remaining = serde_json::to_string(&hashes).map_err(|e| format!("序列化恢复码失败：{e}"))?;
+        tx.execute(
+            "UPDATE users SET totp_recovery_codes = ?1 WHERE id = ?2",
+            params![remaining, user_id],
+        )
+        .map_err(|e| format!("更新恢复码失败：{e}"))?;
+        tx.commit().map_err(|e| format!("提交失败：{e}"))?;
+        Ok(true)
+    }
+
+    /// 关闭 2FA 时把剩余恢复码一并作废
+    pub fn clear_recovery_codes(&self, user_id: i64) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE users SET totp_recovery_codes = NULL WHERE id = ?1",
+            params![user_id],
+        )
+        .map_err(|e| format!("清空恢复码失败：{e}"))?;
+        Ok(())
+    }
+
     /// 标记「登录后必须改密」（--init / --reset-password 发放一次性密码时置位）
     pub fn set_must_change_password(&self, user_id: i64, required: bool) -> Result<(), String> {
         let conn = self.connect()?;
@@ -537,20 +608,37 @@ impl AuthStore {
         Ok(token)
     }
 
-    /// 返回 (user_id) —— 过期会话视为无效并顺手清理。
+    /// 返回 user_id —— 过期会话视为无效并顺手清理。
+    ///
+    /// 滑动续期（设计文档 3.1.3）：剩余不足半个 TTL 时把过期时间往后推，
+    /// 但**不超过** `created_at + SESSION_ABSOLUTE_TTL`（绝对上限 30 天）。
+    /// 只在临近过期时写库，避免每个请求都产生一次 UPDATE。
     pub fn session_user(&self, token: &str) -> Result<Option<i64>, String> {
         let conn = self.connect()?;
-        let row: Option<(i64, i64)> = conn
+        let row: Option<(i64, i64, i64)> = conn
             .query_row(
-                "SELECT user_id, expires_at FROM sessions WHERE token = ?1",
+                "SELECT user_id, expires_at, created_at FROM sessions WHERE token = ?1",
                 params![token],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| format!("查询会话失败：{e}"))?;
 
+        let now = now_secs();
         match row {
-            Some((user_id, expires_at)) if expires_at > now_secs() => Ok(Some(user_id)),
+            Some((user_id, expires_at, created_at)) if expires_at > now => {
+                if expires_at - now <= SESSION_TTL / 2 {
+                    let ceiling = created_at.saturating_add(SESSION_ABSOLUTE_TTL);
+                    let renewed = (now + SESSION_TTL).min(ceiling);
+                    if renewed > expires_at {
+                        let _ = conn.execute(
+                            "UPDATE sessions SET expires_at = ?1 WHERE token = ?2",
+                            params![renewed, token],
+                        );
+                    }
+                }
+                Ok(Some(user_id))
+            }
             Some(_) => {
                 let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);
                 Ok(None)
@@ -623,6 +711,44 @@ pub fn fingerprint(secret: &str) -> String {
 pub fn random_password() -> String {
     use rand::distr::{Alphanumeric, SampleString};
     Alphanumeric.sample_string(&mut rand::rng(), 20)
+}
+
+/// 生成一次性恢复码（设计文档 3.1.4）：默认 10 个，`XXXXX-XXXXX` 的 Crockford Base32。
+///
+/// 10 位 × 32 字符表 ≈ 50 bit 熵，配合「用一次即失效」，SHA-1 指纹足够；
+/// 库里只留指纹（`recovery_code_hash`），明文只在开启 2FA 的响应里出现一次。
+pub fn generate_recovery_codes(count: usize) -> Vec<String> {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut rng = rand::rng();
+    (0..count)
+        .map(|_| {
+            let mut code = String::with_capacity(11);
+            for index in 0..10 {
+                if index == 5 {
+                    code.push('-');
+                }
+                let pick = rand::Rng::random_range(&mut rng, 0..ALPHABET.len());
+                code.push(ALPHABET[pick] as char);
+            }
+            code
+        })
+        .collect()
+}
+
+/// 归一化用户输入（大小写、空格、连字符都不计较；I/L→1、O→0 是 Crockford 的约定）
+pub fn normalize_recovery_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
+        .collect()
+}
+
+fn recovery_code_hash(code: &str) -> String {
+    fingerprint(&format!("asmoday-recovery:{}", normalize_recovery_code(code)))
 }
 
 // ---------------------------------------------------------------------------
@@ -792,5 +918,72 @@ mod tests {
         let blocked = guard.check("1.2.3.4");
         assert!(blocked.is_err(), "第 5 次失败后应被封锁");
         assert!(guard.check("5.6.7.8").is_ok(), "其它 IP 不受影响");
+    }
+
+    #[test]
+    fn recovery_codes_are_hashed_and_single_use() {
+        let store = temp_store("recovery");
+        let user = store.create_user("vfy_recovery", "Abcd1234").unwrap();
+        let codes = generate_recovery_codes(10);
+        assert_eq!(codes.len(), 10);
+        for code in &codes {
+            assert_eq!(code.len(), 11, "XXXXX-XXXXX 共 11 字符");
+            assert_eq!(code.matches('-').count(), 1);
+        }
+
+        store.set_recovery_codes(user.id, &codes).unwrap();
+        // 库里必须是哈希，不能出现任何一个明文
+        let stored: String = store
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT totp_recovery_codes FROM users WHERE id = ?1",
+                params![user.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for code in &codes {
+            assert!(!stored.contains(code), "恢复码明文不得落库");
+        }
+
+        // 大小写 / 连字符都不计较，且只能用一次
+        let sloppy = codes[0].replace('-', "").to_lowercase();
+        assert!(store.consume_recovery_code(user.id, &sloppy).unwrap());
+        assert!(!store.consume_recovery_code(user.id, &codes[0]).unwrap());
+        assert!(store.consume_recovery_code(user.id, &codes[1]).unwrap());
+
+        // 关闭 2FA 时全部作废
+        store.clear_recovery_codes(user.id).unwrap();
+        assert!(!store.consume_recovery_code(user.id, &codes[2]).unwrap());
+    }
+
+    #[test]
+    fn session_slides_but_never_past_absolute_cap() {
+        let store = temp_store("session-slide");
+        let user = store.create_user("vfy_slide", "Abcd1234").unwrap();
+        let token = store.create_session(user.id).unwrap();
+        let now = now_secs();
+
+        // 29 天前创建、60 秒后过期：应被续期，但顶上绝对上限（created_at + 30 天）
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET created_at = ?1, expires_at = ?2 WHERE token = ?3",
+                params![now - 29 * 86_400, now + 60, token],
+            )
+            .unwrap();
+        assert!(store.session_user(&token).unwrap().is_some());
+        let (created, expires): (i64, i64) = store
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT created_at, expires_at FROM sessions WHERE token = ?1",
+                params![token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(expires > now + 3600, "临近过期必须滑动续期");
+        assert!(expires <= created + SESSION_ABSOLUTE_TTL, "不得越过 30 天绝对上限");
     }
 }

@@ -55,6 +55,8 @@ export interface Listing {
   page_size: number
   total: number
   has_more: boolean
+  /** 下一页游标（设计文档 3.2.4：固定排序 + 游标分页） */
+  next_cursor?: string
   /** 目录条目超过后端扫描上限被截断（设计文档 3.2.4） */
   truncated?: boolean
   /** 所在挂载点只读：全部变更入口置灰 */
@@ -161,11 +163,31 @@ export const filesApi = {
 
   roots: () => getJson<RootsResponse>('/api/files/roots'),
 
-  /** `showHidden` 对应后端 `show_hidden`（设计文档 3.2 / 6.1） */
-  list: (path: string, page = 1, showHidden = false, sort = 'name', order = 'asc') =>
-    getJson<Listing>(
-      `/api/files/list?path=${encodePath(path)}&page=${page}&show_hidden=${showHidden}&sort=${sort}&order=${order}`,
-    ),
+  /**
+   * 目录列表（设计文档 3.2.4：游标分页）。
+   *
+   * 首次打开不传 `cursor`（后端从第一页开始并回 `next_cursor`），
+   * 之后一律带上一页的游标——目录内容在翻页途中变化也不会重复或漏项。
+   * `page` 只为兼容老链接保留。
+   */
+  list: (
+    path: string,
+    page = 1,
+    showHidden = false,
+    sort = 'name',
+    order = 'asc',
+    cursor?: string | null,
+  ) => {
+    const params = new URLSearchParams({
+      path,
+      show_hidden: String(showHidden),
+      sort,
+      order,
+    })
+    if (cursor) params.set('cursor', cursor)
+    else params.set('page', String(page))
+    return getJson<Listing>(`/api/files/list?${params.toString()}`)
+  },
 
   /** 直接给 <img>/<video> 用；同样走挂载点校验 */
   rawUrl: (path: string) => `/api/files/raw?path=${encodePath(path)}`,

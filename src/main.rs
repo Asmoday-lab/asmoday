@@ -461,6 +461,11 @@ fn build_router(state: AppState) -> Router {
         // 上传/代理大文件：放宽请求体上限
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .fallback(api::static_files::serve)
+        // 默认安全响应头（设计文档 3.1.9）：放在最外层，index.html 回落也要带上
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::security::security_headers,
+        ))
         .with_state(state)
 }
 
