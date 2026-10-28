@@ -70,6 +70,17 @@ ffmpeg_path = ""
 # 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束。
 upload_max_size_mb = 0
 
+# 日志策略（设计文档 3.7）：默认生产级克制，排障时分级开启，结构化可选。
+[log]
+# 控制台最低级别：debug | info | warn | error | off。默认 info——终端里只出现关键信息。
+console_level = "info"
+# 主文件最低级别（data/logs/asmoday.log，10MiB × 5 轮转）。默认 debug，事后排障有完整线索。
+file_level = "debug"
+# HTTP 访问日志独立级别（方法/路径/状态码/耗时，不含请求体；off 关闭）。默认 info。
+api_level = "info"
+# 输出格式：text（人读，默认）| json（每行一个 JSON 对象，便于机器解析）。
+format = "text"
+
 # ==========================================
 # 以下为可选配置，默认注释。需要时取消注释即可。
 # ==========================================
@@ -107,6 +118,8 @@ pub struct Config {
     pub shares: SharesConfig,
     /// 媒体缓存策略（设计文档 3.4 / 4.2）
     pub media: MediaConfig,
+    /// 日志分级与多输出（设计文档 3.7）
+    pub log: LogConfig,
 }
 
 impl Default for Config {
@@ -118,6 +131,7 @@ impl Default for Config {
             services: Vec::new(),
             shares: SharesConfig::default(),
             media: MediaConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -166,6 +180,34 @@ impl MediaConfig {
     /// 换算成秒，供过期逻辑使用
     pub fn max_age_secs(&self) -> u64 {
         self.thumb_cache_max_age_days.saturating_mul(24 * 60 * 60)
+    }
+}
+
+/// `[log]`：日志分级与多输出策略（设计文档 3.7）。
+///
+/// 策略一句话：**默认生产级克制，排障时分级开启，结构化可选**——
+/// 控制台默认只出 INFO+，文件默认记 DEBUG，API 访问日志走独立级别闸门，
+/// 最详尽的调试信息（源码位置）只有 DEBUG 级别才附带。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// 控制台最低级别：debug | info | warn | error | off（默认 info）
+    pub console_level: String,
+    /// 主文件最低级别（data/logs/asmoday.log，默认 debug）
+    pub file_level: String,
+    /// HTTP 访问日志独立级别（方法/路径/状态码/耗时，不含请求体；off 关闭；默认 info）
+    pub api_level: String,
+    /// 输出格式：text（人读，默认）| json（机器解析，每行一个对象）
+    pub format: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            console_level: "info".to_string(),
+            file_level: "debug".to_string(),
+            api_level: "info".to_string(),
+            format: "text".to_string(),
+        }
     }
 }
 
@@ -427,6 +469,25 @@ impl Config {
             return Err("media.thumb_cache_max_age_days 必须大于 0".to_string());
         }
 
+        // 日志：级别与格式必须是可识别的枚举值（设计文档 3.7）
+        for (field, raw) in [
+            ("log.console_level", &self.log.console_level),
+            ("log.file_level", &self.log.file_level),
+            ("log.api_level", &self.log.api_level),
+        ] {
+            if crate::core::logging::Level::parse(raw).is_none() {
+                return Err(format!(
+                    "{field} 只能是 debug / info / warn / error / off，当前为 {raw:?}"
+                ));
+            }
+        }
+        if !matches!(self.log.format.as_str(), "text" | "json") {
+            return Err(format!(
+                "log.format 只能是 text 或 json，当前为 {:?}",
+                self.log.format
+            ));
+        }
+
         // FFmpeg 路径允许留空（走环境变量 / PATH）；填目录也可以——
         // 解压版安装包给出的就是 `...\ffmpeg\bin`，运行时会自动补上可执行文件名。
         // 这里只做「不是空串」之外的宽松校验，真正的可用性由探测接口判断。
@@ -648,6 +709,8 @@ fn reload_into(state: &crate::AppState, path: &Path) {
                 state
                     .thumbnails
                     .apply_limits(config.media.limit_bytes(), config.media.max_age_secs());
+                // 日志分级同样随配置热更新（设计文档 3.7：排障时改配置即生效，无需重启）
+                crate::core::logging::apply(&config.log);
                 let mut config = config;
                 // 热重载同样要过一遍危险配置自检，不许绕过启动时的拦截
                 let _ = config.apply_safety();

@@ -1,5 +1,6 @@
 //! 路由层。
 
+pub mod access;
 pub mod auth;
 pub mod config;
 pub mod error;

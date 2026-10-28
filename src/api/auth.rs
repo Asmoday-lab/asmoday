@@ -205,7 +205,7 @@ async fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAdd
 }
 
 /// `client_ip` 的纯函数内核（方便单测，不依赖 AppState）。
-fn pick_client_ip(
+pub(crate) fn pick_client_ip(
     trust_proxy_headers: bool,
     trusted: &[String],
     peer_ip: &str,

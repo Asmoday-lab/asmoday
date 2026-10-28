@@ -52,6 +52,11 @@ httpdate = "1"
 [profile.dev]
 debug = 0
 
+# 控制台日志着色（设计文档 3.7）：经典 conhost 需要显式打开 ANSI VT 处理。
+# 仅 Windows 平台、仅 Console 两个 feature，不引入其他 Win32 面。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

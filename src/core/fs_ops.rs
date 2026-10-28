@@ -467,6 +467,13 @@ fn copy_file_with_retry(
         .map_err(|e| FsError::Io(format!("读取源文件信息失败：{e}")))?;
 
     let part = dest_dir.join(part_name(original_name));
+    // DEBUG 通道：复制落点与临时文件全路径，排障「创建临时文件失败」类问题时的关键线索
+    crate::log_debug!(
+        "copying {src_display} -> {part_display} ({size} bytes)",
+        src_display = normalize_display(src),
+        part_display = normalize_display(&part),
+        size = before.len()
+    );
     let copied = stream_copy(src, &part)?;
 
     if copied != before.len() {

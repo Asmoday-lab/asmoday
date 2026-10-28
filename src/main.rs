@@ -178,6 +178,8 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     // ---- 运行日志（data/logs，10 MiB × 5 轮转）----
     core::logging::init(&data_dir);
+    // `[log]` 分级策略（控制台 INFO / 文件 DEBUG / API 通道 / JSON，支持热更新）
+    core::logging::apply(&config.log);
     crate::log_info!(
         "Asmoday {} starting (pid {})",
         env!("CARGO_PKG_VERSION"),
@@ -463,6 +465,11 @@ fn build_router(state: AppState) -> Router {
         // 上传/代理大文件：放宽请求体上限
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .fallback(api::static_files::serve)
+        // HTTP 访问日志（设计文档 3.7：独立 api_level 通道，只记方法/路径/状态码/耗时/IP）
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::access::track,
+        ))
         // 默认安全响应头（设计文档 3.1.9）：放在最外层，index.html 回落也要带上
         .layer(middleware::from_fn_with_state(
             state.clone(),
