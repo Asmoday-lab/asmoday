@@ -553,16 +553,30 @@ fn map_write_error(err: std::io::Error, path: &Path) -> FsError {
     map_io_error(err, "写入失败", path)
 }
 
-/// Windows 共享冲突（os error 32/33）单独成码（E_BUSY）。
+/// 平台 IO 错误归码：共享冲突（32/33）→ `E_BUSY`，拒绝访问（5）→ `E_FORBIDDEN`。
 ///
-/// 「文件正被别的程序占用」是用户可自救的状态（关掉占用程序、稍后重试），
+/// 这两类都是**用户可自救**的状态（关掉占用程序 / 改文件夹权限或以管理员运行），
 /// 报成 500「服务器内部错误」既吓人又没信息。典型场景：下载器还在写
-/// Downloads 里的文件，用户马上就复制它。
+/// Downloads 里的文件，用户马上就复制它；或目标文件夹带着失效 SID。
 fn map_io_error(err: std::io::Error, action: &str, path: &Path) -> FsError {
     if matches!(err.raw_os_error(), Some(32) /* ERROR_SHARING_VIOLATION */ | Some(33) /* ERROR_LOCK_VIOLATION */) {
         return FsError::Busy(format!(
             "{action}：文件正被其他程序占用（{}）",
             normalize_display(path)
+        ));
+    }
+    // os error 5（ERROR_ACCESS_DENIED）几乎总是「目录 ACL 拒绝当前用户写入」：
+    // 典型成因是文件夹带着旧系统 / 其他机器拷贝来的失效 SID，或由管理员权限的
+    // 下载器创建，普通权限的 asmoday 只能读不能写；也可能是杀毒 / 受控文件夹
+    // 访问拦截了未签名的新构建 exe。这是用户可自救的状态，给足排查路径。
+    if err.raw_os_error() == Some(5) /* ERROR_ACCESS_DENIED */ {
+        return FsError::Forbidden(format!(
+            "{action}：目标位置拒绝写入（拒绝访问，os error 5）—— {path_display}。\
+             常见原因：① 文件夹「安全」权限未授予当前用户写入（右键 → 属性 → 安全，\
+             旧系统 / 其他电脑拷来的文件夹常带失效账户）；② 杀毒软件或 Windows \
+             「受控文件夹访问」拦截了 asmoday.exe；③ 该文件夹由管理员权限的程序创建，\
+             需以管理员身份运行 asmoday。",
+            path_display = normalize_display(path)
         ));
     }
     FsError::Io(format!("{action}：{err}"))
@@ -864,6 +878,29 @@ mod tests {
             Path::new("C:/a.txt"),
         );
         assert_eq!(crate::api::error::code_of(&plain), "E_INTERNAL");
+    }
+
+    #[test]
+    fn access_denied_maps_to_forbidden_with_guidance() {
+        // os error 5（拒绝访问，典型：目标目录 ACL 拒绝写入）必须映射成
+        // E_FORBIDDEN(403) 并给出可自救的排查指引，而不是 500 服务器内部错误
+        let err = map_io_error(
+            std::io::Error::from_raw_os_error(5),
+            "创建临时文件失败",
+            Path::new("C:/mnt/lora/luwanq.txt.asmoday-part.ab12cd34"),
+        );
+        assert!(
+            matches!(err, FsError::Forbidden(_)),
+            "实际：{err:?}"
+        );
+        assert_eq!(
+            crate::api::error::code_of(&err),
+            "E_FORBIDDEN",
+            "用户可自救的权限错误不能报成 500"
+        );
+        let text = err.message();
+        assert!(text.contains("拒绝写入"), "文案缺「拒绝写入」：{text}");
+        assert!(text.contains("管理员"), "文案缺「管理员」指引：{text}");
     }
 
     fn scratch(tag: &str) -> PathBuf {
