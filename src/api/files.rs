@@ -168,6 +168,10 @@ pub async fn raw(
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
+    // .asmoday-part 临时文件不可预览/下载（设计文档 3.2.6.4，v3.4.0）
+    if path_guard::is_part_path(&path) {
+        return fs_error(FsError::NotFound("文件不存在".to_string()));
+    }
 
     let meta = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta,
@@ -261,6 +265,10 @@ pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQu
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
+    // .asmoday-part 临时文件不可预览（设计文档 3.2.6.4，v3.4.0）
+    if path_guard::is_part_path(&path) {
+        return fs_error(FsError::NotFound("文件不存在".to_string()));
+    }
 
     let meta = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta,

@@ -349,6 +349,16 @@ pub fn is_part_file(name: &str) -> bool {
     suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// 整条路径的最后一段是否为临时文件。
+///
+/// 设计文档 3.2.6.4（v3.4.0）：临时文件除列表过滤外，**不可预览/下载**——
+/// raw / text / thumb 三个字节出口都要在解析完路径后拦一道。
+pub fn is_part_path(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| is_part_file(&name.to_string_lossy()))
+        .unwrap_or(false)
+}
+
 /// 生成 `.asmoday-part` 临时文件名（8 位 CSPRNG 随机码）
 pub fn part_name(original: &str) -> String {
     use rand::Rng as _;
@@ -571,6 +581,16 @@ mod tests {
         assert!(!is_part_file("movie.mp4.asmoday-part.A1B2C3D4"));
         assert!(!is_part_file("movie.mp4.asmoday-part.a1b2c3d"));
         assert!(!is_part_file("movie.mp4"));
+    }
+
+    #[test]
+    fn part_path_checks_last_segment() {
+        // 整条路径只看最后一段：临时文件不可预览/下载（设计文档 3.2.6.4，v3.4.0）
+        assert!(is_part_path(Path::new("/mnt/a/movie.mp4.asmoday-part.a1b2c3d4")));
+        assert!(is_part_path(Path::new("movie.mp4.asmoday-part.a1b2c3d4")));
+        assert!(!is_part_path(Path::new("/mnt/a/movie.mp4")));
+        // 临时文件所在目录本身不受影响
+        assert!(!is_part_path(Path::new("/mnt/x.asmoday-part.a1b2c3d4/movie.mp4")));
     }
 
     #[test]

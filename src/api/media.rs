@@ -138,6 +138,11 @@ pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery
         Err(err) => return fs_error(err),
     };
 
+    // .asmoday-part 临时文件不可预览（设计文档 3.2.6.4，v3.4.0）：直接回占位图
+    if crate::core::path_guard::is_part_path(&path) {
+        return placeholder();
+    }
+
     if path.is_dir() {
         return placeholder();
     }
