@@ -184,6 +184,7 @@
   "result": {
     "title": "Result",
     "summary": "{ok} succeeded · {failed} failed · {skipped} skipped",
+    "targetDir": "Destination",
     "failures": "Failed items"
   },
   "stat": {

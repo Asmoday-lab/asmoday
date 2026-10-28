@@ -447,7 +447,7 @@ async function submitTransfer() {
     const summary = summarizeResults(response)
     transferDialog.value = null
     exitSelect()
-    showTransferResult(dialog.mode, summary)
+    showTransferResult(dialog.mode, summary, displayPath(dest))
     await open(currentPath.value)
   } catch (err) {
     dialog.error = describe(err).message
@@ -463,14 +463,15 @@ interface TransferSummary {
   failures: { path: string; source?: string; error_code?: string; message?: string }[]
 }
 
-const resultDialog = ref<({ mode: TransferMode } & TransferSummary) | null>(null)
+const resultDialog = ref<({ mode: TransferMode; dest?: string } & TransferSummary) | null>(null)
 
-function showTransferResult(mode: TransferMode, summary: TransferSummary) {
+function showTransferResult(mode: TransferMode, summary: TransferSummary, dest?: string) {
   if (summary.failed === 0) {
     showToast(t('files.transfer.done'))
     return
   }
-  resultDialog.value = { mode, ...summary }
+  // 失败时带上目标目录：权限类错误（如目录拒绝写入）需要一眼定位是哪个目录
+  resultDialog.value = { mode, ...summary, dest }
 }
 
 function failureText(item: { error_code?: string; message?: string }) {
@@ -1873,7 +1874,7 @@ onMounted(boot)
           <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
           <div
             v-if="newMenuOpen"
-            class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+            class="absolute left-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
           >
             <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
               <AppIcon name="folder" :size="14" />
@@ -2689,6 +2690,9 @@ onMounted(boot)
               skipped: resultDialog.skipped,
             })
           }}
+        </p>
+        <p v-if="resultDialog.dest" class="mt-1 break-all text-[11px] text-muted">
+          {{ t('files.result.targetDir') }}：{{ resultDialog.dest }}
         </p>
         <template v-if="resultDialog.failures.length">
           <p class="mt-4 text-[12px] font-medium text-muted">{{ t('files.result.failures') }}</p>

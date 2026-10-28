@@ -184,6 +184,7 @@
   "result": {
     "title": "操作结果",
     "summary": "成功 {ok} · 失败 {failed} · 跳过 {skipped}",
+    "targetDir": "目标目录",
     "failures": "失败项"
   },
   "stat": {
