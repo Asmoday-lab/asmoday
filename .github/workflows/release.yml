@@ -1,0 +1,129 @@
+# 多平台发版流水线（设计文档 9.3）
+#
+# 触发：推送 v* 标签（如 v3.5.2）。每个平台并行构建，产物附到 GitHub Release。
+# 约定：
+# - 先构建前端（pnpm --frozen-lockfile，等价于文档所说 `cd web && npm run build`，
+#   仓库锁文件是 pnpm-lock.yaml，CI 必须用 pnpm 保证可复现）；
+# - 再 cargo build --release --target <triple>，产物固定在
+#   target/<triple>/release/asmoday(.exe)（rust-embed 会把 web 产出的 dist/ 吸进二进制）；
+# - Windows 出 .zip，其余出 .tar.gz。
+#
+# 本地开发严禁交叉编译（文档 9.3）：本地只跑 cargo build / cargo run。
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: asmoday
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # 低功耗设备主力目标：Ubuntu runner + cross 交叉编译
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # musl 目标需要 musl 工具链；cross 目标由 cross 自带容器解决
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build binary (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build binary (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          DIR="${APP_NAME}-${{ matrix.target }}"
+          mkdir -p "$DIR"
+          cp "target/${{ matrix.target }}/release/${APP_NAME}" "$DIR/"
+          cp README.md "$DIR/" 2>/dev/null || true
+          tar czf "${DIR}.tar.gz" "$DIR"
+          echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "${{ env.APP_NAME }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.APP_NAME }}.exe" $dir/
+          if (Test-Path README.md) { Copy-Item README.md $dir/ }
+          Compress-Archive -Path $dir -DestinationPath "${dir}.zip"
+          "ASSET=${dir}.zip" | Add-Content $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -316,6 +316,16 @@ async fn run(cli: Cli) -> Result<(), String> {
             "no administrator yet: open the web UI to finish setup, or run with --init"
         );
     }
+    // 受限令牌提醒（设计文档 3.3.6）：低完整性级别下终端子进程无法写用户目录，
+    // 终端会话已自动把历史重定向到数据目录；这里在启动日志再提示一次，
+    // 让双击 exe / 服务方式启动的用户第一时间看到，而不是等终端报错才察觉。
+    if let Some(level) = crate::core::terminal::process_integrity_level() {
+        if level < 0x2000 {
+            crate::log_warn!(
+                "process token integrity level is restricted (0x{level:04x}); terminal sessions cannot write to the user profile, shell history is redirected to the data directory. Restart asmoday normally (Explorer or a regular console) for a native shell experience."
+            );
+        }
+    }
     crate::log_info!("startup completed in {} ms", started.elapsed().as_millis());
 
     axum::serve(

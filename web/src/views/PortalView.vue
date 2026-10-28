@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
  * 聚合主页：核心入口 + 由 config.toml 的 [[services]] 驱动的外部服务卡片。
- * 服务卡片走内置反代 /proxy/{id}/，iframe 内嵌（后端已剥离 X-Frame-Options）。
+ * 服务卡片直接在新标签打开反代地址 /proxy/{id}/（后端已剥离 X-Frame-Options
+ * 并可注入 Header），不在本站内嵌 iframe（设计文档 3.6 v3.5.2 纠偏）。
  */
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterLink } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -53,14 +54,10 @@ const entries: Entry[] = [
 
 const { t } = useI18n()
 const services = ref<ServiceCard[]>([])
-const active = ref<ServiceCard | null>(null)
-const frameKey = ref(0)
 
-const activeUrl = computed(() => (active.value ? `/proxy/${active.value.id}/` : ''))
-
-function openService(service: ServiceCard) {
-  frameKey.value += 1
-  active.value = service
+/** 卡片打开地址：走内置反代，保留 inject_headers / 混合内容规避能力 */
+function serviceHref(service: ServiceCard): string {
+  return `/proxy/${service.id}/`
 }
 
 onMounted(async () => {
@@ -137,11 +134,14 @@ onMounted(async () => {
         </div>
 
         <div v-else class="grid gap-3 sm:grid-cols-2">
-          <button
+          <a
             v-for="service in services"
             :key="service.id"
+            :href="serviceHref(service)"
+            target="_blank"
+            rel="noopener noreferrer"
             class="glass-card group flex items-center gap-3 rounded-2xl px-4 py-3.5 text-left"
-            @click="openService(service)"
+            :data-service="service.id"
           >
             <span
               class="grid size-10 shrink-0 place-items-center rounded-xl bg-elevated text-muted group-hover:text-accent"
@@ -153,9 +153,9 @@ onMounted(async () => {
               <span class="block truncate text-[12px] text-muted">{{ service.target_url }}</span>
             </span>
             <span class="text-muted opacity-0 transition-opacity group-hover:opacity-100">
-              <AppIcon name="arrowRight" :size="15" />
+              <AppIcon name="arrowUpRight" :size="15" />
             </span>
-          </button>
+          </a>
         </div>
       </div>
 
@@ -163,36 +163,6 @@ onMounted(async () => {
         <AppIcon name="sparkle" :size="14" />
         {{ t('portal.services.note') }}
       </p>
-    </div>
-
-    <!-- 服务内嵌窗口 -->
-    <div
-      v-if="active"
-      class="fixed inset-0 z-50 flex flex-col bg-black/90 p-2 md:p-6"
-      @click.self="active = null"
-    >
-      <div class="mb-2 flex items-center gap-3 px-1 text-white">
-        <span class="text-sm font-medium">{{ active.name }}</span>
-        <span class="truncate text-[12px] text-white/50">{{ activeUrl }}</span>
-        <a
-          :href="activeUrl"
-          target="_blank"
-          rel="noopener"
-          class="ml-auto rounded bg-white/10 px-2 py-1 text-[12px] hover:bg-white/20"
-        >
-          {{ t('portal.services.openNewWindow') }}
-        </a>
-        <button class="rounded bg-white/10 px-2 py-1 text-[12px] hover:bg-white/20" @click="active = null">
-          {{ t('portal.services.close') }}
-        </button>
-      </div>
-      <iframe
-        :key="frameKey"
-        :src="activeUrl"
-        class="min-h-0 w-full flex-1 rounded-lg border border-white/10 bg-white"
-        referrerpolicy="no-referrer"
-        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"
-      />
     </div>
   </section>
 </template>

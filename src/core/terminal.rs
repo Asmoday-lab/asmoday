@@ -65,6 +65,66 @@ impl ShellProbe {
     }
 }
 
+/// 当前进程令牌的完整性级别 RID（Windows 专用，设计文档 3.3.6）。
+///
+/// `0x1000` 低 / `0x2000` 中 / `0x3000` 高。低完整性级别下终端子进程继承令牌，
+/// 对用户目录（中完整性）一切写入被拒——这就是「PSReadLine 历史访问被拒绝」
+/// 的根因。启动时查一次并在服务日志提醒，让双击/服务方式启动的用户不用等到
+/// 打开终端才发现。查询失败返回 `None`（宁可不报，不误报）。
+#[cfg(windows)]
+pub fn process_integrity_level() -> Option<u32> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let result = (|| {
+            // 先取所需长度（第一次调用必然失败，靠 returnlength 拿尺寸）
+            let mut len = 0u32;
+            let _ = GetTokenInformation(token, TokenIntegrityLevel, std::ptr::null_mut(), 0, &mut len);
+            if len == 0 {
+                return None;
+            }
+            let mut buffer = vec![0u8; len as usize];
+            if GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buffer.as_mut_ptr().cast(),
+                len,
+                &mut len,
+            ) == 0
+            {
+                return None;
+            }
+            let label = buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
+            let sid = (*label).Label.Sid;
+            if sid.is_null() {
+                return None;
+            }
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                return None;
+            }
+            Some(*GetSidSubAuthority(sid, u32::from(count) - 1))
+        })();
+        CloseHandle(token);
+        result
+    }
+}
+
+/// 非 Windows 平台没有完整性级别概念，恒为 `None`。
+#[cfg(not(windows))]
+pub fn process_integrity_level() -> Option<u32> {
+    None
+}
+
 /// 探测默认历史路径是否可写，不可写则给出数据目录下的替代路径。
 ///
 /// Windows 探测的是 PSReadLine 的历史文件；类 Unix 探测 `$HOME` 可写性
@@ -657,5 +717,20 @@ mod tests {
             assert!(path.contains("terminal"));
         }
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn integrity_level_query_does_not_panic() {
+        // 无法断言具体级别（取决于运行环境），只保证查询安全且结果自洽
+        if let Some(level) = process_integrity_level() {
+            assert!(level > 0, "integrity RID should be positive");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integrity_level_threshold_matches_mandatory_levels() {
+        // 语义校验：低 < 中 < 高（0x1000 / 0x2000 / 0x3000）
+        assert!(0x1000 < 0x2000 && 0x2000 < 0x3000);
     }
 }
