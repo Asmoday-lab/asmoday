@@ -28,5 +28,15 @@
     "offline": "Cannot reach the service — make sure Asmoday is running",
     "generic": "Terminal error",
     "limit": "Terminal tab limit reached ({max}), close one first"
+  },
+  "safeMode": {
+    "label": "Safe mode",
+    "title": "Start the shell without profile/rc (rescue switch; restarts this terminal)",
+    "on": "Safe mode enabled, terminal restarted",
+    "off": "Safe mode disabled, terminal restarted"
+  },
+  "charset": {
+    "title": "Send chcp 65001 to fix garbled text",
+    "sent": "chcp 65001 sent"
   }
 }

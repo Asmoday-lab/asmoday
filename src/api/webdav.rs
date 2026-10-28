@@ -263,6 +263,10 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             if path_guard::is_part_file(&name) {
                 continue;
             }
+            // 复制目录时把系统垃圾一起搬过去毫无意义，还会让目标端再被同步污染
+            if crate::core::junk::is_system_junk(&name) {
+                continue;
+            }
             copy_recursive(&entry.path(), &dst.join(&name))?;
         }
         Ok(())
@@ -387,6 +391,11 @@ pub async fn handle(
                         let child_name = entry.file_name().to_string_lossy().to_string();
                         // 运行期 .part 临时文件对外不可见
                         if path_guard::is_part_file(&child_name) {
+                            continue;
+                        }
+                        // 系统垃圾不进 PROPFIND：macOS 客户端看到 .DS_Store / ._*
+                        // 就会当作普通文件往回写，形成同步死循环（设计文档 3.3.7）
+                        if crate::core::junk::is_system_junk(&child_name) {
                             continue;
                         }
                         count += 1;
@@ -520,6 +529,16 @@ pub async fn handle(
             if file_name.is_empty() {
                 return dav_error(StatusCode::FORBIDDEN, "挂载点根目录不可覆盖");
             }
+            // 拦截系统垃圾写入：`.DS_Store` / `._*` / `Thumbs.db` 这类文件
+            // 一旦允许落盘，macOS + Windows 双端挂载会互相触发无限同步（设计文档 3.3.7）
+            if crate::core::junk::is_system_junk(&file_name) {
+                crate::log_info!(
+                    "webdav rejected junk upload '{}' on mount {}",
+                    file_name,
+                    mount.info.id
+                );
+                return dav_error(StatusCode::FORBIDDEN, "该文件名属于系统垃圾文件，已被服务器拒绝");
+            }
             let target = match path_guard::resolve_child(mount, &parent_text, &file_name) {
                 Ok(path) => path,
                 Err(err) => {
@@ -626,6 +645,10 @@ pub async fn handle(
                 Some((parent, name)) if !name.is_empty() => (parent.to_string(), name.to_string()),
                 _ => (String::new(), rest.clone()),
             };
+            // 与 PUT 同口径：系统垃圾目录（.Trashes / $RECYCLE.BIN 等）不允许新建
+            if crate::core::junk::is_system_junk(&name) {
+                return dav_error(StatusCode::FORBIDDEN, "该名称属于系统目录，已被服务器拒绝");
+            }
             let target = match path_guard::resolve_child(mount, &parent_text, &name) {
                 Ok(path) => path,
                 Err(err) => {

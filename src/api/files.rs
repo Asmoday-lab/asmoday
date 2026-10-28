@@ -609,6 +609,10 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
 
     while let Ok(Some(entry)) = reader.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
+        // 搜索同样不返回系统垃圾，避免用户搜 "ds" 搜出一堆 .DS_Store（设计文档 3.3.7）
+        if crate::core::junk::is_system_junk(&name) {
+            continue;
+        }
         if !name.to_lowercase().contains(&keyword) {
             continue;
         }

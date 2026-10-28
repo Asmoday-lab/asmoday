@@ -6,6 +6,7 @@ pub mod ffmpeg;
 pub mod fs;
 pub mod fs_ops;
 pub mod id3;
+pub mod junk;
 pub mod locks;
 pub mod logging;
 pub mod path_guard;

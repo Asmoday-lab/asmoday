@@ -27,6 +27,28 @@ pub struct TerminalQuery {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub session_id: Option<String>,
+    /// 纯净模式（设计文档 3.3.7）：跳过 profile/rc，用于配置文件把终端卡死的救急场景
+    #[serde(default, deserialize_with = "boolish")]
+    pub no_profile: Option<bool>,
+}
+
+/// 宽松布尔查询参数：接受 `1/0`、`true/false`、`yes/no`、`on/off`。
+///
+/// 用 `Option<bool>` 直接反序列化时，`?no_profile=1` 会让整条查询串解析失败，
+/// 表现为 WebSocket 握手 400 —— 浏览器只会看到「连接已断开，正在重连」，
+/// 排查成本极高，所以这里一律自己吞下并转成布尔。
+fn boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }))
 }
 
 /// WS /api/terminal/ws?path=&cols=&rows=&session_id=
@@ -118,8 +140,13 @@ pub async fn ws_handler(
     let cols = query.cols.unwrap_or(120).clamp(20, 500);
     let rows = query.rows.unwrap_or(30).clamp(5, 200);
     let session_id = query.session_id.filter(|s| !s.trim().is_empty());
+    let options = crate::core::terminal::ShellOptions {
+        no_profile: query.no_profile.unwrap_or(false),
+    };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, cwd, cols, rows, session_id, warning))
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, state, cwd, cols, rows, session_id, options, warning)
+    })
 }
 
 /// 默认终端目录（设计文档 3.3）：优先用户主目录，其次默认挂载点。
@@ -173,16 +200,21 @@ async fn handle_socket(
     cols: u16,
     rows: u16,
     session_id: Option<String>,
+    options: crate::core::terminal::ShellOptions,
     warning: Option<String>,
 ) {
     let manager = state.terminals.clone();
 
-    // 重连优先复用；否则新建
-    let existing = session_id.as_deref().and_then(|id| manager.get(id));
+    // 重连优先复用；但模式变了（普通 ↔ 纯净）必须重建：profile 是进程启动时
+    // 加载的，已经跑起来的 shell 变不回去
+    let existing = session_id
+        .as_deref()
+        .and_then(|id| manager.get(id))
+        .filter(|session| session.no_profile == options.no_profile);
     let reconnected = existing.is_some();
     let session = match existing {
         Some(session) => session,
-        None => match manager.create(&cwd, cols, rows) {
+        None => match manager.create(&cwd, cols, rows, options) {
             Ok(session) => session,
             Err(message) => {
                 let mut socket = socket;
@@ -205,6 +237,9 @@ async fn handle_socket(
         "shell": session.shell,
         "reconnected": reconnected,
         "buffered": session.replay().len(),
+        // 纯净模式与平台：前端据此显示开关状态与 Windows 的「修复乱码」按钮
+        "no_profile": session.no_profile,
+        "platform": crate::core::terminal::platform(),
         // 目录被删等非致命情况：连接照建，但要让用户知道落点变了
         "warning": warning,
     });

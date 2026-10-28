@@ -9,12 +9,35 @@ export interface TerminalTab {
   /** 后端会话 id，重连时带上即可原地恢复 */
   sessionId: string | null
   status: TerminalStatus
+  /** 纯净模式：跳过 profile/rc（设计文档 3.3.7，救急用） */
+  noProfile: boolean
+  /** 服务端平台（windows/unix），决定是否显示「修复乱码」入口 */
+  platform: string
 }
 
 let seq = 0
 
 const tabs = ref<TerminalTab[]>([])
 const activeId = ref('')
+
+/** 纯净模式的默认值跨会话记住：用户一旦为了救急打开，下次还按这个来 */
+const SAFE_MODE_KEY = 'asmoday.terminal.noProfile'
+
+function loadSafeMode(): boolean {
+  try {
+    return window.localStorage.getItem(SAFE_MODE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function saveSafeModeDefault(value: boolean) {
+  try {
+    window.localStorage.setItem(SAFE_MODE_KEY, value ? '1' : '0')
+  } catch {
+    /* 隐私模式下写不进去，忽略 */
+  }
+}
 
 function basename(path: string): string {
   if (!path) return '~'
@@ -33,6 +56,8 @@ export function useTerminalStore() {
       cwd,
       sessionId: null,
       status: 'connecting',
+      noProfile: loadSafeMode(),
+      platform: '',
     })
     activeId.value = id
     return id

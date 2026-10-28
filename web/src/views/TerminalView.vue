@@ -10,7 +10,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import TerminalPane from '../components/TerminalPane.vue'
-import { useTerminalStore, type TerminalStatus } from '../stores/terminal'
+import { useTerminalStore, saveSafeModeDefault, type TerminalStatus } from '../stores/terminal'
 
 const { tabs, activeId, active, openTab, closeTab, setActive, updateTab } = useTerminalStore()
 const { t } = useI18n()
@@ -78,14 +78,51 @@ function onStatus(payload: { id: string; status: TerminalStatus }) {
   updateTab(payload.id, { status: payload.status })
 }
 
-function onSession(payload: { id: string; sessionId: string; cwd: string }) {
+function onSession(payload: {
+  id: string
+  sessionId: string
+  cwd: string
+  noProfile: boolean
+  platform: string
+}) {
   // 后端返回的是平台原生路径（Windows `C:\Users\x`、Linux `/home/x`），分隔符两种都要认
   const name = payload.cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'shell'
-  updateTab(payload.id, { sessionId: payload.sessionId, cwd: payload.cwd, title: name })
+  updateTab(payload.id, {
+    sessionId: payload.sessionId,
+    cwd: payload.cwd,
+    title: name,
+    noProfile: payload.noProfile,
+    platform: payload.platform,
+  })
 }
 
 function onError(message: string) {
   showToast(message)
+}
+
+/**
+ * 切换纯净模式（设计文档 3.3.7）。
+ *
+ * profile 是 shell 启动时加载的，跑起来就改不回去 —— 只能丢掉当前 PTY 重开一个，
+ * 所以这里同时清掉 sessionId 并主动重连。滚动缓冲会丢，这正是「救急」的代价。
+ */
+function toggleSafeMode() {
+  const tab = active.value
+  if (!tab) return
+  const next = !tab.noProfile
+  saveSafeModeDefault(next)
+  updateTab(tab.id, { noProfile: next, sessionId: null, status: 'connecting' })
+  showToast(next ? t('terminal.safeMode.on') : t('terminal.safeMode.off'))
+  // tab 是响应式对象，pane 读到的已是最新 noProfile，重连即按新模式拉起
+  activePane.value?.reconnect()
+}
+
+/** Windows 乱码一键修：把 chcp 65001 直接打进当前 shell */
+function fixCharset() {
+  const pane = activePane.value
+  if (!pane) return
+  pane.sendRaw('chcp 65001\r')
+  showToast(t('terminal.charset.sent'))
 }
 
 /** 状态栏「重新连接」：自动重试已用尽或服务端拒绝后，给一次手动机会 */
@@ -170,6 +207,35 @@ const statusTone: Record<TerminalStatus, string> = {
           <AppIcon name="plus" :size="14" />
         </button>
       </div>
+
+      <!-- 纯净模式（设计文档 3.3.7）：profile 死循环/严重报错时的救急开关 -->
+      <button
+        type="button"
+        class="flex h-7 shrink-0 items-center gap-1 rounded px-1.5 text-[11px] transition-colors"
+        :class="
+          active?.noProfile
+            ? 'bg-accent-soft text-accent'
+            : 'text-muted hover:bg-elevated hover:text-ink'
+        "
+        :title="t('terminal.safeMode.title')"
+        :disabled="!active"
+        @click="toggleSafeMode"
+      >
+        <AppIcon name="shield" :size="13" />
+        <span class="hidden sm:inline">{{ t('terminal.safeMode.label') }}</span>
+      </button>
+
+      <!-- Windows 字符集一键修复：后端已在启动时 chcp 65001，这里兜底被 profile 改回去的情况 -->
+      <button
+        v-if="active?.platform === 'windows'"
+        type="button"
+        class="flex h-7 shrink-0 items-center gap-1 rounded px-1.5 text-[11px] text-muted transition-colors hover:bg-elevated hover:text-ink"
+        :title="t('terminal.charset.title')"
+        @click="fixCharset"
+      >
+        <AppIcon name="refresh" :size="12" />
+        <span class="hidden sm:inline">UTF-8</span>
+      </button>
 
       <button
         type="button"

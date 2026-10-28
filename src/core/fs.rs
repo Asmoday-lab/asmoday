@@ -305,6 +305,11 @@ pub async fn list_dir(
         if crate::core::path_guard::is_part_file(&name) {
             continue;
         }
+        // 跨平台系统垃圾（desktop.ini / Thumbs.db / .DS_Store / ._* / ~$*）
+        // 优先级高于 show_hidden：开关打开也不返回（设计文档 3.3.7）
+        if crate::core::junk::is_system_junk(&name) {
+            continue;
+        }
         // 设计文档 3.2：默认隐藏以 `.` 开头的系统项（.git / .env …），
         // 开关打开时才一并返回；点数仍在分页之前过滤，total/has_more 才是准的
         if !show_hidden && name.starts_with('.') {

@@ -21,7 +21,10 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'session', payload: { id: string; sessionId: string; cwd: string }): void
+  (
+    e: 'session',
+    payload: { id: string; sessionId: string; cwd: string; noProfile: boolean; platform: string },
+  ): void
   (e: 'status', payload: { id: string; status: TerminalStatus }): void
   (e: 'consumed'): void
   (e: 'error', message: string): void
@@ -92,6 +95,8 @@ function wsUrl(): string {
   // 空串/占位符一律不传，交给后端解析系统主目录（设计文档 6.3）
   if (cwd && !PLACEHOLDER_PATH.test(cwd)) params.set('path', cwd)
   if (props.tab.sessionId) params.set('session_id', props.tab.sessionId)
+  // 纯净模式（设计文档 3.3.7）：后端据此加 -NoProfile / --noprofile --norc
+  if (props.tab.noProfile) params.set('no_profile', '1')
   params.set('cols', String(term?.cols ?? 120))
   params.set('rows', String(term?.rows ?? 30))
   return `${scheme}://${window.location.host}${withBase('/api/terminal/ws')}?${params.toString()}`
@@ -169,6 +174,8 @@ function connect() {
           cwd?: string
           message?: string
           warning?: string | null
+          no_profile?: boolean
+          platform?: string
         }
         if (control.type === 'ready' && control.session_id) {
           attempts = 0
@@ -178,6 +185,8 @@ function connect() {
             id: props.tab.id,
             sessionId: control.session_id,
             cwd: control.cwd ?? props.tab.cwd,
+            noProfile: control.no_profile ?? props.tab.noProfile,
+            platform: control.platform ?? '',
           })
           emit('status', { id: props.tab.id, status: 'ready' })
         } else if (control.type === 'error') {

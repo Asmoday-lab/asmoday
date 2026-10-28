@@ -318,6 +318,12 @@ fn scan(
             let Ok(file_type) = entry.file_type() else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
 
+            // 系统垃圾（Thumbs.db / .DS_Store / ._* / ~$*）一律不进媒体库，
+            // 否则相册里会混进一堆打不开的元数据文件（设计文档 3.3.7）
+            if crate::core::junk::is_system_junk(&name) {
+                continue;
+            }
+
             if file_type.is_dir() {
                 if level + 1 <= depth
                     && !name.starts_with('.')

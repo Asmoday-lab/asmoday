@@ -1,6 +1,12 @@
 //! PTY 会话池（设计文档 3.3）。
 //!
 //! - 每个会话是一条真实的系统 shell（Windows 走 ConPTY），不是模拟终端；
+//! - **环境变量全量继承**当前进程（`CommandBuilder::new` 以 `env::vars_os()` 为基线，
+//!   全程**不调用** `env_clear()`）：`PATH` / `HOME` / `USERPROFILE` 原样带下去，
+//!   终端里的 conda / node / cargo 才能像原生终端一样跑（设计文档 3.3.6）；
+//! - 子进程的 stderr 与 stdout 共用同一个 pty 从设备，**不做任何过滤**，
+//!   profile / bashrc 的报错会原样经 WebSocket 推到 xterm（`PSReadLine` 历史
+//!   文件写不进去之类只报错、不中断会话）；
 //! - 输出进环形缓冲区（512 KiB），断线重连时先回放，再追增量；
 //! - 连接数归零后启动 3 分钟回收计时，期间重连即可原地续命；
 //! - 会话 id 由进程内计数器生成，不对外暴露任何 shell 参数拼接。
@@ -22,11 +28,25 @@ pub const MAX_SESSIONS: usize = 10;
 /// 环形缓冲区容量
 const BUFFER_CAPACITY: usize = 512 * 1024;
 
+/// 拉起 shell 的方式（设计文档 3.3.7）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellOptions {
+    /// 纯净模式：跳过 profile / rc，专用于配置文件死循环或严重报错时的救急
+    pub no_profile: bool,
+}
+
+/// 目标平台标识（前端据此决定是否显示「修复乱码」按钮）
+pub const fn platform() -> &'static str {
+    if cfg!(windows) { "windows" } else { "unix" }
+}
+
 /// 一条 PTY 会话。
 pub struct Session {
     pub id: String,
     pub cwd: String,
     pub shell: String,
+    /// 是否以纯净模式拉起（重连时展示用；模式不同不能复用同一会话）
+    pub no_profile: bool,
     pub created: Instant,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -116,6 +136,56 @@ fn default_shell() -> String {
         .unwrap_or_else(|| "/bin/bash".to_string())
 }
 
+/// 按模式挑 shell（设计文档 3.3.7）。
+#[cfg(windows)]
+fn shell_for(_options: ShellOptions) -> String {
+    // Windows 的纯净模式是同一个 powershell.exe 加 `-NoProfile`，二进制不变
+    default_shell()
+}
+
+/// 按模式挑 shell：纯净模式固定 bash。
+///
+/// `--noprofile --norc` 是 bash 专有参数，用户 `$SHELL` 是 zsh/fish 时直接传过去
+/// 会启动失败；所以只在确实有 bash 时切过去，没有就退回原 shell（不加参数）。
+#[cfg(not(windows))]
+fn shell_for(options: ShellOptions) -> String {
+    if options.no_profile && Path::new("/bin/bash").is_file() {
+        return "/bin/bash".to_string();
+    }
+    default_shell()
+}
+
+/// 追加 shell 启动参数。
+///
+/// Windows 的两个关键点：
+/// 1. `-Command chcp 65001` 必须放在 `-Command` 里 —— 它在 profile **之后**执行，
+///    否则用户 profile 里的 `chcp` 会把代码页改回去，中文还是乱码；
+/// 2. `-NoExit` 保证命令跑完不停，否则 powershell 会立刻退出。
+#[cfg(windows)]
+fn apply_shell_args(command: &mut CommandBuilder, _shell: &str, options: ShellOptions) {
+    command.arg("-NoLogo");
+    if options.no_profile {
+        command.arg("-NoProfile");
+    }
+    command.arg("-NoExit");
+    command.arg("-Command");
+    command.arg("chcp.com 65001 > $null");
+}
+
+/// 类 Unix：纯净模式跳过 profile 与 rc（救急用）。
+///
+/// 只有 bash 认这两个参数；其它 shell 一律不加（宁可不纯净，也不能起不来）。
+#[cfg(not(windows))]
+fn apply_shell_args(command: &mut CommandBuilder, shell: &str, options: ShellOptions) {
+    let is_bash = Path::new(shell)
+        .file_name()
+        .map(|name| name.eq_ignore_ascii_case("bash"))
+        .unwrap_or(false);
+    if options.no_profile && is_bash {
+        command.args(["--noprofile", "--norc"]);
+    }
+}
+
 /// 把工作目录转换成目标平台的原生形式再交给 PTY。
 ///
 /// 前端可能传来 POSIX 风格的 `C:/Users/me`；Windows 上路径含空格或中文时
@@ -152,7 +222,13 @@ impl TerminalManager {
     /// 在指定目录拉起一条新会话。
     ///
     /// 超过 [`MAX_SESSIONS`] 时先回收已经断线（无连接）的会话，仍然超限就拒绝。
-    pub fn create(&self, cwd: &Path, cols: u16, rows: u16) -> Result<Arc<Session>, String> {
+    pub fn create(
+        &self,
+        cwd: &Path,
+        cols: u16,
+        rows: u16,
+        options: ShellOptions,
+    ) -> Result<Arc<Session>, String> {
         if self.len() >= MAX_SESSIONS {
             let idle: Vec<String> = self
                 .inner
@@ -184,14 +260,16 @@ impl TerminalManager {
             })
             .map_err(|e| format!("创建 PTY 失败：{e}"))?;
 
-        let shell = default_shell();
+        let shell = shell_for(options);
         let mut command = CommandBuilder::new(&shell);
         // 统一成原生路径再交给 PTY：前端传来的 `C:/Users/me` 在这里变成
         // `C:\Users\me`，避免个别 shell/带空格目录下的启动失败
         let native = native_cwd(cwd);
         command.cwd(&native);
+        // 只覆盖「终端能力」相关变量；`PATH` / `HOME` 等一律继承，绝不 env_clear()
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        apply_shell_args(&mut command, &shell, options);
 
         let child = pair
             .slave
@@ -215,6 +293,7 @@ impl TerminalManager {
             id: id.clone(),
             cwd: session_display(&native),
             shell: shell.clone(),
+            no_profile: options.no_profile,
             created: Instant::now(),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
