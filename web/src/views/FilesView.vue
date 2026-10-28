@@ -1169,19 +1169,6 @@ function goHome() {
   if (route.name !== 'files') void router.replace({ name: 'files' })
 }
 
-/**
- * 面包屑点击（设计文档 3.2.1 语义）：
- * - 多挂载点模式：前两级（🏠 与挂载点名）都回 `/files` 卡片页；
- * - 单挂载点模式：首级回挂载点根目录，其余级打开对应目录。
- */
-function onCrumbClick(index: number, crumb: { label: string; path: string }) {
-  if (index === 0 && !singleMount.value) {
-    goHome()
-    return
-  }
-  void open(crumb.path)
-}
-
 async function open(
   path: string,
   pageNo = 1,
@@ -1851,7 +1838,7 @@ onMounted(boot)
               class="max-w-[160px] shrink-0 truncate rounded px-1.5 py-1 transition-colors hover:bg-elevated"
               :class="index === crumbs.length - 1 ? 'text-ink' : 'text-muted'"
               :title="crumb.label"
-              @click="onCrumbClick(index, crumb)"
+              @click="open(crumb.path)"
             >
               {{ crumb.label }}
             </button>

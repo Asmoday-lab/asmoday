@@ -53,8 +53,10 @@ export async function browseMedia(
 export interface Album {
   name: string
   path: string
-  /** 相册内图片数量（递归统计） */
+  /** 该目录第一层的图片数量（与点进去看到的条数一致） */
   count: number
+  /** 是否就是扫描起点（挂载目录本身也算一本相册，v2.8 口径） */
+  is_root: boolean
   cover: string | null
   /** 封面的 ThumbHash 与平均色 */
   cover_hash: string | null
@@ -68,7 +70,7 @@ export interface AlbumsResult {
   truncated: boolean
 }
 
-/** 相册清单：只回子文件夹，无图文件夹后端已过滤 */
+/** 相册清单：回「直接含图片的目录」（含挂载目录），无图目录后端已过滤 */
 export async function browseAlbums(path?: string, depth = 3): Promise<AlbumsResult> {
   const params = new URLSearchParams({ depth: String(depth) })
   if (path) params.set('path', path)

@@ -302,8 +302,9 @@ async function openAlbum(album: Album) {
   albumLoading.value = true
   albumItems.value = []
   try {
-    // 册内递归展示（与后端统计 count 的口径一致，否则「4 项」点进去只有 1 张）
-    const result = await browseMedia(album.path, 'image', 3)
+    // 只列册内第一层（depth=0 = 不进子目录，与后端统计 count 的口径一致，
+    // v2.8 相册视图同款；递归会把子目录的图也算进来，条数就对不上了）
+    const result = await browseMedia(album.path, 'image', 0)
     albumItems.value = result.items
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
@@ -333,10 +334,18 @@ function albumHash(album: Album): string | null {
 }
 
 /**
+ * 相册标题（v2.8 口径）：挂载目录本身那本册显示「根目录」，其余用目录名。
+ */
+function albumLabel(album: Album): string {
+  return album.is_root ? t('gallery.photos.rootFolder') : album.name
+}
+
+/**
  * 相册副标题（对齐 v2.9 的「N 张 · 路径」）。
- * 相册列表是根下直接子目录，相对路径与册名相同时只显示数量，避免「album-b · album-b」。
+ * 根目录相册与册名重复时只显示数量，避免「根目录 · 根目录」。
  */
 function albumSubtitle(album: Album): string {
+  if (album.is_root) return t('gallery.photos.albumItems', { count: album.count })
   const folder = relativeFolder(album.path)
   return folder === album.name
     ? t('gallery.photos.albumItems', { count: album.count })
@@ -611,7 +620,7 @@ onBeforeUnmount(() => {
             {{ t('gallery.photos.backToAlbums') }}
           </button>
           <div class="min-w-0 flex-1">
-            <p class="truncate text-sm font-semibold text-ink">{{ activeAlbum.name }}</p>
+            <p class="truncate text-sm font-semibold text-ink">{{ albumLabel(activeAlbum) }}</p>
             <p class="truncate text-[12px] text-muted">{{ albumSubtitle(activeAlbum) }}</p>
           </div>
           <button
@@ -692,7 +701,7 @@ onBeforeUnmount(() => {
             type="button"
             class="group text-left"
             :data-album="album.name"
-            :title="album.name"
+            :title="albumLabel(album)"
             @click="openAlbum(album)"
           >
             <div
@@ -724,7 +733,7 @@ onBeforeUnmount(() => {
                 {{ t('gallery.photos.albumItems', { count: album.count }) }}
               </span>
             </div>
-            <p class="mt-2 truncate text-sm font-medium text-ink">{{ album.name }}</p>
+            <p class="mt-2 truncate text-sm font-medium text-ink">{{ albumLabel(album) }}</p>
             <!-- 副标题（对齐 v2.9）：数量 + 册内路径，卡片不只剩一个封面和名字 -->
             <p class="truncate text-[12px] text-muted">{{ albumSubtitle(album) }}</p>
           </button>

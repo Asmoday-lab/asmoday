@@ -46,11 +46,6 @@ encoding_rs = "0.8"
 # WebDAV PROPFIND 的 RFC1123 时间格式（axum 内部同款，不新增传递依赖）
 httpdate = "1"
 
-# Windows 专属：启动时查询进程令牌完整性级别（受限令牌提醒，设计文档 3.3.6）。
-# portable-pty 已带入 windows-sys 0.61，这里复用同一版本，不增加新传递依赖。
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
-
 # 发布体积裁剪（见设计文档 9.1）
 # Windows 下某些 MSVC 环境会在 C 依赖（SQLite / ring 等）上触发
 # cl.exe D8050「无法把命令行放入调试记录」，关闭 dev 调试信息即可绕开。

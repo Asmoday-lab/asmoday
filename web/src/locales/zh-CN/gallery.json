@@ -11,8 +11,8 @@
     "videoBadge": "视频",
     "truncated": "目录过大，仅索引前 4000 项",
     "rootFolder": "根目录",
-    "albumEmpty": "没有找到含照片的文件夹",
-    "albumEmptyHint": "时间线里会展示散落在根目录的照片"
+    "albumEmpty": "没有找到含图片的文件夹",
+    "albumEmptyHint": "把图片放进挂载点（含根目录）就会出现在这里"
   },
   "cinema": {
     "title": "影视库",

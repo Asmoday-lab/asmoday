@@ -5,7 +5,7 @@
     "portal": "聚合主页",
     "files": "文件管理",
     "terminal": "系统终端",
-    "photos": "照片相册",
+    "photos": "图片库",
     "cinema": "影视库",
     "music": "音乐库",
     "shares": "分享与图床",
@@ -17,7 +17,7 @@
   "subtitle": {
     "portal": "服务聚合与运行概览",
     "files": "浏览 · 上传 · 在线编辑",
-    "photos": "相册与时间线",
+    "photos": "相册 · 时间线",
     "cinema": "本地影片与续播",
     "music": "本地音频与歌词",
     "terminal": "真实 PTY 会话与断线保活",

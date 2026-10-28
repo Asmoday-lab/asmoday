@@ -144,16 +144,13 @@ pub async fn ws_handler(
         no_profile: query.no_profile.unwrap_or(false),
     };
 
-    // 受限环境探测提前到升级 WS 之前：历史重定向要在 shell 拉起前就位
-    let probe = crate::core::terminal::probe_shell_env(&state.data_dir);
-    // 两类非致命提示合并：目录落点变化 + 受限环境说明
-    let warning = match (warning, probe.notice.clone()) {
-        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-        (a, b) => a.or(b),
-    };
+    // 历史记录强制隔离（设计文档 3.3.5）：不做探测、不做条件分支，
+    // 一律把 shell 历史钉在 <data>/terminal_history/，绝不碰 %APPDATA% / ~。
+    // 权限受限与重定向本身不提示（前端必须静默），warning 只保留目录落点变化。
+    let env = crate::core::terminal::prepare_env(&state.data_dir);
 
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, cwd, cols, rows, session_id, options, probe, warning)
+        handle_socket(socket, state, cwd, cols, rows, session_id, options, env, warning)
     })
 }
 
@@ -209,7 +206,7 @@ async fn handle_socket(
     rows: u16,
     session_id: Option<String>,
     options: crate::core::terminal::ShellOptions,
-    probe: crate::core::terminal::ShellProbe,
+    env: crate::core::terminal::TerminalEnv,
     warning: Option<String>,
 ) {
     let manager = state.terminals.clone();
@@ -223,7 +220,7 @@ async fn handle_socket(
     let reconnected = existing.is_some();
     let session = match existing {
         Some(session) => session,
-        None => match manager.create(&cwd, cols, rows, options, &probe) {
+        None => match manager.create(&cwd, cols, rows, options, &env) {
             Ok(session) => session,
             Err(message) => {
                 let mut socket = socket;

@@ -118,7 +118,6 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "toml",
- "windows-sys",
 ]
 
 [[package]]

@@ -43,193 +43,38 @@ fn absolutize(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(stripped.to_string())
 }
 
-/// shell 环境探测结果（与本地 shell 一致性自愈，设计文档 3.3.6）。
+/// 终端启动环境（设计文档 3.3.5，历史记录强制隔离：极高优先级）。
 ///
-/// 服务进程可能运行在受限令牌下（Windows 低完整性级别 / 类 Unix 主目录只读），
-/// 此时 shell 写自己的历史文件必然「访问被拒绝」——PSReadLine 每敲一条命令
-/// 就报一次红字，conda/npm 写配置全挂，终端体验和本地天差地别。
-/// 探测到这种情况时，把历史文件重定向到数据目录（依然全站共享一份，等价于
-/// 本地多窗口共享历史），并在终端里打一条一次性说明。
+/// **绝不依赖系统目录**：无论进程是否有管理员权限，一律把 shell 历史指向
+/// `<data_dir>/terminal_history/`，不再去碰 `%APPDATA%\...\PSReadLine` 或
+/// `~/.bash_history`。Windows 的 UAC / 低完整性级别令牌下，写用户目录必被拒，
+/// 那就会变成「每敲一条命令就红字一次」——所以不做探测、不做条件分支，
+/// 直接隔离，终端行为和原生完全一致，前端也无需弹任何提示。
 #[derive(Debug, Clone, Default)]
-pub struct ShellProbe {
-    /// 历史文件替代路径；`None` = 默认路径可写，不做任何干预
-    pub history_override: Option<String>,
-    /// 已本地化的说明文字（打进终端 + 随 ready 帧给前端）
-    pub notice: Option<String>,
+pub struct TerminalEnv {
+    /// 隔离后的历史文件绝对路径（已展开，不依赖 shell 自己的 cwd）
+    pub history_path: Option<String>,
 }
 
-impl ShellProbe {
-    /// 是否处于受限环境
-    pub fn degraded(&self) -> bool {
-        self.history_override.is_some()
-    }
-}
-
-/// 当前进程令牌的完整性级别 RID（Windows 专用，设计文档 3.3.6）。
+/// 准备隔离的历史目录（设计文档 3.3.5）。
 ///
-/// `0x1000` 低 / `0x2000` 中 / `0x3000` 高。低完整性级别下终端子进程继承令牌，
-/// 对用户目录（中完整性）一切写入被拒——这就是「PSReadLine 历史访问被拒绝」
-/// 的根因。启动时查一次并在服务日志提醒，让双击/服务方式启动的用户不用等到
-/// 打开终端才发现。查询失败返回 `None`（宁可不报，不误报）。
-#[cfg(windows)]
-pub fn process_integrity_level() -> Option<u32> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    unsafe {
-        let mut token = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return None;
-        }
-        let result = (|| {
-            // 先取所需长度（第一次调用必然失败，靠 returnlength 拿尺寸）
-            let mut len = 0u32;
-            let _ = GetTokenInformation(token, TokenIntegrityLevel, std::ptr::null_mut(), 0, &mut len);
-            if len == 0 {
-                return None;
-            }
-            let mut buffer = vec![0u8; len as usize];
-            if GetTokenInformation(
-                token,
-                TokenIntegrityLevel,
-                buffer.as_mut_ptr().cast(),
-                len,
-                &mut len,
-            ) == 0
-            {
-                return None;
-            }
-            let label = buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
-            let sid = (*label).Label.Sid;
-            if sid.is_null() {
-                return None;
-            }
-            let count = *GetSidSubAuthorityCount(sid);
-            if count == 0 {
-                return None;
-            }
-            Some(*GetSidSubAuthority(sid, u32::from(count) - 1))
-        })();
-        CloseHandle(token);
-        result
-    }
-}
-
-/// 非 Windows 平台没有完整性级别概念，恒为 `None`。
-#[cfg(not(windows))]
-pub fn process_integrity_level() -> Option<u32> {
-    None
-}
-
-/// 探测默认历史路径是否可写，不可写则给出数据目录下的替代路径。
-///
-/// Windows 探测的是 PSReadLine 的历史文件；类 Unix 探测 `$HOME` 可写性
-/// （bash/zsh 的 `HISTFILE` 都落在主目录）。探测只在拉起会话时做一次，开销可忽略。
-///
-/// 注意 `data_dir` 会被先规范化成绝对路径：`-d data` 这类相对参数如果不展开，
-/// 注入给 PSReadLine 的 HistorySavePath 就会按 **shell 自己的 cwd**（往往是
+/// `data_dir` 会先规范化成绝对路径：`-d data` 这类相对参数如果不展开，
+/// 注入给 PSReadLine 的 HistorySavePath 会按 **shell 自己的 cwd**（往往是
 /// 主目录）解析，历史写去一个谁都找不到的地方。
-#[cfg(windows)]
-pub fn probe_shell_env(data_dir: &Path) -> ShellProbe {
-    use std::fs::OpenOptions;
-
+///
+/// 目录建不出来（磁盘满 / 权限全坏）时仍然注入路径——让 shell 自己报错并
+/// 原样透传，绝不回退到系统目录。
+pub fn prepare_env(data_dir: &Path) -> TerminalEnv {
     let data_dir = absolutize(data_dir);
-    let appdata = match std::env::var("APPDATA") {
-        Ok(value) if !value.trim().is_empty() => std::path::PathBuf::from(value),
-        // APPDATA 缺失时按 Known Folder 的常见位置猜；猜错也只是探测错，不会写坏东西
-        _ => match dirs::home_dir() {
-            Some(home) => home.join("AppData").join("Roaming"),
-            None => return ShellProbe::default(),
-        },
+    let dir = data_dir.join("terminal_history");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = if cfg!(windows) {
+        dir.join("ConsoleHost_history.txt")
+    } else {
+        dir.join(".bash_history")
     };
-    let history = appdata
-        .join("Microsoft")
-        .join("Windows")
-        .join("PowerShell")
-        .join("PSReadLine")
-        .join("ConsoleHost_history.txt");
-
-    // PSReadLine 自己会在首次保存时建目录，这里只探测：目录可建 + 文件可追加
-    if let Some(parent) = history.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let writable = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&history)
-        .is_ok();
-    if writable {
-        return ShellProbe::default();
-    }
-
-    let fallback_dir = data_dir.join("terminal");
-    let fallback = fallback_dir.join("ConsoleHost_history.txt");
-    let usable = std::fs::create_dir_all(&fallback_dir).is_ok()
-        && OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&fallback)
-            .is_ok();
-    if !usable {
-        // 连数据目录都写不了（磁盘满 / 权限全坏）就只能原样放行，让 shell 自己报错
-        return ShellProbe::default();
-    }
-
-    ShellProbe {
-        history_override: Some(fallback.to_string_lossy().into_owned()),
-        notice: Some(
-            "检测到服务进程运行在受限令牌下（低完整性级别），无法写入系统 PSReadLine 历史；\
-             本会话已把命令历史重定向到数据目录，其余功能不受影响。\
-             若要与本地终端完全一致，请以正常方式重启服务。"
-                .to_string(),
-        ),
-    }
-}
-
-/// 类 Unix 版：探测 `$HOME` 可写性，不可写时把 `HISTFILE` 指到数据目录。
-#[cfg(not(windows))]
-pub fn probe_shell_env(data_dir: &Path) -> ShellProbe {
-    use std::fs::OpenOptions;
-
-    // 同 Windows：相对 data_dir 必须先展开成绝对路径，HISTFILE 才靠得住
-    let data_dir = absolutize(data_dir);
-    let Some(home) = dirs::home_dir() else {
-        return ShellProbe::default();
-    };
-    let probe = home.join(".asmoday-history-probe");
-    let writable = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .is_ok();
-    if writable {
-        let _ = std::fs::remove_file(&probe);
-        return ShellProbe::default();
-    }
-
-    let fallback_dir = data_dir.join("terminal");
-    let fallback = fallback_dir.join(".bash_history");
-    let usable = std::fs::create_dir_all(&fallback_dir).is_ok()
-        && OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&fallback)
-            .is_ok();
-    if !usable {
-        return ShellProbe::default();
-    }
-
-    ShellProbe {
-        history_override: Some(fallback.to_string_lossy().into_owned()),
-        notice: Some(
-            "检测到主目录不可写（服务进程权限受限），本会话已把 shell 历史重定向到数据目录。\
-             若要与本地终端完全一致，请以正常方式重启服务。"
-                .to_string(),
-        ),
+    TerminalEnv {
+        history_path: Some(file.to_string_lossy().into_owned()),
     }
 }
 
@@ -366,34 +211,34 @@ fn shell_for(options: ShellOptions) -> String {
     default_shell()
 }
 
-/// 组装 Windows `-Command` 的载荷。
+/// 组装 Windows `-Command` 的载荷（设计文档 3.3.5）。
 ///
-/// 两个关键点：
-/// 1. `chcp 65001` 放在 `-Command` 里 —— 它在 profile **之后**执行，
-///    否则用户 profile 里的 `chcp` 会把代码页改回去，中文还是乱码；
-/// 2. 历史文件重定向（受限令牌自愈）排在 chcp **之前**：Set-PSReadLineOption
-///    必须在用户敲第一条命令前生效，否则第一条命令就会触发一次红字报错。
-fn windows_command_payload(history_override: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(path) = history_override {
+/// 顺序是硬要求：
+/// 1. `chcp 65001` **优先**：先切 UTF-8 代码页，之后所有输出（含 profile 报错）才不乱码；
+/// 2. `Set-PSReadLineOption -HistorySavePath` 把历史钉死在隔离目录，用户敲第一条
+///    命令前就生效——绝不落到 `%APPDATA%`（受限令牌下必被拒，红字会一条接一条）。
+fn windows_command_payload(history_path: Option<&str>) -> String {
+    let mut parts: Vec<String> = vec!["chcp.com 65001 > $null".to_string()];
+    if let Some(path) = history_path {
         // PowerShell 单引号字符串里，' 用 '' 转义
         let escaped = path.replace('\'', "''");
         parts.push(format!("Set-PSReadLineOption -HistorySavePath '{escaped}'"));
     }
-    parts.push("chcp.com 65001 > $null".to_string());
     parts.join("; ")
 }
 
 /// 追加 shell 启动参数。
 ///
-/// Windows 走 `-NoExit -Command`：无论是否需要历史重定向，`-Command` 传进去的
-/// 命令都不算交互输入，**不会**污染 PSReadLine 历史或屏幕输出。
+/// Windows 走 `-NoExit -Command`：`-NoExit` 保证 `-Command` 执行完后**留在交互式
+/// 会话里**（否则 PowerShell 会直接退出），同时 `$PROFILE` 照常加载——Conda、fnm
+/// 的初始化都写在那里，不带 `-NoExit` 的 `-Command` 会让这些环境变量全丢。
+/// `-Command` 传进去的命令不算交互输入，**不会**污染 PSReadLine 历史或屏幕输出。
 #[cfg(windows)]
 fn apply_shell_args(
     command: &mut CommandBuilder,
     _shell: &str,
     options: ShellOptions,
-    history_override: Option<&str>,
+    history_path: Option<&str>,
 ) {
     command.arg("-NoLogo");
     if options.no_profile {
@@ -401,7 +246,7 @@ fn apply_shell_args(
     }
     command.arg("-NoExit");
     command.arg("-Command");
-    command.arg(windows_command_payload(history_override));
+    command.arg(windows_command_payload(history_path));
 }
 
 /// 类 Unix：默认以 **Login Shell** 启动（设计文档 3.3.5）。
@@ -414,10 +259,10 @@ fn apply_shell_args(
     command: &mut CommandBuilder,
     shell: &str,
     options: ShellOptions,
-    history_override: Option<&str>,
+    history_path: Option<&str>,
 ) {
     // 历史重定向靠 HISTFILE 环境变量（bash/zsh 都认），放在参数处理之前
-    if let Some(path) = history_override {
+    if let Some(path) = history_path {
         command.env("HISTFILE", path);
     }
 
@@ -478,14 +323,14 @@ impl TerminalManager {
     /// 在指定目录拉起一条新会话。
     ///
     /// 超过 [`MAX_SESSIONS`] 时先回收已经断线（无连接）的会话，仍然超限就拒绝。
-    /// `probe` 是 [`probe_shell_env`] 的结果：受限环境下带历史重定向与用户说明。
+    /// `env` 是 [`prepare_env`] 的结果：历史文件已隔离到数据目录。
     pub fn create(
         &self,
         cwd: &Path,
         cols: u16,
         rows: u16,
         options: ShellOptions,
-        probe: &ShellProbe,
+        env: &TerminalEnv,
     ) -> Result<Arc<Session>, String> {
         if self.len() >= MAX_SESSIONS {
             let idle: Vec<String> = self
@@ -524,10 +369,15 @@ impl TerminalManager {
         // `C:\Users\me`，避免个别 shell/带空格目录下的启动失败
         let native = native_cwd(cwd);
         command.cwd(&native);
-        // 只覆盖「终端能力」相关变量；`PATH` / `HOME` 等一律继承，绝不 env_clear()
+        // 设计文档 3.3.5：必须完整继承父进程环境变量。portable-pty 默认就继承，
+        // 这里显式写一遍，防止将来有人加 `env_clear()` 把 PATH / HOME / conda 弄丢。
+        for (key, value) in std::env::vars_os() {
+            command.env(key, value);
+        }
+        // 只覆盖「终端能力」相关变量
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        apply_shell_args(&mut command, &shell, options, probe.history_override.as_deref());
+        apply_shell_args(&mut command, &shell, options, env.history_path.as_deref());
 
         let child = pair
             .slave
@@ -590,16 +440,9 @@ impl TerminalManager {
                 .map_err(|e| format!("启动 PTY 读取线程失败：{e}"))?;
         }
 
-        // 受限环境说明：写进环缓冲（重连回放也在）+ 广播给当前连接
-        if let Some(notice) = &probe.notice {
-            let banner = format!(
-                "\r\n\x1b[33m[asmoday] {notice}\x1b[0m\r\n"
-            );
-            if let Ok(mut buffer) = session.buffer.lock() {
-                buffer.extend(banner.bytes());
-            }
-            let _ = session.output.send(banner.into_bytes());
-        }
+        // 历史文件已强制隔离到数据目录（设计文档 3.3.5），
+        // 这里不再往终端里打任何「权限受限 / 已重定向」的横幅：前端必须静默，
+        // 终端要像原生一样顺滑。
 
         self.inner
             .lock()
@@ -673,11 +516,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_probe_default_is_healthy() {
-        let probe = ShellProbe::default();
-        assert!(!probe.degraded());
-        assert!(probe.history_override.is_none());
-        assert!(probe.notice.is_none());
+    fn history_is_always_isolated_under_data_dir() {
+        let temp = std::env::temp_dir().join("asmoday-term-env-test");
+        let _ = std::fs::create_dir_all(&temp);
+        let env = prepare_env(&temp);
+        let path = env.history_path.expect("历史路径必须总是给出（强制隔离）");
+        let normalized = path.replace('\\', "/");
+        assert!(
+            normalized.contains("/terminal_history/"),
+            "历史必须落在 data/terminal_history/：{path}"
+        );
+        // 绝不指向系统 PSReadLine 历史目录（受限令牌下必失败）
+        assert!(!normalized.to_lowercase().contains("powershell/psreadline"));
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[cfg(windows)]
@@ -689,14 +540,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_command_redirects_history_before_chcp() {
-        let payload = windows_command_payload(Some(r"C:/data/terminal/ConsoleHost_history.txt"));
-        assert!(payload.starts_with("Set-PSReadLineOption -HistorySavePath 'C:"));
-        // 重定向必须在 chcp 之前：第一条命令敲下去时 PSReadLine 就要用新路径
-        let redirect = payload.find("Set-PSReadLineOption").unwrap();
-        let chcp = payload.find("chcp.com").unwrap();
-        assert!(redirect < chcp);
-        assert!(payload.ends_with("ConsoleHost_history.txt'; chcp.com 65001 > $null"));
+    fn windows_command_chcp_first_then_history() {
+        let payload = windows_command_payload(Some("C:/data/terminal_history/ConsoleHost_history.txt"));
+        // 设计文档 3.3.5：chcp 65001 优先发送
+        assert!(payload.starts_with("chcp.com 65001 > $null; "));
+        assert!(payload.contains(
+            r"Set-PSReadLineOption -HistorySavePath 'C:/data/terminal_history/ConsoleHost_history.txt'"
+        ));
     }
 
     #[cfg(windows)]
@@ -708,29 +558,42 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn unix_probe_reports_unwritable_home() {
-        // 用一个必然不可写的目录当数据目录，探测只验证「能给出替代路径」的结构
-        let temp = std::env::temp_dir().join("asmoday-term-probe-test");
+    fn unix_history_file_lands_in_data_dir() {
+        let temp = std::env::temp_dir().join("asmoday-term-unix-test");
         let _ = std::fs::create_dir_all(&temp);
-        let probe = probe_shell_env(&temp);
-        if let Some(path) = &probe.history_override {
-            assert!(path.contains("terminal"));
-        }
+        let env = prepare_env(&temp);
+        let path = env.history_path.unwrap();
+        assert!(path.replace('\\', "/").ends_with("terminal_history/.bash_history"));
         let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn integrity_level_query_does_not_panic() {
-        // 无法断言具体级别（取决于运行环境），只保证查询安全且结果自洽
-        if let Some(level) = process_integrity_level() {
-            assert!(level > 0, "integrity RID should be positive");
-        }
     }
 
     #[cfg(windows)]
     #[test]
-    fn integrity_level_threshold_matches_mandatory_levels() {
-        // 语义校验：低 < 中 < 高（0x1000 / 0x2000 / 0x3000）
-        assert!(0x1000 < 0x2000 && 0x2000 < 0x3000);
+    fn windows_args_keep_noexit_and_profile() {
+        let mut command = CommandBuilder::new("powershell.exe");
+        apply_shell_args(&mut command, "powershell.exe", ShellOptions::default(), Some("C:/h.txt"));
+        let args: Vec<String> = command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        // -NoExit 必须在：否则 -Command 执行完 PowerShell 直接退出，$PROFILE 也白加载
+        assert!(args.contains(&"-NoExit".to_string()));
+        assert!(!args.contains(&"-NoProfile".to_string()));
+
+        // 纯净模式逃生舱
+        let mut pure = CommandBuilder::new("powershell.exe");
+        apply_shell_args(
+            &mut pure,
+            "powershell.exe",
+            ShellOptions { no_profile: true },
+            None,
+        );
+        let pure_args: Vec<String> = pure
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(pure_args.contains(&"-NoProfile".to_string()));
     }
 }
