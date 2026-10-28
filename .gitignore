@@ -1,5 +1,8 @@
 /target
 
+# 会话临时脚本 / 测试沙箱（跑完即删，绝不入库）
+/.scratch
+
 # 前端产物（由 vite build 输出，供 rust-embed 打包）
 /dist
 
