@@ -513,10 +513,10 @@ fn copy_file_with_retry(
 /// 流式复制（禁止 `read()` 整个文件，设计文档 8.5 第 4 条）
 fn stream_copy(src: &Path, part: &Path) -> Result<u64, FsError> {
     let input = std::fs::File::open(src)
-        .map_err(|e| FsError::Io(format!("打开源文件失败：{e}")))?;
+        .map_err(|e| map_io_error(e, "打开源文件失败", src))?;
     let mut reader = BufReader::with_capacity(COPY_BUFFER, input);
     let output = std::fs::File::create(part)
-        .map_err(|e| FsError::Io(format!("创建临时文件失败：{e}")))?;
+        .map_err(|e| map_io_error(e, "创建临时文件失败", part))?;
     let mut writer = BufWriter::with_capacity(COPY_BUFFER, output);
 
     let mut total = 0u64;
@@ -524,7 +524,7 @@ fn stream_copy(src: &Path, part: &Path) -> Result<u64, FsError> {
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|e| FsError::Io(format!("读取源文件失败：{e}")))?;
+            .map_err(|e| map_io_error(e, "读取源文件失败", src))?;
         if read == 0 {
             break;
         }
@@ -550,7 +550,22 @@ fn map_write_error(err: std::io::Error, path: &Path) -> FsError {
             normalize_display(path)
         ));
     }
-    FsError::Io(format!("写入失败：{err}"))
+    map_io_error(err, "写入失败", path)
+}
+
+/// Windows 共享冲突（os error 32/33）单独成码（E_BUSY）。
+///
+/// 「文件正被别的程序占用」是用户可自救的状态（关掉占用程序、稍后重试），
+/// 报成 500「服务器内部错误」既吓人又没信息。典型场景：下载器还在写
+/// Downloads 里的文件，用户马上就复制它。
+fn map_io_error(err: std::io::Error, action: &str, path: &Path) -> FsError {
+    if matches!(err.raw_os_error(), Some(32) /* ERROR_SHARING_VIOLATION */ | Some(33) /* ERROR_LOCK_VIOLATION */) {
+        return FsError::Busy(format!(
+            "{action}：文件正被其他程序占用（{}）",
+            normalize_display(path)
+        ));
+    }
+    FsError::Io(format!("{action}：{err}"))
 }
 
 fn copy_dir_contents(src: &Path, dest: &Path) -> Result<(), FsError> {
@@ -819,6 +834,37 @@ pub fn ensure_space(dir: &Path, needed: u64) -> Result<(), FsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_sharing_violation_maps_to_busy_not_internal() {
+        // os error 32/33（文件被占用）必须映射成 E_BUSY，而不是 500 服务器内部错误
+        let err = map_io_error(
+            std::io::Error::from_raw_os_error(32),
+            "打开源文件失败",
+            Path::new("C:/Downloads/a.jpg"),
+        );
+        assert!(matches!(err, FsError::Busy(_)), "实际：{err:?}");
+        assert_eq!(
+            crate::api::error::code_of(&err),
+            "E_BUSY",
+            "用户可自救的占用错误不能报成 500"
+        );
+        assert_eq!(
+            crate::api::error::code_of(&map_io_error(
+                std::io::Error::from_raw_os_error(33),
+                "写入失败",
+                Path::new("C:/Downloads/a.jpg"),
+            )),
+            "E_BUSY"
+        );
+        // 其他 IO 错误维持 E_INTERNAL 不变
+        let plain = map_io_error(
+            std::io::Error::other("boom"),
+            "打开源文件失败",
+            Path::new("C:/a.txt"),
+        );
+        assert_eq!(crate::api::error::code_of(&plain), "E_INTERNAL");
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

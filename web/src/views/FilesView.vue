@@ -394,7 +394,9 @@ function showTransferResult(mode: TransferMode, summary: TransferSummary) {
 }
 
 function failureText(item: { error_code?: string; message?: string }) {
-  return localizedCode(item.error_code) ?? item.message ?? t('common.state.unknownError')
+  // 后端 message 是中文且指向具体原因（如「文件正被其他程序占用」），
+  // 比通用错误码文案更有用；只有 message 缺失时才退回错误码翻译。
+  return item.message?.trim() || localizedCode(item.error_code) || t('common.state.unknownError')
 }
 
 // ---------------- 多选（设计文档 3.2.6.6 / 8.6） ----------------
@@ -2529,7 +2531,7 @@ onMounted(boot)
       </div>
     </div>
 
-    <!-- 批量结果汇总（设计文档 6.2：逐项 error_code 翻译，不甩英文 message） -->
+    <!-- 批量结果汇总（设计文档 6.2：逐项展示后端中文 message，缺 message 才退回 error_code 翻译） -->
     <div
       v-if="resultDialog"
       class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"

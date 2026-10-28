@@ -159,22 +159,47 @@ pub struct TerminalManager {
     counter: Arc<AtomicUsize>,
 }
 
-/// 默认 Shell（设计文档 3.3 / 6.3）。
+/// 默认 Shell（设计文档 3.3 / 3.3.5）。
 ///
-/// - Windows：显式拉起 `powershell.exe`。`%COMSPEC%` 指向的是 cmd.exe，
-///   不符合设计要求；优先用 System32 下的绝对路径，避免 PATH 被改坏时找不到。
+/// - Windows：**优先 PowerShell 7（pwsh.exe）**。Conda、fnm 这类工具的初始化
+///   通常只写在 pwsh 7 的 `$PROFILE`（`Documents\PowerShell\`）里，5.1 的
+///   `powershell.exe` 读的是另一份 `Documents\WindowsPowerShell\` profile——
+///   固定拉 5.1 会出现「终端里 node 找不到」的落差（Windows Terminal 装了
+///   pwsh 时同样默认用它）。逐个候选探测，都没有才回退 System32 的 5.1。
 /// - 类 Unix：读 `$SHELL`，不可用（未设置或文件不存在）时回退 `/bin/bash`。
 #[cfg(windows)]
 fn default_shell() -> String {
-    if let Ok(root) = std::env::var("SystemRoot") {
-        let candidate = Path::new(&root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        if candidate.is_file() {
-            return candidate.to_string_lossy().to_string();
+    // 依优先级排列的候选：商店版 pwsh 的执行别名也认（该目录只列已安装应用的别名）
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for root in ["ProgramFiles", "ProgramW6432"] {
+        if let Ok(dir) = std::env::var(root) {
+            candidates.push(
+                Path::new(&dir)
+                    .join("PowerShell")
+                    .join("7")
+                    .join("pwsh.exe"),
+            );
         }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(
+            Path::new(&local)
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("pwsh.exe"),
+        );
+    }
+    if let Ok(root) = std::env::var("SystemRoot") {
+        candidates.push(
+            Path::new(&root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+        );
+    }
+    if let Some(shell) = candidates.into_iter().find(|p| p.is_file()) {
+        return shell.to_string_lossy().to_string();
     }
     let fallback = Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
     if fallback.is_file() {
@@ -195,7 +220,7 @@ fn default_shell() -> String {
 /// 按模式挑 shell（设计文档 3.3.7）。
 #[cfg(windows)]
 fn shell_for(_options: ShellOptions) -> String {
-    // Windows 的纯净模式是同一个 powershell.exe 加 `-NoProfile`，二进制不变
+    // Windows 的纯净模式是同一个 shell exe 加 `-NoProfile`，二进制不变
     default_shell()
 }
 
@@ -565,6 +590,31 @@ mod tests {
         let path = env.history_path.unwrap();
         assert!(path.replace('\\', "/").ends_with("terminal_history/.bash_history"));
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_shell_prefers_pwsh7_when_installed() {
+        let shell = default_shell();
+        // 装了 pwsh 7 就必须优先拉起：Conda/fnm 初始化通常只写在 pwsh 7 的
+        // $PROFILE 里，5.1 读不到（表现为终端里 node 找不到）
+        let pwsh_installed = ["ProgramFiles", "ProgramW6432"].iter().any(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|dir| Path::new(&dir).join("PowerShell").join("7").join("pwsh.exe").is_file())
+                .unwrap_or(false)
+        });
+        if pwsh_installed {
+            assert!(
+                shell.to_lowercase().ends_with("pwsh.exe"),
+                "装了 pwsh 7 就必须优先拉起，实际：{shell}"
+            );
+        }
+        // 无论走哪个候选，都必须是本机真实存在的可执行文件
+        assert!(
+            Path::new(&shell).is_file() || shell == "powershell.exe",
+            "默认 shell 必须真实存在：{shell}"
+        );
     }
 
     #[cfg(windows)]
