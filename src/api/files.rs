@@ -44,6 +44,24 @@ pub struct PathQuery {
     pub path: String,
 }
 
+/// `PUT /api/files/raw` 的保存选项（设计文档 3.2.2.1）。
+///
+/// 三个参数都**可选**：前端读文件时拿到了原文件的编码 / 换行 / BOM，保存时原样带回；
+/// 老客户端不带参数时按「磁盘上现有文件」的元信息推断，绝不默认成 LF 覆盖。
+#[derive(Debug, Deserialize)]
+pub struct SaveQuery {
+    pub path: String,
+    /// `lf` / `crlf`
+    #[serde(default)]
+    pub eol: Option<String>,
+    /// `1` / `0`（也接受 true/false）
+    #[serde(default)]
+    pub bom: Option<String>,
+    /// `utf-8` / `gbk` / `utf-16le` / `utf-16be`
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
 async fn roots_for(state: &AppState) -> RootSet {
     let config = state.config.read().await;
     fs::load_roots(&config, &state.cwd)
@@ -230,10 +248,86 @@ pub async fn raw(
     }
 }
 
+/// GET /api/files/text：编辑器专用的 JSON 读取（设计文档 3.2.2.1）。
+///
+/// 与 `/api/files/raw` 的区别是**带元信息**：字符编码、换行符风格、是否有 BOM。
+/// 内容里的换行符统一成 `\n` 传输，保存时由服务端按 `eol_type` 还原。
+pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    let set = mounts_for(&state).await;
+    let Some(mount) = set.find_by_path_text(&query.path) else {
+        return fs_error(FsError::NotFound(format!("路径不在任何挂载点内：{}", query.path)));
+    };
+    let path = match path_guard::resolve_existing(mount, &query.path) {
+        Ok(path) => path,
+        Err(err) => return fs_error(err),
+    };
+
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta,
+        Err(e) => return fs_error(FsError::Io(format!("读取文件信息失败：{e}"))),
+    };
+    if meta.is_dir() {
+        return fail(StatusCode::BAD_REQUEST, "目标是目录，无法用编辑器打开");
+    }
+    if meta.len() as usize > MAX_EDIT_BYTES {
+        return fail_code(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "E_TOO_LARGE",
+            format!("文件超过编辑器上限（{} MiB）", MAX_EDIT_BYTES / 1024 / 1024),
+        );
+    }
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = fs::extension_of_name(&name);
+    let (kind, editable) = fs::classify_name(&name, &ext, false);
+    if kind != "text" || !editable {
+        return fail_code(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "E_NOT_TEXT",
+            "内置编辑器只支持文本类文件",
+        );
+    }
+
+    let raw = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) => return fs_error(FsError::Io(format!("读取文件失败：{e}"))),
+    };
+
+    // 解不出干净文本就报错，绝不把替换字符（�）喂给编辑器让用户「保存」回磁盘
+    let decoded = match crate::core::text_codec::decode(&raw) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            return fail_code(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "E_ENCODING",
+                err.message(),
+            );
+        }
+    };
+
+    Json(json!({
+        "path": fs::normalize_display(&path),
+        "name": name,
+        "content": decoded.text,
+        "encoding": decoded.encoding.as_str(),
+        "encoding_label": decoded.encoding.label(),
+        "eol_type": decoded.eol.as_str(),
+        "eol_label": decoded.eol.label(),
+        "has_bom": decoded.has_bom,
+        "mixed_eol": decoded.mixed_eol,
+        "size": raw.len(),
+        "readonly": mount.info.readonly,
+    }))
+    .into_response()
+}
+
 /// PUT /api/files/raw：文本文件写回。
 pub async fn write_text(
     State(state): State<AppState>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<SaveQuery>,
     body: Bytes,
 ) -> Response {
     if body.len() > MAX_EDIT_BYTES {
@@ -243,8 +337,17 @@ pub async fn write_text(
         );
     }
 
-    let set = roots_for(&state).await;
-    let path = match fs::resolve_existing(&query.path, &set.allowed) {
+    let set = mounts_for(&state).await;
+    let Some(mount) = set.find_by_path_text(&query.path) else {
+        return fs_error(FsError::NotFound(format!(
+            "路径不在任何挂载点内：{}",
+            query.path
+        )));
+    };
+    if let Err(err) = mount.ensure_writable() {
+        return fs_error(err);
+    }
+    let path = match path_guard::resolve_existing(mount, &query.path) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -270,9 +373,49 @@ pub async fn write_text(
         );
     }
 
-    if std::str::from_utf8(&body).is_err() {
-        return fail_code(StatusCode::BAD_REQUEST, "NOT_TEXT", "Content is not valid UTF-8 text");
-    }
+    let text = match std::str::from_utf8(&body) {
+        Ok(text) => text,
+        Err(_) => {
+            return fail_code(StatusCode::BAD_REQUEST, "NOT_TEXT", "Content is not valid UTF-8 text");
+        }
+    };
+
+    // 目标风格：显式参数优先，其次沿用磁盘上现有文件的编码 / 换行 / BOM
+    let existing = read_style_snapshot(&path).await;
+    let encoding = match query.encoding.as_deref() {
+        Some(raw) => match crate::core::text_codec::TextEncoding::parse(raw) {
+            Some(encoding) => encoding,
+            None => return fail(StatusCode::BAD_REQUEST, format!("不支持的编码：{raw}")),
+        },
+        None => existing.0,
+    };
+    let eol = match query.eol.as_deref() {
+        Some(raw) => match crate::core::text_codec::Eol::parse(raw) {
+            Some(eol) => eol,
+            None => return fail(StatusCode::BAD_REQUEST, format!("不支持的换行符：{raw}")),
+        },
+        None => existing.1,
+    };
+    let bom = match query.bom.as_deref() {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => return fail(StatusCode::BAD_REQUEST, format!("bom 参数不合法：{other}")),
+        },
+        None => existing.2,
+    };
+
+    // 编码不可逆（例如 GBK 文件里出现 emoji）：拒绝写盘，宁可报错也不落一坨乱码
+    let encoded = match crate::core::text_codec::encode(text, encoding, eol, bom) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return fail_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "E_ENCODING",
+                err.message(),
+            );
+        }
+    };
 
     // 原子替换：同目录临时文件 + rename，避免写一半断电导致文件损坏
     let file_name = path
@@ -281,7 +424,7 @@ pub async fn write_text(
         .unwrap_or_else(|| "file".to_string());
     let tmp = path.with_file_name(format!(".{file_name}.asmoday-save.tmp"));
 
-    if let Err(e) = tokio::fs::write(&tmp, &body).await {
+    if let Err(e) = tokio::fs::write(&tmp, &encoded).await {
         return fs_error(FsError::Io(format!("写入临时文件失败：{e}")));
     }
     if let Err(e) = tokio::fs::rename(&tmp, &path).await {
@@ -292,9 +435,28 @@ pub async fn write_text(
     Json(json!({
         "status": "ok",
         "path": fs::normalize_display(&path),
-        "size": body.len(),
+        "size": encoded.len(),
+        // 回传实际落盘风格，前端据此刷新状态栏（避免客户端与服务端推断不一致）
+        "encoding": encoding.as_str(),
+        "encoding_label": encoding.label(),
+        "eol_type": eol.as_str(),
+        "has_bom": bom && encoding != crate::core::text_codec::TextEncoding::Gbk,
     }))
     .into_response()
+}
+
+/// 现有文件的（编码, 换行, BOM）；读不出来或解不出来时退回 UTF-8 / LF / 无 BOM。
+async fn read_style_snapshot(
+    path: &std::path::Path,
+) -> (crate::core::text_codec::TextEncoding, crate::core::text_codec::Eol, bool) {
+    use crate::core::text_codec::{Eol, TextEncoding};
+    match tokio::fs::read(path).await {
+        Ok(bytes) => match crate::core::text_codec::decode(&bytes) {
+            Ok(decoded) => (decoded.encoding, decoded.eol, decoded.has_bom),
+            Err(_) => (TextEncoding::Utf8, Eol::Lf, false),
+        },
+        Err(_) => (TextEncoding::Utf8, Eol::Lf, false),
+    }
 }
 
 /// 供其它模块复用的配置快照读取（阶段三终端联动会用到挂载点校验）。

@@ -29,10 +29,12 @@ import {
   filesApi,
   summarizeResults,
   type EntryInfo,
+  type EolType,
   type FileStat,
   type Listing,
   type MountPoint,
   type OnConflict,
+  type TextEncoding,
 } from '../api/files'
 import { localizedCode, messageFromBody } from '../lib/errors'
 import { sharesApi } from '../api/shares'
@@ -853,9 +855,21 @@ interface EditorState {
   original: string
   saving: boolean
   error: string | null
+  // ---- 代码页元信息（设计文档 3.2.2.1）：保存时必须原样带回 ----
+  encoding: TextEncoding
+  /** 打开文件时的编码，用于判断「用户手动转换过」 */
+  encodingOriginal: TextEncoding
+  eol: EolType
+  eolOriginal: EolType
+  hasBom: boolean
+  /** 原文混用 LF 与 CRLF（后端按多数派定风格，保存后统一） */
+  mixedEol: boolean
+  readonly: boolean
 }
 
 const editor = ref<EditorState | null>(null)
+/** 编码 / 换行符下拉菜单 */
+const metaMenu = ref(false)
 /** 只读预览面板（Markdown / CSV / PDF / 不支持格式） */
 const preview = ref<EntryInfo | null>(null)
 const editorLoading = ref(false)
@@ -864,7 +878,30 @@ const toast = ref('')
 const entries = computed(() => listing.value?.entries ?? [])
 const total = computed(() => listing.value?.total ?? 0)
 const hasMore = computed(() => listing.value?.has_more ?? false)
-const dirty = computed(() => !!editor.value && editor.value.content !== editor.value.original)
+const dirty = computed(() => {
+  const state = editor.value
+  if (!state) return false
+  // 换行符 / 编码的转换也算未保存修改：它们会改变落盘字节
+  return (
+    state.content !== state.original ||
+    state.eol !== state.eolOriginal ||
+    state.encoding !== state.encodingOriginal
+  )
+})
+
+/** 状态栏展示用的编码名（与后端 `encoding_label` 同一套写法） */
+const ENCODING_LABELS: Record<TextEncoding, string> = {
+  'utf-8': 'UTF-8',
+  gbk: 'GBK',
+  'utf-16le': 'UTF-16 LE',
+  'utf-16be': 'UTF-16 BE',
+}
+const encodingLabel = (encoding: TextEncoding) => ENCODING_LABELS[encoding] ?? encoding.toUpperCase()
+const eolLabel = (eol: EolType) => (eol === 'crlf' ? 'CRLF' : 'LF')
+const EOL_OPTIONS: { value: EolType; label: string; hint: string }[] = [
+  { value: 'lf', label: 'LF', hint: 'Linux / macOS' },
+  { value: 'crlf', label: 'CRLF', hint: 'Windows' },
+]
 
 const crumbs = computed(() => {
   const path = currentPath.value
@@ -1148,6 +1185,7 @@ function onEntryClick(entry: EntryInfo, event?: MouseEvent) {
 async function openEditor(entry: EntryInfo) {
   preview.value = null
   editorLoading.value = true
+  metaMenu.value = false
   editor.value = {
     path: entry.path,
     name: entry.name,
@@ -1156,23 +1194,55 @@ async function openEditor(entry: EntryInfo) {
     original: '',
     saving: false,
     error: null,
+    encoding: 'utf-8',
+    encodingOriginal: 'utf-8',
+    eol: 'lf',
+    eolOriginal: 'lf',
+    hasBom: false,
+    mixedEol: false,
+    readonly: false,
   }
+  const opened = entry.path
   try {
-    const text = await filesApi.readText(entry.path)
+    // 走 /api/files/text：正文里的换行已被后端归一成 \n，元信息单独返回
+    const file = await filesApi.readEditorFile(opened)
     const state = editor.value
-    if (!state) return
-    state.content = text
-    state.original = text
+    // 加载期间用户可能已经切到别的文件，按路径判定而不是对象身份（proxy 恒不等）
+    if (!state || state.path !== opened) return
+    state.content = file.content
+    state.original = file.content
+    state.encoding = file.encoding
+    state.encodingOriginal = file.encoding
+    state.eol = file.eol_type
+    state.eolOriginal = file.eol_type
+    state.hasBom = file.has_bom
+    state.mixedEol = file.mixed_eol
+    state.readonly = file.readonly
   } catch (err) {
     const info = describe(err)
-    if (editor.value) editor.value.error = info.message
+    if (editor.value?.path === opened) editor.value.error = info.message
   } finally {
-    editorLoading.value = false
+    if (editor.value?.path === opened) editorLoading.value = false
   }
 }
 
 function onEditorChange(value: string) {
   if (editor.value) editor.value.content = value
+}
+
+/** 状态栏下拉菜单：切换换行符（或把 GBK 转成 UTF-8） */
+function pickEol(eol: EolType) {
+  const state = editor.value
+  metaMenu.value = false
+  if (!state || state.eol === eol) return
+  state.eol = eol
+}
+
+function convertToUtf8() {
+  const state = editor.value
+  metaMenu.value = false
+  if (!state || state.encoding === 'utf-8') return
+  state.encoding = 'utf-8'
 }
 
 async function saveEditor() {
@@ -1181,8 +1251,19 @@ async function saveEditor() {
   state.saving = true
   state.error = null
   try {
-    await filesApi.saveText(state.path, state.content)
+    const result = await filesApi.saveText(state.path, state.content, {
+      encoding: state.encoding,
+      eol: state.eol,
+      bom: state.hasBom,
+    })
     state.original = state.content
+    // 以服务端实际落盘的风格为准（例如 GBK 不支持 BOM 时会被忽略）
+    state.encoding = result.encoding
+    state.encodingOriginal = result.encoding
+    state.eol = result.eol_type
+    state.eolOriginal = result.eol_type
+    state.hasBom = result.has_bom
+    state.mixedEol = false
     showToast(t('files.editor.saved'))
     // 目录里的体积/时间需要刷新
     if (listing.value) {
@@ -1322,6 +1403,72 @@ onMounted(boot)
           @save="saveEditor"
         />
       </div>
+
+      <!-- 状态栏：编码 + 换行符（设计文档 3.2.2.1），点击可手动转换 -->
+      <footer
+        class="relative flex h-8 shrink-0 items-center gap-2 border-t border-line bg-panel px-2 text-[11px] text-muted"
+      >
+        <button
+          type="button"
+          class="flex items-center gap-1.5 rounded-md px-1.5 py-0.5 transition-colors hover:bg-elevated hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
+          :title="t('files.editor.meta.toggle')"
+          :disabled="editor.readonly"
+          @click="metaMenu = !metaMenu"
+        >
+          <span class="font-mono">{{ encodingLabel(editor.encoding) }}</span>
+          <span class="opacity-40">·</span>
+          <span class="font-mono">{{ eolLabel(editor.eol) }}</span>
+          <span
+            v-if="editor.hasBom"
+            class="rounded bg-elevated px-1 text-[10px] tracking-wide"
+            :title="t('files.editor.meta.bomHint')"
+          >
+            BOM
+          </span>
+        </button>
+        <span v-if="editor.mixedEol" class="fg-warn">
+          {{ t('files.editor.meta.mixed', { eol: eolLabel(editor.eol) }) }}
+        </span>
+        <span v-if="editor.readonly" class="ml-auto">{{ t('files.editor.meta.readonly') }}</span>
+
+        <div v-if="metaMenu" class="fixed inset-0 z-30" @click="metaMenu = false" />
+        <div
+          v-if="metaMenu"
+          class="absolute bottom-full left-2 z-40 mb-1 w-56 overflow-hidden rounded-lg border border-line bg-elevated py-1 shadow-xl"
+        >
+          <p class="px-2.5 py-1 text-[10px] tracking-wide text-muted uppercase">
+            {{ t('files.editor.meta.eol') }}
+          </p>
+          <button
+            v-for="option in EOL_OPTIONS"
+            :key="option.value"
+            type="button"
+            class="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-panel"
+            :class="editor.eol === option.value ? 'text-accent' : 'text-ink'"
+            @click="pickEol(option.value)"
+          >
+            <span class="font-mono">{{ option.label }}</span>
+            <span class="text-[10px] text-muted">{{ option.hint }}</span>
+          </button>
+          <div class="my-1 border-t border-line" />
+          <p class="px-2.5 py-1 text-[10px] tracking-wide text-muted uppercase">
+            {{ t('files.editor.meta.encoding') }}
+          </p>
+          <button
+            v-if="editor.encoding !== 'utf-8'"
+            type="button"
+            class="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs text-ink transition-colors hover:bg-panel"
+            @click="convertToUtf8"
+          >
+            <span>{{ t('files.editor.meta.toUtf8') }}</span>
+            <span class="text-[10px] text-muted">UTF-8</span>
+          </button>
+          <p v-else class="flex items-center justify-between px-2.5 py-1.5 text-xs text-muted">
+            <span class="font-mono">UTF-8</span>
+            <span class="text-accent">✓</span>
+          </p>
+        </div>
+      </footer>
     </div>
 
     <!-- 中栏：只读预览（Markdown / CSV / PDF / 不支持格式） -->

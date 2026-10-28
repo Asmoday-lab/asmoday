@@ -52,7 +52,16 @@
     "save": "保存",
     "saving": "保存中",
     "saved": "已保存",
-    "confirmClose": "有未保存的修改，确定关闭？"
+    "confirmClose": "有未保存的修改，确定关闭？",
+    "meta": {
+      "toggle": "编码与换行符（点击可转换）",
+      "eol": "换行符",
+      "encoding": "字符编码",
+      "toUtf8": "转为 UTF-8",
+      "bomHint": "文件带 UTF-8 BOM，保存时会原样保留",
+      "mixed": "原文换行符混用，保存后统一为 {eol}",
+      "readonly": "只读挂载点"
+    }
   },
   "menu": {
     "openDir": "打开目录",

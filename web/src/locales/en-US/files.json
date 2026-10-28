@@ -52,7 +52,16 @@
     "save": "Save",
     "saving": "Saving",
     "saved": "Saved",
-    "confirmClose": "You have unsaved changes. Close anyway?"
+    "confirmClose": "You have unsaved changes. Close anyway?",
+    "meta": {
+      "toggle": "Encoding and line endings",
+      "eol": "Line endings",
+      "encoding": "Encoding",
+      "toUtf8": "Convert to UTF-8",
+      "bomHint": "File has a UTF-8 BOM; it will be preserved on save",
+      "mixed": "Mixed line endings in source; will be normalized to {eol}",
+      "readonly": "Read-only mount"
+    }
   },
   "menu": {
     "openDir": "Open folder",

@@ -75,6 +75,18 @@ async function renderMarkdown(text: string): Promise<string> {
   return clean
 }
 
+/**
+ * 预览正文：优先走 `/api/files/text`（带编码探测，GBK 的 md/csv 不会变乱码），
+ * 失败再退回原始字节流 —— 预览是只读的，解码失败就按 UTF-8 尽力显示。
+ */
+async function readDecoded(path: string): Promise<string> {
+  try {
+    return (await filesApi.readEditorFile(path)).content
+  } catch {
+    return filesApi.readText(path)
+  }
+}
+
 async function load() {
   error.value = ''
   markdownHtml.value = ''
@@ -86,12 +98,12 @@ async function load() {
   loading.value = true
   try {
     if (kind.value === 'markdown') {
-      markdownHtml.value = await renderMarkdown(await filesApi.readText(props.entry.path))
+      markdownHtml.value = await renderMarkdown(await readDecoded(props.entry.path))
     } else {
       oversized.value = props.entry.size > CSV_SIZE_LIMIT
       const text = oversized.value
         ? await filesApi.readTextPrefix(props.entry.path, CSV_PREFIX_BYTES)
-        : await filesApi.readText(props.entry.path)
+        : await readDecoded(props.entry.path)
       table.value = parseCsv(text, CSV_MAX_ROWS, delimiter.value)
     }
   } catch (err) {

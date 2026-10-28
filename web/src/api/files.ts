@@ -100,8 +100,45 @@ export interface FileStat {
   owner: string | null
 }
 
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: { Accept: 'application/json' } })
+/** 编辑器支持的字符编码（设计文档 3.2.2.1） */
+export type TextEncoding = 'utf-8' | 'gbk' | 'utf-16le' | 'utf-16be'
+
+/** 换行符风格：lf = Linux/macOS，crlf = Windows */
+export type EolType = 'lf' | 'crlf'
+
+/** `GET /api/files/text` 的返回：正文 + 编码/换行/BOM 元信息 */
+export interface EditorFile {
+  path: string
+  name: string
+  /** 换行符已由后端统一成 `\n`，保存时按 eol_type 还原 */
+  content: string
+  encoding: TextEncoding
+  encoding_label: string
+  eol_type: EolType
+  eol_label: string
+  has_bom: boolean
+  /** 原文同时存在 LF 与 CRLF（保存后统一成 eol_type） */
+  mixed_eol: boolean
+  size: number
+  readonly: boolean
+}
+
+export interface SaveTextOptions {
+  encoding?: TextEncoding
+  eol?: EolType
+  bom?: boolean
+}
+
+export interface SaveTextResult {
+  status: string
+  size: number
+  encoding: TextEncoding
+  encoding_label: string
+  eol_type: EolType
+  has_bom: boolean
+}
+
+async function getJson<T>(url: string): Promise<T> {  const res = await fetch(url, { headers: { Accept: 'application/json' } })
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as T
 }
@@ -152,14 +189,32 @@ export const filesApi = {
     return new TextDecoder('utf-8', { fatal: false }).decode(buffer.slice(0, limit))
   },
 
-  async saveText(path: string, content: string): Promise<{ status: string; size: number }> {
-    const res = await fetch(`/api/files/raw?path=${encodePath(path)}`, {
+  /**
+   * 编辑器加载：带编码 / 换行符 / BOM 元信息（设计文档 3.2.2.1）。
+   * 后端解不出干净文本时直接报错（E_ENCODING），绝不返回乱码。
+   */
+  readEditorFile: (path: string) => getJson<EditorFile>(`/api/files/text?path=${encodePath(path)}`),
+
+  /**
+   * 保存文本。`options` 必须带上读文件时拿到的编码/换行符/BOM，
+   * 否则服务端会按磁盘现状推断 —— 任何情况下都不会把 LF 文件强转成 CRLF。
+   */
+  async saveText(
+    path: string,
+    content: string,
+    options: SaveTextOptions = {},
+  ): Promise<SaveTextResult> {
+    const params = new URLSearchParams({ path })
+    if (options.encoding) params.set('encoding', options.encoding)
+    if (options.eol) params.set('eol', options.eol)
+    if (options.bom !== undefined) params.set('bom', options.bom ? '1' : '0')
+    const res = await fetch(`/api/files/raw?${params.toString()}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
       body: content,
     })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
-    return (await res.json()) as { status: string; size: number }
+    return (await res.json()) as SaveTextResult
   },
 
   // -------------------------------------------------------------------------

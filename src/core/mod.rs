@@ -10,5 +10,6 @@ pub mod locks;
 pub mod logging;
 pub mod path_guard;
 pub mod terminal;
+pub mod text_codec;
 pub mod thumbnail;
 pub mod totp;

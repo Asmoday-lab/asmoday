@@ -412,6 +412,7 @@ fn protected_routes() -> Router<AppState> {
                 .put(api::files::write_text)
                 .delete(api::files::delete),
         )
+        .route("/api/files/text", get(api::files::read_text))
         .route("/api/files/thumb", get(api::media::thumb))
         .route(
             "/api/files/upload",
