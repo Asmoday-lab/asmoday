@@ -26,16 +26,19 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
+
       - name: Build frontend
         working-directory: web
         run: |
           pnpm install --frozen-lockfile
           pnpm run build
+
       - name: Upload frontend dist
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
-          path: web/dist
+          # 【关键修复】你的 Vite 输出在项目根目录的 dist，而不是 web/dist
+          path: dist
 
   # ==========================================
   # Job 2: 多平台后端构建与打包
@@ -62,12 +65,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # 下载刚刚构建好的前端产物
       - name: Download frontend dist
         uses: actions/download-artifact@v4
         with:
           name: frontend-dist
-          path: web/dist
+          # 【关键修复】下载到项目根目录的 dist，供 rust-embed 吸收
+          path: dist
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,6 +78,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Linux 环境统一使用 Zig 交叉编译
       - name: Install Zig & cargo-zigbuild
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
@@ -123,7 +127,6 @@ jobs:
           path: |
             *.tar.gz
             *.zip
-          # 防止覆盖同名包，将原始 mac 包保留用于合并
           overwrite: true
 
   # ==========================================
@@ -182,7 +185,6 @@ jobs:
         run: |
           mkdir -p final_release
           
-          # 显式点名，绝不使用 find 扫全盘
           cp dist/x86_64-pc-windows-msvc/asmoday-x86_64-pc-windows-msvc.zip final_release/
           cp dist/x86_64-unknown-linux-musl/asmoday-x86_64-unknown-linux-musl.tar.gz final_release/
           cp dist/aarch64-unknown-linux-musl/asmoday-aarch64-unknown-linux-musl.tar.gz final_release/
