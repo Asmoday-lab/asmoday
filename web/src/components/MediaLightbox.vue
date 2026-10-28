@@ -13,7 +13,10 @@
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
+import ContextMenu, { type ContextMenuItem } from './ContextMenu.vue'
 import { coverUrl, rawUrl, thumbUrl } from '../api/media'
+import { sharesApi } from '../api/shares'
+import { openShare } from '../stores/share'
 import { useScrollLock } from '../composables/useScrollLock'
 import { bindVolume } from '../lib/volume'
 import {
@@ -104,6 +107,57 @@ watch(
   },
 )
 
+// ---------------- 右键菜单（设计文档 3.2.5：灯箱复用全局 ContextMenu） ----------------
+const menu = ref<{ x: number; y: number } | null>(null)
+
+function openMenu(event: MouseEvent) {
+  menu.value = { x: event.clientX, y: event.clientY }
+}
+
+const menuItems = computed<ContextMenuItem[]>(() => {
+  const current = item.value
+  if (!current) return []
+  const items: ContextMenuItem[] = [
+    { id: 'open', label: t('gallery.viewer.openOriginal'), icon: 'globe' },
+    { id: 'download', label: t('gallery.viewer.original'), icon: 'download' },
+    { id: 'share', label: t('files.mediaMenu.share'), icon: 'share' },
+  ]
+  if (current.kind === 'image') {
+    items.push({ id: 'directLink', label: t('files.mediaMenu.directLink'), icon: 'link' })
+  }
+  return items
+})
+
+async function onMenuSelect(id: string) {
+  const current = item.value
+  menu.value = null
+  if (!current) return
+  if (id === 'open') {
+    window.open(rawUrl(current.path), '_blank', 'noopener')
+  } else if (id === 'download') {
+    const link = document.createElement('a')
+    link.href = rawUrl(current.path)
+    link.download = current.name
+    link.rel = 'noopener'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  } else if (id === 'share') {
+    openShare(current.path, current.name)
+  } else if (id === 'directLink') {
+    try {
+      const created = await sharesApi.create(current.path, { days: 0, allow_download: true })
+      await navigator.clipboard.writeText(`${location.origin}${sharesApi.rawUrl(created.token)}`)
+      copiedPath.value = current.path
+      window.setTimeout(() => (copiedPath.value = null), 2200)
+    } catch {
+      /* 剪贴板被拒就算了，不打断浏览 */
+    }
+  }
+}
+
+const copiedPath = ref<string | null>(null)
+
 onMounted(() => window.addEventListener('keydown', onKey))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
@@ -115,6 +169,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       class="fixed inset-0 z-[80] flex flex-col bg-black/[0.97]"
       data-testid="media-lightbox"
       @click.self="closeLightbox()"
+      @contextmenu.prevent="openMenu"
     >
       <header class="flex h-12 shrink-0 items-center gap-3 px-3 md:px-4">
         <p class="min-w-0 flex-1 truncate text-xs text-white/70">
@@ -250,6 +305,26 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           </span>
         </button>
       </div>
+
+      <!-- 全局右键菜单（下载 / 分享 / 复制直链 / 新窗口打开） -->
+      <ContextMenu
+        :open="!!menu"
+        :x="menu?.x ?? 0"
+        :y="menu?.y ?? 0"
+        :items="menuItems"
+        @select="onMenuSelect"
+        @close="menu = null"
+      />
+
+      <!-- 直链复制成功的一次性提示 -->
+      <Transition name="fade">
+        <p
+          v-if="copiedPath"
+          class="pointer-events-none absolute bottom-24 left-1/2 -translate-x-1/2 rounded-full bg-white/90 px-4 py-1.5 text-xs text-black shadow-lg"
+        >
+          {{ t('common.clipboard.linkCopied') }}
+        </p>
+      </Transition>
     </div>
   </Teleport>
 </template>

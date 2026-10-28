@@ -207,7 +207,8 @@
     "delete": "Delete",
     "noDownloadable": "None of the selected items is a file",
     "downloadConfirm": "About to download {count} files",
-    "downloadHint": "Your browser may block multiple downloads; allow them for this site"
+    "downloadHint": "Your browser may block multiple downloads; allow them for this site",
+    "toggle": "Select this item"
   },
   "sort": {
     "label": "Sort",
@@ -221,5 +222,13 @@
     "name": "Name",
     "size": "Size",
     "time": "Modified"
+  },
+  "mediaMenu": {
+    "open": "Open",
+    "play": "Play",
+    "download": "Download",
+    "share": "Share",
+    "directLink": "Copy direct link",
+    "properties": "Properties"
   }
 }

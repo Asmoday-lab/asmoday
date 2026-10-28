@@ -10,16 +10,15 @@
 import {
   computed,
   defineAsyncComponent,
-  nextTick,
   onBeforeUnmount,
   onMounted,
-  reactive,
   ref,
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
+import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
 import FilePreviewPane from '../components/FilePreviewPane.vue'
 import VirtualGrid from '../components/VirtualGrid.vue'
 import VirtualList from '../components/VirtualList.vue'
@@ -43,6 +42,7 @@ import { formatSize, formatTime } from '../lib/format'
 import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
 import { openLightbox, type LightboxItem } from '../stores/lightbox'
+import { openShare, shareTarget } from '../stores/share'
 
 // CodeMirror 内核与语言包都在这个异步 chunk 里，首次打开编辑器才下载
 const CodeEditor = defineAsyncComponent(() => import('../components/CodeEditor.vue'))
@@ -51,30 +51,12 @@ const { isDark } = useTheme()
 const { t } = useI18n()
 const router = useRouter()
 
-/** 右键菜单 */
+/** 右键菜单目标（定位与视口夹取由全局 ContextMenu 组件负责） */
 const menu = ref<{ x: number; y: number; entry: EntryInfo } | null>(null)
-const menuEl = ref<HTMLElement | null>(null)
 
-/**
- * 右键菜单定位（v2.8 修）：原来用固定 316px 估算高度，菜单实际有 11 项约 380px，
- * 矮窗口下「属性 / 删除」被挤出视口，点了没反应。改成先按光标位置渲染，
- * 下一帧按真实尺寸夹到视口内（放不下就向上翻转）。
- */
-async function openMenu(event: MouseEvent, entry: EntryInfo) {
-  const margin = 8
+function openMenu(event: MouseEvent, entry: EntryInfo) {
   menu.value = { x: event.clientX, y: event.clientY, entry }
   selected.value = entry.path
-  await nextTick()
-  const el = menuEl.value
-  if (!el || !menu.value) return
-  const rect = el.getBoundingClientRect()
-  const maxX = Math.max(margin, window.innerWidth - rect.width - margin)
-  const maxY = Math.max(margin, window.innerHeight - rect.height - margin)
-  menu.value = {
-    ...menu.value,
-    x: Math.min(Math.max(margin, event.clientX), maxX),
-    y: Math.min(Math.max(margin, event.clientY), maxY),
-  }
 }
 
 function openTerminal(entry: EntryInfo) {
@@ -121,42 +103,7 @@ function menuDownload() {
 }
 
 // ---------------- 分享 / 图床直链（设计文档 3.1 / 3.2） ----------------
-const shareDialog = ref<{ entry: EntryInfo } | null>(null)
-const shareForm = reactive({ password: '', days: 0, allowDownload: true })
-const shareBusy = ref(false)
-const shareResult = ref<{ url: string; token: string } | null>(null)
-const shareError = ref('')
-
-function openShareDialog() {
-  const entry = menu.value?.entry
-  menu.value = null
-  if (!entry) return
-  shareForm.password = ''
-  shareForm.days = 7
-  shareForm.allowDownload = true
-  shareResult.value = null
-  shareError.value = ''
-  shareDialog.value = { entry }
-}
-
-async function createShare() {
-  const dialog = shareDialog.value
-  if (!dialog || shareBusy.value) return
-  shareBusy.value = true
-  shareError.value = ''
-  try {
-    const result = await sharesApi.create(dialog.entry.path, {
-      password: shareForm.password || undefined,
-      days: shareForm.days,
-      allow_download: shareForm.allowDownload,
-    })
-    shareResult.value = { url: `${location.origin}${result.url}`, token: result.token }
-  } catch (err) {
-    shareError.value = err instanceof Error ? err.message : t('files.share.failed')
-  } finally {
-    shareBusy.value = false
-  }
-}
+// 分享表单已抽成全局单例（components/ShareDialog.vue），这里只负责唤起。
 
 /** 图片一键复制图床直链：永久、无口令的 raw 地址 */
 async function copyDirectLink(entry: EntryInfo) {
@@ -172,12 +119,118 @@ async function copyDirectLink(entry: EntryInfo) {
 
 function menuShare() {
   const entry = menu.value?.entry
-  if (entry) openShareDialog()
+  if (entry) {
+    menu.value = null
+    openShare(entry.path, entry.name)
+  }
 }
 
 function menuDirectLink() {
   const entry = menu.value?.entry
   if (entry) void copyDirectLink(entry)
+}
+
+/** 右键菜单条目（设计文档 3.2.5）：只读挂载点的变更项统一置灰并带原因 */
+const fileMenuItems = computed<ContextMenuItem[]>(() => {
+  const entry = menu.value?.entry
+  if (!entry) return []
+  const hint = t('files.readonly.tooltip')
+  const items: ContextMenuItem[] = [
+    {
+      id: 'open',
+      label: entry.is_dir
+        ? t('files.menu.openDir')
+        : entry.editable
+          ? t('files.menu.edit')
+          : t('files.menu.open'),
+      icon: entry.is_dir ? 'folderOpen' : 'file',
+    },
+  ]
+  if (entry.is_dir) {
+    items.push({ id: 'terminal', label: t('files.menu.terminal'), icon: 'terminal' })
+  }
+  items.push({ id: 'copyPath', label: t('files.menu.copyPath'), icon: 'fileText' })
+  if (!entry.is_dir) {
+    items.push({ id: 'download', label: t('files.menu.download'), icon: 'archive' })
+  }
+  items.push({ id: 'share', label: t('files.menu.share'), icon: 'share' })
+  if (entry.kind === 'image' && !entry.is_dir) {
+    items.push({ id: 'directLink', label: t('files.menu.directLink'), icon: 'link' })
+  }
+  items.push(
+    {
+      id: 'rename',
+      label: t('files.menu.rename'),
+      icon: 'edit',
+      divider: true,
+      disabled: readonly.value,
+      hint,
+    },
+    {
+      id: 'move',
+      label: t('files.menu.moveTo'),
+      icon: 'arrowRight',
+      disabled: readonly.value,
+      hint,
+    },
+    {
+      id: 'copy',
+      label: t('files.menu.copyTo'),
+      icon: 'gallery',
+      disabled: readonly.value,
+      hint,
+    },
+    { id: 'properties', label: t('files.menu.properties'), icon: 'chip', divider: true },
+    {
+      id: 'delete',
+      label: t('files.menu.delete'),
+      icon: 'trash',
+      danger: true,
+      disabled: readonly.value,
+      hint,
+    },
+  )
+  return items
+})
+
+function onMenuSelect(id: string) {
+  switch (id) {
+    case 'open':
+      menuOpenEntry()
+      break
+    case 'terminal':
+      menuOpenTerminal()
+      break
+    case 'copyPath':
+      menuCopyPath()
+      break
+    case 'download':
+      menuDownload()
+      break
+    case 'share':
+      menuShare()
+      break
+    case 'directLink':
+      menuDirectLink()
+      break
+    case 'rename':
+      openRenameDialog()
+      break
+    case 'move':
+      openTransferDialog('move')
+      break
+    case 'copy':
+      openTransferDialog('copy')
+      break
+    case 'properties':
+      openStatDialog()
+      break
+    case 'delete':
+      openDeleteDialog()
+      break
+    default:
+      menu.value = null
+  }
 }
 
 // ---------------- 新建 / 重命名 / 移动复制（设计文档 3.2.6 / 6.2 / 8.5） ----------------
@@ -375,6 +428,12 @@ function exitSelect() {
 
 function isSelected(path: string) {
   return selection.value.includes(path)
+}
+
+/** 悬停复选框：没进多选模式时点一下就进（并勾上本项），已在多选里则纯切换 */
+function toggleFromCheckbox(entry: EntryInfo) {
+  if (selectMode.value) toggleSelect(entry)
+  else enterSelect(entry)
 }
 
 // ---- 长按判定 ----
@@ -592,16 +651,6 @@ const statRelativeDir = computed(() => {
   const parts = normalized.split('/').filter(Boolean).filter((part) => !/^[a-zA-Z]:$/.test(part))
   return parts.length ? `/${parts.join('/')}` : '/'
 })
-
-async function copyShareResult() {
-  if (!shareResult.value) return
-  try {
-    await navigator.clipboard.writeText(shareResult.value.url)
-    showToast(t('common.clipboard.linkCopied'))
-  } catch {
-    showToast(t('common.clipboard.denied'))
-  }
-}
 
 const roots = ref<MountPoint[]>([])
 const rootsImplicit = ref(false)
@@ -1323,7 +1372,7 @@ function toneFor(entry: EntryInfo) {
 useScrollLock(
   computed(() =>
     Boolean(
-      shareDialog.value ||
+      shareTarget.value ||
         editor.value ||
         preview.value ||
         deleteTargets.value.length ||
@@ -1832,14 +1881,20 @@ onMounted(boot)
               @touchend="cancelPress"
               @touchcancel="cancelPress"
             >
+              <!-- 悬停浮现复选框（设计文档 3.2.1 / 8.4.12）：不进多选也能一键勾上 -->
               <span
-                v-if="selectMode"
-                class="absolute right-1 top-1 grid size-5 place-items-center rounded-full border transition-colors"
-                :class="
+                role="checkbox"
+                :aria-checked="isSelected(entry.path)"
+                :title="t('files.select.toggle')"
+                class="absolute right-1 top-1 z-10 grid size-5 cursor-pointer place-items-center rounded-full border transition-all"
+                :class="[
                   isSelected(entry.path)
                     ? 'border-accent bg-accent text-white'
-                    : 'border-line bg-panel text-transparent'
-                "
+                    : 'border-line bg-panel/90 text-transparent hover:border-accent/60',
+                  selectMode ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                ]"
+                data-select-toggle
+                @click.stop="toggleFromCheckbox(entry)"
               >
                 <AppIcon name="check" :size="11" />
               </span>
@@ -1902,14 +1957,19 @@ onMounted(boot)
               @touchend="cancelPress"
               @touchcancel="cancelPress"
             >
+              <!-- 列表左侧常驻复选框（设计文档 3.2.1：必须有） -->
               <span
-                v-if="selectMode"
-                class="grid size-4 shrink-0 place-items-center rounded-full border transition-colors"
+                role="checkbox"
+                :aria-checked="isSelected(entry.path)"
+                :title="t('files.select.toggle')"
+                class="grid size-4 shrink-0 cursor-pointer place-items-center rounded-full border transition-colors"
                 :class="
                   isSelected(entry.path)
                     ? 'border-accent bg-accent text-white'
-                    : 'border-line text-transparent'
+                    : 'border-line text-transparent hover:border-accent/60'
                 "
+                data-select-toggle
+                @click.stop="toggleFromCheckbox(entry)"
               >
                 <AppIcon name="check" :size="10" />
               </span>
@@ -2009,99 +2069,15 @@ onMounted(boot)
       </template>
     </div>
 
-    <!-- 右键菜单 -->
-    <div v-if="menu" class="fixed inset-0 z-40" @click="menu = null" @contextmenu.prevent="menu = null" />
-    <div
-      v-if="menu"
-      ref="menuEl"
-      class="fixed z-50 max-h-[calc(100dvh-16px)] w-48 overflow-y-auto overflow-x-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
-      :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
-    >
-      <button class="menu-item" @click="menuOpenEntry">
-        <AppIcon :name="menu.entry.is_dir ? 'folderOpen' : 'file'" :size="14" />
-        {{
-          menu.entry.is_dir
-            ? t('files.menu.openDir')
-            : menu.entry.editable
-              ? t('files.menu.edit')
-              : t('files.menu.open')
-        }}
-      </button>
-      <button v-if="menu.entry.is_dir" class="menu-item" @click="menuOpenTerminal">
-        <AppIcon name="terminal" :size="14" />
-        {{ t('files.menu.terminal') }}
-      </button>
-      <button class="menu-item" @click="menuCopyPath">
-        <AppIcon name="fileText" :size="14" />
-        {{ t('files.menu.copyPath') }}
-      </button>
-      <button v-if="!menu.entry.is_dir" class="menu-item" @click="menuDownload">
-        <AppIcon name="archive" :size="14" />
-        {{ t('files.menu.download') }}
-      </button>
-      <button class="menu-item" @click="menuShare">
-        <AppIcon name="share" :size="14" />
-        {{ t('files.menu.share') }}
-      </button>
-      <button
-        v-if="menu.entry.kind === 'image' && !menu.entry.is_dir"
-        class="menu-item"
-        @click="menuDirectLink"
-      >
-        <AppIcon name="link" :size="14" />
-        {{ t('files.menu.directLink') }}
-      </button>
-      <div class="my-1 border-t border-line" />
-      <button
-        class="menu-item"
-        :class="readonly ? 'menu-item--off' : ''"
-        :disabled="readonly"
-        :title="readonly ? t('files.readonly.tooltip') : ''"
-        @click="openRenameDialog"
-      >
-        <AppIcon name="edit" :size="14" />
-        {{ t('files.menu.rename') }}
-      </button>
-      <button
-        class="menu-item"
-        :class="readonly ? 'menu-item--off' : ''"
-        :disabled="readonly"
-        :title="readonly ? t('files.readonly.tooltip') : ''"
-        @click="openTransferDialog('move')"
-      >
-        <AppIcon name="arrowRight" :size="14" />
-        {{ t('files.menu.moveTo') }}
-      </button>
-      <button
-        class="menu-item"
-        :class="readonly ? 'menu-item--off' : ''"
-        :disabled="readonly"
-        :title="readonly ? t('files.readonly.tooltip') : ''"
-        @click="openTransferDialog('copy')"
-      >
-        <AppIcon name="gallery" :size="14" />
-        {{ t('files.menu.copyTo') }}
-      </button>
-      <div class="my-1 border-t border-line" />
-      <button class="menu-item" @click="openStatDialog">
-        <AppIcon name="chip" :size="14" />
-        {{ t('files.menu.properties') }}
-      </button>
-      <button
-        class="menu-item menu-item--danger"
-        :class="readonly ? 'menu-item--off' : ''"
-        :disabled="readonly"
-        :title="readonly ? t('files.readonly.tooltip') : ''"
-        @click="openDeleteDialog()"
-      >
-        <AppIcon name="trash" :size="14" />
-        {{ t('files.menu.delete') }}
-      </button>
-      <!-- 置灰项在部分浏览器上不弹原生 Tooltip，这里再给一条常驻说明 -->
-      <p v-if="readonly" class="px-3 pt-1 pb-1.5 text-[11px] leading-snug text-muted">
-        {{ t('files.readonly.tooltip') }}
-      </p>
-    </div>
+    <!-- 全局右键菜单（设计文档 3.2.5：文件管理 / 灯箱 / 影视库共用同一组件） -->
+    <ContextMenu
+      :open="!!menu"
+      :x="menu?.x ?? 0"
+      :y="menu?.y ?? 0"
+      :items="fileMenuItems"
+      @select="onMenuSelect"
+      @close="menu = null"
+    />
 
     <!-- 删除确认 -->
     <div
@@ -2542,88 +2518,6 @@ onMounted(boot)
       </div>
     </div>
 
-    <!-- 分享弹窗 -->
-    <div v-if="shareDialog" class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4" @click.self="shareDialog = null">
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <template v-if="!shareResult">
-          <p class="text-sm font-medium text-ink">{{ t('files.share.create') }}</p>
-          <p class="mt-0.5 truncate text-[12px] text-muted">
-            {{ shareDialog.entry.name }}
-          </p>
-
-          <label class="mt-4 block text-[12px] text-muted">
-            {{ t('files.share.password') }}
-            <input
-              v-model="shareForm.password"
-              type="text"
-              :placeholder="t('files.share.passwordPlaceholder')"
-              class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-            />
-          </label>
-
-          <label class="mt-3 block text-[12px] text-muted">
-            {{ t('files.share.expiry') }}
-            <select
-              v-model.number="shareForm.days"
-              class="mt-1 w-full rounded-lg border border-line bg-elevated px-2 py-2 text-xs text-ink outline-none focus:border-accent"
-            >
-              <option :value="1">{{ t('files.share.days1') }}</option>
-              <option :value="7">{{ t('files.share.days7') }}</option>
-              <option :value="30">{{ t('files.share.days30') }}</option>
-              <option :value="0">{{ t('files.share.permanent') }}</option>
-            </select>
-          </label>
-
-          <label class="mt-3 flex items-center gap-2 text-xs text-ink">
-            <input v-model="shareForm.allowDownload" type="checkbox" class="accent-[var(--accent)]" />
-            {{ t('files.share.allowDownload') }}
-          </label>
-
-          <p v-if="shareError" class="mt-3 text-xs fg-danger">{{ shareError }}</p>
-
-          <div class="mt-5 flex justify-end gap-2">
-            <button
-              class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-              @click="shareDialog = null"
-            >
-              {{ t('common.action.cancel') }}
-            </button>
-            <button
-              class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-              :disabled="shareBusy"
-              @click="createShare"
-            >
-              {{ shareBusy ? t('common.action.creating') : t('files.share.submit') }}
-            </button>
-          </div>
-        </template>
-
-        <template v-else>
-          <p class="text-sm font-medium text-ink">{{ t('files.share.created') }}</p>
-          <div class="mt-3 break-all rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink">
-            {{ shareResult.url }}
-          </div>
-          <p class="mt-2 text-[12px] text-muted">
-            {{ t('files.share.hint') }}
-          </p>
-          <div class="mt-4 flex justify-end gap-2">
-            <button
-              class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-              @click="shareDialog = null"
-            >
-              {{ t('common.action.close') }}
-            </button>
-            <button
-              class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
-              @click="copyShareResult"
-            >
-              {{ t('files.share.copyLink') }}
-            </button>
-          </div>
-        </template>
-      </div>
-    </div>
-
     <!-- 拖拽上传遮罩 -->
     <div
       v-if="dragging && currentPath"
@@ -2687,35 +2581,5 @@ onMounted(boot)
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
-}
-.menu-item {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  font-size: 13px;
-  color: var(--text-main);
-  transition: background-color 0.15s ease;
-}
-.menu-item:hover {
-  background: var(--bg-elevated);
-}
-.menu-item--danger {
-  color: var(--tone-danger);
-}
-.menu-item--danger:hover {
-  background: rgb(248 113 113 / 0.12);
-}
-/* 只读挂载点：置灰但仍可 hover 出 Tooltip（设计文档 8.4 第 7 条） */
-.menu-item--off,
-.menu-item--off:hover {
-  cursor: not-allowed;
-  background: transparent;
-  opacity: 0.4;
-}
-.menu-item--off.menu-item--danger,
-.menu-item--off.menu-item--danger:hover {
-  color: var(--tone-danger);
 }
 </style>

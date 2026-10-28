@@ -9,6 +9,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
+import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
 import {
   browseMedia,
   coverUrl,
@@ -19,10 +20,13 @@ import {
   thumbUrl,
   type MediaItem,
 } from '../api/media'
+import { sharesApi } from '../api/shares'
 import { formatSize } from '../lib/format'
 import { useScrollLock } from '../composables/useScrollLock'
 import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
+import { openShare } from '../stores/share'
+import { thumbHashToDataUrl } from '../lib/thumbhash'
 
 /** 缩略图加载失败（坏文件 / 无权限）时回落图标，别留一块空色块 */
 const failedThumbs = ref<Set<string>>(new Set())
@@ -34,7 +38,6 @@ const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer
 const { t } = useI18n()
 
 type MediaTab = 'photos' | 'cinema' | 'music'
-type PhotoView = 'timeline' | 'albums'
 
 // 媒体分区由路由驱动（/photos /cinema /music 共用本组件，见 router 的 meta.mediaTab）
 const route = useRoute()
@@ -44,11 +47,9 @@ watch(
   (value) => {
     if (value === 'photos' || value === 'cinema' || value === 'music') {
       tab.value = value
-      activeAlbum.value = null
     }
   },
 )
-const photoView = ref<PhotoView>('albums')
 
 const items = ref<MediaItem[]>([])
 const root = ref('')
@@ -75,8 +76,6 @@ onBeforeUnmount(() => {
 
 // 影视库播放器是整屏遮罩，锁住底层滚动（设计文档 8.4）；灯箱自己管自己的锁
 useScrollLock(computed(() => Boolean(playing.value)))
-/** 进入某个相册后的详情列表；null = 相册列表 */
-const activeAlbum = ref<{ folder: string; name: string; items: MediaItem[] } | null>(null)
 
 // ---------------- 收藏 / 播放历史 / 播放器降级开关 ----------------
 const favorites = ref(new Set<string>())
@@ -182,7 +181,6 @@ function fmtSeconds(seconds: number): string {
   return `${minutes}:${String(total % 60).padStart(2, '0')}`
 }
 
-const images = computed(() => items.value.filter((item) => item.kind === 'image'))
 /** 照片分区只含图片与视频（音频归音乐库，否则时间线里会出现点不开的黑块） */
 const photoItems = computed(() =>
   items.value.filter((item) => item.kind === 'image' || item.kind === 'video'),
@@ -253,37 +251,6 @@ const timelineSorted = computed(() =>
   })),
 )
 
-interface Album {
-  folder: string
-  name: string
-  cover: MediaItem
-  items: MediaItem[]
-  count: number
-}
-
-/** 相册：按所在文件夹聚合 */
-const albums = computed<Album[]>(() => {
-  const groups = new Map<string, MediaItem[]>()
-  for (const item of images.value) {
-    const bucket = groups.get(item.folder)
-    if (bucket) bucket.push(item)
-    else groups.set(item.folder, [item])
-  }
-  return [...groups.entries()]
-    .map(([folder, list]) => ({
-      folder,
-      name: relativeFolder(folder),
-      cover: list[0],
-      items: list,
-      count: list.length,
-    }))
-    .sort((a, b) => b.count - a.count)
-})
-
-function openAlbum(album: Album) {
-  activeAlbum.value = { folder: album.folder, name: album.name, items: album.items }
-}
-
 /** 点开图片/视频：交给全局灯箱（设计文档 3.2：严禁重复造轮子） */
 function openViewer(list: MediaItem[], index: number) {
   openLightbox(
@@ -298,6 +265,92 @@ function openViewer(list: MediaItem[], index: number) {
   )
 }
 
+// ---------------- 媒体库右键菜单（设计文档 3.2.5 / 8.4.13） ----------------
+//
+// 相册时间线、影视海报墙、音乐列表都复用全局 ContextMenu —— 媒体库不允许
+// 变成「只能看不能操作」的死水，下载 / 分享 / 复制直链 / 收藏必须在原地可达。
+const mediaMenu = ref<{ x: number; y: number; item: MediaItem; context: MediaTab } | null>(null)
+
+function openMediaMenu(event: MouseEvent, item: MediaItem, context: MediaTab) {
+  mediaMenu.value = { x: event.clientX, y: event.clientY, item, context }
+}
+
+const mediaMenuItems = computed<ContextMenuItem[]>(() => {
+  const current = mediaMenu.value
+  if (!current) return []
+  const item = current.item
+  const items: ContextMenuItem[] = []
+  items.push({
+    id: 'open',
+    label:
+      current.context === 'photos' ? t('files.mediaMenu.open') : t('files.mediaMenu.play'),
+    icon: current.context === 'photos' ? 'eye' : 'play',
+  })
+  items.push({ id: 'download', label: t('files.mediaMenu.download'), icon: 'download' })
+  items.push({ id: 'share', label: t('files.mediaMenu.share'), icon: 'share' })
+  if (item.kind === 'image') {
+    items.push({ id: 'directLink', label: t('files.mediaMenu.directLink'), icon: 'link' })
+  }
+  items.push({
+    id: 'favorite',
+    label: isFavorite(item.path) ? t('gallery.favorite.remove') : t('gallery.favorite.add'),
+    icon: 'heart',
+    divider: true,
+  })
+  return items
+})
+
+async function onMediaMenuSelect(id: string) {
+  const current = mediaMenu.value
+  mediaMenu.value = null
+  if (!current) return
+  const item = current.item
+  switch (id) {
+    case 'open': {
+      if (current.context === 'photos') {
+        const index = photoItems.value.findIndex((entry) => entry.path === item.path)
+        openViewer(photoItems.value, index > 0 ? index : 0)
+      } else if (current.context === 'cinema') {
+        playing.value = item
+      } else {
+        const index = audios.value.findIndex((entry) => entry.path === item.path)
+        player.play(audios.value, index > 0 ? index : 0)
+      }
+      break
+    }
+    case 'download':
+      window.open(rawUrl(item.path), '_blank', 'noopener')
+      break
+    case 'share':
+      openShare(item.path, item.name)
+      break
+    case 'directLink':
+      await copyDirectLink(item)
+      break
+    case 'favorite':
+      await toggleFavorite(item)
+      break
+    default:
+      break
+  }
+}
+
+/** 图床直链：永久、无口令的 raw 分享地址（与文件管理里的同名动作一致） */
+async function copyDirectLink(item: MediaItem) {
+  try {
+    const created = await sharesApi.create(item.path, { days: 0, allow_download: true })
+    await navigator.clipboard.writeText(`${location.origin}${sharesApi.rawUrl(created.token)}`)
+    showToast(t('files.menu.directLinkCopied'))
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('files.menu.directLinkFailed'))
+  }
+}
+
+/** ThumbHash 模糊占位（设计文档 3.4.3）：真图未到时先给一张同构图的小图，避免整块跳色 */
+function hashPlaceholder(item: MediaItem): string | null {
+  return thumbHashToDataUrl(item.hash)
+}
+
 function onKey(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null
   // 输入框里不抢键
@@ -307,7 +360,6 @@ function onKey(event: KeyboardEvent) {
     if (event.key === 'Escape') playing.value = null
     return
   }
-  if (event.key === 'Escape') activeAlbum.value = null
 }
 
 async function load() {
@@ -354,22 +406,10 @@ onBeforeUnmount(() => {
   <section class="flex h-full min-h-0 flex-col">
     <!-- 顶部：照片子视图 + 控制区 -->
     <header class="flex shrink-0 flex-wrap items-center gap-4 border-b border-line px-4 py-2 md:px-6">
-      <div v-if="tab === 'photos'" class="flex items-center gap-6 text-sm font-medium">
-        <button
-          class="pb-2 transition-colors"
-          :class="photoView === 'albums' ? 'border-b-2 border-accent text-ink' : 'text-muted hover:text-ink'"
-          @click="photoView = 'albums'"
-        >
-          {{ t('gallery.photos.albums') }}
-        </button>
-        <button
-          class="pb-2 transition-colors"
-          :class="photoView === 'timeline' ? 'border-b-2 border-accent text-ink' : 'text-muted hover:text-ink'"
-          @click="photoView = 'timeline'"
-        >
-          {{ t('gallery.photos.timeline') }}
-        </button>
-      </div>
+      <!-- 照片库只有时间线一种形态（设计文档 3.4.3：严禁展示文件夹，子目录图片直接捞平） -->
+      <p v-if="tab === 'photos'" class="text-sm font-medium text-ink">
+        {{ t('gallery.photos.timeline') }}
+      </p>
 
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
         <span v-if="truncated" class="rounded bg-amber-500/15 px-2 py-0.5 fg-warn">
@@ -434,98 +474,8 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 相册详情：点进去看这个目录下的全部照片 -->
-      <div v-else-if="activeAlbum" class="h-full overflow-y-auto">
-        <div
-          class="sticky top-0 z-10 flex items-center gap-3 border-b border-line bg-base/85 px-4 py-2 backdrop-blur md:px-6"
-        >
-          <button
-            class="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
-            @click="activeAlbum = null"
-          >
-            <AppIcon name="arrowLeft" :size="13" />
-            {{ t('gallery.photos.backToAlbums') }}
-          </button>
-          <div class="min-w-0 flex-1">
-            <p class="truncate text-sm font-semibold text-ink">{{ activeAlbum.name }}</p>
-            <p class="truncate text-[12px] text-muted">
-              {{
-                t('gallery.photos.albumMeta', {
-                  count: activeAlbum.items.length,
-                  folder: relativeFolder(activeAlbum.folder),
-                })
-              }}
-            </p>
-          </div>
-          <button
-            class="shrink-0 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
-            @click="openViewer(activeAlbum.items, 0)"
-          >
-            {{ t('gallery.photos.slideshow') }}
-          </button>
-        </div>
-
-        <div
-          class="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] gap-2 p-3 md:grid-cols-[repeat(auto-fill,minmax(170px,1fr))] md:gap-3 md:p-5"
-        >
-          <button
-            v-for="(photo, index) in activeAlbum.items"
-            :key="photo.path"
-            class="group relative aspect-square overflow-hidden rounded-lg border border-transparent transition-colors hover:border-accent/40"
-            :style="{ backgroundColor: placeholderFor(photo) }"
-            :title="photo.name"
-            @click="openViewer(activeAlbum.items, index)"
-          >
-            <img
-              :src="thumbUrl(photo.path, 400)"
-              class="size-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-              loading="lazy"
-              alt=""
-            />
-          </button>
-        </div>
-      </div>
-
-      <!-- 相册列表 -->
-      <div v-else-if="photoView === 'albums'" class="h-full overflow-y-auto px-4 py-4 md:px-6">
-        <div class="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(200px,1fr))]">
-          <button
-            v-for="album in albums"
-            :key="album.folder"
-            class="group text-left"
-            @click="openAlbum(album)"
-          >
-            <div
-              class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line"
-              :style="{ backgroundColor: placeholderFor(album.cover) }"
-            >
-              <img
-                :src="thumbUrl(album.cover.path, 480)"
-                class="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-                loading="lazy"
-                alt=""
-              />
-              <span
-                class="absolute right-1.5 bottom-1.5 rounded-full bg-black/55 px-2 py-0.5 text-[11px] text-white backdrop-blur"
-              >
-                {{ t('gallery.photos.albumItems', { count: album.count }) }}
-              </span>
-            </div>
-            <p class="mt-2 truncate text-sm font-medium text-ink">{{ album.name }}</p>
-            <p class="truncate text-[12px] text-muted">
-              {{
-                t('gallery.photos.albumMeta', {
-                  count: album.count,
-                  folder: relativeFolder(album.folder),
-                })
-              }}
-            </p>
-          </button>
-        </div>
-      </div>
-
       <!-- 时间线：单滚轴 + content-visibility 跳过离屏渲染（万级条目也不卡） -->
-      <div v-else class="h-full overflow-y-auto">
+      <div v-else class="h-full overflow-y-auto" data-testid="photo-timeline">
         <div v-for="group in timelineSorted" :key="group.label" class="mb-6">
           <div
             class="sticky top-0 z-10 border-b border-line/60 bg-base/85 px-4 py-2 text-sm font-semibold text-ink backdrop-blur md:px-6"
@@ -544,13 +494,23 @@ onBeforeUnmount(() => {
               class="group relative aspect-square overflow-hidden rounded-lg border border-transparent transition-colors hover:border-line"
               style="content-visibility: auto; contain-intrinsic-size: 150px"
               :style="{ backgroundColor: placeholderFor(item) }"
+              :data-photo="item.path"
               @click="openViewer(group.items, index)"
+              @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
             >
+              <!-- ThumbHash 模糊占位：真图加载完成前就有正确构图，避免整块跳色 -->
+              <img
+                v-if="hashPlaceholder(item)"
+                :src="hashPlaceholder(item)!"
+                class="absolute inset-0 size-full scale-110 object-cover blur-md"
+                aria-hidden="true"
+                alt=""
+              />
               <!-- 视频同样取后端首帧当封面（v2.8），失败才回落图标 -->
               <img
                 v-if="!failedThumbs.has(item.path) && (item.kind === 'image' || item.kind === 'video')"
                 :src="thumbUrl(item.path, 400)"
-                class="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                 loading="lazy"
                 alt=""
                 @error="markThumbFailed(item.path)"
@@ -595,12 +555,22 @@ onBeforeUnmount(() => {
           v-for="video in videos"
           :key="video.path"
           class="group text-left"
+          :data-video="video.path"
           @click="playing = video"
+          @contextmenu.prevent="openMediaMenu($event, video, 'cinema')"
         >
           <div
             class="relative aspect-video overflow-hidden rounded-xl border border-line bg-black"
             :style="{ backgroundColor: placeholderFor(video) }"
           >
+            <!-- ThumbHash 模糊占位（影视库同样用，避免海报墙一片黑后突然跳出画面） -->
+            <img
+              v-if="hashPlaceholder(video)"
+              :src="hashPlaceholder(video)!"
+              class="absolute inset-0 size-full scale-110 object-cover blur-md"
+              aria-hidden="true"
+              alt=""
+            />
             <!-- 视频封面走后端 ffmpeg 首帧（v2.9），拿不到再退回图标占位 -->
             <img
               v-if="!failedThumbs.has(video.path)"
@@ -703,6 +673,7 @@ onBeforeUnmount(() => {
               :key="track.path"
               class="group cursor-pointer transition-colors hover:bg-elevated/50"
               @click="player.play(audios, index)"
+              @contextmenu.prevent="openMediaMenu($event, track, 'music')"
             >
               <td class="px-2 py-3 md:px-3">
                 <span class="group-hover:hidden" :class="player.isCurrent(track.path) ? 'text-accent' : ''">
@@ -811,6 +782,16 @@ onBeforeUnmount(() => {
         />
       </div>
     </div>
+
+    <!-- 全局右键菜单（设计文档 8.4.13：媒体库与文件管理共用同一组件） -->
+    <ContextMenu
+      :open="!!mediaMenu"
+      :x="mediaMenu?.x ?? 0"
+      :y="mediaMenu?.y ?? 0"
+      :items="mediaMenuItems"
+      @select="onMediaMenuSelect"
+      @close="mediaMenu = null"
+    />
 
     <!-- 轻提示（坏文件 / 不支持格式） -->
     <Transition name="fade">

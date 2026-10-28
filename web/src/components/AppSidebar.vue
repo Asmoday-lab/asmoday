@@ -1,15 +1,14 @@
 <script setup lang="ts">
 /**
  * 全局侧边栏：PC 端固定 240px，可折叠为图标栏（w-60 ↔ w-16），移动端为抽屉。
- * 分组对齐原型：工作区 / 媒体库（照片·影视·音乐）/ 系统（分享与图床·设置）；
- * 底部为「仅图标」的主题切换按钮（设计文档 8.2：严禁整行文字大按钮）。
+ * 分组对齐原型：工作区 / 媒体库（照片·影视·音乐）/ 系统（分享与图床·设置）。
+ * 主题切换入口**不在**这里（设计文档 8.2：禁止侧边栏底部孤立图标），统一收在顶栏账号菜单。
  */
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
-import { useTheme } from '../composables/useTheme'
 
 const props = defineProps<{
   open: boolean
@@ -17,7 +16,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 
-const { isDark, mode, cycle } = useTheme()
 const { t } = useI18n()
 const router = useRouter()
 
@@ -61,11 +59,6 @@ const groups: NavGroup[] = [
 
 const route = useRoute()
 const isActive = (to: string) => (to === '/' ? route.path === '/' : route.path.startsWith(to))
-
-/** Tooltip 说明「点了会怎样」，同时交代当前处于哪一态（8.2 要求悬停显示「切换主题」） */
-const themeTip = computed(
-  () => `${t('common.theme.switch')} · ${t(`common.theme.${mode.value}`)}`,
-)
 
 // 桌面折叠（移动端抽屉不受影响）
 const COLLAPSE_KEY = 'asmoday.sidebar.collapsed'
@@ -164,19 +157,5 @@ const itemClass = (to: string) => [
         </RouterLink>
       </template>
     </nav>
-
-    <!-- 底部主题切换（设计文档 8.2：仅图标 + Tooltip，循环 light → dark → system） -->
-    <div class="shrink-0 border-t border-line py-2" :class="collapsed ? 'md:px-1.5' : 'px-2'">
-      <button
-        class="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-elevated hover:text-ink"
-        :class="collapsed ? 'mx-auto' : 'mx-auto md:ml-1 md:mr-auto'"
-        :title="themeTip"
-        :aria-label="themeTip"
-        data-testid="theme-toggle"
-        @click="cycle"
-      >
-        <AppIcon :name="isDark ? 'moon' : 'sun'" :size="16" />
-      </button>
-    </div>
   </aside>
 </template>

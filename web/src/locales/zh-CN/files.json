@@ -207,7 +207,8 @@
     "delete": "删除",
     "noDownloadable": "所选项目中没有可下载的文件",
     "downloadConfirm": "将下载 {count} 个文件",
-    "downloadHint": "浏览器可能拦截多个并发下载，请允许本站的自动下载"
+    "downloadHint": "浏览器可能拦截多个并发下载，请允许本站的自动下载",
+    "toggle": "选择此项"
   },
   "sort": {
     "label": "排序",
@@ -221,5 +222,13 @@
     "name": "名称",
     "size": "大小",
     "time": "修改时间"
+  },
+  "mediaMenu": {
+    "open": "打开",
+    "play": "播放",
+    "download": "下载",
+    "share": "分享",
+    "directLink": "复制直链",
+    "properties": "属性"
   }
 }

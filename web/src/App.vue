@@ -11,12 +11,27 @@ import AppIcon from './components/AppIcon.vue'
 import AppSidebar from './components/AppSidebar.vue'
 import MediaLightbox from './components/MediaLightbox.vue'
 import MusicBar from './components/MusicBar.vue'
+import ShareDialog from './components/ShareDialog.vue'
 import { currentTrack } from './stores/player'
 import { authApi } from './api/auth'
+import { useTheme, type ThemeMode } from './composables/useTheme'
 
 const route = useRoute()
 const router = useRouter()
 const { t, locale } = useI18n()
+
+// 主题切换入口统一收在右上角账号菜单里（设计文档 8.2：侧边栏底部不得留孤立图标）
+const { mode: themeMode, setTheme } = useTheme()
+const themeOptions: { key: ThemeMode; label: string }[] = [
+  { key: 'light', label: 'common.theme.light' },
+  { key: 'dark', label: 'common.theme.dark' },
+  { key: 'system', label: 'common.theme.system' },
+]
+
+function pickTheme(next: ThemeMode) {
+  setTheme(next)
+  accountOpen.value = false
+}
 
 const drawerOpen = ref(false)
 const accountOpen = ref(false)
@@ -132,11 +147,39 @@ async function logout() {
 
           <div
             v-if="accountOpen"
-            class="absolute right-0 z-50 mt-2 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+            class="absolute right-0 z-50 mt-2 w-48 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+            data-testid="account-menu"
           >
             <p class="truncate px-3 py-2 text-[12px] text-muted">
               {{ username ?? t('common.account.notLoggedIn') }}
             </p>
+
+            <!-- 主题三态（设计文档 8.2：浅色 / 深色 / 跟随系统，当前项打勾） -->
+            <div class="my-1 border-t border-line" />
+            <p class="px-3 pt-1 pb-1 text-[11px] font-medium text-muted">
+              {{ t('common.theme.switch') }}
+            </p>
+            <button
+              v-for="option in themeOptions"
+              :key="option.key"
+              class="flex w-full items-center gap-2 px-3 py-2 text-xs text-ink transition-colors hover:bg-elevated"
+              :data-testid="`theme-${option.key}`"
+              @click="pickTheme(option.key)"
+            >
+              <AppIcon
+                :name="option.key === 'system' ? 'chip' : option.key === 'dark' ? 'moon' : 'sun'"
+                :size="13"
+              />
+              <span class="flex-1 text-left">{{ t(option.label) }}</span>
+              <AppIcon
+                v-if="themeMode === option.key"
+                name="check"
+                :size="12"
+                class="text-accent"
+              />
+            </button>
+
+            <div class="my-1 border-t border-line" />
             <button
               class="flex w-full items-center gap-2 px-3 py-2 text-xs text-ink transition-colors hover:bg-elevated"
               @click="logout"
@@ -171,6 +214,9 @@ async function logout() {
 
     <!-- 全局媒体灯箱（单实例，Teleport 到 body；文件管理与相册共用） -->
     <MediaLightbox />
+
+    <!-- 全局分享弹窗（单实例；文件右键与各媒体库共用） -->
+    <ShareDialog />
 
     <!-- 一次性密码强制改密（--init / --reset 后首登） -->
     <div v-if="mustChangePassword" class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4">
