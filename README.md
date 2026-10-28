@@ -2,7 +2,7 @@
 
 个人媒体与设备控制中枢 · Rust(Axum) + Vue 3(Vite) + TailwindCSS v4 · **单二进制发布**。
 
-当前状态：对齐设计文档 **v2.4.0**。除认证、配置双模编辑与热重载、上传与搜索、分享/图床、收藏与续播外，本版新增**文件变更操作全链路**（新建/重命名/移动/复制/删除 + 多选批量 + 一次性令牌）、挂载点模型与单挂载点直达、统一错误码与日志规范、软链接与并发安全、危险配置自检、缩略图批量重建与三类清理入口。
+当前状态：对齐设计文档 **v2.5.0**。除认证、配置双模编辑与热重载、上传与搜索、分享/图床、收藏与续播外，本版新增**文件变更操作全链路**（新建/重命名/移动/复制/删除 + 多选批量 + 一次性令牌）、挂载点模型与单挂载点直达、统一错误码与日志规范、软链接与并发安全、危险配置自检、缩略图批量重建与三类清理入口。
 
 ## 一、启动
 
@@ -45,7 +45,7 @@ npm run dev     # http://localhost:5173，/api 与 WS 自动代理到 4242
 | 媒体 | 缩略图**WebP 优先**（有 libwebp 编码器的 FFmpeg 时输出 WebP，无则降级 JPEG/PNG；按实际格式回 Content-Type）+ 信号量（并发 2）+ 磁盘缓存 + `[media]` 可配置淘汰（`thumb_cache_max_size_mb` 默认 1024 MiB LRU + `thumb_cache_max_age_days` 默认 90 天过期，每 30 分钟后台清理，设置页可查看用量并手动清空）+ **ThumbHash 占位**（扫描时返回平均色，图未加载前不白屏）；相册/时间线（虚拟列表）；影视墙（**外部可选 FFmpeg 截首帧作封面**，WebP 优先 → JPEG → PNG 逐级降级，与缩略图共用 LRU 缓存；**路径可填可执行文件或安装目录**）+ Video.js 10（`@videojs/html` 自定义元素，neutral 皮肤）+ **外挂字幕**（同目录同名 `.srt/.vtt`，后端统一转 WebVTT）+ 原生播放器降级开关 + 播放进度续播；音乐 **ID3 标签与内嵌封面**（`APIC/PIC`，`GET /api/media/cover`）+ 全局悬浮播放条（循环/单曲/随机 + 进度拖拽 + **音量记忆**（默认 35%、`asm_volume` 持久化、静音恢复静音前音量、移动端隐藏滑块）+ **播放列表抽屉**（PC 贴条上方/移动端占下半屏，切歌/清空/高亮））+ `.lrc` 歌词滚动；收藏与「只看收藏」 |
 | 分享与图床 | 文件右键「分享…」（口令/有效期/允许下载）与「复制图床直链」；公开页 `/s/{token}`（口令解锁、内联预览、目录浏览与子文件下载）；独立「分享与图床」管理页；`[shares].referer_allowlist` 防盗链 |
 | 反代网关 | `[[services]]` 驱动的 `/proxy/<id>/…` 透传：剥离 X-Frame-Options/CSP、WebSocket 升级、Header 注入、绝对链接改写、忽略证书 |
-| WebDAV | `/dav` 挂载，App Token 认证（`asm_` 前缀、SHA-1 存库、只读/读写、有效期），OPTIONS/PROPFIND/GET/PUT/MKCOL/DELETE/MOVE |
+| WebDAV | `/dav/<mount_id>/*` 挂载（设计文档 v2.5.0 3.10）：Basic Auth（用户名=Token 名，密码=`asm_` 明文）+ SHA-1 存库 + 过期校验；OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/MOVE/COPY/LOCK/UNLOCK；只读 Token 与只读挂载点双重 403；PUT 流式落盘（`.asmoday-part` 临时文件 + 原子重命名，绝不 to_bytes）；GET/HEAD 支持 Range；LOCK/UNLOCK 为伪锁；失败计入独立防爆破池 |
 | 单二进制 | `rust-embed` 内嵌 dist，非 `/api`、`/proxy`、`/dav` 路径回落 `index.html`（History 路由），`/assets/*` 强缓存；**子路径部署**：`[server.proxy].base_url` 非空时整站挂到该前缀（`/` 重定向过去，index.html 运行时注入 `window.__ASMODAY_BASE__`，JS/CSS 资源引用构建期即为相对路径，任意前缀下都成立） |
 | 运行日志 | `data/logs/asmoday.log`（INFO/WARN/ERROR，UTC ISO8601），单文件 10 MiB、保留 5 份轮转，防撑爆 |
 
@@ -100,13 +100,13 @@ npm run dev     # http://localhost:5173，/api 与 WS 自动代理到 4242
 | WS | `/api/terminal/ws?path=&cols=&rows=&session_id=` | PTY 字节流 |
 | GET/POST/DELETE | `/api/tokens` | WebDAV 令牌 |
 | any | `/proxy/{id}/*` | 外部服务反代 |
-| any | `/dav/*` | WebDAV（Basic + App Token） |
+| any | `/dav/<mount_id>/*` | WebDAV 服务端（Basic：用户名=Token 名 + `asm_` 令牌；写方法被只读双重拦截；禁止跨挂载点 Destination；`/dav/*` 不参与 SPA Fallback） |
 
 ## 五、安全模型
 
 **文件路径三道闸**：挂载点白名单 → 显式拒绝 `..` 组件 → `canonicalize` 后做 `starts_with` 包含性校验。
 
-**WebDAV**：Basic 密码必须是 `asm_` 令牌（不是主密码）；令牌只存摘要、可设只读与有效期。
+**WebDAV**（设计文档 v2.5.0 3.10）：Basic 用户名必须是 Token 名、密码是 `asm_` 明文（不是主密码）；令牌只存摘要、可设只读与有效期；认证失败计入独立防爆破池（5 次封 15 分钟，与登录/分享互不影响）。
 
 **代理**：只允许配置里声明的 `[[services]]`，路径不可拼接到任意主机。
 
@@ -142,7 +142,8 @@ asmoday/
 - **`allow_download=false` 不是 DRM**：它只隐藏入口、拦住 `?download=1`，不防 F12 抓包、缓存嗅探与录屏。
 - **无回收站**：删除是物理硬删，没有 undo；确认弹窗的「输入目录名 / 一次性令牌」防的是误操作与脚本漏确认，不是安全边界。
 - **无断点续传 / 无异步任务队列**：上传中断需重传；单次 copy/move/delete 上限 100 项或 2 GiB，超限请去终端 `cp`/`mv`。
-- **WebDAV 属于超出文档最小集的扩展**：设计文档 v2.4.0 明确「不做 WebDAV 服务端」，本仓库保留 `/dav` 挂载（App Token 认证）作为可选能力。
+- **WebDAV 的 LOCK 是伪锁**：只返回随机 `Lock-Token`，不维护超时表；并发安全依托 per-path 文件互斥锁，不提供严格分布式锁语义。
+- **WebDAV MOVE/COPY 仅限同挂载点**：Destination 指向其他 mount_id 直接 403；跨挂载点搬运请走前端 move（复制→校验→删源）。
 
 ## 八、开发自测
 

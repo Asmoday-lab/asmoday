@@ -140,19 +140,24 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     }
 }
 
-/// 校验 WebDAV Basic 凭证，返回 (只读?, 剩余天数)
-pub fn verify_token(state: &AppState, token: &str) -> Option<bool> {
+/// 校验 WebDAV Basic 凭证（设计文档 v2.5.0 3.10）：
+/// 用户名必须是 Token 名，密码是 `asm_` 明文；哈希匹配且未过期才放行。
+/// 返回只读标记。
+pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<bool> {
     let conn = state.auth_connection().ok()?;
     let hashed = hash_token(token);
-    let row: Option<(i64, Option<i64>)> = conn
+    let row: Option<(String, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT is_readonly, expires_at FROM access_tokens WHERE token_hash = ?1",
+            "SELECT token_name, is_readonly, expires_at FROM access_tokens WHERE token_hash = ?1",
             [hashed],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok();
 
-    let (readonly, expires_at) = row?;
+    let (token_name, readonly, expires_at) = row?;
+    if token_name != username {
+        return None;
+    }
     if let Some(expires) = expires_at {
         if expires <= now_secs() {
             return None;

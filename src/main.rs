@@ -47,6 +47,8 @@ pub struct AppState {
     pub login_guard: Arc<core::auth::LoginGuard>,
     /// 分享口令尝试限流（与登录池**完全隔离**，设计文档 3.1.5）
     pub share_guard: Arc<core::auth::LoginGuard>,
+    /// WebDAV Basic Auth 尝试限流（与登录 / 分享池**互相隔离**，设计文档 v2.5.0 3.10）
+    pub dav_guard: Arc<core::auth::LoginGuard>,
     /// per-path 并发锁（设计文档 3.2.8）
     pub path_locks: Arc<core::locks::PathLocks>,
     /// 批量删除的一次性令牌
@@ -211,6 +213,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         auth: Arc::clone(&auth),
         login_guard: Arc::new(core::auth::LoginGuard::new()),
         share_guard: Arc::new(core::auth::LoginGuard::new()),
+        dav_guard: Arc::new(core::auth::LoginGuard::new()),
         path_locks: Arc::new(core::locks::PathLocks::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),

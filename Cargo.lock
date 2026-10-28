@@ -100,6 +100,7 @@ dependencies = [
  "encoding_rs",
  "futures-util",
  "hmac",
+ "httpdate",
  "image",
  "mime_guess",
  "notify",

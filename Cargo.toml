@@ -43,6 +43,8 @@ tokio-tungstenite = "0.29"
 notify = "8"
 # 字幕编码探测：.srt 极大概率是 GBK，UTF-8 失败时用它兜底（设计文档 3.4.7 第 3 条）
 encoding_rs = "0.8"
+# WebDAV PROPFIND 的 RFC1123 时间格式（axum 内部同款，不新增传递依赖）
+httpdate = "1"
 
 # 发布体积裁剪（见设计文档 9.1）
 # Windows 下某些 MSVC 环境会在 C 依赖（SQLite / ring 等）上触发

@@ -90,7 +90,7 @@ pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
     }
 
     // API / 代理路径未命中时不回落到 index.html
-    if path.starts_with("api/") || path.starts_with("proxy/") {
+    if path.starts_with("api/") || path.starts_with("proxy/") || path.starts_with("dav/") {
         return (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "application/json")],
