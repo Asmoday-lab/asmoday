@@ -46,6 +46,37 @@ export async function browseMedia(
   return (await res.json()) as BrowseResult
 }
 
+/**
+ * 相册（照片库「相册视图」的卡片，设计文档 3.4.3）。
+ * 后端已剔除内部没有任何图片的目录，`cover` 一定是相册里最新的一张图。
+ */
+export interface Album {
+  name: string
+  path: string
+  /** 相册内图片数量（递归统计） */
+  count: number
+  cover: string | null
+  /** 封面的 ThumbHash 与平均色 */
+  cover_hash: string | null
+  cover_color: string | null
+  modified: number | null
+}
+
+export interface AlbumsResult {
+  root: string
+  items: Album[]
+  truncated: boolean
+}
+
+/** 相册清单：只回子文件夹，无图文件夹后端已过滤 */
+export async function browseAlbums(path?: string, depth = 3): Promise<AlbumsResult> {
+  const params = new URLSearchParams({ depth: String(depth) })
+  if (path) params.set('path', path)
+  const res = await fetch(`/api/media/albums?${params.toString()}`)
+  if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+  return (await res.json()) as AlbumsResult
+}
+
 /** 缩略图（后端信号量限流，拥塞时返回占位图） */
 export function thumbUrl(path: string, width = 320): string {
   return withBase(`/api/files/thumb?path=${encodeURIComponent(path)}&w=${width}`)

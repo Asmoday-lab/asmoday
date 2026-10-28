@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -64,6 +64,62 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 
 fn session_cookie(token: &str, max_age: i64) -> String {
     format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+}
+
+/// CSRF 第一道防线（设计文档 3.1.3）：Cookie 认证下的写操作必须与请求 Host 同源。
+///
+/// 判定口径：
+/// - 只检 `POST / PUT / PATCH / DELETE`（GET/HEAD 不改状态）；
+/// - `Origin` 优先，其次 `Referer`；两者都缺失时放行（curl / 老浏览器 / 非浏览器客户端）；
+/// - `Origin: null` 视为不可信（沙箱 iframe、file://），直接拒绝；
+/// - 比较时剥掉 scheme 与默认端口（80/443），子路径部署的前缀不影响主机比较。
+fn origin_matches_host(headers: &HeaderMap, method: &Method) -> bool {
+    if !matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return true;
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        // 没有 Host 头（HTTP/1.0 或测试客户端）：无从判定，交给 SameSite=Lax 兜底
+        return true;
+    };
+    let candidate = headers
+        .get(header::ORIGIN)
+        .or_else(|| headers.get(header::REFERER))
+        .and_then(|value| value.to_str().ok());
+    let Some(candidate) = candidate else {
+        return true;
+    };
+    if candidate.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let authority = candidate
+        .split("://")
+        .nth(1)
+        .unwrap_or(candidate)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        // 去掉 userinfo（`user:pass@host`）
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    normalize_authority(authority) == normalize_authority(host)
+}
+
+/// 主机名归一：小写 + 去掉默认端口
+fn normalize_authority(value: &str) -> String {
+    let lowered = value.trim().to_ascii_lowercase();
+    for suffix in [":80", ":443"] {
+        if let Some(stripped) = lowered.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+    lowered
 }
 
 fn cleared_cookie() -> String {
@@ -196,12 +252,16 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
         .map(|ConnectInfo(addr)| *addr);
 
     let mut auth_user: Option<AuthUser> = None;
+    // 本次请求是否靠会话 Cookie 认证：只有 Cookie 才需要 CSRF 同源校验
+    // （Token / SSO Header 不会被浏览器自动携带，不构成 CSRF 面）
+    let mut via_cookie = false;
 
     if let Some(token) = cookie_token(request.headers()) {
         match state.auth.session_user(&token) {
             Ok(Some(user_id)) => match state.auth.user_by_id(user_id) {
                 Ok(Some(user)) => {
-                    auth_user = Some(AuthUser { id: user.id, username: user.username })
+                    auth_user = Some(AuthUser { id: user.id, username: user.username });
+                    via_cookie = true;
                 }
                 _ => return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_USER_MISSING", "User not found"),
             },
@@ -219,6 +279,15 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
     let Some(user) = auth_user else {
         return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", "Unauthorized");
     };
+
+    // CSRF（设计文档 3.1.3）：Cookie 认证的写操作必须同源，SameSite=Lax 只是第二道防线
+    if via_cookie && !origin_matches_host(request.headers(), request.method()) {
+        return json_error_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Cross-site request rejected",
+        );
+    }
 
     request.extensions_mut().insert(user);
     next.run(request).await
@@ -518,4 +587,80 @@ pub async fn totp_disable(
     }
 
     Json(json!({ "status": "ok", "totp_enabled": false })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{origin_matches_host, normalize_authority};
+    use axum::http::{HeaderMap, Method, header};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            match *name {
+                "host" => {
+                    map.insert(header::HOST, value.parse().unwrap());
+                }
+                "origin" => {
+                    map.insert(header::ORIGIN, value.parse().unwrap());
+                }
+                "referer" => {
+                    map.insert(header::REFERER, value.parse().unwrap());
+                }
+                _ => {}
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn csrf_allows_safe_methods() {
+        let map = headers(&[("host", "nas.local:4242"), ("origin", "http://evil.example")]);
+        assert!(origin_matches_host(&map, &Method::GET));
+        assert!(origin_matches_host(&map, &Method::HEAD));
+    }
+
+    #[test]
+    fn csrf_accepts_same_origin() {
+        let map = headers(&[("host", "nas.local:4242"), ("origin", "http://nas.local:4242")]);
+        assert!(origin_matches_host(&map, &Method::POST));
+    }
+
+    #[test]
+    fn csrf_rejects_cross_site_origin() {
+        let map = headers(&[("host", "nas.local:4242"), ("origin", "https://evil.example")]);
+        assert!(!origin_matches_host(&map, &Method::DELETE));
+    }
+
+    #[test]
+    fn csrf_ignores_default_port_difference() {
+        let map = headers(&[("host", "nas.local"), ("origin", "https://nas.local:443")]);
+        assert!(origin_matches_host(&map, &Method::PUT));
+    }
+
+    #[test]
+    fn csrf_uses_referer_when_origin_missing() {
+        let map = headers(&[("host", "nas.local:4242"), ("referer", "http://nas.local:4242/files/m0/a")]);
+        assert!(origin_matches_host(&map, &Method::POST));
+    }
+
+    #[test]
+    fn csrf_rejects_null_origin() {
+        let map = headers(&[("host", "nas.local:4242"), ("origin", "null")]);
+        assert!(!origin_matches_host(&map, &Method::POST));
+    }
+
+    #[test]
+    fn csrf_allows_requests_without_origin() {
+        // curl / 老浏览器不会带 Origin：交给 SameSite=Lax，不误伤 API 调用
+        let map = headers(&[("host", "nas.local:4242")]);
+        assert!(origin_matches_host(&map, &Method::POST));
+    }
+
+    #[test]
+    fn authority_normalization_strips_default_ports() {
+        assert_eq!(normalize_authority("NAS.Local:443"), "nas.local");
+        assert_eq!(normalize_authority("nas.local:80"), "nas.local");
+        assert_eq!(normalize_authority("nas.local:4242"), "nas.local:4242");
+    }
 }

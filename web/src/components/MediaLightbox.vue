@@ -41,11 +41,39 @@ const total = lightboxTotal
 
 /** 打不开的图片（坏文件 / 无权限）回退成图标，避免整屏空白 */
 const failed = ref(new Set<string>())
+/** 原图已解码完成的路径：在此之前用缩略图打底（设计文档 3.4.4） */
+const ready = ref<string | null>(null)
+/** 已经静默预加载过的路径，避免来回翻页重复请求 */
+const preloaded = new Set<string>()
 const audioEl = ref<HTMLAudioElement | null>(null)
 const stripEl = ref<HTMLElement | null>(null)
 const thumbRefs = ref<Record<number, HTMLElement | null>>({})
 
 useScrollLock(isOpen)
+
+/** 静默预加载前后各一张：停留当前图时后台把邻居下载到缓存（设计文档 3.4.4） */
+function preloadNeighbors() {
+  if (!isOpen.value) return
+  const list = lightboxState.items
+  for (const offset of [-1, 1]) {
+    const entry = list[lightboxState.index + offset]
+    if (!entry || entry.kind !== 'image' || preloaded.has(entry.path)) continue
+    preloaded.add(entry.path)
+    const image = new Image()
+    image.decoding = 'async'
+    image.src = rawUrl(entry.path)
+  }
+}
+
+// 换图就重置「已加载」状态，让打底层重新顶上来；顺便预热左右邻居
+watch(
+  () => [item.value?.path, isOpen.value] as const,
+  () => {
+    ready.value = null
+    preloadNeighbors()
+  },
+  { immediate: true },
+)
 
 function onKey(event: KeyboardEvent) {
   if (!isOpen.value) return
@@ -208,14 +236,26 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           <AppIcon name="chevronLeft" :size="18" />
         </button>
 
-        <!-- 图片 -->
+        <!-- 图片：缩略图打底 → 原图淡入（设计文档 3.4.4 渐进式加载，严禁黑屏） -->
         <template v-if="item.kind === 'image'">
+          <!-- 打底层：用已经缓存过的缩略图铺满舞台（模糊处理），点击瞬间就有画面 -->
+          <img
+            v-if="!failed.has(item.path)"
+            :src="thumbUrl(item.path, 960)"
+            class="pointer-events-none absolute inset-0 z-0 m-auto max-h-full max-w-full object-contain opacity-70 blur-md"
+            aria-hidden="true"
+            alt=""
+          />
+          <!-- 原图：加载完成后淡入，层级永远高于遮罩与打底层 -->
           <img
             v-if="!failed.has(item.path)"
             :key="item.path"
             :src="rawUrl(item.path)"
-            class="max-h-full max-w-full rounded-lg object-contain"
+            class="relative z-10 max-h-full max-w-full rounded-lg object-contain transition-opacity duration-300"
+            :class="ready === item.path ? 'opacity-100' : 'opacity-0'"
+            data-testid="lightbox-image"
             alt=""
+            @load="ready = item.path"
             @error="markFailed(item.path)"
           />
           <div v-else class="grid place-items-center gap-2 text-white/50">

@@ -71,6 +71,31 @@ pub struct BrowseResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AlbumsQuery {
+    pub path: Option<String>,
+    /// 统计单个相册时向下钻取的层数（相册内部的子目录也算同一本相册）
+    pub depth: Option<usize>,
+}
+
+/// 相册（照片库「相册视图」的卡片，设计文档 3.4.3）。
+///
+/// `count == 0` 的目录绝不出现在结果里 —— 无图文件夹就是空壳卡片。
+#[derive(Debug, Clone, Serialize)]
+pub struct Album {
+    pub name: String,
+    pub path: String,
+    /// 相册内图片数量（递归统计）
+    pub count: usize,
+    /// 封面 = 该相册里**最新**的一张图片
+    pub cover: Option<String>,
+    /// 封面的 ThumbHash 与平均色（前端模糊打底，避免整块跳色）
+    pub cover_hash: Option<String>,
+    pub cover_color: Option<String>,
+    /// 相册内最新一张图片的修改时间（排序用）
+    pub modified: Option<u64>,
+}
+
 fn placeholder() -> Response {
     (
         StatusCode::OK,
@@ -250,6 +275,36 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
     }
 }
 
+/// GET /api/media/albums?path=…&depth=3
+///
+/// 照片库「相册视图」：只回子文件夹（不含文件），并剔除内部一张图片都没有的目录。
+/// 封面必须取相册里最新的一张图（设计文档 3.4.3），所以统计时要一路记下最大 mtime。
+pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQuery>) -> Response {
+    let root = match resolve_default(&state, query.path.as_deref()).await {
+        Ok(path) => path,
+        Err(err) => return fs_error(err),
+    };
+    if !root.is_dir() {
+        return fs_error(FsError::BadRequest("目标不是目录".to_string()));
+    }
+
+    let depth = query.depth.unwrap_or(3).clamp(1, 4);
+    let scan_root = root.clone();
+    let auth_store = Arc::clone(&state.auth);
+    let outcome =
+        tokio::task::spawn_blocking(move || scan_albums(&scan_root, depth, &auth_store)).await;
+
+    match outcome {
+        Ok((items, truncated)) => Json(json!({
+            "root": fs::normalize_display(&root),
+            "items": items,
+            "truncated": truncated,
+        }))
+        .into_response(),
+        Err(err) => fs_error(FsError::Io(format!("扫描相册失败：{err}"))),
+    }
+}
+
 /// 扫描时要跳过的目录名：应用自身的数据/构建产物不算媒体库
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -422,6 +477,145 @@ fn scan(
     // 新的在前
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     (out, scanned, truncated)
+}
+
+// ---------------------------------------------------------------------------
+// 照片库相册视图（设计文档 3.4.3）
+// ---------------------------------------------------------------------------
+
+/// 单个相册最多扫多少个目录项（防止一本相册把请求拖死）
+const ALBUM_SCAN_LIMIT: usize = 20_000;
+
+fn scan_albums(
+    root: &Path,
+    depth: usize,
+    auth: &crate::core::auth::AuthStore,
+) -> (Vec<Album>, bool) {
+    let mut albums: Vec<Album> = Vec::new();
+    // 与 albums 一一对应的封面真实路径（取 ThumbHash 用；展示串已换成 `/` 分隔，
+    // 拿展示串算 key 会与缩略图生成时的 key 不一致）
+    let mut covers: Vec<Option<PathBuf>> = Vec::new();
+    let mut truncated = false;
+
+    let Ok(reader) = std::fs::read_dir(root) else {
+        return (albums, truncated);
+    };
+
+    for entry in reader.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 隐藏目录与工程目录不算相册（`data` / `node_modules` 之类）
+        if name.starts_with('.')
+            || SKIP_DIRS.contains(&name.to_lowercase().as_str())
+            || crate::core::junk::is_system_junk(&name)
+        {
+            continue;
+        }
+
+        let dir = entry.path();
+        let mut count = 0usize;
+        // (mtime, path)：相册封面取最新的一张图
+        let mut newest: Option<(u64, PathBuf)> = None;
+        let mut scanned = 0usize;
+        let mut stack: Vec<(PathBuf, usize)> = vec![(dir.clone(), 1)];
+
+        'walk: while let Some((current, level)) = stack.pop() {
+            let Ok(items) = std::fs::read_dir(&current) else { continue };
+            for item in items.flatten() {
+                scanned += 1;
+                if scanned > ALBUM_SCAN_LIMIT {
+                    truncated = true;
+                    break 'walk;
+                }
+                let Ok(item_type) = item.file_type() else { continue };
+                let child_name = item.file_name().to_string_lossy().to_string();
+                if crate::core::junk::is_system_junk(&child_name) {
+                    continue;
+                }
+                if item_type.is_dir() {
+                    if level < depth
+                        && !child_name.starts_with('.')
+                        && !SKIP_DIRS.contains(&child_name.to_lowercase().as_str())
+                    {
+                        stack.push((item.path(), level + 1));
+                    }
+                    continue;
+                }
+                if !item_type.is_file() {
+                    continue;
+                }
+                let ext = fs::extension_of_name(&child_name);
+                // 图标类 SVG 不算照片
+                if ext == "svg" {
+                    continue;
+                }
+                let (kind, _) = fs::classify_name(&child_name, &ext, false);
+                if kind != "image" {
+                    continue;
+                }
+                count += 1;
+                let mtime = item
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|delta| delta.as_secs())
+                    .unwrap_or(0);
+                if newest.as_ref().map(|(best, _)| mtime > *best).unwrap_or(true) {
+                    newest = Some((mtime, item.path()));
+                }
+            }
+        }
+
+        // 一张图都没有的目录绝不上架（设计文档 3.4.3）
+        if count == 0 {
+            continue;
+        }
+
+        let (modified, cover_source) = match newest {
+            Some((mtime, path)) => (Some(mtime), Some(path)),
+            None => (None, None),
+        };
+        albums.push(Album {
+            name,
+            path: fs::normalize_display(&dir),
+            count,
+            cover: cover_source.as_ref().map(|path| fs::normalize_display(path)),
+            cover_hash: None,
+            cover_color: None,
+            modified,
+        });
+        covers.push(cover_source);
+    }
+
+    // 封面 ThumbHash 一次性批量取（与媒体列表同一条惰性迁移路径）
+    let lookup: Vec<(usize, PathBuf)> = covers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| path.as_ref().map(|path| (index, path.clone())))
+        .collect();
+    if !lookup.is_empty() {
+        let keys: Vec<String> = lookup
+            .iter()
+            .map(|(_, path)| crate::core::thumbnail::Thumbnailer::hash_key(path))
+            .collect();
+        let hits = auth.thumb_hashes_get_many(&keys);
+        for ((index, _), key) in lookup.iter().zip(keys.iter()) {
+            if let Some(hash) = hits.get(key) {
+                if let Some(album) = albums.get_mut(*index) {
+                    album.cover_hash = Some(hash.clone());
+                    album.cover_color = average_color(hash);
+                }
+            }
+        }
+    }
+
+    // 新的在前；没有 mtime 的沉底
+    albums.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+    (albums, truncated)
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,8 @@
     "failed": "Failed to load mounts",
     "empty": "No mount available yet",
     "emptyHint": "Add [[system.mounts]] under Settings → Advanced, or edit config.toml directly",
-    "missingToast": "This mount path is unavailable, please check config.toml"
+    "missingToast": "This mount path is unavailable, please check config.toml",
+    "opening": "Opening mount…"
   },
   "toolbar": {
     "refresh": "Refresh",

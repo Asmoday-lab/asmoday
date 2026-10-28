@@ -204,6 +204,10 @@ impl AuthStore {
             .map_err(|e| format!("打开数据库 {} 失败：{e}", self.db_path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| format!("设置 WAL 失败：{e}"))?;
+        // 设计文档 4.1：【强制】busy_timeout=5000 —— 缩略图/媒体扫描与 Web 请求并发写库时
+        // 不要立刻抛 SQLITE_BUSY，等 5 秒让锁自然释放
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(|e| format!("设置 busy_timeout 失败：{e}"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| format!("设置外键失败：{e}"))?;
         Ok(conn)
@@ -213,6 +217,20 @@ impl AuthStore {
         let conn = self.connect()?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("初始化数据库结构失败：{e}"))?;
+        // 数据库文件权限 0600（设计文档 4.1）：里面是密码哈希、TOTP 密钥与会话，
+        // 绝不能给同机其他用户可读
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&self.db_path) {
+                if meta.permissions().mode() & 0o777 != 0o600 {
+                    let _ = std::fs::set_permissions(
+                        &self.db_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+        }
         // 存量库补列：CREATE TABLE IF NOT EXISTS 对老库不生效
         let _ = conn.execute(
             "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",

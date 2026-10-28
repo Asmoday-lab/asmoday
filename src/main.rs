@@ -421,6 +421,7 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/files/search", get(api::files::search))
         .route("/api/files/subtitle", get(api::files::subtitle))
         .route("/api/media/browse", get(api::media::browse))
+        .route("/api/media/albums", get(api::media::albums))
         .route("/api/media/cover", get(api::media::cover))
         .route("/api/media/progress", post(api::media::progress))
         .route("/api/media/history", get(api::media::history))

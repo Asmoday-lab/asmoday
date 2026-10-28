@@ -16,7 +16,7 @@ import {
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
 import FilePreviewPane from '../components/FilePreviewPane.vue'
@@ -49,6 +49,7 @@ const CodeEditor = defineAsyncComponent(() => import('../components/CodeEditor.v
 
 const { isDark } = useTheme()
 const { t } = useI18n()
+const route = useRoute()
 const router = useRouter()
 
 /** 右键菜单目标（定位与视口夹取由全局 ContextMenu 组件负责） */
@@ -659,6 +660,66 @@ const readonly = computed(() => listing.value?.readonly ?? false)
 /** 在线挂载点数量：1 个时跳过卡片页直达根目录（设计文档 3.2.1） */
 const onlineMounts = computed(() => roots.value.filter((root) => root.online))
 const singleMount = computed(() => onlineMounts.value.length === 1)
+/** 当前所在挂载点（URL 里的 :mountId 与它保持同步） */
+const activeMount = ref<MountPoint | null>(null)
+/** 单挂载点 replace 跳转期间的全屏 Loading（设计文档 8.1：防闪烁） */
+const redirecting = ref(false)
+
+/**
+ * 路径 → 挂载点：取「最长前缀命中」，避免 `/mnt/a` 与 `/mnt/ab` 互相误判。
+ * 面包屑与 URL 同步共用同一套判定。
+ */
+function mountForPath(path: string): MountPoint | null {
+  const normalized = path.replace(/\\/g, '/')
+  let matched: MountPoint | null = null
+  let matchedLength = -1
+  for (const root of roots.value) {
+    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (
+      prefix &&
+      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
+      prefix.length > matchedLength
+    ) {
+      matched = root
+      matchedLength = prefix.length
+    }
+  }
+  return matched
+}
+
+/** 挂载点 + 绝对路径 → 路由目标（`/files/:mountId/<相对段>`） */
+function routeFor(mount: MountPoint, path: string) {
+  const base = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
+  const normalized = path.replace(/\\/g, '/')
+  const rest = base && normalized.toLowerCase().startsWith(base.toLowerCase())
+    ? normalized.slice(base.length)
+    : ''
+  const segments = rest.split('/').filter(Boolean)
+  return { name: 'files-mount' as const, params: { mountId: mount.id, pathMatch: segments } }
+}
+
+/** 路由参数 → 绝对路径（vue-router 已对 params 解码，这里不做二次解码） */
+function pathFromRoute(mount: MountPoint, raw: unknown): string {
+  const segments = Array.isArray(raw) ? raw.map(String) : raw ? [String(raw)] : []
+  const base = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
+  return segments.length ? `${base}/${segments.filter(Boolean).join('/')}` : mount.path
+}
+
+/**
+ * 把当前目录同步进 URL（设计文档 3.2.1）。
+ *
+ * 文件管理不允许「原地换目录但不改 URL」——刷新、分享、浏览器前进后退都必须能回到同一目录。
+ * 页内跳转默认 replace：避免在一个目录里点十下就压十层历史；从卡片页进入挂载点才 push。
+ */
+function syncUrl(path: string, mode: 'push' | 'replace' = 'replace') {
+  const mount = mountForPath(path)
+  if (!mount) return
+  activeMount.value = mount
+  const target = routeFor(mount, path)
+  if (router.resolve(target).fullPath === route.fullPath) return
+  const navigate = mode === 'push' ? router.push : router.replace
+  void navigate(target)
+}
 /** 工具栏「新建」下拉 */
 const newMenuOpen = ref(false)
 const currentPath = ref('')
@@ -1008,7 +1069,7 @@ function describe(err: unknown): { status: number; message: string } {
   return { status: 0, message: err instanceof Error ? err.message : t('common.state.unknownError') }
 }
 
-/** 重新加载挂载点，并回到挂载点入口页 */
+/** 重新加载挂载点，并按 URL 落到对应目录（设计文档 3.2.1 路由强制规范） */
 async function boot() {
   loading.value = true
   error.value = null
@@ -1022,13 +1083,40 @@ async function boot() {
     const data = await filesApi.mounts()
     roots.value = data.mounts
     rootsImplicit.value = data.implicit
+
+    // 一、URL 里已带 mountId（单挂载点跳转后的稳定形态 / 直接粘贴深链接）
+    const requestedId = typeof route.params.mountId === 'string' ? route.params.mountId : ''
+    const requested = requestedId
+      ? data.mounts.find((mount) => mount.id === requestedId)
+      : undefined
+    if (requested && requested.online) {
+      activeMount.value = requested
+      const target = pathFromRoute(requested, route.params.pathMatch)
+      const opened = await open(target, 1, { sync: false })
+      if (!opened && target !== requested.path) {
+        // 深链接指向的目录已不存在：退到挂载点根，别把用户留在报错页
+        showToast(t('files.roots.missingToast'))
+        await open(requested.path, 1, { sync: false })
+      }
+      return
+    }
+    // 配置被改过，URL 里的挂载点已经没了 → 卡片页才是正确落点
+    if (requestedId) void router.replace({ name: 'files' })
+
     const online = data.mounts.filter((mount) => mount.online)
     if (!data.mounts.length) {
       error.value = null
     } else if (online.length === 1) {
-      // 单挂载点：跳过卡片页直达根目录。这里用「直接打开」而不是再压一层路由，
-      // 返回卡片页由面包屑的 home 按钮处理，逻辑等价且不产生历史栈膨胀。
-      await openRoot(online[0])
+      // 单挂载点：必须 router.replace 到 /files/:mountId/，跳过卡片页直达根目录。
+      // 严禁「原地打开不改 URL」——那样刷新会回到卡片页，深链接也无从分享。
+      redirecting.value = true
+      try {
+        activeMount.value = online[0]
+        await router.replace(routeFor(online[0], online[0].path))
+        await open(online[0].path, 1, { sync: false })
+      } finally {
+        redirecting.value = false
+      }
       return
     }
   } catch (err) {
@@ -1039,28 +1127,29 @@ async function boot() {
 }
 
 /** 打开挂载点根（内部走 open，但保留 loading 态避免白屏闪烁） */
-async function openRoot(root: MountPoint) {
+async function openRoot(root: MountPoint, options: { push?: boolean } = {}) {
   if (!root.online) {
     showToast(t('files.roots.missingToast'))
     return
   }
   if (editor.value) closeEditor()
-  await open(root.path)
+  activeMount.value = root
+  await open(root.path, 1, { push: options.push })
 }
 
 /** 进入某个挂载点 */
 function enterRoot(root: MountPoint) {
-  void openRoot(root)
+  void openRoot(root, { push: true })
 }
 
 /** 面包屑首段：多挂载点回卡片页，单挂载点回该挂载点根目录 */
 function goHome() {
-  if (singleMount.value) {
-    const root = onlineMounts.value[0]
-    if (root && currentPath.value !== root.path) {
+  const home = activeMount.value ?? (singleMount.value ? onlineMounts.value[0] : null)
+  if (singleMount.value && home) {
+    if (currentPath.value !== home.path) {
       if (editor.value) closeEditor()
       preview.value = null
-      void open(root.path)
+      void open(home.path)
       return
     }
   }
@@ -1071,9 +1160,16 @@ function goHome() {
   selected.value = null
   searchTerm.value = ''
   error.value = null
+  activeMount.value = null
+  // 回到卡片页时 URL 也要跟着回 /files（否则刷新又跳回目录）
+  if (route.name !== 'files') void router.replace({ name: 'files' })
 }
 
-async function open(path: string, pageNo = 1) {
+async function open(
+  path: string,
+  pageNo = 1,
+  options: { sync?: boolean; push?: boolean } = {},
+): Promise<boolean> {
   loading.value = true
   error.value = null
   selected.value = null
@@ -1083,8 +1179,11 @@ async function open(path: string, pageNo = 1) {
     listing.value = data
     currentPath.value = data.path
     page.value = data.page
+    if (options.sync !== false) syncUrl(data.path, options.push ? 'push' : 'replace')
+    return true
   } catch (err) {
     error.value = describe(err)
+    return false
   } finally {
     loading.value = false
   }
@@ -1386,6 +1485,30 @@ useScrollLock(
   ),
 )
 
+// 浏览器前进/后退或外部改 URL：按新 URL 重新定位，但不反向 sync（否则死循环）
+watch(
+  () => [route.params.mountId, route.params.pathMatch] as const,
+  async () => {
+    const id = typeof route.params.mountId === 'string' ? route.params.mountId : ''
+    if (!id) {
+      // 回到卡片页
+      if (currentPath.value) {
+        currentPath.value = ''
+        listing.value = null
+        activeMount.value = null
+      }
+      return
+    }
+    if (redirecting.value) return
+    const mount = roots.value.find((root) => root.id === id)
+    if (!mount || !mount.online) return
+    const target = pathFromRoute(mount, route.params.pathMatch)
+    if (target === currentPath.value) return
+    activeMount.value = mount
+    await open(target, 1, { sync: false })
+  },
+)
+
 onMounted(boot)
 </script>
 
@@ -1396,6 +1519,20 @@ onMounted(boot)
     @dragleave.prevent="dragging = false"
     @drop.prevent="onDrop"
   >
+    <!-- 单挂载点 replace 跳转期间的全屏遮罩：绝不闪一下卡片页（设计文档 8.1 防闪烁） -->
+    <div
+      v-if="redirecting"
+      class="absolute inset-0 z-40 grid place-items-center bg-base/85 backdrop-blur-sm"
+      data-testid="files-redirecting"
+    >
+      <div class="flex items-center gap-2 text-xs text-muted">
+        <span class="size-4 animate-spin rounded-full border-2 border-line border-t-accent" />
+        <span>
+          {{ t('files.roots.opening') }}
+          <template v-if="activeMount"> · {{ activeMount.name }}</template>
+        </span>
+      </div>
+    </div>
 
     <!-- 右栏：编辑器 或 列表 -->
     <div v-if="editor" class="flex min-w-0 flex-1 flex-col">
@@ -1881,12 +2018,12 @@ onMounted(boot)
               @touchend="cancelPress"
               @touchcancel="cancelPress"
             >
-              <!-- 悬停浮现复选框（设计文档 3.2.1 / 8.4.12）：不进多选也能一键勾上 -->
+              <!-- 悬停浮现复选框（设计文档 3.2.1 / 8.4.12）：左上角，与缩略图角标区分 -->
               <span
                 role="checkbox"
                 :aria-checked="isSelected(entry.path)"
                 :title="t('files.select.toggle')"
-                class="absolute right-1 top-1 z-10 grid size-5 cursor-pointer place-items-center rounded-full border transition-all"
+                class="absolute left-1 top-1 z-10 grid size-5 cursor-pointer place-items-center rounded-full border transition-all"
                 :class="[
                   isSelected(entry.path)
                     ? 'border-accent bg-accent text-white'

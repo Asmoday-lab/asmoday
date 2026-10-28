@@ -10,7 +10,9 @@
     "backToAlbums": "Albums",
     "videoBadge": "Video",
     "truncated": "Folder too large — only the first 4000 entries are indexed",
-    "rootFolder": "Root"
+    "rootFolder": "Root",
+    "albumEmpty": "No folders with photos yet",
+    "albumEmptyHint": "Photos loose in the root still show up in the timeline"
   },
   "cinema": {
     "title": "Cinema",

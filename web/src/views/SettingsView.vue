@@ -973,7 +973,7 @@ onMounted(() => {
           }}</span>
           <!-- 危险操作固定在行末，hover 变红（8.4.2） -->
           <button
-            class="flex w-6 shrink-0 justify-end text-muted transition-colors hover-danger"
+            class="flex w-6 shrink-0 justify-end text-muted transition-colors hover:text-red-500"
             :title="t('settings.security.deleteToken')"
             @click="deleteToken(token.id)"
           >

@@ -25,8 +25,8 @@ use tokio::sync::broadcast;
 pub const REAP_DELAY: Duration = Duration::from_secs(180);
 /// 单用户最大并发 PTY 会话数（设计文档 3.3：防前端死循环重连把 CPU 打满）
 pub const MAX_SESSIONS: usize = 10;
-/// 环形缓冲区容量
-const BUFFER_CAPACITY: usize = 512 * 1024;
+/// 环形缓冲区容量（设计文档 3.3.3：上限 1MB，超出丢最旧数据）
+const BUFFER_CAPACITY: usize = 1024 * 1024;
 
 /// 拉起 shell 的方式（设计文档 3.3.7）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -172,17 +172,31 @@ fn apply_shell_args(command: &mut CommandBuilder, _shell: &str, options: ShellOp
     command.arg("chcp.com 65001 > $null");
 }
 
-/// 类 Unix：纯净模式跳过 profile 与 rc（救急用）。
+/// 类 Unix：默认以 **Login Shell** 启动（设计文档 3.3.5）。
 ///
-/// 只有 bash 认这两个参数；其它 shell 一律不加（宁可不纯净，也不能起不来）。
+/// `bash -l` / `zsh -l` 会读 `/etc/profile` 与用户的 profile 脚本，Conda、nvm、fnm
+/// 这些工具的初始化都藏在里面；不登录启动的 shell 会让用户觉得「终端里的环境和 SSH 里不一样」。
+/// 纯净模式（救急）则反过来：跳过 profile 与 rc，并固定用 bash 以保证 `--noprofile --norc` 有效。
 #[cfg(not(windows))]
 fn apply_shell_args(command: &mut CommandBuilder, shell: &str, options: ShellOptions) {
-    let is_bash = Path::new(shell)
+    let name = Path::new(shell)
         .file_name()
-        .map(|name| name.eq_ignore_ascii_case("bash"))
-        .unwrap_or(false);
-    if options.no_profile && is_bash {
-        command.args(["--noprofile", "--norc"]);
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_bash = name == "bash";
+
+    if options.no_profile {
+        // 只有 bash 认这两个参数；其它 shell 一律不加（宁可不纯净，也不能起不来）
+        if is_bash {
+            command.args(["--noprofile", "--norc"]);
+        }
+        return;
+    }
+
+    // `-l` 只给认识的 POSIX 家族 shell；nushell / elvish 之类参数不同，绝不硬塞
+    const LOGIN_SHELLS: &[&str] = &["bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh"];
+    if LOGIN_SHELLS.contains(&name.as_str()) {
+        command.arg("-l");
     }
 }
 

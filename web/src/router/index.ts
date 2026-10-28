@@ -45,6 +45,13 @@ const routes: RouteRecordRaw[] = [
     meta: { title: 'common.nav.files', icon: 'folder', subtitle: 'common.subtitle.files' },
   },
   {
+    // 单挂载点必须 router.replace 到这里（设计文档 3.2.1），深链接形如 /files/<id>/a/b
+    path: '/files/:mountId/:pathMatch(.*)*',
+    name: 'files-mount',
+    component: () => import('../views/FilesView.vue'),
+    meta: { title: 'common.nav.files', icon: 'folder', subtitle: 'common.subtitle.files' },
+  },
+  {
     path: '/photos',
     name: 'photos',
     component: () => import('../views/GalleryView.vue'),

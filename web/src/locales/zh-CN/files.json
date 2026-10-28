@@ -11,7 +11,8 @@
     "failed": "挂载点加载失败",
     "empty": "还没有可浏览的挂载点",
     "emptyHint": "到「系统设置 → 高级」里添加 [[system.mounts]]，或直接编辑 config.toml",
-    "missingToast": "该挂载点路径不可用，请检查 config.toml"
+    "missingToast": "该挂载点路径不可用，请检查 config.toml",
+    "opening": "正在打开挂载点…"
   },
   "toolbar": {
     "refresh": "刷新",

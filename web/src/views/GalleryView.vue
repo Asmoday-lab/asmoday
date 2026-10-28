@@ -10,14 +10,17 @@ import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
+import PhotoTile from '../components/PhotoTile.vue'
 import {
+  browseAlbums,
   browseMedia,
   coverUrl,
   libraryApi,
-  placeholderFor,
   placeholderColor,
+  placeholderFor,
   rawUrl,
   thumbUrl,
+  type Album,
   type MediaItem,
 } from '../api/media'
 import { sharesApi } from '../api/shares'
@@ -251,6 +254,88 @@ const timelineSorted = computed(() =>
   })),
 )
 
+// ---------------- 照片库双视图（设计文档 3.4.3） ----------------
+//
+// 相册视图 = 子文件夹卡片（封面取册内最新一张图，空册由后端剔除）；
+// 时间线视图 = 忽略目录层级、按月吸顶的全部照片。两个视图平级，用户显式切换，
+// 绝不允许以「优化」为由只留一种（设计文档 1.4 第 9 条）。
+type PhotoView = 'albums' | 'timeline'
+const PHOTO_VIEW_KEY = 'asmoday.photos.view'
+const photoView = ref<PhotoView>(
+  localStorage.getItem(PHOTO_VIEW_KEY) === 'timeline' ? 'timeline' : 'albums',
+)
+
+const albums = ref<Album[]>([])
+const albumsLoading = ref(false)
+const albumsError = ref('')
+/** 已经点进去的那本相册；非空时相册视图展示册内图片 */
+const activeAlbum = ref<Album | null>(null)
+const albumItems = ref<MediaItem[]>([])
+const albumLoading = ref(false)
+/** 相册封面加载失败（坏图）时回退纯色，不再重复请求 */
+const albumCoverFailed = ref(new Set<string>())
+
+async function loadAlbums() {
+  if (albumsLoading.value) return
+  albumsLoading.value = true
+  albumsError.value = ''
+  try {
+    const result = await browseAlbums(undefined, 3)
+    albums.value = result.items
+  } catch (err) {
+    albumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
+  } finally {
+    albumsLoading.value = false
+  }
+}
+
+function setPhotoView(view: PhotoView) {
+  if (photoView.value === view) return
+  photoView.value = view
+  localStorage.setItem(PHOTO_VIEW_KEY, view)
+  closeAlbum()
+  if (view === 'albums' && albums.value.length === 0) void loadAlbums()
+}
+
+async function openAlbum(album: Album) {
+  activeAlbum.value = album
+  albumLoading.value = true
+  albumItems.value = []
+  try {
+    // 册内递归展示（与后端统计 count 的口径一致，否则「4 项」点进去只有 1 张）
+    const result = await browseMedia(album.path, 'image', 3)
+    albumItems.value = result.items
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    albumLoading.value = false
+  }
+}
+
+function closeAlbum() {
+  activeAlbum.value = null
+  albumItems.value = []
+  albumLoading.value = false
+}
+
+/** 当前正在浏览的照片列表：相册详情与时间线各自独立 */
+function currentPhotoList(): MediaItem[] {
+  return photoView.value === 'albums' && activeAlbum.value ? albumItems.value : photoItems.value
+}
+
+function albumColor(album: Album): string {
+  return album.cover_color ?? placeholderColor(album.path)
+}
+
+/** 相册封面也没有缩略图时（首次浏览），用封面 ThumbHash 打底 */
+function albumHash(album: Album): string | null {
+  return thumbHashToDataUrl(album.cover_hash)
+}
+
+function markAlbumCoverFailed(path: string) {
+  albumCoverFailed.value = new Set(albumCoverFailed.value).add(path)
+}
+
 /** 点开图片/视频：交给全局灯箱（设计文档 3.2：严禁重复造轮子） */
 function openViewer(list: MediaItem[], index: number) {
   openLightbox(
@@ -308,8 +393,9 @@ async function onMediaMenuSelect(id: string) {
   switch (id) {
     case 'open': {
       if (current.context === 'photos') {
-        const index = photoItems.value.findIndex((entry) => entry.path === item.path)
-        openViewer(photoItems.value, index > 0 ? index : 0)
+        const list = currentPhotoList()
+        const index = list.findIndex((entry) => entry.path === item.path)
+        openViewer(list, index > 0 ? index : 0)
       } else if (current.context === 'cinema') {
         playing.value = item
       } else {
@@ -370,6 +456,11 @@ async function load() {
     items.value = result.items
     root.value = result.root
     truncated.value = result.truncated
+    // 照片库同时刷新相册清单（后端会剔除空相册）
+    if (tab.value === 'photos') {
+      closeAlbum()
+      void loadAlbums()
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
@@ -406,10 +497,35 @@ onBeforeUnmount(() => {
   <section class="flex h-full min-h-0 flex-col">
     <!-- 顶部：照片子视图 + 控制区 -->
     <header class="flex shrink-0 flex-wrap items-center gap-4 border-b border-line px-4 py-2 md:px-6">
-      <!-- 照片库只有时间线一种形态（设计文档 3.4.3：严禁展示文件夹，子目录图片直接捞平） -->
-      <p v-if="tab === 'photos'" class="text-sm font-medium text-ink">
-        {{ t('gallery.photos.timeline') }}
-      </p>
+      <!-- 照片库双视图（设计文档 3.4.3）：[相册] 与 [时间线] 是两个平级视图，缺一不可 -->
+      <div
+        v-if="tab === 'photos'"
+        class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
+        data-testid="photo-view-switch"
+      >
+        <button
+          class="rounded px-2.5 py-1 transition-colors"
+          :class="
+            photoView === 'albums'
+              ? 'bg-accent-soft text-accent'
+              : 'text-muted hover:text-ink'
+          "
+          @click="setPhotoView('albums')"
+        >
+          {{ t('gallery.photos.albums') }}
+        </button>
+        <button
+          class="rounded px-2.5 py-1 transition-colors"
+          :class="
+            photoView === 'timeline'
+              ? 'bg-accent-soft text-accent'
+              : 'text-muted hover:text-ink'
+          "
+          @click="setPhotoView('timeline')"
+        >
+          {{ t('gallery.photos.timeline') }}
+        </button>
+      </div>
 
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
         <span v-if="truncated" class="rounded bg-amber-500/15 px-2 py-0.5 fg-warn">
@@ -462,71 +578,167 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 照片 -->
+    <!-- 照片：相册 / 时间线 两个平级视图（设计文档 3.4.3） -->
     <div v-else-if="tab === 'photos'" class="min-h-0 flex-1">
-      <div v-if="photoItems.length === 0" class="grid h-full place-items-center text-center">
-        <div>
-          <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-            <AppIcon name="gallery" :size="22" />
+      <!-- 相册详情：只看当前这本相册里的图片 -->
+      <div v-if="photoView === 'albums' && activeAlbum" class="flex h-full flex-col">
+        <header
+          class="flex h-10 shrink-0 items-center gap-2 border-b border-line/60 px-4 text-sm md:px-6"
+        >
+          <button
+            class="flex shrink-0 items-center gap-0.5 rounded px-1.5 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+            data-testid="album-back"
+            @click="closeAlbum"
+          >
+            <AppIcon name="chevronLeft" :size="13" />
+            {{ t('gallery.photos.backToAlbums') }}
+          </button>
+          <span class="min-w-0 truncate font-medium text-ink">{{ activeAlbum.name }}</span>
+          <span class="ml-auto shrink-0 text-[12px] text-muted">
+            {{ t('gallery.photos.albumItems', { count: albumItems.length }) }}
           </span>
-          <p class="text-sm text-ink">{{ t('gallery.photos.empty') }}</p>
-          <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.emptyHint') }}</p>
+        </header>
+
+        <div class="min-h-0 flex-1 overflow-y-auto p-2 md:p-3">
+          <div
+            v-if="albumLoading"
+            class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
+          >
+            <div v-for="i in 12" :key="i" class="skeleton aspect-square rounded-lg" />
+          </div>
+          <div
+            v-else-if="albumItems.length === 0"
+            class="grid h-full place-items-center text-center"
+          >
+            <p class="text-sm text-muted">{{ t('gallery.photos.empty') }}</p>
+          </div>
+          <div
+            v-else
+            class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
+            data-testid="album-photos"
+          >
+            <PhotoTile
+              v-for="(item, index) in albumItems"
+              :key="item.path"
+              :item="item"
+              @click="openViewer(albumItems, index)"
+              @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
+            />
+          </div>
         </div>
       </div>
 
-      <!-- 时间线：单滚轴 + content-visibility 跳过离屏渲染（万级条目也不卡） -->
-      <div v-else class="h-full overflow-y-auto" data-testid="photo-timeline">
-        <div v-for="group in timelineSorted" :key="group.label" class="mb-6">
-          <div
-            class="sticky top-0 z-10 border-b border-line/60 bg-base/85 px-4 py-2 text-sm font-semibold text-ink backdrop-blur md:px-6"
-          >
-            {{ group.label }}
-            <span class="ml-2 text-[12px] font-normal text-muted">
-              {{ t('gallery.photos.albumItems', { count: group.items.length }) }}
+      <!-- 相册卡片：封面取册内最新一张图，空相册后端已剔除 -->
+      <div v-else-if="photoView === 'albums'" class="h-full overflow-y-auto p-2 md:p-3" data-testid="photo-albums">
+        <div
+          v-if="albumsLoading"
+          class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
+        >
+          <div v-for="i in 8" :key="i" class="skeleton aspect-[4/3] rounded-xl" />
+        </div>
+
+        <div v-else-if="albumsError" class="grid h-full place-items-center text-center">
+          <div>
+            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+              <AppIcon name="alert" :size="22" />
             </span>
+            <p class="text-sm text-ink">{{ t('gallery.toolbar.loadFailed') }}</p>
+            <p class="mt-1 text-xs text-muted">{{ albumsError }}</p>
           </div>
-          <div
-            class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 p-2 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2 md:p-3"
+        </div>
+
+        <div v-else-if="albums.length === 0" class="grid h-full place-items-center text-center">
+          <div>
+            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+              <AppIcon name="gallery" :size="22" />
+            </span>
+            <p class="text-sm text-ink">{{ t('gallery.photos.albumEmpty') }}</p>
+            <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.albumEmptyHint') }}</p>
+          </div>
+        </div>
+
+        <div
+          v-else
+          class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
+        >
+          <button
+            v-for="album in albums"
+            :key="album.path"
+            type="button"
+            class="group text-left"
+            :data-album="album.name"
+            :title="album.name"
+            @click="openAlbum(album)"
           >
-            <button
-              v-for="(item, index) in group.items"
-              :key="item.path"
-              class="group relative aspect-square overflow-hidden rounded-lg border border-transparent transition-colors hover:border-line"
-              style="content-visibility: auto; contain-intrinsic-size: 150px"
-              :style="{ backgroundColor: placeholderFor(item) }"
-              :data-photo="item.path"
-              @click="openViewer(group.items, index)"
-              @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
+            <div
+              class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line"
+              :style="{ backgroundColor: albumColor(album) }"
             >
-              <!-- ThumbHash 模糊占位：真图加载完成前就有正确构图，避免整块跳色 -->
+              <!-- ThumbHash 打底：封面还没加载完也不是一块死色 -->
               <img
-                v-if="hashPlaceholder(item)"
-                :src="hashPlaceholder(item)!"
+                v-if="albumHash(album)"
+                :src="albumHash(album)!"
                 class="absolute inset-0 size-full scale-110 object-cover blur-md"
                 aria-hidden="true"
                 alt=""
               />
-              <!-- 视频同样取后端首帧当封面（v2.8），失败才回落图标 -->
               <img
-                v-if="!failedThumbs.has(item.path) && (item.kind === 'image' || item.kind === 'video')"
-                :src="thumbUrl(item.path, 400)"
+                v-if="album.cover && !albumCoverFailed.has(album.path)"
+                :src="thumbUrl(album.cover, 480)"
                 class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                 loading="lazy"
                 alt=""
-                @error="markThumbFailed(item.path)"
+                @error="markAlbumCoverFailed(album.path)"
               />
-              <span v-else class="grid size-full place-items-center text-white/70" :title="item.name">
-                <AppIcon :name="item.kind === 'video' ? 'video' : 'gallery'" :size="26" />
+              <span v-else class="relative grid size-full place-items-center text-white/60">
+                <AppIcon name="gallery" :size="26" />
               </span>
               <span
-                v-if="item.kind === 'video'"
-                class="absolute right-1 bottom-1 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
+                class="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
               >
-                {{ t('gallery.photos.videoBadge') }}
+                {{ t('gallery.photos.albumItems', { count: album.count }) }}
               </span>
-            </button>
+            </div>
+            <p class="mt-2 truncate text-sm font-medium text-ink">{{ album.name }}</p>
+          </button>
+        </div>
+      </div>
+
+      <!-- 时间线：忽略目录层级、按月吸顶（设计文档 3.4.3 视图二） -->
+      <div v-else class="h-full overflow-y-auto" data-testid="photo-timeline">
+        <div v-if="photoItems.length === 0" class="grid h-full place-items-center text-center">
+          <div>
+            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+              <AppIcon name="gallery" :size="22" />
+            </span>
+            <p class="text-sm text-ink">{{ t('gallery.photos.empty') }}</p>
+            <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.emptyHint') }}</p>
           </div>
         </div>
+
+        <template v-else>
+          <div v-for="group in timelineSorted" :key="group.label" class="mb-6">
+            <div
+              class="sticky top-0 z-10 border-b border-line/60 bg-base/85 px-4 py-2 text-sm font-semibold text-ink backdrop-blur md:px-6"
+            >
+              {{ group.label }}
+              <span class="ml-2 text-[12px] font-normal text-muted">
+                {{ t('gallery.photos.albumItems', { count: group.items.length }) }}
+              </span>
+            </div>
+            <div
+              class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 p-2 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2 md:p-3"
+            >
+              <PhotoTile
+                v-for="(item, index) in group.items"
+                :key="item.path"
+                :item="item"
+                @click="openViewer(group.items, index)"
+                @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
+              />
+            </div>
+          </div>
+        </template>
       </div>
     </div>
 
