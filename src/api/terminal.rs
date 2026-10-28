@@ -144,8 +144,16 @@ pub async fn ws_handler(
         no_profile: query.no_profile.unwrap_or(false),
     };
 
+    // 受限环境探测提前到升级 WS 之前：历史重定向要在 shell 拉起前就位
+    let probe = crate::core::terminal::probe_shell_env(&state.data_dir);
+    // 两类非致命提示合并：目录落点变化 + 受限环境说明
+    let warning = match (warning, probe.notice.clone()) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+        (a, b) => a.or(b),
+    };
+
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, cwd, cols, rows, session_id, options, warning)
+        handle_socket(socket, state, cwd, cols, rows, session_id, options, probe, warning)
     })
 }
 
@@ -201,6 +209,7 @@ async fn handle_socket(
     rows: u16,
     session_id: Option<String>,
     options: crate::core::terminal::ShellOptions,
+    probe: crate::core::terminal::ShellProbe,
     warning: Option<String>,
 ) {
     let manager = state.terminals.clone();
@@ -214,7 +223,7 @@ async fn handle_socket(
     let reconnected = existing.is_some();
     let session = match existing {
         Some(session) => session,
-        None => match manager.create(&cwd, cols, rows, options) {
+        None => match manager.create(&cwd, cols, rows, options, &probe) {
             Ok(session) => session,
             Err(message) => {
                 let mut socket = socket;
@@ -240,7 +249,7 @@ async fn handle_socket(
         // 纯净模式与平台：前端据此显示开关状态与 Windows 的「修复乱码」按钮
         "no_profile": session.no_profile,
         "platform": crate::core::terminal::platform(),
-        // 目录被删等非致命情况：连接照建，但要让用户知道落点变了
+        // 目录被删 / 受限环境等非致命情况：连接照建，但要让用户知道
         "warning": warning,
     });
     if sink.send(Message::Text(ready.to_string().into())).await.is_err() {
