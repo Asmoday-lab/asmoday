@@ -3,7 +3,9 @@
 //! - 并发上限 2（信号量），拿不到就回占位图，绝不让数千张图一起解码把 CPU 打满；
 //! - 结果落磁盘缓存，键 = 路径 + 修改时间 + 大小 + 宽度（源文件 mtime 变了自动失效）；
 //! - 容量上限与过期天数来自 `config.toml` 的 `[media]`，按 LRU + 过期天数淘汰；
-//! - 生成时顺带算一枚 ThumbHash（约 25 字节），供前端做「主色调模糊占位」防抖动。
+//! - 生成时顺带算一枚 ThumbHash（约 25 字节），供前端做「主色调模糊占位」防抖动；
+//!   **v2.8.2 起存 SQLite `thumb_hashes` 表**，不再落盘旁路文件 —— 几十万张图的
+//!   场景下碎文件会撑爆低功耗设备的 inode，Base64 文本进库零 inode 成本。
 //!
 //! 红线：图片走内置解码器；视频只允许经**外部可选** FFmpeg 截取首帧当封面，
 //! 自身绝不链接 libav*，也绝不参与任何转码（设计文档 3.4 / 3.5）。
@@ -49,6 +51,16 @@ pub enum ThumbOutcome {
     Ready(Rendered),
     /// 队列拥塞或解码失败 → 占位图
     Placeholder,
+}
+
+/// 生成成功时随 `get()` 带出的新鲜 ThumbHash：由调用方写进 SQLite
+/// （`AuthStore::thumb_hash_set`），缓存命中时为 None（库里已有）。
+#[derive(Debug, Clone)]
+pub struct FreshHash {
+    /// 库主键 = `hash_key`（路径 + mtime + 大小的摘要，与宽度无关）
+    pub key: String,
+    /// ThumbHash 的 Base64 文本
+    pub value: String,
 }
 
 pub struct Thumbnailer {
@@ -110,8 +122,11 @@ impl Thumbnailer {
         format!("{:016x}-{width}p", hasher.finish())
     }
 
-    /// ThumbHash 旁路文件键：与宽度无关，任何尺寸生成一次即可复用
-    fn hash_key(path: &Path) -> String {
+    /// ThumbHash 的库键：与宽度无关，任何尺寸生成一次即可复用。
+    ///
+    /// **v2.8.2 起只作 SQLite `thumb_hashes` 表的主键**，不再生成同名旁路文件；
+    /// 存量部署的 `<key>.th` 文件由媒体扫描惰性搬进库后删除。
+    pub fn hash_key(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
         let mut hasher = DefaultHasher::new();
         path.to_string_lossy().hash(&mut hasher);
@@ -132,19 +147,19 @@ impl Thumbnailer {
         (len, mtime)
     }
 
-    /// 读取已算好的 ThumbHash（base64 字符串）。没有就返回 None，由前端回退纯色。
-    pub fn thumb_hash(&self, path: &Path) -> Option<String> {
-        let file = self.cache_dir.join(Self::hash_key(path));
-        let raw = std::fs::read_to_string(file).ok()?;
-        let trimmed = raw.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    }
-
     /// 取缩略图：缓存 → 限流生成 → 占位。
+    ///
+    /// 返回 `(结果, 新鲜 ThumbHash)`：缓存命中时第二个值为 None；
+    /// 生成成功时带上 hash 由调用方入库，本模块**不再**写任何 `.th` 文件。
     ///
     /// `webp_bin` 为可用的 FFmpeg；给了且该构建支持 libwebp 时输出 WebP（设计文档 3.4），
     /// 否则退回内置 JPEG 编码器。缓存里同时兼容两种后缀，换构建也不会重复生成。
-    pub async fn get(&self, path: &Path, width: u32, webp_bin: Option<&Path>) -> ThumbOutcome {
+    pub async fn get(
+        &self,
+        path: &Path,
+        width: u32,
+        webp_bin: Option<&Path>,
+    ) -> (ThumbOutcome, Option<FreshHash>) {
         let width = width.clamp(64, 1024);
         let base = self.cache_dir.join(Self::cache_base(path, width));
 
@@ -156,18 +171,18 @@ impl Thumbnailer {
                     .write(true)
                     .open(&file)
                     .await;
-                return ThumbOutcome::Ready(Rendered { bytes, mime });
+                return (ThumbOutcome::Ready(Rendered { bytes, mime }), None);
             }
         }
 
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
             Ok(Ok(permit)) => permit,
             // 队列被打满：立刻回占位图，由前端稍后重试
-            _ => return ThumbOutcome::Placeholder,
+            _ => return (ThumbOutcome::Placeholder, None),
         };
 
         let source = path.to_path_buf();
-        let sidecar = self.cache_dir.join(Self::hash_key(path));
+        let hash_key = Self::hash_key(&source);
         let cache_dir = self.cache_dir.clone();
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
@@ -177,22 +192,28 @@ impl Thumbnailer {
         let result = tokio::task::spawn_blocking(move || {
             let (thumb, hash) = render_thumbnail(&source, width)?;
             let (bytes, mime) = encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &base)?;
-            let _ = std::fs::write(&sidecar, BASE64.encode(&hash));
+            let fresh = FreshHash {
+                key: hash_key,
+                value: BASE64.encode(&hash),
+            };
             if cache_dir.exists() {
                 let _ = cleanup_cache(&cache_dir, limit, max_age);
             }
-            Some((bytes, mime))
+            Some((bytes, mime, fresh))
         })
         .await;
 
         drop(permit);
 
         match result {
-            Ok(Some((bytes, mime))) => {
+            Ok(Some((bytes, mime, fresh))) => {
                 self.count_generated();
-                ThumbOutcome::Ready(Rendered { bytes, mime })
+                (
+                    ThumbOutcome::Ready(Rendered { bytes, mime }),
+                    Some(fresh),
+                )
             }
-            _ => ThumbOutcome::Placeholder,
+            _ => (ThumbOutcome::Placeholder, None),
         }
     }
 
@@ -519,6 +540,49 @@ mod tests {
         assert_eq!(&bytes[..2], &[0xff, 0xd8], "应输出 JPEG 魔数");
         assert!(base.with_extension("jpg").is_file());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_returns_fresh_hash_without_sidecar_file() {
+        // v2.8.2 回归：ThumbHash 只随 get() 返回并由调用方入库，缓存目录里绝不能出现 .th 碎文件
+        let dir = scratch_dir("thumb-no-sidecar");
+        let source = dir.join("a.png");
+        let mut image = image::RgbaImage::new(48, 24);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([40, 160, 90, 255]);
+        }
+        image.save(&source).unwrap();
+
+        let cache = scratch_dir("thumb-no-sidecar-cache");
+        let thumbnails = Thumbnailer::new(cache.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (outcome, fresh) = rt.block_on(thumbnails.get(&source, 64, None));
+        assert!(matches!(outcome, ThumbOutcome::Ready(_)));
+
+        let fresh = fresh.expect("首次生成必须带出新鲜 ThumbHash");
+        assert_eq!(fresh.key, Thumbnailer::hash_key(&source));
+        assert!(!fresh.value.is_empty());
+        assert!(
+            BASE64.decode(fresh.value.as_bytes()).is_ok(),
+            "hash 必须是合法 Base64"
+        );
+
+        // 缓存目录里只允许有缩略图本体，不允许任何 .th 旁路文件
+        let entries: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(!entries.is_empty(), "缩略图本体应已落盘");
+        assert!(
+            entries.iter().all(|name| !name.ends_with(".th")),
+            "不应出现 .th 旁路文件：{entries:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&cache);
     }
 
     #[test]

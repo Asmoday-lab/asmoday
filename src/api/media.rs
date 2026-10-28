@@ -137,7 +137,7 @@ pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery
             .filter(|bin| bin.is_file())
     };
 
-    let outcome = match kind {
+    let (outcome, fresh) = match kind {
         "image" => {
             state
                 .thumbnails
@@ -147,14 +147,20 @@ pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery
         "video" => {
             // 影视库封面：靠外部可选 FFmpeg 截首帧（设计文档 3.4）；
             // 未配置或截帧失败一律回占位图，绝不阻塞列表渲染
-            match ffmpeg_bin {
+            let outcome = match ffmpeg_bin {
                 Some(bin) => state.thumbnails.video_poster(&path, &bin, width).await,
                 None => ThumbOutcome::Placeholder,
-            }
+            };
+            (outcome, None)
         }
         // 音频/其它：没有可截的帧，统一占位（设计文档 8.3）
-        _ => ThumbOutcome::Placeholder,
+        _ => (ThumbOutcome::Placeholder, None),
     };
+
+    // 新鲜 ThumbHash 入库（v2.8.2：SQLite，不再落 .th 旁路文件）
+    if let Some(fresh) = fresh {
+        state.auth.thumb_hash_set(&fresh.key, &fresh.value);
+    }
 
     match outcome {
         ThumbOutcome::Ready(rendered) => (
@@ -226,8 +232,11 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
 
     let scan_root = root.clone();
     let thumbnails = Arc::clone(&state.thumbnails);
-    let outcome =
-        tokio::task::spawn_blocking(move || scan(&scan_root, &wanted, depth, &thumbnails)).await;
+    let auth_store = Arc::clone(&state.auth);
+    let outcome = tokio::task::spawn_blocking(move || {
+        scan(&scan_root, &wanted, depth, &thumbnails, &auth_store)
+    })
+    .await;
 
     match outcome {
         Ok((items, scanned, truncated)) => Json(BrowseResult {
@@ -284,11 +293,13 @@ fn scan(
     wanted: &[&str],
     depth: usize,
     thumbnails: &crate::core::thumbnail::Thumbnailer,
+    auth: &crate::core::auth::AuthStore,
 ) -> (Vec<MediaItem>, usize, bool) {
     let mut out = Vec::new();
     let mut scanned = 0usize;
     let mut truncated = false;
-    let mut hashes = 0usize;
+    // 参与取色的图片下标 + 源路径（走完目录后统一批量查库，HASH_LIMIT 内）
+    let mut hash_candidates: Vec<(usize, PathBuf)> = Vec::new();
 
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
@@ -336,22 +347,14 @@ fn scan(
             } else {
                 Default::default()
             };
-            // ThumbHash 只有「缩略图已生成过」的图片才有，首次浏览回退纯色占位
-            let hash = if kind == "image" && hashes < HASH_LIMIT {
-                let value = thumbnails.thumb_hash(&path);
-                if value.is_some() {
-                    hashes += 1;
-                }
-                value
-            } else {
-                None
-            };
-            let color = hash.as_deref().and_then(average_color);
             let subtitle = if kind == "video" {
                 find_subtitle(&path)
             } else {
                 None
             };
+            // ThumbHash 在目录走完后统一从 SQLite 批量取（v2.8.2），首次浏览回退纯色占位
+            let is_image = kind == "image";
+            let has_hash_slot = is_image && hash_candidates.len() < HASH_LIMIT;
             out.push(MediaItem {
                 name,
                 path: fs::normalize_display(&path),
@@ -367,11 +370,47 @@ fn scan(
                 artist: tags.artist,
                 album: tags.album,
                 cover: tags.has_cover,
-                hash,
-                color,
+                hash: None,
+                color: None,
                 subtitle,
             });
+            if has_hash_slot {
+                hash_candidates.push((out.len() - 1, path));
+            }
         }
+    }
+
+    // 批量取 ThumbHash：一次连接逐键查 SQLite；库未命中的话顺手把存量 .th
+    // 旁路文件搬进库（v2.8.2 升级路径），搬完即删，老部署零手工迁移。
+    if !hash_candidates.is_empty() {
+        let keys: Vec<String> = hash_candidates
+            .iter()
+            .map(|(_, path)| crate::core::thumbnail::Thumbnailer::hash_key(path))
+            .collect();
+        let mut hits = auth.thumb_hashes_get_many(&keys);
+        let mut migrated: Vec<(String, String)> = Vec::new();
+        for ((index, _), key) in hash_candidates.iter().zip(keys.iter()) {
+            let mut value = hits.remove(key);
+            if value.is_none() {
+                // 键名本身就是旁路文件名（`<hash>.th`）
+                let sidecar = thumbnails.cache_dir().join(key);
+                if let Ok(raw) = std::fs::read_to_string(&sidecar) {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        value = Some(trimmed.to_string());
+                        migrated.push((key.clone(), trimmed.to_string()));
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
+                }
+            }
+            if let Some(hash) = value {
+                if let Some(item) = out.get_mut(*index) {
+                    item.hash = Some(hash.clone());
+                    item.color = average_color(&hash);
+                }
+            }
+        }
+        auth.thumb_hashes_set_many(&migrated);
     }
 
     // 新的在前
@@ -537,7 +576,10 @@ pub async fn cache_stats(State(state): State<AppState>) -> Response {
 /// POST /api/media/cache/clear：清空缩略图缓存（源文件不受影响）
 pub async fn clear_cache(State(state): State<AppState>) -> Response {
     let thumbnails = Arc::clone(&state.thumbnails);
-    match tokio::task::spawn_blocking(move || thumbnails.clear()).await {
+    let result = tokio::task::spawn_blocking(move || thumbnails.clear()).await;
+    // 缓存图都删了，ThumbHash 色值也没意义了，一并清表（下次生成会重建）
+    state.auth.thumb_hashes_clear();
+    match result {
         Ok(Ok((files, bytes))) => {
             Json(json!({ "status": "ok", "files": files, "bytes": bytes })).into_response()
         }

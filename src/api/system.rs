@@ -279,14 +279,25 @@ async fn run_rebuild(state: AppState) {
         .filter(|bin| bin.is_file());
 
     for (path, is_video) in candidates {
-        let outcome = if is_video {
+        let (outcome, fresh) = if is_video {
             match ffmpeg_bin.as_deref() {
-                Some(bin) => state.thumbnails.video_poster(&path, bin, 320).await,
-                None => thumbnail::ThumbOutcome::Placeholder,
+                Some(bin) => (
+                    state.thumbnails.video_poster(&path, bin, 320).await,
+                    None,
+                ),
+                None => (thumbnail::ThumbOutcome::Placeholder, None),
             }
         } else {
-            state.thumbnails.get(&path, 320, ffmpeg_bin.as_deref()).await
+            state
+                .thumbnails
+                .get(&path, 320, ffmpeg_bin.as_deref())
+                .await
         };
+
+        // 新鲜 ThumbHash 入库（v2.8.2：SQLite，不再落 .th 旁路文件）
+        if let Some(fresh) = fresh {
+            state.auth.thumb_hash_set(&fresh.key, &fresh.value);
+        }
 
         if let Ok(mut status) = state.rebuild.lock() {
             match outcome {

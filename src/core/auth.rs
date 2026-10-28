@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -79,6 +80,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS thumb_hashes (
+    key TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +99,8 @@ pub struct User {
 
 pub struct AuthStore {
     db_path: PathBuf,
+    /// ThumbHash 写入计数：每 256 次顺带做一次 LRU 裁剪，防止表被频繁改动的源文件撑大
+    hash_saves: AtomicU64,
 }
 
 pub fn now_secs() -> i64 {
@@ -103,11 +112,86 @@ pub fn now_secs() -> i64 {
 
 impl AuthStore {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            hash_saves: AtomicU64::new(0),
+        }
     }
 
     pub fn db_path(&self) -> &PathBuf {
         &self.db_path
+    }
+
+    // -----------------------------------------------------------------------
+    // ThumbHash 存储（v2.8.2：不再落 .th 旁路文件，改存 SQLite）
+    // -----------------------------------------------------------------------
+
+    /// 批量读取 ThumbHash（媒体扫描用）。
+    ///
+    /// 一次连接内复用 prepared statement 逐键查，几万行的表上也只是微秒级/键；
+    /// 任何失败都返回空表，调用方回退纯色占位。
+    pub fn thumb_hashes_get_many(&self, keys: &[String]) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        if keys.is_empty() {
+            return map;
+        }
+        let Ok(conn) = self.connect() else {
+            return map;
+        };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT hash FROM thumb_hashes WHERE key = ?1")
+        else {
+            return map;
+        };
+        for key in keys {
+            if let Ok(Some(hash)) =
+                stmt.query_row(params![key], |row| row.get::<_, String>(0)).optional()
+            {
+                map.insert(key.clone(), hash);
+            }
+        }
+        map
+    }
+
+    /// 写入 ThumbHash（缩略图生成成功时调用）
+    pub fn thumb_hash_set(&self, key: &str, hash: &str) {
+        self.thumb_hashes_set_many(std::slice::from_ref(&(key.to_string(), hash.to_string())));
+    }
+
+    /// 批量写入；每 256 次顺带按 updated_at 做 LRU 裁剪（保留最新 4 万行）
+    pub fn thumb_hashes_set_many(&self, entries: &[(String, String)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let Ok(conn) = self.connect() else {
+            return;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "INSERT OR REPLACE INTO thumb_hashes (key, hash, updated_at) VALUES (?1, ?2, ?3)",
+        ) else {
+            return;
+        };
+        let now = now_secs();
+        for (key, hash) in entries {
+            let _ = stmt.execute(params![key, hash, now]);
+        }
+        let saves = self.hash_saves.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        // 取模判断而非等值判断：批量写入跨过 256 边界时也要触发一次
+        if (saves % 256) + entries.len() as u64 >= 256 {
+            let _ = conn.execute(
+                "DELETE FROM thumb_hashes WHERE key NOT IN \
+                 (SELECT key FROM thumb_hashes ORDER BY updated_at DESC LIMIT 40000)",
+                [],
+            );
+        }
+    }
+
+    /// 清空 ThumbHash 表（设置页「清理媒体缓存」联动：缓存图都删了，色值也没意义了）
+    pub fn thumb_hashes_clear(&self) {
+        let Ok(conn) = self.connect() else {
+            return;
+        };
+        let _ = conn.execute("DELETE FROM thumb_hashes", []);
     }
 
     fn connect(&self) -> Result<Connection, String> {
@@ -633,6 +717,51 @@ mod tests {
         assert!(store.create_user("a", "Asmoday#2026").is_err()); // 用户名太短
         assert!(store.create_user("admin", "short").is_err());
         assert!(store.create_user("admin", "12345678").is_err());
+    }
+
+    #[test]
+    fn thumb_hashes_roundtrip_and_prune() {
+        let store = temp_store("thumbhash");
+
+        // 写入 + 批量读回
+        store.thumb_hash_set("key-a", "AAEC");
+        store.thumb_hash_set("key-b", "BBED");
+        store.thumb_hash_set("key-c", "CAFE");
+        let got = store.thumb_hashes_get_many(&[
+            "key-a".to_string(),
+            "key-c".to_string(),
+            "key-missing".to_string(),
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get("key-a").map(String::as_str), Some("AAEC"));
+        assert_eq!(got.get("key-c").map(String::as_str), Some("CAFE"));
+        assert!(!got.contains_key("key-missing"));
+
+        // 覆盖写：同 key 只保留最新值
+        store.thumb_hash_set("key-a", "ZZZZ");
+        let got = store.thumb_hashes_get_many(&["key-a".to_string()]);
+        assert_eq!(got.get("key-a").map(String::as_str), Some("ZZZZ"));
+
+        // 裁剪：把 LRU 上限临时压到 2 行（直接用 SQL 模拟同一策略），确认删除逻辑生效
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "DELETE FROM thumb_hashes WHERE key NOT IN \
+             (SELECT key FROM thumb_hashes ORDER BY updated_at DESC LIMIT 2)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let got = store.thumb_hashes_get_many(&[
+            "key-a".to_string(),
+            "key-b".to_string(),
+            "key-c".to_string(),
+        ]);
+        assert_eq!(got.len(), 2, "裁剪后只保留最新 2 行");
+
+        // 清空（设置页「清理媒体缓存」联动）
+        store.thumb_hashes_clear();
+        let got = store.thumb_hashes_get_many(&["key-a".to_string()]);
+        assert!(got.is_empty());
     }
 
     #[test]
