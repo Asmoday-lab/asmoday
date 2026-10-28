@@ -75,7 +75,7 @@ onMounted(loadShares)
 
 <template>
   <section class="mx-auto w-full max-w-4xl px-4 py-6 md:px-8 md:py-10">
-    <div class="rounded-xl border border-line p-4 text-[11px] leading-relaxed text-muted">
+    <div class="rounded-xl border border-line p-4 text-[12px] leading-relaxed text-muted">
       {{ t('shares.list.intro') }}
     </div>
 
@@ -90,13 +90,13 @@ onMounted(loadShares)
           <AppIcon :name="share.is_folder ? 'folder' : 'file'" :size="14" />
         </span>
         <span class="min-w-0 flex-1 truncate text-ink" :title="share.path">{{ share.path }}</span>
-        <span v-if="share.has_password" class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted">
+        <span v-if="share.has_password" class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted">
           {{ t('shares.list.password') }}
         </span>
-        <span v-if="!share.allow_download && !share.is_folder" class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted">
+        <span v-if="!share.allow_download && !share.is_folder" class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted">
           {{ t('shares.list.noDownload') }}
         </span>
-        <span class="hidden w-20 shrink-0 text-right text-[11px] text-muted sm:block">
+        <span class="hidden w-20 shrink-0 text-right text-[12px] text-muted sm:block">
           {{ formatExpiry(share.expires_at) }}
         </span>
         <button
@@ -106,18 +106,18 @@ onMounted(loadShares)
         >
           <AppIcon name="link" :size="13" />
         </button>
-        <button class="shrink-0 text-muted hover:text-red-400"  :title="t('shares.list.revoke')" @click="revokeShare(share.token)">
+        <button class="shrink-0 text-muted hover-danger"  :title="t('shares.list.revoke')" @click="revokeShare(share.token)">
           <AppIcon name="close" :size="14" />
         </button>
       </div>
-      <p v-if="!shares.length" class="px-4 py-3 text-[11px] text-muted">
+      <p v-if="!shares.length" class="px-4 py-3 text-[12px] text-muted">
         {{ t('shares.list.empty') }}
       </p>
     </div>
 
     <p
       v-if="sharesError"
-      class="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400"
+      class="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
     >
       {{ sharesError }}
     </p>

@@ -46,8 +46,8 @@ const entries: Entry[] = [
     to: '/terminal',
     key: 'portal.entries.terminal',
     icon: 'terminal',
-    tone: 'bg-emerald-500/15 text-emerald-500',
-    hoverTone: 'group-hover:text-emerald-500',
+    tone: 'bg-emerald-500/15 fg-ok',
+    hoverTone: 'group-hover:fg-ok',
   },
 ]
 
@@ -127,7 +127,7 @@ onMounted(async () => {
           <h2 class="text-xs font-semibold tracking-[0.16em] text-muted uppercase">
             {{ t('portal.services.title') }}
           </h2>
-          <span class="text-[11px] text-muted">
+          <span class="text-[12px] text-muted">
             {{ t('portal.services.count', { count: services.length }) }}
           </span>
         </div>
@@ -150,7 +150,7 @@ onMounted(async () => {
             </span>
             <span class="min-w-0 flex-1">
               <span class="block truncate text-sm font-medium text-ink">{{ service.name }}</span>
-              <span class="block truncate text-[11px] text-muted">{{ service.target_url }}</span>
+              <span class="block truncate text-[12px] text-muted">{{ service.target_url }}</span>
             </span>
             <span class="text-muted opacity-0 transition-opacity group-hover:opacity-100">
               <AppIcon name="arrowRight" :size="15" />
@@ -173,16 +173,16 @@ onMounted(async () => {
     >
       <div class="mb-2 flex items-center gap-3 px-1 text-white">
         <span class="text-sm font-medium">{{ active.name }}</span>
-        <span class="truncate text-[11px] text-white/50">{{ activeUrl }}</span>
+        <span class="truncate text-[12px] text-white/50">{{ activeUrl }}</span>
         <a
           :href="activeUrl"
           target="_blank"
           rel="noopener"
-          class="ml-auto rounded bg-white/10 px-2 py-1 text-[11px] hover:bg-white/20"
+          class="ml-auto rounded bg-white/10 px-2 py-1 text-[12px] hover:bg-white/20"
         >
           {{ t('portal.services.openNewWindow') }}
         </a>
-        <button class="rounded bg-white/10 px-2 py-1 text-[11px] hover:bg-white/20" @click="active = null">
+        <button class="rounded bg-white/10 px-2 py-1 text-[12px] hover:bg-white/20" @click="active = null">
           {{ t('portal.services.close') }}
         </button>
       </div>

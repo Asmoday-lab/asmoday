@@ -7,7 +7,16 @@
  * - 双击按类型分流到**全局**预览：图片/音视频→MediaLightbox，Markdown/CSV/PDF→只读预览面板，
  *   纯文本/代码→CodeMirror，Office/压缩包→提示下载（3.2 文件预览矩阵）。
  */
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import {
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+} from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -42,14 +51,28 @@ const router = useRouter()
 
 /** 右键菜单 */
 const menu = ref<{ x: number; y: number; entry: EntryInfo } | null>(null)
+const menuEl = ref<HTMLElement | null>(null)
 
-function openMenu(event: MouseEvent, entry: EntryInfo) {
-  menu.value = {
-    x: Math.min(event.clientX, window.innerWidth - 184),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 316)),
-    entry,
-  }
+/**
+ * 右键菜单定位（v2.8 修）：原来用固定 316px 估算高度，菜单实际有 11 项约 380px，
+ * 矮窗口下「属性 / 删除」被挤出视口，点了没反应。改成先按光标位置渲染，
+ * 下一帧按真实尺寸夹到视口内（放不下就向上翻转）。
+ */
+async function openMenu(event: MouseEvent, entry: EntryInfo) {
+  const margin = 8
+  menu.value = { x: event.clientX, y: event.clientY, entry }
   selected.value = entry.path
+  await nextTick()
+  const el = menuEl.value
+  if (!el || !menu.value) return
+  const rect = el.getBoundingClientRect()
+  const maxX = Math.max(margin, window.innerWidth - rect.width - margin)
+  const maxY = Math.max(margin, window.innerHeight - rect.height - margin)
+  menu.value = {
+    ...menu.value,
+    x: Math.min(Math.max(margin, event.clientX), maxX),
+    y: Math.min(Math.max(margin, event.clientY), maxY),
+  }
 }
 
 function openTerminal(entry: EntryInfo) {
@@ -450,10 +473,14 @@ const deleteNameMatches = computed(() => {
   return deleteConfirmName.value.trim() === target.name.trim()
 })
 
+/** 删除统计请求序号（同 statDialog：不能用数组身份比较） */
+let deleteRequestSeq = 0
+
 function openDeleteDialog(targets?: EntryInfo[]) {
   const list = targets ?? (menu.value ? [menu.value.entry] : [])
   menu.value = null
   if (!list.length) return
+  const seq = ++deleteRequestSeq
   deleteTargets.value = list
   deleteConfirmName.value = ''
   deleteError.value = ''
@@ -461,10 +488,9 @@ function openDeleteDialog(targets?: EntryInfo[]) {
   void (async () => {
     try {
       const survey = await filesApi.measure(list.map((entry) => entry.path))
-      // 弹窗可能已被关掉：只在仍是同一次打开时回填
-      if (deleteTargets.value === list) deleteSurvey.value = survey
+      if (seq === deleteRequestSeq && deleteTargets.value.length) deleteSurvey.value = survey
     } catch {
-      if (deleteTargets.value === list) {
+      if (seq === deleteRequestSeq && deleteTargets.value.length) {
         deleteSurvey.value = { items: list.length, bytes: 0, truncated: false }
       }
     }
@@ -507,20 +533,24 @@ const statDialog = ref<{
   error: string
 } | null>(null)
 
+/** 属性请求序号：ref.value 是深响应 proxy，与原始对象恒不相等，只能用序号判定「仍是这次打开」 */
+let statRequestSeq = 0
+
 function openStatDialog() {
   const entry = menu.value?.entry
   menu.value = null
   if (!entry) return
-  const dialog = { entry, data: null, busy: true, error: '' }
-  statDialog.value = dialog
+  const seq = ++statRequestSeq
+  statDialog.value = { entry, data: null, busy: true, error: '' }
   void (async () => {
     try {
       const data = await filesApi.stat(entry.path)
-      // 用户可能已经关掉弹窗：只在仍是同一次打开时回填
-      if (statDialog.value === dialog) statDialog.value = { ...dialog, data, busy: false }
+      if (seq === statRequestSeq && statDialog.value) {
+        statDialog.value = { ...statDialog.value, data, busy: false }
+      }
     } catch (err) {
-      if (statDialog.value === dialog) {
-        statDialog.value = { ...dialog, busy: false, error: describe(err).message }
+      if (seq === statRequestSeq && statDialog.value) {
+        statDialog.value = { ...statDialog.value, busy: false, error: describe(err).message }
       }
     }
   })()
@@ -980,6 +1010,11 @@ function markThumbFailed(path: string) {
   thumbFailed.value = new Set(thumbFailed.value).add(path)
 }
 
+/** 图片与视频都能出真缩略图（视频由后端 ffmpeg 抽首帧，v2.8） */
+function hasThumb(entry: EntryInfo) {
+  return !entry.is_dir && (entry.kind === 'image' || entry.kind === 'video')
+}
+
 function closePreview() {
   preview.value = null
 }
@@ -1157,18 +1192,18 @@ function iconFor(entry: EntryInfo) {
 }
 
 function toneFor(entry: EntryInfo) {
-  if (entry.is_dir) return 'text-amber-400'
+  if (entry.is_dir) return 'fg-warn'
   switch (entry.kind) {
     case 'image':
-      return 'text-sky-400'
+      return 'fg-info'
     case 'video':
-      return 'text-violet-400'
+      return 'fg-video'
     case 'audio':
-      return 'text-emerald-400'
+      return 'fg-ok'
     case 'archive':
-      return 'text-orange-400'
+      return 'fg-archive'
     case 'text':
-      return 'text-indigo-300'
+      return 'fg-text'
     default:
       return 'text-muted'
   }
@@ -1213,7 +1248,7 @@ onMounted(boot)
           <AppIcon name="arrowLeft" :size="14" />
           {{ t('files.editor.back') }}
         </button>
-        <p class="min-w-0 flex-1 truncate text-[13px] text-ink">
+        <p class="min-w-0 flex-1 truncate text-[14px] text-ink">
           {{ editor.name }}
           <span v-if="dirty" class="text-accent" :title="t('files.editor.unsaved')">●</span>
         </p>
@@ -1233,13 +1268,13 @@ onMounted(boot)
         >
           <AppIcon name="save" :size="13" />
           {{ editor.saving ? t('files.editor.saving') : t('files.editor.save') }}
-          <kbd class="ml-1 rounded bg-black/25 px-1 text-[10px]">Ctrl+S</kbd>
+          <kbd class="ml-1 rounded bg-black/25 px-1 text-[11px]">Ctrl+S</kbd>
         </button>
       </header>
 
       <p
         v-if="editor.error"
-        class="border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs text-red-400"
+        class="border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs fg-danger"
       >
         {{ editor.error }}
       </p>
@@ -1273,10 +1308,10 @@ onMounted(boot)
       <!-- 挂载点入口（设计文档 3.2：极简无树，主区域平铺所有挂载点） -->
       <template v-if="!currentPath">
         <header class="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-panel px-3">
-          <span class="text-[13px] font-medium text-ink">{{ t('files.roots.title') }}</span>
+          <span class="text-[14px] font-medium text-ink">{{ t('files.roots.title') }}</span>
           <span
             v-if="rootsImplicit"
-            class="rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted"
+            class="rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted"
             :title="t('files.roots.implicitHint')"
           >
             {{ t('files.roots.implicit') }}
@@ -1343,12 +1378,12 @@ onMounted(boot)
                 <span class="mt-0.5 flex items-center gap-1.5">
                   <span
                     v-if="root.readonly"
-                    class="shrink-0 rounded bg-elevated px-1 py-px text-[10px] text-muted"
+                    class="shrink-0 rounded bg-elevated px-1 py-px text-[11px] text-muted"
                     :title="t('files.readonly.tooltip')"
                   >
                     {{ t('files.readonly.badge') }}
                   </span>
-                  <span class="truncate text-[11px] text-muted">
+                  <span class="truncate text-[12px] text-muted">
                     {{ root.online ? t('files.roots.browse') : t('files.roots.unavailable') }}
                   </span>
                 </span>
@@ -1411,7 +1446,7 @@ onMounted(boot)
         </button>
         <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
 
-        <nav class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[12px]">
+        <nav class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[13px]">
           <button
             class="shrink-0 rounded px-1.5 py-1 text-muted transition-colors hover:bg-elevated hover:text-ink"
             :title="t('files.toolbar.home')"
@@ -1441,7 +1476,7 @@ onMounted(boot)
         <!-- 只读挂载点：全部变更入口置灰并带 Tooltip（设计文档 8.4 第 7 条） -->
         <span
           v-if="readonly"
-          class="hidden shrink-0 items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted sm:flex"
+          class="hidden shrink-0 items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted sm:flex"
           :title="t('files.readonly.tooltip')"
           data-testid="readonly-badge"
         >
@@ -1456,7 +1491,7 @@ onMounted(boot)
           <input
             v-model="searchTerm"
             :placeholder="searching ? t('files.toolbar.searching') : t('files.toolbar.searchPlaceholder')"
-            class="w-full rounded-full border border-line bg-elevated py-1 pl-7 pr-7 text-[11px] text-ink outline-none focus:border-accent"
+            class="w-full rounded-full border border-line bg-elevated py-1 pl-7 pr-7 text-[12px] text-ink outline-none focus:border-accent"
             @input="scheduleSearch"
             @keydown.esc="clearSearch"
           />
@@ -1502,7 +1537,7 @@ onMounted(boot)
               {{ t(`files.sort.${option.key}`) }}
               <span
                 v-if="sortKey === option.key"
-                class="ml-auto text-[10px] text-muted"
+                class="ml-auto text-[11px] text-muted"
               >{{ sortDir === 'asc' ? '↑' : '↓' }}</span>
             </button>
           </div>
@@ -1544,7 +1579,7 @@ onMounted(boot)
         <!-- 单目录扫描上限 10000 条（设计文档 3.2.4） -->
         <p
           v-if="listing?.truncated"
-          class="border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-500"
+          class="border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[12px] fg-warn"
         >
           {{ t('files.list.truncated') }}
         </p>
@@ -1634,20 +1669,27 @@ onMounted(boot)
               </span>
               <!-- 缩略图随格宽放大（≥100x100，设计文档 v2.7.0 3.2.1 / 8.4.5） -->
               <span
-                class="grid aspect-square w-full place-items-center overflow-hidden rounded-lg bg-elevated/60 transition-transform group-hover:scale-105"
+                class="relative grid aspect-square w-full place-items-center overflow-hidden rounded-lg bg-elevated/60 transition-transform group-hover:scale-105"
                 :class="toneFor(entry)"
               >
                 <img
-                  v-if="entry.kind === 'image' && !thumbFailed.has(entry.path)"
-                  :src="thumbUrl(entry.path, 240)"
+                  v-if="hasThumb(entry) && !thumbFailed.has(entry.path)"
+                  :src="thumbUrl(entry.path, 320)"
                   class="size-full object-cover"
                   loading="lazy"
                   alt=""
                   @error="markThumbFailed(entry.path)"
                 />
                 <AppIcon v-else :name="iconFor(entry)" :size="34" />
+                <!-- 视频封面之上叠播放角标，一眼区分「能看」和「只是文件」 -->
+                <span
+                  v-if="entry.kind === 'video' && !thumbFailed.has(entry.path)"
+                  class="pointer-events-none absolute right-1.5 bottom-1.5 grid size-6 place-items-center rounded-full bg-black/55 text-white backdrop-blur"
+                >
+                  <AppIcon name="play" :size="11" />
+                </span>
               </span>
-              <span class="w-full truncate text-center text-[11px] leading-tight text-ink">
+              <span class="w-full truncate text-center text-[12px] leading-tight text-ink">
                 {{ entry.name }}
               </span>
             </button>
@@ -1657,7 +1699,7 @@ onMounted(boot)
         <!-- 列表视图（定高虚拟列表，设计文档 v2.7.0 3.2.1：表头行 + h-12 行高） -->
         <template v-else>
           <div
-            class="sticky top-0 z-10 flex h-10 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[11px] font-medium text-muted"
+            class="sticky top-0 z-10 flex h-10 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[12px] font-medium text-muted"
           >
             <span class="min-w-0 flex-1">{{ t('files.header.name') }}</span>
             <span class="w-24 shrink-0 text-right">{{ t('files.header.size') }}</span>
@@ -1668,7 +1710,7 @@ onMounted(boot)
           <VirtualList :items="displayEntries" :row-height="48">
           <template #default="{ item: entry }">
             <div
-              class="entry-tile flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[12px] transition-colors hover:bg-elevated/60"
+              class="entry-tile flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[13px] transition-colors hover:bg-elevated/60"
               :class="[
                 selected === entry.path ? 'bg-accent-soft' : '',
                 selectMode && isSelected(entry.path) ? 'bg-accent-soft' : '',
@@ -1719,7 +1761,7 @@ onMounted(boot)
       <!-- 底栏 / 分页 -->
       <footer
         v-if="!loading && !error"
-        class="flex h-9 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[11px] text-muted"
+        class="flex h-9 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[12px] text-muted"
       >
         <span v-if="isSearching">
           {{ t('files.list.found', { count: displayEntries.length }) }}
@@ -1742,18 +1784,18 @@ onMounted(boot)
           data-testid="select-bar"
         >
           <div class="flex items-center gap-1.5 px-3 py-2">
-            <span class="min-w-0 flex-1 truncate text-[11px] text-muted">
+            <span class="min-w-0 flex-1 truncate text-[12px] text-muted">
               {{ t('files.select.count', { count: selection.length }) }}
             </span>
             <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50"
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50"
               @click="downloadSelected"
             >
               <AppIcon name="download" :size="12" />
               <span class="hidden sm:inline">{{ t('files.select.download') }}</span>
             </button>
             <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
               :disabled="readonly"
               :title="readonly ? t('files.readonly.tooltip') : ''"
               @click="openTransferDialog('move', selectedEntries)"
@@ -1762,7 +1804,7 @@ onMounted(boot)
               <span class="hidden sm:inline">{{ t('files.select.move') }}</span>
             </button>
             <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
               :disabled="readonly"
               :title="readonly ? t('files.readonly.tooltip') : ''"
               @click="openTransferDialog('copy', selectedEntries)"
@@ -1771,7 +1813,7 @@ onMounted(boot)
               <span class="hidden sm:inline">{{ t('files.select.copy') }}</span>
             </button>
             <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] text-red-400 transition-colors hover:border-red-400/50 disabled:cursor-not-allowed disabled:opacity-40"
+              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] fg-danger transition-colors hover:border-red-400/50 disabled:cursor-not-allowed disabled:opacity-40"
               :disabled="readonly"
               :title="readonly ? t('files.readonly.tooltip') : ''"
               @click="openDeleteDialog(selectedEntries)"
@@ -1780,7 +1822,7 @@ onMounted(boot)
               <span class="hidden sm:inline">{{ t('files.select.delete') }}</span>
             </button>
             <button
-              class="rounded-md bg-elevated px-2 py-1 text-[11px] text-ink transition-colors hover:bg-line"
+              class="rounded-md bg-elevated px-2 py-1 text-[12px] text-ink transition-colors hover:bg-line"
               @click="exitSelect"
             >
               {{ t('files.select.cancel') }}
@@ -1795,7 +1837,8 @@ onMounted(boot)
     <div v-if="menu" class="fixed inset-0 z-40" @click="menu = null" @contextmenu.prevent="menu = null" />
     <div
       v-if="menu"
-      class="fixed z-50 w-44 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+      ref="menuEl"
+      class="fixed z-50 max-h-[calc(100dvh-16px)] w-48 overflow-y-auto overflow-x-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
       :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
     >
       <button class="menu-item" @click="menuOpenEntry">
@@ -1879,7 +1922,7 @@ onMounted(boot)
         {{ t('files.menu.delete') }}
       </button>
       <!-- 置灰项在部分浏览器上不弹原生 Tooltip，这里再给一条常驻说明 -->
-      <p v-if="readonly" class="px-3 pt-1 pb-1.5 text-[10px] leading-snug text-muted">
+      <p v-if="readonly" class="px-3 pt-1 pb-1.5 text-[11px] leading-snug text-muted">
         {{ t('files.readonly.tooltip') }}
       </p>
     </div>
@@ -1894,7 +1937,7 @@ onMounted(boot)
         <p class="text-sm font-medium text-ink">{{ deleteTitle }}</p>
         <p
           v-if="deleteTargets.length === 1"
-          class="mt-2 break-all text-[11px] text-muted"
+          class="mt-2 break-all text-[12px] text-muted"
         >
           {{ deleteTargets[0].name }}
         </p>
@@ -1902,14 +1945,14 @@ onMounted(boot)
           <li
             v-for="entry in deleteTargets"
             :key="entry.path"
-            class="truncate text-[11px] text-muted"
+            class="truncate text-[12px] text-muted"
           >
             {{ entry.name }}
           </li>
         </ul>
 
         <!-- 删除前统计（设计文档 3.2.6.5） -->
-        <p class="mt-2 text-[11px] text-muted">
+        <p class="mt-2 text-[12px] text-muted">
           <template v-if="!deleteSurvey">{{ t('files.delete.measuring') }}</template>
           <template v-else-if="deleteSurvey.truncated">
             {{ t('files.delete.summaryMore', { count: deleteSurvey.items }) }}
@@ -1925,12 +1968,12 @@ onMounted(boot)
         </p>
         <p
           v-if="deleteSurvey?.truncated || (deleteSurvey?.items ?? 0) > 1000"
-          class="mt-1 text-[11px] text-amber-500"
+          class="mt-1 text-[12px] fg-warn"
         >
           {{ t('files.delete.large') }}
         </p>
 
-        <p class="mt-3 text-xs leading-relaxed text-red-400">
+        <p class="mt-3 text-xs leading-relaxed fg-danger">
           {{
             t(
               deleteNeedsName
@@ -1942,7 +1985,7 @@ onMounted(boot)
           }}
         </p>
         <!-- 删除单个目录必须输入目录名（设计文档 3.2.6.5：防误触，不是安全边界） -->
-        <label v-if="deleteNeedsName" class="mt-3 block text-[11px] text-muted">
+        <label v-if="deleteNeedsName" class="mt-3 block text-[12px] text-muted">
           {{ t('files.delete.confirmNameLabel') }}
           <input
             v-model="deleteConfirmName"
@@ -1952,9 +1995,9 @@ onMounted(boot)
             data-testid="delete-confirm-name"
             @keydown.enter="confirmDelete"
           />
-          <span class="mt-1 block text-[10px] text-muted">{{ t('files.delete.confirmNameHint') }}</span>
+          <span class="mt-1 block text-[11px] text-muted">{{ t('files.delete.confirmNameHint') }}</span>
         </label>
-        <p v-if="deleteError" class="mt-3 text-xs text-red-400">{{ deleteError }}</p>
+        <p v-if="deleteError" class="mt-3 text-xs fg-danger">{{ deleteError }}</p>
         <div class="mt-5 flex justify-end gap-2">
           <button
             class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
@@ -2017,8 +2060,8 @@ onMounted(boot)
             )
           }}
         </p>
-        <p class="mt-0.5 truncate text-[11px] text-muted">{{ currentPath }}</p>
-        <label class="mt-4 block text-[11px] text-muted">
+        <p class="mt-0.5 truncate text-[12px] text-muted">{{ currentPath }}</p>
+        <label class="mt-4 block text-[12px] text-muted">
           {{ t('files.create.placeholder') }}
           <input
             v-model="createDialog.name"
@@ -2029,7 +2072,7 @@ onMounted(boot)
             @keydown.enter="submitCreate"
           />
         </label>
-        <p v-if="createDialog.error" class="mt-3 text-xs text-red-400">{{ createDialog.error }}</p>
+        <p v-if="createDialog.error" class="mt-3 text-xs fg-danger">{{ createDialog.error }}</p>
         <div class="mt-5 flex justify-end gap-2">
           <button
             class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
@@ -2056,8 +2099,8 @@ onMounted(boot)
     >
       <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ t('files.rename.title') }}</p>
-        <p class="mt-0.5 break-all text-[11px] text-muted">{{ renameDialog.entry.name }}</p>
-        <label class="mt-4 block text-[11px] text-muted">
+        <p class="mt-0.5 break-all text-[12px] text-muted">{{ renameDialog.entry.name }}</p>
+        <label class="mt-4 block text-[12px] text-muted">
           {{ t('files.rename.label') }}
           <input
             v-model="renameDialog.name"
@@ -2067,7 +2110,7 @@ onMounted(boot)
             @keydown.enter="submitRename"
           />
         </label>
-        <p v-if="renameDialog.error" class="mt-3 text-xs text-red-400">{{ renameDialog.error }}</p>
+        <p v-if="renameDialog.error" class="mt-3 text-xs fg-danger">{{ renameDialog.error }}</p>
         <div class="mt-5 flex justify-end gap-2">
           <button
             class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
@@ -2102,7 +2145,7 @@ onMounted(boot)
             )
           }}
         </p>
-        <p class="mt-0.5 text-[11px] text-muted">
+        <p class="mt-0.5 text-[12px] text-muted">
           {{
             transferDialog.targets.length === 1
               ? transferDialog.targets[0].path
@@ -2110,21 +2153,21 @@ onMounted(boot)
           }}
         </p>
 
-        <label class="mt-4 block text-[11px] text-muted">
+        <label class="mt-4 block text-[12px] text-muted">
           {{ t('files.transfer.destination') }}
           <input
             v-model="transferDialog.dest"
             type="text"
-            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[11px] text-ink outline-none focus:border-accent"
+            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[12px] text-ink outline-none focus:border-accent"
             data-testid="transfer-dest"
             @keydown.enter="submitTransfer"
           />
-          <span class="mt-1 block text-[10px] text-muted">
+          <span class="mt-1 block text-[11px] text-muted">
             {{ t('files.transfer.destinationHint') }}
           </span>
         </label>
 
-        <p class="mt-4 text-[11px] text-muted">{{ t('files.transfer.conflict') }}</p>
+        <p class="mt-4 text-[12px] text-muted">{{ t('files.transfer.conflict') }}</p>
         <div class="mt-1.5 space-y-1">
           <label
             v-for="option in CONFLICT_OPTIONS"
@@ -2151,7 +2194,7 @@ onMounted(boot)
           </label>
         </div>
 
-        <p v-if="transferDialog.error" class="mt-3 text-xs text-red-400">
+        <p v-if="transferDialog.error" class="mt-3 text-xs fg-danger">
           {{ transferDialog.error }}
         </p>
         <div class="mt-5 flex justify-end gap-2">
@@ -2205,15 +2248,15 @@ onMounted(boot)
           }}
         </p>
         <template v-if="resultDialog.failures.length">
-          <p class="mt-4 text-[11px] font-medium text-muted">{{ t('files.result.failures') }}</p>
+          <p class="mt-4 text-[12px] font-medium text-muted">{{ t('files.result.failures') }}</p>
           <ul class="mt-1.5 max-h-48 space-y-1 overflow-y-auto">
             <li
               v-for="item in resultDialog.failures"
               :key="item.path"
               class="rounded-lg border border-line bg-elevated px-2.5 py-1.5"
             >
-              <p class="break-all text-[11px] text-ink">{{ item.source ?? item.path }}</p>
-              <p class="mt-0.5 text-[10px] text-red-400">{{ failureText(item) }}</p>
+              <p class="break-all text-[12px] text-ink">{{ item.source ?? item.path }}</p>
+              <p class="mt-0.5 text-[11px] fg-danger">{{ failureText(item) }}</p>
             </li>
           </ul>
         </template>
@@ -2236,13 +2279,13 @@ onMounted(boot)
     >
       <div class="w-full max-w-md rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ t('files.stat.title') }}</p>
-        <p class="mt-0.5 break-all text-[11px] text-muted">{{ statDialog.entry.path }}</p>
+        <p class="mt-0.5 break-all text-[12px] text-muted">{{ statDialog.entry.path }}</p>
 
         <p v-if="statDialog.busy" class="mt-4 text-xs text-muted">
           {{ t('common.action.loading') }}
         </p>
-        <p v-else-if="statDialog.error" class="mt-4 text-xs text-red-400">{{ statDialog.error }}</p>
-        <dl v-else-if="statDialog.data" class="mt-4 space-y-1.5 text-[11px]">
+        <p v-else-if="statDialog.error" class="mt-4 text-xs fg-danger">{{ statDialog.error }}</p>
+        <dl v-else-if="statDialog.data" class="mt-4 space-y-1.5 text-[12px]">
           <div class="flex gap-3">
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.size') }}</dt>
             <dd class="min-w-0 flex-1 break-all text-ink">
@@ -2275,7 +2318,7 @@ onMounted(boot)
           </div>
           <div v-if="statDialog.data.is_symlink" class="flex gap-3">
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.symlink') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-amber-500">
+            <dd class="min-w-0 flex-1 break-all fg-warn">
               {{ statDialog.data.symlink_target ?? '—' }}
             </dd>
           </div>
@@ -2301,11 +2344,11 @@ onMounted(boot)
       <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <template v-if="!shareResult">
           <p class="text-sm font-medium text-ink">{{ t('files.share.create') }}</p>
-          <p class="mt-0.5 truncate text-[11px] text-muted">
+          <p class="mt-0.5 truncate text-[12px] text-muted">
             {{ shareDialog.entry.name }}
           </p>
 
-          <label class="mt-4 block text-[11px] text-muted">
+          <label class="mt-4 block text-[12px] text-muted">
             {{ t('files.share.password') }}
             <input
               v-model="shareForm.password"
@@ -2315,7 +2358,7 @@ onMounted(boot)
             />
           </label>
 
-          <label class="mt-3 block text-[11px] text-muted">
+          <label class="mt-3 block text-[12px] text-muted">
             {{ t('files.share.expiry') }}
             <select
               v-model.number="shareForm.days"
@@ -2333,7 +2376,7 @@ onMounted(boot)
             {{ t('files.share.allowDownload') }}
           </label>
 
-          <p v-if="shareError" class="mt-3 text-xs text-red-400">{{ shareError }}</p>
+          <p v-if="shareError" class="mt-3 text-xs fg-danger">{{ shareError }}</p>
 
           <div class="mt-5 flex justify-end gap-2">
             <button
@@ -2357,7 +2400,7 @@ onMounted(boot)
           <div class="mt-3 break-all rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink">
             {{ shareResult.url }}
           </div>
-          <p class="mt-2 text-[11px] text-muted">
+          <p class="mt-2 text-[12px] text-muted">
             {{ t('files.share.hint') }}
           </p>
           <div class="mt-4 flex justify-end gap-2">
@@ -2385,7 +2428,7 @@ onMounted(boot)
     >
       <div class="rounded-2xl border-2 border-dashed border-accent/60 bg-panel/80 px-10 py-8 text-center">
         <p class="text-sm font-medium text-ink">{{ t('files.upload.dropTitle') }}</p>
-        <p class="mt-1 max-w-xs truncate text-[11px] text-muted">{{ currentPath }}</p>
+        <p class="mt-1 max-w-xs truncate text-[12px] text-muted">{{ currentPath }}</p>
       </div>
     </div>
 
@@ -2394,14 +2437,14 @@ onMounted(boot)
       v-if="uploads.length"
       class="absolute right-3 bottom-12 z-40 w-64 space-y-2 rounded-xl border border-line bg-panel p-3 shadow-xl"
     >
-      <p class="text-[11px] font-medium text-muted">
+      <p class="text-[12px] font-medium text-muted">
         {{ t('files.upload.queue', { count: uploads.length }) }}
       </p>
       <div v-for="task in uploads" :key="task.id" class="space-y-1">
-        <div class="flex items-center gap-2 text-[11px]">
+        <div class="flex items-center gap-2 text-[12px]">
           <span class="min-w-0 flex-1 truncate text-ink">{{ task.name }}</span>
           <span
-            :class="task.status === 'error' ? 'text-red-400' : 'text-muted'"
+            :class="task.status === 'error' ? 'fg-danger' : 'text-muted'"
             :title="task.error ?? ''"
           >
             {{
@@ -2447,8 +2490,8 @@ onMounted(boot)
   width: 100%;
   align-items: center;
   gap: 8px;
-  padding: 7px 12px;
-  font-size: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
   color: var(--text-main);
   transition: background-color 0.15s ease;
 }
@@ -2456,7 +2499,7 @@ onMounted(boot)
   background: var(--bg-elevated);
 }
 .menu-item--danger {
-  color: #f87171;
+  color: var(--tone-danger);
 }
 .menu-item--danger:hover {
   background: rgb(248 113 113 / 0.12);
@@ -2470,6 +2513,6 @@ onMounted(boot)
 }
 .menu-item--off.menu-item--danger,
 .menu-item--off.menu-item--danger:hover {
-  color: #f87171;
+  color: var(--tone-danger);
 }
 </style>

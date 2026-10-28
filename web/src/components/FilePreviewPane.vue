@@ -121,9 +121,9 @@ defineExpose({ load })
         <AppIcon name="arrowLeft" :size="14" />
         {{ t('files.preview.back') }}
       </button>
-      <p class="min-w-0 flex-1 truncate text-[13px] text-ink">
+      <p class="min-w-0 flex-1 truncate text-[14px] text-ink">
         {{ entry.name }}
-        <span class="ml-2 text-[11px] text-muted">{{ formatSize(entry.size) }}</span>
+        <span class="ml-2 text-[12px] text-muted">{{ formatSize(entry.size) }}</span>
       </p>
 
       <button
@@ -148,7 +148,7 @@ defineExpose({ load })
       <div v-if="loading" class="space-y-2">
         <div v-for="i in 8" :key="i" class="skeleton h-3 rounded" :style="{ width: `${95 - i * 7}%` }" />
       </div>
-      <p v-else-if="error" class="text-xs text-red-400">{{ error }}</p>
+      <p v-else-if="error" class="text-xs fg-danger">{{ error }}</p>
       <!-- eslint-disable-next-line vue/no-v-html -- 已过 DOMPurify，设计文档 3.1 允许 -->
       <article v-else class="md-body" v-html="markdownHtml" />
     </div>
@@ -157,7 +157,7 @@ defineExpose({ load })
     <div v-else-if="kind === 'csv'" class="flex min-h-0 flex-1 flex-col">
       <p
         v-if="oversized || table?.truncated"
-        class="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-500"
+        class="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[12px] fg-warn"
       >
         {{
           oversized
@@ -170,12 +170,12 @@ defineExpose({ load })
       <div v-if="loading" class="space-y-2 p-4">
         <div v-for="i in 10" :key="i" class="skeleton h-4 rounded" />
       </div>
-      <p v-else-if="error" class="p-4 text-xs text-red-400">{{ error }}</p>
+      <p v-else-if="error" class="p-4 text-xs fg-danger">{{ error }}</p>
       <div v-else-if="table" class="min-h-0 flex-1 overflow-auto">
-        <table class="w-full border-collapse text-[12px]">
+        <table class="w-full border-collapse text-[13px]">
           <thead class="sticky top-0 bg-elevated">
             <tr>
-              <th class="w-10 border-b border-line px-2 py-1.5 text-right text-[10px] font-normal text-muted">
+              <th class="w-10 border-b border-line px-2 py-1.5 text-right text-[11px] font-normal text-muted">
                 #
               </th>
               <th
@@ -194,7 +194,7 @@ defineExpose({ load })
               :key="rowIndex"
               class="odd:bg-panel/40 hover:bg-elevated/60"
             >
-              <td class="border-b border-line/60 px-2 py-1 text-right text-[10px] text-muted">
+              <td class="border-b border-line/60 px-2 py-1 text-right text-[11px] text-muted">
                 {{ rowIndex + 2 }}
               </td>
               <td
@@ -231,7 +231,7 @@ defineExpose({ load })
         </span>
         <p class="text-sm font-medium text-ink">{{ t('files.preview.unsupportedTitle') }}</p>
         <p class="mt-1 text-xs leading-relaxed text-muted">{{ unsupportedReason }}</p>
-        <p class="mt-3 truncate text-[11px] text-muted/70">
+        <p class="mt-3 truncate text-[12px] text-muted/70">
           {{ entry.name }} · {{ formatSize(entry.size) }}
         </p>
         <button

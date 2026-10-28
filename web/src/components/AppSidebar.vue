@@ -2,7 +2,7 @@
 /**
  * 全局侧边栏：PC 端固定 240px，可折叠为图标栏（w-60 ↔ w-16），移动端为抽屉。
  * 分组对齐原型：工作区 / 媒体库（照片·影视·音乐）/ 系统（分享与图床·设置）；
- * 底部为全宽主题切换按钮。
+ * 底部为「仅图标」的主题切换按钮（设计文档 8.2：严禁整行文字大按钮）。
  */
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -17,7 +17,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 
-const { isDark, toggle } = useTheme()
+const { isDark, mode, cycle } = useTheme()
 const { t } = useI18n()
 const router = useRouter()
 
@@ -61,6 +61,11 @@ const groups: NavGroup[] = [
 
 const route = useRoute()
 const isActive = (to: string) => (to === '/' ? route.path === '/' : route.path.startsWith(to))
+
+/** Tooltip 说明「点了会怎样」，同时交代当前处于哪一态（8.2 要求悬停显示「切换主题」） */
+const themeTip = computed(
+  () => `${t('common.theme.switch')} · ${t(`common.theme.${mode.value}`)}`,
+)
 
 // 桌面折叠（移动端抽屉不受影响）
 const COLLAPSE_KEY = 'asmoday.sidebar.collapsed'
@@ -160,17 +165,17 @@ const itemClass = (to: string) => [
       </template>
     </nav>
 
-    <!-- 底部主题切换（原型：全宽按钮） -->
-    <div class="shrink-0 border-t border-line p-3">
+    <!-- 底部主题切换（设计文档 8.2：仅图标 + Tooltip，循环 light → dark → system） -->
+    <div class="shrink-0 border-t border-line py-2" :class="collapsed ? 'md:px-1.5' : 'px-2'">
       <button
-        class="flex w-full items-center justify-center rounded-lg bg-elevated/60 py-2.5 text-muted transition-colors hover:bg-elevated hover:text-ink"
-        :title="isDark ? t('common.theme.toLight') : t('common.theme.toDark')"
-        @click="toggle"
+        class="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-elevated hover:text-ink"
+        :class="collapsed ? 'mx-auto' : 'mx-auto md:ml-1 md:mr-auto'"
+        :title="themeTip"
+        :aria-label="themeTip"
+        data-testid="theme-toggle"
+        @click="cycle"
       >
-        <AppIcon :name="isDark ? 'moon' : 'sun'" :size="15" class="shrink-0" />
-        <span v-if="!collapsed" class="ml-2">
-          {{ isDark ? t('common.theme.dark') : t('common.theme.light') }}
-        </span>
+        <AppIcon :name="isDark ? 'moon' : 'sun'" :size="16" />
       </button>
     </div>
   </aside>

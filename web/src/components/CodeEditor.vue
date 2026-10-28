@@ -109,9 +109,11 @@ function baseExtensions(): Extension[] {
       emit('change', update.state.doc.toString())
     }),
     EditorView.theme({
-      '&': { height: '100%', fontSize: '13px' },
-      '.cm-scroller': { fontFamily: 'var(--font-app-mono)', lineHeight: '1.6' },
-      '.cm-content': { padding: '12px 0' },
+      // 源码模式字号 14px（13px 在 1080p 上偏小，用户反馈看不清）
+      '&': { height: '100%', fontSize: '14px' },
+      '.cm-scroller': { fontFamily: 'var(--font-app-mono)', lineHeight: '1.7' },
+      '.cm-content': { padding: '14px 0' },
+      '.cm-gutters': { fontSize: '13px' },
     }),
   ]
 }

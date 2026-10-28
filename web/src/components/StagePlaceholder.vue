@@ -24,7 +24,7 @@ withDefaults(
         </span>
         <div class="min-w-0">
           <p
-            class="mb-1 inline-flex items-center rounded-full border border-line px-2 py-0.5 text-[10px] font-medium tracking-wider text-muted uppercase"
+            class="mb-1 inline-flex items-center rounded-full border border-line px-2 py-0.5 text-[11px] font-medium tracking-wider text-muted uppercase"
           >
             {{ stage }}
           </p>
@@ -39,7 +39,7 @@ withDefaults(
           :key="point.title"
           class="rounded-xl border border-line bg-elevated/40 p-3.5"
         >
-          <p class="mb-1 text-[13px] font-medium text-ink">{{ point.title }}</p>
+          <p class="mb-1 text-[14px] font-medium text-ink">{{ point.title }}</p>
           <p class="text-xs leading-relaxed text-muted">{{ point.detail }}</p>
         </div>
       </div>

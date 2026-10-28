@@ -182,7 +182,7 @@ onMounted(() => void boot())
             </span>
             <div class="min-w-0">
               <p class="truncate text-sm font-medium">{{ info.name }}</p>
-              <p class="text-[11px] text-muted">
+              <p class="text-[12px] text-muted">
                 {{ fmtExpiry(info.expires_at) }}
                 <span v-if="info.has_password"> · {{ t('shares.public.passwordProtected') }}</span>
                 <span v-if="!info.allow_download && !info.is_folder">
@@ -264,8 +264,8 @@ onMounted(() => void boot())
                 <span class="shrink-0 text-muted">
                   <AppIcon :name="iconFor(entry)" :size="16" />
                 </span>
-                <span class="min-w-0 flex-1 truncate text-[13px]">{{ entry.name }}</span>
-                <span class="shrink-0 text-[11px] text-muted">
+                <span class="min-w-0 flex-1 truncate text-[14px]">{{ entry.name }}</span>
+                <span class="shrink-0 text-[12px] text-muted">
                   {{ entry.is_dir ? '' : fmtSize(entry.size) }}
                 </span>
                 <a
@@ -283,7 +283,7 @@ onMounted(() => void boot())
           </div>
         </div>
 
-        <footer class="border-t border-line/60 px-5 py-3 text-center text-[10px] text-muted">
+        <footer class="border-t border-line/60 px-5 py-3 text-center text-[11px] text-muted">
           {{ t('shares.public.footer') }}
         </footer>
       </div>

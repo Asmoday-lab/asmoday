@@ -70,7 +70,9 @@
     "light": "Light",
     "dark": "Dark",
     "toLight": "Switch to light",
-    "toDark": "Switch to dark"
+    "toDark": "Switch to dark",
+    "switch": "Switch theme",
+    "system": "System"
   },
   "account": {
     "logout": "Sign out",

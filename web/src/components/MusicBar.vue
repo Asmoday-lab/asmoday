@@ -198,14 +198,14 @@ watch(
       >
         <div class="border-b border-line/60 px-4 py-2 text-center">
           <p class="truncate text-sm font-medium text-ink">{{ displayTitle }}</p>
-          <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
+          <p class="truncate text-[12px] text-muted">{{ displayArtist }}</p>
         </div>
         <div v-if="player.state.lyrics" ref="lyricBox" class="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           <p
             v-for="(line, index) in player.state.lyrics"
             :key="index"
             :data-line="index"
-            class="py-1.5 text-center text-[13px] transition-colors"
+            class="py-1.5 text-center text-[14px] transition-colors"
             :class="index === activeLyric ? 'font-medium text-accent' : 'text-muted'"
           >
             {{ line.text || '···' }}
@@ -230,12 +230,12 @@ watch(
           <p class="min-w-0 flex-1 truncate text-sm font-medium text-ink">
             {{ t('gallery.player.playlist') }}
           </p>
-          <span class="shrink-0 text-[11px] text-muted">
+          <span class="shrink-0 text-[12px] text-muted">
             {{ t('gallery.player.playlistCount', { count: player.state.queue.length }) }}
           </span>
           <button
             v-if="player.state.queue.length > 0"
-            class="shrink-0 rounded px-1.5 py-1 text-[11px] text-muted transition-colors hover:text-ink"
+            class="shrink-0 rounded px-1.5 py-1 text-[12px] text-muted transition-colors hover:text-ink"
             @click="player.clearQueue(); listOpen = false"
           >
             {{ t('gallery.player.playlistClear') }}
@@ -257,7 +257,7 @@ watch(
             @click="player.jump(index)"
           >
             <span
-              class="w-5 shrink-0 text-center text-[11px] tabular-nums"
+              class="w-5 shrink-0 text-center text-[12px] tabular-nums"
               :class="index === player.state.index ? 'text-accent' : 'text-muted'"
             >
               <AppIcon
@@ -269,12 +269,12 @@ watch(
             </span>
             <span class="min-w-0 flex-1">
               <span
-                class="block truncate text-[13px]"
+                class="block truncate text-[14px]"
                 :class="index === player.state.index ? 'font-medium text-accent' : 'text-ink'"
               >
                 {{ trackTitle(track.path, track.title, track.name) }}
               </span>
-              <span class="block truncate text-[11px] text-muted">
+              <span class="block truncate text-[12px] text-muted">
                 {{ track.artist ?? track.folder }}
               </span>
             </span>
@@ -305,13 +305,13 @@ watch(
 
         <div class="min-w-0 w-32 md:w-56">
           <button
-            class="block w-full truncate text-left text-[12px] font-medium text-ink hover:text-accent"
+            class="block w-full truncate text-left text-[13px] font-medium text-ink hover:text-accent"
             :title="displayTitle"
             @click="toggleLyrics"
           >
             {{ displayTitle }}
           </button>
-          <p class="truncate text-[10px] text-muted">{{ displayArtist }}</p>
+          <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
         </div>
 
         <div class="flex shrink-0 items-center gap-1">
@@ -346,7 +346,7 @@ watch(
         </div>
 
         <div class="hidden min-w-0 flex-1 items-center gap-2 sm:flex">
-          <span class="shrink-0 text-[10px] text-muted tabular-nums">{{ fmt(player.state.currentTime) }}</span>
+          <span class="shrink-0 text-[11px] text-muted tabular-nums">{{ fmt(player.state.currentTime) }}</span>
           <input
             type="range"
             min="0"
@@ -358,7 +358,7 @@ watch(
             @change="onSeekCommit"
             @pointerdown="seeking = true"
           />
-          <span class="shrink-0 text-[10px] text-muted tabular-nums">{{ fmt(player.state.duration) }}</span>
+          <span class="shrink-0 text-[11px] text-muted tabular-nums">{{ fmt(player.state.duration) }}</span>
         </div>
 
         <!-- 音量（8.4 音乐条：PC 常驻滑块；移动端隐藏，交给手机物理按键） -->

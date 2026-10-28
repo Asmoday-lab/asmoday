@@ -152,7 +152,7 @@ const statusTone: Record<TerminalStatus, string> = {
           <AppIcon name="terminal" :size="13" />
           <span class="max-w-[140px] truncate">{{ tab.title }}</span>
           <span
-            class="ml-1 rounded px-1 text-[10px] text-muted opacity-0 transition-opacity group-hover:opacity-100"
+            class="ml-1 rounded px-1 text-[11px] text-muted opacity-0 transition-opacity group-hover:opacity-100"
             role="button"
             :title="t('terminal.tabs.close')"
             @click.stop="closeTab(tab.id)"
@@ -255,7 +255,7 @@ const statusTone: Record<TerminalStatus, string> = {
     <!-- 底部状态提示 -->
     <footer
       v-if="tabs.length > 0"
-      class="flex h-6 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[10px] text-muted"
+      class="flex h-6 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[11px] text-muted"
     >
       <span class="truncate">{{ active?.cwd || t('terminal.tabs.defaultDir') }}</span>
       <span class="ml-3 flex shrink-0 items-center gap-2">
@@ -271,7 +271,7 @@ const statusTone: Record<TerminalStatus, string> = {
         <button
           v-if="active && (active.status === 'closed' || active.status === 'error')"
           type="button"
-          class="flex items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-ink transition-colors hover:bg-elevated/80"
+          class="flex items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-ink transition-colors hover:bg-elevated/80"
           :title="t('terminal.reconnect.title')"
           @click="reconnectActive"
         >

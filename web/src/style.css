@@ -20,6 +20,16 @@
   --scrollbar: #333;
   --shadow-soft: 0 20px 50px rgba(0, 0, 0, 0.45);
 
+  /* 语义前景色：深浅色各一套，避免浅色主题下 400 档颜色糊在白底上看不清 */
+  --tone-danger: #f87171;
+  --tone-warn: #fbbf24;
+  --tone-ok: #34d399;
+  --tone-info: #38bdf8;
+  --tone-video: #a78bfa;
+  --tone-audio: #34d399;
+  --tone-archive: #fb923c;
+  --tone-text: #a5b4fc;
+
   --font-app-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
     'PingFang SC', 'Microsoft YaHei', sans-serif;
   --font-app-mono: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace;
@@ -34,14 +44,58 @@
   --bg-card: rgba(255, 255, 255, 0.7);
   --bg-card-hover: rgba(255, 255, 255, 0.95);
   --text-main: #0f172a;
-  --text-muted: #64748b;
-  --border-color: rgba(0, 0, 0, 0.08);
+  /* 原来是 #64748b，小字号在浅底上偏灰；压到 slate-600 提高对比 */
+  --text-muted: #475569;
+  --border-color: rgba(15, 23, 42, 0.12);
   --accent: #4f46e5;
-  --accent-soft: rgba(79, 70, 229, 0.1);
+  --accent-soft: rgba(79, 70, 229, 0.12);
   --scrollbar: #cbd5e1;
   --shadow-soft: 0 20px 40px rgba(15, 23, 42, 0.12);
 
+  --tone-danger: #b91c1c;
+  --tone-warn: #a16207;
+  --tone-ok: #047857;
+  --tone-info: #0369a1;
+  --tone-video: #6d28d9;
+  --tone-audio: #047857;
+  --tone-archive: #c2410c;
+  --tone-text: #4338ca;
+
   color-scheme: light;
+}
+
+/* 语义色工具类（模板里写 fg-danger，不写死 text-red-400） */
+.fg-danger {
+  color: var(--tone-danger);
+}
+.fg-warn {
+  color: var(--tone-warn);
+}
+.fg-ok {
+  color: var(--tone-ok);
+}
+.fg-info {
+  color: var(--tone-info);
+}
+.fg-video {
+  color: var(--tone-video);
+}
+.fg-audio {
+  color: var(--tone-audio);
+}
+.fg-archive {
+  color: var(--tone-archive);
+}
+.fg-text {
+  color: var(--tone-text);
+}
+/* 危险操作 hover（删除 / 吊销）：浅色主题下 400 档太浅 */
+.hover-danger:hover {
+  color: var(--tone-danger);
+}
+/* group-hover:fg-ok 的变体写法（自定义工具类不支持 Tailwind 变体前缀） */
+.group:hover .group-hover\:fg-ok {
+  color: var(--tone-ok);
 }
 
 /* 把运行时变量桥接成 Tailwind 工具类：bg-canvas / bg-panel / text-ink / border-line ... */
@@ -60,7 +114,20 @@
 
   --font-sans: var(--font-app-sans);
   --font-mono: var(--font-app-mono);
+
+  /* 字号整体上调一档：12px 正文字号在高分屏上偏小（用户反馈「字体太小」） */
+  --text-xs: 0.8125rem; /* 13px */
+  --text-xs--line-height: 1.25rem;
+  --text-sm: 0.9375rem; /* 15px */
+  --text-sm--line-height: 1.4rem;
+  --text-base: 1.0625rem; /* 17px */
+  --text-base--line-height: 1.6rem;
+  --text-lg: 1.1875rem; /* 19px */
+  --text-lg--line-height: 1.75rem;
+  --text-xl: 1.375rem; /* 22px */
+  --text-xl--line-height: 1.9rem;
 }
+
 
 html,
 body,
@@ -73,10 +140,21 @@ body {
   background-color: var(--bg-base);
   color: var(--text-main);
   font-family: var(--font-app-sans);
+  font-size: 0.9375rem; /* 15px，与 text-sm 对齐 */
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   transition: background-color 0.3s ease, color 0.3s ease;
   overflow: hidden;
 }
+
+/* 设计文档 8.2：主题过渡严禁进入代码编辑器与终端（会闪烁 + 重绘开销） */
+.cm-editor,
+.cm-editor *,
+.xterm,
+.xterm * {
+  transition: none !important;
+}
+
 
 *,
 *::before,

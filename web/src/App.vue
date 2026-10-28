@@ -134,7 +134,7 @@ async function logout() {
             v-if="accountOpen"
             class="absolute right-0 z-50 mt-2 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
           >
-            <p class="truncate px-3 py-2 text-[11px] text-muted">
+            <p class="truncate px-3 py-2 text-[12px] text-muted">
               {{ username ?? t('common.account.notLoggedIn') }}
             </p>
             <button
@@ -175,7 +175,7 @@ async function logout() {
     <!-- 一次性密码强制改密（--init / --reset 后首登） -->
     <div v-if="mustChangePassword" class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4">
       <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-6 shadow-xl">
-        <span class="mb-3 grid size-10 place-items-center rounded-full bg-amber-500/15 text-amber-400">
+        <span class="mb-3 grid size-10 place-items-center rounded-full bg-amber-500/15 fg-warn">
           <AppIcon name="lock" :size="18" />
         </span>
         <p class="text-sm font-medium text-ink">{{ t('auth.forceChange.title') }}</p>
@@ -205,7 +205,7 @@ async function logout() {
           />
         </div>
 
-        <p v-if="passwordError" class="mt-2 text-xs text-red-400">{{ passwordError }}</p>
+        <p v-if="passwordError" class="mt-2 text-xs fg-danger">{{ passwordError }}</p>
 
         <button
           class="mt-4 w-full rounded-lg bg-accent py-2 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"

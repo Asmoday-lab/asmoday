@@ -24,6 +24,12 @@ import { useScrollLock } from '../composables/useScrollLock'
 import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
 
+/** 缩略图加载失败（坏文件 / 无权限）时回落图标，别留一块空色块 */
+const failedThumbs = ref<Set<string>>(new Set())
+function markThumbFailed(path: string) {
+  failedThumbs.value = new Set(failedThumbs.value).add(path)
+}
+
 const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
 const { t } = useI18n()
 
@@ -365,8 +371,8 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div class="ml-auto flex items-center gap-2 text-[11px] text-muted">
-        <span v-if="truncated" class="rounded bg-amber-500/15 px-2 py-0.5 text-amber-400">
+      <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
+        <span v-if="truncated" class="rounded bg-amber-500/15 px-2 py-0.5 fg-warn">
           {{ t('gallery.photos.truncated') }}
         </span>
         <button
@@ -442,7 +448,7 @@ onBeforeUnmount(() => {
           </button>
           <div class="min-w-0 flex-1">
             <p class="truncate text-sm font-semibold text-ink">{{ activeAlbum.name }}</p>
-            <p class="truncate text-[11px] text-muted">
+            <p class="truncate text-[12px] text-muted">
               {{
                 t('gallery.photos.albumMeta', {
                   count: activeAlbum.items.length,
@@ -500,13 +506,13 @@ onBeforeUnmount(() => {
                 alt=""
               />
               <span
-                class="absolute right-1.5 bottom-1.5 rounded-full bg-black/55 px-2 py-0.5 text-[10px] text-white backdrop-blur"
+                class="absolute right-1.5 bottom-1.5 rounded-full bg-black/55 px-2 py-0.5 text-[11px] text-white backdrop-blur"
               >
                 {{ t('gallery.photos.albumItems', { count: album.count }) }}
               </span>
             </div>
             <p class="mt-2 truncate text-sm font-medium text-ink">{{ album.name }}</p>
-            <p class="truncate text-[11px] text-muted">
+            <p class="truncate text-[12px] text-muted">
               {{
                 t('gallery.photos.albumMeta', {
                   count: album.count,
@@ -525,7 +531,7 @@ onBeforeUnmount(() => {
             class="sticky top-0 z-10 border-b border-line/60 bg-base/85 px-4 py-2 text-sm font-semibold text-ink backdrop-blur md:px-6"
           >
             {{ group.label }}
-            <span class="ml-2 text-[11px] font-normal text-muted">
+            <span class="ml-2 text-[12px] font-normal text-muted">
               {{ t('gallery.photos.albumItems', { count: group.items.length }) }}
             </span>
           </div>
@@ -540,19 +546,21 @@ onBeforeUnmount(() => {
               :style="{ backgroundColor: placeholderFor(item) }"
               @click="openViewer(group.items, index)"
             >
+              <!-- 视频同样取后端首帧当封面（v2.8），失败才回落图标 -->
               <img
-                v-if="item.kind === 'image'"
-                :src="thumbUrl(item.path, 320)"
+                v-if="!failedThumbs.has(item.path) && (item.kind === 'image' || item.kind === 'video')"
+                :src="thumbUrl(item.path, 400)"
                 class="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                 loading="lazy"
                 alt=""
+                @error="markThumbFailed(item.path)"
               />
               <span v-else class="grid size-full place-items-center text-white/70" :title="item.name">
-                <AppIcon name="video" :size="26" />
+                <AppIcon :name="item.kind === 'video' ? 'video' : 'gallery'" :size="26" />
               </span>
               <span
                 v-if="item.kind === 'video'"
-                class="absolute right-1 bottom-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white backdrop-blur"
+                class="absolute right-1 bottom-1 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
               >
                 {{ t('gallery.photos.videoBadge') }}
               </span>
@@ -602,16 +610,16 @@ onBeforeUnmount(() => {
             </div>
             <span
               v-if="resumeAt(video.path) > 10"
-              class="absolute left-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[10px] text-white backdrop-blur"
+              class="absolute left-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
             >
               {{ t('gallery.cinema.resume', { time: fmtSeconds(resumeAt(video.path)) }) }}
             </span>
-            <span class="absolute right-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[10px] text-white">
+            <span class="absolute right-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] text-white">
               {{ formatSize(video.size) }}
             </span>
             <button
               class="absolute right-1.5 top-1.5 grid size-7 place-items-center rounded-full bg-black/45 text-white/80 backdrop-blur transition-colors hover:text-white"
-              :class="isFavorite(video.path) ? 'text-red-400' : ''"
+              :class="isFavorite(video.path) ? 'fg-danger' : ''"
               :title="isFavorite(video.path) ? t('gallery.favorite.remove') : t('gallery.favorite.add')"
               @click.stop="toggleFavorite(video)"
             >
@@ -619,7 +627,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p class="mt-2 truncate text-sm font-medium text-ink">{{ video.name }}</p>
-          <p class="truncate text-[11px] text-muted">{{ video.folder }}</p>
+          <p class="truncate text-[12px] text-muted">{{ video.folder }}</p>
         </button>
       </div>
     </div>
@@ -734,7 +742,7 @@ onBeforeUnmount(() => {
               <td class="px-2 py-3 text-right">
                 <button
                   class="rounded-md p-1.5 transition-colors"
-                  :class="isFavorite(track.path) ? 'text-red-400' : 'text-muted hover:text-ink'"
+                  :class="isFavorite(track.path) ? 'fg-danger' : 'text-muted hover:text-ink'"
                   :title="isFavorite(track.path) ? t('gallery.favorite.remove') : t('gallery.favorite.add')"
                   @click.stop="toggleFavorite(track)"
                 >
@@ -769,10 +777,10 @@ onBeforeUnmount(() => {
             @timeupdate="reportProgress(($event.target as HTMLVideoElement).currentTime)"
             @ended="onPlayEnded(playing.path)"
           />
-          <p v-if="nativeError" class="mt-2 text-center text-xs text-amber-300">
+          <p v-if="nativeError" class="mt-2 text-center text-xs fg-warn">
             {{ nativeError }}
             <button
-              class="ml-2 rounded border border-amber-300/40 px-2 py-0.5 text-[11px] text-amber-200 transition-colors hover:bg-amber-300/10"
+              class="ml-2 rounded border border-amber-300/40 px-2 py-0.5 text-[12px] fg-warn transition-colors hover:bg-amber-300/10"
               @click="downloadPlaying"
             >
               {{ t('gallery.video.tryDownload') }}

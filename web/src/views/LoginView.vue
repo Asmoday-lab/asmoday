@@ -78,7 +78,7 @@ function changeLocale(event: Event) {
     <div class="absolute top-4 right-4 flex items-center gap-2">
       <select
         :value="locale"
-        class="rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-muted outline-none focus:border-accent"
+        class="rounded-lg border border-line bg-elevated px-2 py-1.5 text-[12px] text-muted outline-none focus:border-accent"
         :aria-label="t('common.language.label')"
         @change="changeLocale"
       >
@@ -110,7 +110,7 @@ function changeLocale(event: Event) {
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
         <label class="block">
-          <span class="mb-1 block text-[11px] text-muted">{{ t('auth.login.username') }}</span>
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.username') }}</span>
           <input
             v-model="username"
             type="text"
@@ -121,7 +121,7 @@ function changeLocale(event: Event) {
         </label>
 
         <label class="block">
-          <span class="mb-1 block text-[11px] text-muted">{{ t('auth.login.password') }}</span>
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
           <input
             v-model="password"
             type="password"
@@ -132,7 +132,7 @@ function changeLocale(event: Event) {
         </label>
 
         <label v-if="isSetup" class="block">
-          <span class="mb-1 block text-[11px] text-muted">{{ t('auth.login.confirmPassword') }}</span>
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.confirmPassword') }}</span>
           <input
             v-model="confirm"
             type="password"
@@ -145,13 +145,13 @@ function changeLocale(event: Event) {
         <template v-if="!isSetup">
           <button
             type="button"
-            class="text-[11px] text-muted transition-colors hover:text-ink"
+            class="text-[12px] text-muted transition-colors hover:text-ink"
             @click="showTotp = !showTotp"
           >
             {{ showTotp ? t('auth.login.totpHide') : t('auth.login.totpToggle') }}
           </button>
           <label v-if="showTotp" class="block">
-            <span class="mb-1 block text-[11px] text-muted">{{ t('auth.login.totpLabel') }}</span>
+            <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
             <input
               v-model="totp"
               type="text"
@@ -165,7 +165,7 @@ function changeLocale(event: Event) {
 
         <p
           v-if="error"
-          class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400"
+          class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
         >
           {{ error }}
         </p>
@@ -178,7 +178,7 @@ function changeLocale(event: Event) {
           {{ submitting ? t('auth.login.submitting') : isSetup ? t('auth.login.submitSetup') : t('auth.login.submit') }}
         </button>
 
-        <p class="pt-1 text-center text-[11px] leading-relaxed text-muted">
+        <p class="pt-1 text-center text-[12px] leading-relaxed text-muted">
           {{ isSetup ? t('auth.login.footerSetup') : t('auth.login.footerLogin') }}
         </p>
       </form>

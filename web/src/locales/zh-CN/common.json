@@ -70,7 +70,9 @@
     "light": "浅色",
     "dark": "深色",
     "toLight": "切换到浅色",
-    "toDark": "切换到深色"
+    "toDark": "切换到深色",
+    "switch": "切换主题",
+    "system": "跟随系统"
   },
   "account": {
     "logout": "退出登录",

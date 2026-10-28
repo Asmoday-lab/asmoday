@@ -230,7 +230,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-      <p v-if="errorMsg" class="text-amber-300">{{ errorMsg }}</p>
+      <p v-if="errorMsg" class="fg-warn">{{ errorMsg }}</p>
       <a
         :href="src"
         target="_blank"

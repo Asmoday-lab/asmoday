@@ -23,7 +23,7 @@ import { ECOSYSTEM } from '../constants/ecosystem'
 const CodeEditor = defineAsyncComponent(() => import('../components/CodeEditor.vue'))
 
 const { t, locale } = useI18n()
-const { mode: themeMode, setTheme } = useTheme()
+const { mode: themeMode, setTheme, isDark } = useTheme()
 
 interface Mount {
   name: string
@@ -81,18 +81,19 @@ const tabs: { key: Tab; label: string }[] = [
 const tab = ref<Tab>('general')
 
 // ---------------- 通用：主题 / 语言 ----------------
-const themes: { key: ThemeMode; label: string; icon: 'sun' | 'moon' }[] = [
-  { key: 'light', label: 'settings.general.themeLight', icon: 'sun' },
-  { key: 'dark', label: 'settings.general.themeDark', icon: 'moon' },
+const themes: { key: ThemeMode; label: string }[] = [
+  { key: 'dark', label: 'settings.general.themeDark' },
+  { key: 'light', label: 'settings.general.themeLight' },
+  { key: 'system', label: 'settings.general.themeSystem' },
 ]
 
 function pickLocale(next: Locale) {
   applyLocale(next)
 }
 
-/** 通用面板复位：主题回深色、语言回到浏览器识别结果（不写死某一种语言） */
+/** 通用面板复位：主题回「跟随系统」（8.2 默认值）、语言回到浏览器识别结果 */
 function resetGeneral() {
-  setTheme('dark')
+  setTheme('system')
   applyLocale(detectLocale())
   showToast(t('settings.general.resetDone'))
 }
@@ -550,12 +551,12 @@ onMounted(() => {
       >
         {{ t(item.label) }}
       </button>
-      <span class="ml-auto text-[11px] text-muted">{{ authApi.username.value }}</span>
+      <span class="ml-auto text-[12px] text-muted">{{ authApi.username.value }}</span>
     </nav>
 
     <p
       v-if="error"
-      class="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400"
+      class="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
     >
       {{ error }}
     </p>
@@ -567,8 +568,8 @@ onMounted(() => {
       class="mb-4 rounded-lg px-3 py-2 text-xs"
       :class="
         issue.level === 'error'
-          ? 'border border-red-500/30 bg-red-500/10 text-red-400'
-          : 'border border-amber-500/30 bg-amber-500/10 text-amber-500'
+          ? 'border border-red-500/30 bg-red-500/10 fg-danger'
+          : 'border border-amber-500/30 bg-amber-500/10 fg-warn'
       "
       :data-safety="issue.code"
     >
@@ -583,24 +584,20 @@ onMounted(() => {
         </p>
         <div class="grid gap-3 sm:grid-cols-2">
           <div>
-            <span class="mb-1 block text-[11px] text-muted">{{ t('settings.general.theme') }}</span>
-            <div class="flex items-center rounded-lg border border-line p-0.5 text-xs">
-              <button
-                v-for="item in themes"
-                :key="item.key"
-                class="flex flex-1 items-center justify-center gap-1.5 rounded px-2.5 py-1 transition-colors"
-                :class="
-                  themeMode === item.key ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'
-                "
-                @click="setTheme(item.key)"
-              >
-                <AppIcon :name="item.icon" :size="13" />
+            <span class="mb-1 block text-[12px] text-muted">{{ t('settings.general.theme') }}</span>
+            <select
+              :value="themeMode"
+              class="h-10 w-full rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+              data-testid="theme-select"
+              @change="setTheme(($event.target as HTMLSelectElement).value as ThemeMode)"
+            >
+              <option v-for="item in themes" :key="item.key" :value="item.key">
                 {{ t(item.label) }}
-              </button>
-            </div>
+              </option>
+            </select>
           </div>
           <div>
-            <span class="mb-1 block text-[11px] text-muted">{{
+            <span class="mb-1 block text-[12px] text-muted">{{
               t('settings.general.language')
             }}</span>
             <select
@@ -614,7 +611,7 @@ onMounted(() => {
             </select>
           </div>
         </div>
-        <p class="mt-2 text-[11px] text-muted">{{ t('settings.general.languageHint') }}</p>
+        <p class="mt-2 text-[12px] text-muted">{{ t('settings.general.languageHint') }}</p>
       </div>
 
       <div class="rounded-xl border border-line p-6">
@@ -622,7 +619,7 @@ onMounted(() => {
           <p class="text-xs font-semibold tracking-wider text-muted uppercase">
             {{ t('settings.general.overview') }}
           </p>
-          <button class="text-[11px] text-accent hover:underline" @click="tab = 'advanced'">
+          <button class="text-[12px] text-accent hover:underline" @click="tab = 'advanced'">
             {{ t('settings.advanced.form') }} →
           </button>
         </div>
@@ -637,7 +634,7 @@ onMounted(() => {
             :class="index % 2 === 1 ? 'bg-elevated/40' : ''"
           >
             <span class="text-muted">{{ row.label }}</span>
-            <span class="truncate font-mono text-[13px] text-ink">{{ row.value }}</span>
+            <span class="truncate font-mono text-[14px] text-ink">{{ row.value }}</span>
           </div>
         </div>
       </div>
@@ -652,14 +649,14 @@ onMounted(() => {
         </span>
         <span class="min-w-0 flex-1">
           <span class="block text-sm font-medium text-ink">{{ t('ecosystem.title') }}</span>
-          <span class="mt-0.5 block truncate text-[11px] text-muted">{{ t('ecosystem.intro') }}</span>
+          <span class="mt-0.5 block truncate text-[12px] text-muted">{{ t('ecosystem.intro') }}</span>
         </span>
         <AppIcon name="arrowRight" :size="14" class="shrink-0 text-muted" />
       </button>
 
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-6">
         <div class="min-w-0">
-          <p class="text-[11px] text-muted">{{ t('settings.general.resetHint') }}</p>
+          <p class="text-[12px] text-muted">{{ t('settings.general.resetHint') }}</p>
         </div>
         <button
           class="shrink-0 rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
@@ -695,11 +692,11 @@ onMounted(() => {
             · {{ t('settings.media.cacheLimit', { mb: cache.limit_mb, days: cache.max_age_days }) }}
           </span>
         </p>
-        <p class="mt-1 text-[11px] text-muted/70">{{ t('settings.media.cacheHint') }}</p>
+        <p class="mt-1 text-[12px] text-muted/70">{{ t('settings.media.cacheHint') }}</p>
 
         <div v-if="draft" class="mt-3 grid gap-3 sm:grid-cols-2">
           <label class="block">
-            <span class="mb-1 block text-[11px] text-muted">{{ t('settings.media.thumbSize') }}</span>
+            <span class="mb-1 block text-[12px] text-muted">{{ t('settings.media.thumbSize') }}</span>
             <input
               v-model.number="draft.media.thumb_cache_max_size_mb"
               type="number"
@@ -708,7 +705,7 @@ onMounted(() => {
             />
           </label>
           <label class="block">
-            <span class="mb-1 block text-[11px] text-muted">{{ t('settings.media.thumbAge') }}</span>
+            <span class="mb-1 block text-[12px] text-muted">{{ t('settings.media.thumbAge') }}</span>
             <input
               v-model.number="draft.media.thumb_cache_max_age_days"
               type="number"
@@ -726,22 +723,22 @@ onMounted(() => {
             {{ t('settings.media.ffmpeg') }}
           </p>
           <span
-            class="rounded-full px-2 py-0.5 text-[10px]"
-            :class="ffmpegBadge.ok ? 'bg-emerald-500/15 text-emerald-400' : 'bg-elevated text-muted'"
+            class="rounded-full px-2 py-0.5 text-[11px]"
+            :class="ffmpegBadge.ok ? 'bg-emerald-500/15 fg-ok' : 'bg-elevated text-muted'"
           >
             {{ ffmpegBadge.text }}
           </span>
-          <span v-if="ffmpeg?.path" class="truncate font-mono text-[10px] text-muted">
+          <span v-if="ffmpeg?.path" class="truncate font-mono text-[11px] text-muted">
             {{ ffmpeg.path }}
           </span>
-          <span class="text-[10px] text-muted/70">
+          <span class="text-[11px] text-muted/70">
             {{ t('settings.media.ffmpegSource', { source: ffmpegSourceLabel }) }}
           </span>
           <!-- libwebp 支持探测（设计文档 3.5）：决定缩略图能否输出 WebP -->
           <span
             v-if="ffmpeg?.status === 'ok'"
-            class="rounded-full px-2 py-0.5 text-[10px]"
-            :class="ffmpeg.webp_support ? 'bg-sky-500/15 text-sky-400' : 'bg-elevated text-muted'"
+            class="rounded-full px-2 py-0.5 text-[11px]"
+            :class="ffmpeg.webp_support ? 'bg-sky-500/15 fg-info' : 'bg-elevated text-muted'"
             data-testid="webp-badge"
           >
             {{ ffmpeg.webp_support ? t('settings.media.webpOn') : t('settings.media.webpOff') }}
@@ -749,7 +746,7 @@ onMounted(() => {
         </div>
 
         <label class="block">
-          <span class="mb-1 block text-[11px] text-muted">{{ t('settings.media.ffmpegPath') }}</span>
+          <span class="mb-1 block text-[12px] text-muted">{{ t('settings.media.ffmpegPath') }}</span>
           <div class="flex gap-2">
             <input
               v-if="draft"
@@ -766,12 +763,12 @@ onMounted(() => {
             </button>
           </div>
         </label>
-        <p class="mt-2 text-[11px] text-muted">{{ t('settings.media.ffmpegPathHint') }}</p>
-        <p class="mt-1 text-[11px] text-amber-400/80">{{ t('settings.media.note') }}</p>
+        <p class="mt-2 text-[12px] text-muted">{{ t('settings.media.ffmpegPathHint') }}</p>
+        <p class="mt-1 text-[12px] fg-warn/80">{{ t('settings.media.note') }}</p>
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-6">
-        <p class="text-[11px] text-muted">{{ t('settings.media.resetHint') }}</p>
+        <p class="text-[12px] text-muted">{{ t('settings.media.resetHint') }}</p>
         <div class="flex shrink-0 items-center gap-2">
           <button
             class="rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
@@ -824,7 +821,7 @@ onMounted(() => {
           >
             {{ t('settings.security.submit') }}
           </button>
-          <span class="text-[11px] text-muted">{{ t('settings.security.hint') }}</span>
+          <span class="text-[12px] text-muted">{{ t('settings.security.hint') }}</span>
         </div>
       </div>
 
@@ -834,21 +831,21 @@ onMounted(() => {
             {{ t('settings.security.totp') }}
           </p>
           <span
-            class="rounded-full px-2 py-0.5 text-[10px]"
-            :class="totpEnabled ? 'bg-emerald-500/15 text-emerald-400' : 'bg-elevated text-muted'"
+            class="rounded-full px-2 py-0.5 text-[11px]"
+            :class="totpEnabled ? 'bg-emerald-500/15 fg-ok' : 'bg-elevated text-muted'"
           >
             {{ totpEnabled ? t('settings.security.totpOn') : t('settings.security.totpOff') }}
           </span>
         </div>
 
         <template v-if="!totpEnabled">
-          <p class="mb-2 text-[11px] text-muted">{{ t('settings.security.totpHint') }}</p>
+          <p class="mb-2 text-[12px] text-muted">{{ t('settings.security.totpHint') }}</p>
           <button class="rounded-md border border-line px-3 py-1.5 text-xs text-ink" @click="startTotp">
             {{ t('settings.security.totpGenerate') }}
           </button>
           <div v-if="totpSecret" class="mt-3 space-y-2">
             <p class="font-mono text-xs break-all text-ink">{{ totpSecret }}</p>
-            <p class="font-mono text-[10px] break-all text-muted">{{ totpUri }}</p>
+            <p class="font-mono text-[11px] break-all text-muted">{{ totpUri }}</p>
             <div class="flex gap-2">
               <input
                 v-model="totpCode"
@@ -872,7 +869,7 @@ onMounted(() => {
               class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
             />
             <button
-              class="rounded-md border border-red-500/40 px-3 py-1.5 text-xs text-red-400"
+              class="rounded-md border border-red-500/40 px-3 py-1.5 text-xs fg-danger"
               @click="disableTotp"
             >
               {{ t('settings.security.totpDisable') }}
@@ -883,7 +880,7 @@ onMounted(() => {
 
       <p
         v-if="securityError"
-        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400"
+        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
       >
         {{ securityError }}
       </p>
@@ -902,7 +899,7 @@ onMounted(() => {
             class="grid h-10 w-10 shrink-0 place-items-center rounded-md border transition-colors"
             :class="
               davCopied
-                ? 'border-emerald-500/40 text-emerald-400'
+                ? 'border-emerald-500/40 fg-ok'
                 : 'border-line text-muted hover:text-ink'
             "
             :title="davCopied ? t('settings.security.davCopied') : t('settings.security.copyDav')"
@@ -912,7 +909,7 @@ onMounted(() => {
             <AppIcon :name="davCopied ? 'check' : 'copy'" :size="14" />
           </button>
         </div>
-        <p class="text-[11px] leading-relaxed text-muted">{{ t('settings.security.davHint') }}</p>
+        <p class="text-[12px] leading-relaxed text-muted">{{ t('settings.security.davHint') }}</p>
       </div>
 
       <div class="rounded-xl border border-line p-6">
@@ -925,10 +922,10 @@ onMounted(() => {
             :placeholder="t('settings.security.tokenName')"
             class="h-10 w-40 rounded-lg border border-line bg-elevated px-3 text-xs text-ink outline-none focus:border-accent"
           />
-          <label class="flex items-center gap-1 text-[11px] text-muted">
+          <label class="flex items-center gap-1 text-[12px] text-muted">
             <input v-model="tokenReadonly" type="checkbox" /> {{ t('settings.security.readonly') }}
           </label>
-          <label class="flex items-center gap-1 text-[11px] text-muted">
+          <label class="flex items-center gap-1 text-[12px] text-muted">
             {{ t('settings.security.tokenDays') }}
             <input
               v-model.number="tokenDays"
@@ -944,7 +941,7 @@ onMounted(() => {
         </div>
 
         <div v-if="newToken" class="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
-          <p class="mb-1 text-[11px] font-medium text-amber-300">
+          <p class="mb-1 text-[12px] font-medium fg-warn">
             {{ t('settings.security.tokenOnce') }}
           </p>
           <p class="font-mono text-xs break-all text-ink select-all">{{ newToken }}</p>
@@ -954,7 +951,7 @@ onMounted(() => {
       <div class="overflow-hidden rounded-xl border border-line">
         <!-- 表头与数据列严格对齐，行高统一 h-12（8.4.2） -->
         <div
-          class="flex h-10 items-center gap-4 border-b border-line bg-elevated/60 px-4 text-[11px] font-medium text-muted"
+          class="flex h-10 items-center gap-4 border-b border-line bg-elevated/60 px-4 text-[12px] font-medium text-muted"
         >
           <span class="min-w-0 flex-1">{{ t('settings.security.colName') }}</span>
           <span class="w-14 shrink-0 text-center">{{ t('settings.security.colPerm') }}</span>
@@ -968,34 +965,34 @@ onMounted(() => {
           :class="index % 2 === 1 ? 'bg-elevated/40' : ''"
         >
           <span class="min-w-0 flex-1 truncate text-ink">{{ token.name }}</span>
-          <span class="w-14 shrink-0 rounded bg-elevated px-1.5 py-0.5 text-center text-[10px] text-muted">
+          <span class="w-14 shrink-0 rounded bg-elevated px-1.5 py-0.5 text-center text-[11px] text-muted">
             {{ token.readonly ? t('settings.security.readonly') : t('settings.security.readwrite') }}
           </span>
-          <span class="w-24 shrink-0 text-right text-[11px] text-muted">{{
+          <span class="w-24 shrink-0 text-right text-[12px] text-muted">{{
             formatExpiry(token.expires_at)
           }}</span>
           <!-- 危险操作固定在行末，hover 变红（8.4.2） -->
           <button
-            class="flex w-6 shrink-0 justify-end text-muted transition-colors hover:text-red-500"
+            class="flex w-6 shrink-0 justify-end text-muted transition-colors hover-danger"
             :title="t('settings.security.deleteToken')"
             @click="deleteToken(token.id)"
           >
             <AppIcon name="close" :size="14" />
           </button>
         </div>
-        <p v-if="!tokens.length" class="px-4 py-3 text-[11px] text-muted">
+        <p v-if="!tokens.length" class="px-4 py-3 text-[12px] text-muted">
           {{ t('settings.security.tokenEmpty') }}
         </p>
       </div>
 
       <p
         v-if="tokenError"
-        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400"
+        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
       >
         {{ tokenError }}
       </p>
 
-      <div class="rounded-xl border border-line p-6 text-[11px] leading-relaxed text-muted">
+      <div class="rounded-xl border border-line p-6 text-[12px] leading-relaxed text-muted">
         <p class="mb-1 font-medium text-ink">{{ t('settings.security.forgotTitle') }}</p>
         {{ t('settings.security.forgotBody') }}
         <code class="rounded bg-elevated px-1 py-0.5">asmoday --reset-password</code>
@@ -1022,7 +1019,7 @@ onMounted(() => {
             {{ t('settings.advanced.source') }}
           </button>
         </div>
-        <span class="text-[11px] text-muted">
+        <span class="text-[12px] text-muted">
           {{
             configMode === 'form'
               ? t('settings.advanced.formHint')
@@ -1058,7 +1055,7 @@ onMounted(() => {
           </p>
           <div class="grid gap-3 sm:grid-cols-2">
             <label class="block">
-              <span class="mb-1 block text-[11px] text-muted">{{ t('settings.advanced.port') }}</span>
+              <span class="mb-1 block text-[12px] text-muted">{{ t('settings.advanced.port') }}</span>
               <input
                 v-model.number="draft.server.port"
                 type="number"
@@ -1068,7 +1065,7 @@ onMounted(() => {
               />
             </label>
             <label class="block">
-              <span class="mb-1 block text-[11px] text-muted">{{ t('settings.advanced.baseUrl') }}</span>
+              <span class="mb-1 block text-[12px] text-muted">{{ t('settings.advanced.baseUrl') }}</span>
               <input
                 v-model="draft.server.proxy.base_url"
                 class="w-full rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
@@ -1080,10 +1077,10 @@ onMounted(() => {
             <input v-model="draft.server.proxy.trust_proxy_headers" type="checkbox" />
             {{ t('settings.advanced.trustProxy') }}
           </label>
-          <p class="mt-2 text-[11px] text-muted">{{ t('settings.advanced.portHint') }}</p>
+          <p class="mt-2 text-[12px] text-muted">{{ t('settings.advanced.portHint') }}</p>
         </div>
 
-        <p class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-300">
+        <p class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px] fg-warn">
           {{ t('settings.advanced.protected') }}
         </p>
 
@@ -1092,11 +1089,11 @@ onMounted(() => {
             <p class="text-xs font-semibold tracking-wider text-muted uppercase">
               {{ t('settings.advanced.mounts') }}
             </p>
-            <button class="text-[11px] text-accent hover:underline" @click="addMount">
+            <button class="text-[12px] text-accent hover:underline" @click="addMount">
               + {{ t('settings.advanced.add') }}
             </button>
           </div>
-          <p v-if="!draft.system.mounts.length" class="text-[11px] text-muted">
+          <p v-if="!draft.system.mounts.length" class="text-[12px] text-muted">
             {{ t('settings.advanced.mountsHint') }}
           </p>
           <div v-for="(mount, index) in draft.system.mounts" :key="index" class="mb-2 flex gap-2">
@@ -1110,7 +1107,7 @@ onMounted(() => {
               :placeholder="t('settings.advanced.mountPath')"
               class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
             />
-            <button class="text-muted hover:text-red-400" @click="removeMount(index)">
+            <button class="text-muted hover-danger" @click="removeMount(index)">
               <AppIcon name="close" :size="14" />
             </button>
           </div>
@@ -1121,11 +1118,11 @@ onMounted(() => {
             <p class="text-xs font-semibold tracking-wider text-muted uppercase">
               {{ t('settings.advanced.services') }}
             </p>
-            <button class="text-[11px] text-accent hover:underline" @click="addService">
+            <button class="text-[12px] text-accent hover:underline" @click="addService">
               + {{ t('settings.advanced.add') }}
             </button>
           </div>
-          <p v-if="!draft.services.length" class="text-[11px] text-muted">
+          <p v-if="!draft.services.length" class="text-[12px] text-muted">
             {{ t('settings.advanced.servicesHint') }}
           </p>
           <div
@@ -1149,11 +1146,11 @@ onMounted(() => {
                 placeholder="http://192.168.1.50:3000"
                 class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
               />
-              <button class="text-muted hover:text-red-400" @click="removeService(index)">
+              <button class="text-muted hover-danger" @click="removeService(index)">
                 <AppIcon name="close" :size="14" />
               </button>
             </div>
-            <div class="flex flex-wrap items-center gap-3 text-[11px] text-muted">
+            <div class="flex flex-wrap items-center gap-3 text-[12px] text-muted">
               <label class="flex items-center gap-1">
                 <input v-model="service.strip_prefix" type="checkbox" />
                 {{ t('settings.advanced.stripPrefix') }}
@@ -1170,29 +1167,38 @@ onMounted(() => {
               <input
                 :value="injectKey(service)"
                 :placeholder="t('settings.advanced.injectKey')"
-                class="w-36 rounded border border-line bg-elevated px-2 py-1 font-mono text-[11px] text-ink outline-none focus:border-accent"
+                class="w-36 rounded border border-line bg-elevated px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
                 @input="setInject(service, ($event.target as HTMLInputElement).value, injectValue(service))"
               />
               <input
                 :value="injectValue(service)"
                 :placeholder="t('settings.advanced.injectValue')"
-                class="w-32 rounded border border-line bg-elevated px-2 py-1 font-mono text-[11px] text-ink outline-none focus:border-accent"
+                class="w-32 rounded border border-line bg-elevated px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
                 @input="setInject(service, injectKey(service), ($event.target as HTMLInputElement).value)"
               />
             </div>
           </div>
         </div>
 
-        <p class="text-[11px] text-muted">{{ t('settings.advanced.resetHint') }}</p>
+        <p class="text-[12px] text-muted">{{ t('settings.advanced.resetHint') }}</p>
       </div>
 
-      <!-- 源码模式 -->
+      <!-- 源码模式：按视口高度自适应，避免 420px 固定高在桌面端只剩一条缝（8.4.1） -->
       <div v-else class="overflow-hidden rounded-xl border border-line">
-        <div v-if="rawLoading" class="grid h-[420px] place-items-center text-xs text-muted">
+        <div
+          v-if="rawLoading"
+          class="grid h-[min(72vh,760px)] place-items-center text-sm text-muted"
+        >
           {{ t('settings.advanced.loadingRaw') }}
         </div>
-        <div v-else class="h-[420px]">
-          <CodeEditor :content="rawText" language="toml" :dark="true" @change="onRawChange" />
+        <div v-else class="flex h-[min(72vh,760px)] min-h-[420px] flex-col">
+          <CodeEditor
+            :content="rawText"
+            language="toml"
+            :dark="isDark"
+            class="min-h-0 flex-1"
+            @change="onRawChange"
+          />
         </div>
       </div>
     </div>
@@ -1202,7 +1208,7 @@ onMounted(() => {
       <p class="text-xs text-muted">{{ t('ecosystem.intro') }}</p>
 
       <div v-for="category in ECOSYSTEM" :key="category.id" class="space-y-2">
-        <p class="text-[11px] font-semibold tracking-wider text-muted uppercase">
+        <p class="text-[12px] font-semibold tracking-wider text-muted uppercase">
           {{ t(`ecosystem.categories.${category.id}`) }}
         </p>
         <div class="grid gap-2 sm:grid-cols-2">
@@ -1219,7 +1225,7 @@ onMounted(() => {
             </span>
             <span class="min-w-0 flex-1">
               <span class="block truncate text-sm font-medium text-ink">{{ item.name }}</span>
-              <span class="mt-0.5 block text-[11px] leading-relaxed text-muted">
+              <span class="mt-0.5 block text-[12px] leading-relaxed text-muted">
                 {{ t(`ecosystem.items.${item.id}`) }}
               </span>
             </span>
@@ -1228,7 +1234,7 @@ onMounted(() => {
         </div>
       </div>
 
-      <p class="rounded-xl border border-line px-4 py-3 text-[11px] leading-relaxed text-muted">
+      <p class="rounded-xl border border-line px-4 py-3 text-[12px] leading-relaxed text-muted">
         {{ t('ecosystem.footer') }}
       </p>
     </div>

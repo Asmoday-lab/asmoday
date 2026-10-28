@@ -27,7 +27,8 @@
     "ecosystemLink": "查看生态推荐",
     "reset": "恢复通用面板默认值",
     "resetHint": "只重置主题与语言，不触碰挂载点、外部服务等高级配置。",
-    "resetDone": "已恢复通用面板默认值"
+    "resetDone": "已恢复通用面板默认值",
+    "themeSystem": "跟随系统"
   },
   "media": {
     "cache": "媒体缓存",

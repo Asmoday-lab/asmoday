@@ -27,7 +27,8 @@
     "ecosystemLink": "Browse the ecosystem",
     "reset": "Reset this panel to defaults",
     "resetHint": "Only resets theme and language — mounts and services are never touched.",
-    "resetDone": "General panel reset to defaults"
+    "resetDone": "General panel reset to defaults",
+    "themeSystem": "System"
   },
   "media": {
     "cache": "Media cache",

@@ -1,18 +1,19 @@
 <script setup lang="ts">
 /**
- * 全局媒体灯箱（设计文档 3.2 / 7 / 8.4.9）。
+ * 全局媒体灯箱（设计文档 3.2 / 8.4.9 / v2.8）。
  *
- * - **单例**：只在 App.vue 挂在一次，Teleport 到 body；文件管理、相册、影视库都复用它，
- *   严禁各自再手写 `<img>` / `<video>` 弹窗；
- * - 图片支持左右切换（← →），视频走全局 MediaPlayer，音频用原生 `<audio>` + 全局音量；
- * - 关闭时整块 `v-if` 卸载，MediaPlayer 内部会 `pause(); src=''; load()` 彻底销毁，
- *   不会在后台继续缓冲（8.4.9）；
- * - 打开时锁底层滚动，按 Esc 关闭。
+ * - **单例**：只在 App.vue 挂一次，Teleport 到 body；文件管理、相册、影视库都复用它；
+ * - 图片 / 视频 / 音频混排也能左右切换（← →），视频走全局 MediaPlayer；
+ * - **翻页按钮贴容器左右边缘绝对定位**：按钮位置绝不能跟着图片宽度走
+ *   （原来放在 flex 流里，图片一变宽按钮就往外漂，点「下一张」要重新找位置）；
+ * - **底部缩略图条可滚动**：滚轮纵向增量映射成横向滚动，当前项自动滚入视野；
+ * - 视频缩略图用后端抽取的首帧，播放器传 `poster`，点开即有画面而不是一片黑；
+ * - 关闭时整块 `v-if` 卸载，MediaPlayer 内部会 `pause(); src=''; load()` 彻底销毁。
  */
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
-import { coverUrl, rawUrl } from '../api/media'
+import { coverUrl, rawUrl, thumbUrl } from '../api/media'
 import { useScrollLock } from '../composables/useScrollLock'
 import { bindVolume } from '../lib/volume'
 import {
@@ -38,6 +39,8 @@ const total = lightboxTotal
 /** 打不开的图片（坏文件 / 无权限）回退成图标，避免整屏空白 */
 const failed = ref(new Set<string>())
 const audioEl = ref<HTMLAudioElement | null>(null)
+const stripEl = ref<HTMLElement | null>(null)
+const thumbRefs = ref<Record<number, HTMLElement | null>>({})
 
 useScrollLock(isOpen)
 
@@ -54,6 +57,35 @@ function onKey(event: KeyboardEvent) {
 function markFailed(path: string) {
   failed.value = new Set(failed.value).add(path)
 }
+
+/** 缩略图统一用后端首帧（视频也有），失败时退回类型图标 */
+function thumbOf(path: string, width: number) {
+  return thumbUrl(path, width)
+}
+
+/** 滚轮在缩略图条上是「横向滚动」，别让浏览器把它当成页面滚动（8.2 滚动体验） */
+function onStripWheel(event: WheelEvent) {
+  const el = stripEl.value
+  if (!el) return
+  const delta = Math.abs(event.deltaY) > Math.abs(event.deltaX) ? event.deltaY : event.deltaX
+  if (delta === 0) return
+  el.scrollLeft += delta
+  event.preventDefault()
+}
+
+function setThumbRef(index: number, el: Element | null) {
+  thumbRefs.value[index] = el as HTMLElement | null
+}
+
+/** 切换项后把当前缩略图滚到可见区域（不改变页面滚动） */
+watch(
+  () => lightboxState.index,
+  async (index) => {
+    await nextTick()
+    const el = thumbRefs.value[index]
+    el?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' })
+  },
+)
 
 function onAudioReady(event: Event) {
   bindVolume(event.target as HTMLAudioElement)
@@ -80,14 +112,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   <Teleport to="body">
     <div
       v-if="isOpen && item"
-      class="fixed inset-0 z-[80] flex flex-col bg-black/95 backdrop-blur-sm"
+      class="fixed inset-0 z-[80] flex flex-col bg-black/[0.97]"
       data-testid="media-lightbox"
       @click.self="closeLightbox()"
     >
       <header class="flex h-12 shrink-0 items-center gap-3 px-3 md:px-4">
         <p class="min-w-0 flex-1 truncate text-xs text-white/70">
           {{ item.name }}
-          <span v-if="total > 1" class="ml-2 shrink-0 text-white/45">{{ lightboxState.index + 1 }} / {{ total }}</span>
+          <span v-if="total > 1" class="ml-2 shrink-0 text-white/45">
+            {{ lightboxState.index + 1 }} / {{ total }}
+          </span>
         </p>
         <a
           :href="rawUrl(item.path)"
@@ -107,11 +141,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         </button>
       </header>
 
-      <div class="flex min-h-0 flex-1 items-center justify-center px-2 pb-4">
+      <!-- 舞台：翻页按钮 absolute 贴在左右边缘，与媒体实际宽度无关 -->
+      <div class="relative flex min-h-0 flex-1 items-center justify-center px-3 pb-2 md:px-14">
         <button
           v-if="total > 1"
-          class="mr-2 grid size-10 shrink-0 place-items-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
+          class="absolute left-1 top-1/2 z-10 grid size-10 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white backdrop-blur transition-colors hover:bg-black/70 md:left-3"
           :title="t('gallery.viewer.prev')"
+          data-testid="lightbox-prev"
           @click.stop="stepLightbox(-1)"
         >
           <AppIcon name="chevronLeft" :size="18" />
@@ -137,6 +173,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         <div v-else-if="item.kind === 'video'" :key="item.path" class="w-full max-w-4xl">
           <MediaPlayer
             :src="rawUrl(item.path)"
+            :poster="thumbUrl(item.path, 960)"
             :subtitle="item.subtitle ?? null"
             :autoplay="true"
             @close="closeLightbox()"
@@ -169,39 +206,66 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
         <button
           v-if="total > 1"
-          class="ml-2 grid size-10 shrink-0 place-items-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
+          class="absolute right-1 top-1/2 z-10 grid size-10 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white backdrop-blur transition-colors hover:bg-black/70 md:right-3"
           :title="t('gallery.viewer.next')"
+          data-testid="lightbox-next"
           @click.stop="stepLightbox(1)"
         >
           <AppIcon name="chevronRight" :size="18" />
         </button>
       </div>
 
-      <!-- 缩略图条：多于 1 项时提供快速跳转 -->
+      <!-- 缩略图条：可横向滚动 + 滚轮映射 + 当前项自动定位（v2.8） -->
       <div
         v-if="total > 1"
-        class="flex h-16 shrink-0 items-center gap-1.5 overflow-x-auto px-3 pb-2"
+        ref="stripEl"
+        class="lightbox-strip flex h-[76px] shrink-0 items-center gap-1.5 overflow-x-auto overflow-y-hidden px-3 pb-2"
+        data-testid="lightbox-strip"
+        @wheel="onStripWheel"
       >
         <button
           v-for="(entry, index) in lightboxState.items"
           :key="entry.path"
+          :ref="(el) => setThumbRef(index, el as Element | null)"
           class="relative size-12 shrink-0 overflow-hidden rounded-md border transition-opacity"
-          :class="index === lightboxState.index ? 'border-white/80' : 'border-transparent opacity-55 hover:opacity-90'"
+          :class="
+            index === lightboxState.index
+              ? 'border-white/80 opacity-100'
+              : 'border-transparent opacity-55 hover:opacity-90'
+          "
           :title="entry.name"
           @click="jumpLightbox(index)"
         >
           <img
-            v-if="entry.kind === 'image'"
-            :src="rawUrl(entry.path)"
+            :src="thumbOf(entry.path, 160)"
             alt=""
             class="size-full object-cover"
             loading="lazy"
+            @error="
+              ($event.target as HTMLImageElement).classList.add('hidden')
+            "
           />
-          <span v-else class="grid size-full place-items-center bg-white/10 text-white/70">
-            <AppIcon :name="entry.kind === 'video' ? 'video' : 'audio'" :size="16" />
+          <span class="pointer-events-none absolute inset-0 grid place-items-center text-white/70">
+            <AppIcon v-if="entry.kind !== 'image'" :name="entry.kind === 'video' ? 'video' : 'audio'" :size="14" />
           </span>
         </button>
       </div>
     </div>
   </Teleport>
 </template>
+
+<style scoped>
+/* 滚动条在深色 backdrop 上默认几乎看不见：给缩略图条一条常驻的细滚动条 */
+.lightbox-strip {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.35) transparent;
+  overscroll-behavior-x: contain;
+}
+.lightbox-strip::-webkit-scrollbar {
+  height: 6px;
+}
+.lightbox-strip::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.35);
+  border-radius: 3px;
+}
+</style>
