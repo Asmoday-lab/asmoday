@@ -440,26 +440,30 @@ fn platform_rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    const AT_FDCWD: i32 = -100;
-    const RENAME_NOREPLACE: u32 = 1;
+    const AT_FDCWD: i64 = -100;
+    const RENAME_NOREPLACE: i64 = 1;
 
+    // musl 不导出 renameat2 包装函数（glibc 才有），改走 syscall(2)——
+    // musl 与 glibc 都导出 syscall。系统调用号按内核 ABI 取：
+    // x86_64=316、aarch64/riscv64=276。
     unsafe extern "C" {
-        fn renameat2(
-            olddirfd: i32,
-            oldpath: *const i8,
-            newdirfd: i32,
-            newpath: *const i8,
-            flags: u32,
-        ) -> i32;
+        fn syscall(number: i64, ...) -> i64;
     }
+
+    #[cfg(target_arch = "x86_64")]
+    const SYS_RENAMEAT2: i64 = 316;
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    const SYS_RENAMEAT2: i64 = 276;
 
     let from_c = CString::new(from.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let to_c = CString::new(to.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     let rc = unsafe {
-        renameat2(
+        syscall(
+            SYS_RENAMEAT2,
             AT_FDCWD,
             from_c.as_ptr(),
             AT_FDCWD,
@@ -467,10 +471,27 @@ fn platform_rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
             RENAME_NOREPLACE,
         )
     };
+    // 未知架构：直接走 ENOSYS 降级路径
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    let rc: i64 = {
+        let _ = (&from_c, &to_c);
+        -1
+    };
+
     if rc == 0 {
         return Ok(());
     }
-    let err = std::io::Error::last_os_error();
+    // 未知架构时未真正发起系统调用，直接按 ENOSYS 处理；
+    // 已知架构时取真实 errno。
+    let err = if cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )) {
+        std::io::Error::last_os_error()
+    } else {
+        std::io::Error::from_raw_os_error(38) // ENOSYS
+    };
     // 老内核 / 不支持的 FS：退回「硬链接占位 + 删除源」，链接本身是原子的
     if matches!(err.raw_os_error(), Some(38) /* ENOSYS */ | Some(22) /* EINVAL */) {
         std::fs::hard_link(from, to)?;
