@@ -76,6 +76,44 @@ async function copyPath(entry: EntryInfo) {
   menu.value = null
 }
 
+/**
+ * 相对挂载点的路径（设计文档 3.2.5）：最长前缀匹配挂载根，POSIX 风格。
+ * 例：挂载点「媒体盘」→ `/movies`；挂在根上的条目就是 `/`。
+ */
+function relativePathOf(entry: EntryInfo): string {
+  const normalized = entry.path.replace(/\\/g, '/')
+  let matchedPrefix = ''
+  for (const root of roots.value) {
+    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (
+      prefix &&
+      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
+      prefix.length > matchedPrefix.length
+    ) {
+      matchedPrefix = prefix
+    }
+  }
+  if (!matchedPrefix) return normalized
+  const rest = normalized.slice(matchedPrefix.length).replace(/^\/+/, '')
+  return `/${rest}`
+}
+
+/** 复制相对路径：只暴露挂载点内的位置，不含宿主机目录结构 */
+async function copyRelativePath(entry: EntryInfo) {
+  try {
+    await navigator.clipboard.writeText(relativePathOf(entry))
+    showToast(t('files.menu.pathCopied'))
+  } catch {
+    showToast(t('common.clipboard.denied'))
+  }
+  menu.value = null
+}
+
+/** 复制绝对路径（物理路径）。仅控制台菜单可达——分享访客页没有本菜单（设计文档 3.2.5）。 */
+async function copyAbsolutePath(entry: EntryInfo) {
+  await copyPath(entry)
+}
+
 function downloadEntry(entry: EntryInfo) {
   menu.value = null
   window.open(filesApi.rawUrl(entry.path), '_blank', 'noopener')
@@ -91,11 +129,6 @@ function menuOpenTerminal() {
   const entry = menu.value?.entry
   menu.value = null
   if (entry) openTerminal(entry)
-}
-
-function menuCopyPath() {
-  const entry = menu.value?.entry
-  if (entry) void copyPath(entry)
 }
 
 function menuDownload() {
@@ -147,10 +180,13 @@ const fileMenuItems = computed<ContextMenuItem[]>(() => {
       icon: entry.is_dir ? 'folderOpen' : 'file',
     },
   ]
-  if (entry.is_dir) {
-    items.push({ id: 'terminal', label: t('files.menu.terminal'), icon: 'terminal' })
-  }
-  items.push({ id: 'copyPath', label: t('files.menu.copyPath'), icon: 'fileText' })
+  // 极客联动（设计文档 3.2.5）：「在此终端中打开」紧跟「打开」——文件取所在目录，
+  // 想操作路径时一键进终端优先于复制路径。
+  items.push({ id: 'terminal', label: t('files.menu.terminal'), icon: 'terminal' })
+  items.push({ id: 'copyRelativePath', label: t('files.menu.copyRelativePath'), icon: 'fileText' })
+  // 复制绝对路径只在控制台菜单出现：本视图必须登录会话才可达，
+  // 分享访客页（ShareView）没有 ContextMenu，后端 stat 也只对会话返回物理路径。
+  items.push({ id: 'copyAbsolutePath', label: t('files.menu.copyAbsolutePath'), icon: 'link' })
   if (!entry.is_dir) {
     items.push({ id: 'download', label: t('files.menu.download'), icon: 'archive' })
   }
@@ -202,9 +238,18 @@ function onMenuSelect(id: string) {
     case 'terminal':
       menuOpenTerminal()
       break
-    case 'copyPath':
-      menuCopyPath()
+    case 'copyRelativePath': {
+      const relEntry = menu.value?.entry
+      menu.value = null
+      if (relEntry) void copyRelativePath(relEntry)
       break
+    }
+    case 'copyAbsolutePath': {
+      const absEntry = menu.value?.entry
+      menu.value = null
+      if (absEntry) void copyAbsolutePath(absEntry)
+      break
+    }
     case 'download':
       menuDownload()
       break

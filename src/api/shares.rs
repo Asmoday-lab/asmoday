@@ -389,9 +389,11 @@ pub async fn info(
 
     let name = path.split('/').filter(|s| !s.is_empty()).next_back().unwrap_or(&path).to_string();
 
+    // **安全边界（设计文档 3.2.5）**：公开接口严禁返回物理路径 `path`——
+    // 访客在 devtools 里就能看到宿主机目录结构。子路径导航全部用 token+sub，
+    // 前端也从不消费这个字段（v3.5.9 起停发）。
     Json(json!({
         "name": name,
-        "path": path,
         "is_folder": is_folder,
         "has_password": password_hash.is_some(),
         "allow_download": allow_download,

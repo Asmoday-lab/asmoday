@@ -786,7 +786,10 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<StatQuery>)
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs()),
         "mime": mime,
+        // 真实物理路径（canonicalize 结果）。**仅限控制台会话**：本路由在会话
+        // 中间件之后，分享访客走 /api/public/share/*，到不了这里（设计文档 3.2.5）。
         "real_path": real_path,
+        "real_absolute_path": real_path,
         "readonly": readonly,
         "width": width,
         "height": height,

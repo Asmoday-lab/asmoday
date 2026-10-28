@@ -23,7 +23,6 @@ export interface CreateShareResult {
 
 export interface PublicShareInfo {
   name: string
-  path: string
   is_folder: boolean
   has_password: boolean
   allow_download: boolean
