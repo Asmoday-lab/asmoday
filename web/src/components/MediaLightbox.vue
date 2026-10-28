@@ -78,6 +78,9 @@ watch(
 function onKey(event: KeyboardEvent) {
   if (!isOpen.value) return
   if (event.key === 'Escape') {
+    // 标记「这一击已被灯箱消费」：页面级监听（如相册详情的 Esc 返回）据此跳过，
+    // 否则一次 Esc 会同时关掉灯箱和相册，连退两层
+    event.preventDefault()
     closeLightbox()
     return
   }

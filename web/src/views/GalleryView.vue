@@ -332,6 +332,17 @@ function albumHash(album: Album): string | null {
   return thumbHashToDataUrl(album.cover_hash)
 }
 
+/**
+ * 相册副标题（对齐 v2.9 的「N 张 · 路径」）。
+ * 相册列表是根下直接子目录，相对路径与册名相同时只显示数量，避免「album-b · album-b」。
+ */
+function albumSubtitle(album: Album): string {
+  const folder = relativeFolder(album.path)
+  return folder === album.name
+    ? t('gallery.photos.albumItems', { count: album.count })
+    : t('gallery.photos.albumMeta', { count: album.count, folder })
+}
+
 function markAlbumCoverFailed(path: string) {
   albumCoverFailed.value = new Set(albumCoverFailed.value).add(path)
 }
@@ -445,6 +456,11 @@ function onKey(event: KeyboardEvent) {
   if (playing.value) {
     if (event.key === 'Escape') playing.value = null
     return
+  }
+  // 相册详情里按 Esc 退回相册列表（对齐 v2.9）；灯箱会先消费掉 Esc 并 preventDefault，
+  // 这里判 defaultPrevented，避免一次 Esc 连退两层
+  if (event.key === 'Escape' && !event.defaultPrevented && activeAlbum.value) {
+    closeAlbum()
   }
 }
 
@@ -582,21 +598,30 @@ onBeforeUnmount(() => {
     <div v-else-if="tab === 'photos'" class="min-h-0 flex-1">
       <!-- 相册详情：只看当前这本相册里的图片 -->
       <div v-if="photoView === 'albums' && activeAlbum" class="flex h-full flex-col">
+        <!-- 相册详情头（对齐 v2.9 交互）：返回 + 册名/册内路径 + 幻灯片，滚动时始终可见 -->
         <header
-          class="flex h-10 shrink-0 items-center gap-2 border-b border-line/60 px-4 text-sm md:px-6"
+          class="sticky top-0 z-10 flex shrink-0 items-center gap-3 border-b border-line bg-base/85 px-4 py-2 backdrop-blur md:px-6"
         >
           <button
-            class="flex shrink-0 items-center gap-0.5 rounded px-1.5 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+            class="flex shrink-0 items-center gap-0.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
             data-testid="album-back"
             @click="closeAlbum"
           >
             <AppIcon name="chevronLeft" :size="13" />
             {{ t('gallery.photos.backToAlbums') }}
           </button>
-          <span class="min-w-0 truncate font-medium text-ink">{{ activeAlbum.name }}</span>
-          <span class="ml-auto shrink-0 text-[12px] text-muted">
-            {{ t('gallery.photos.albumItems', { count: albumItems.length }) }}
-          </span>
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-sm font-semibold text-ink">{{ activeAlbum.name }}</p>
+            <p class="truncate text-[12px] text-muted">{{ albumSubtitle(activeAlbum) }}</p>
+          </div>
+          <button
+            class="shrink-0 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+            :disabled="albumLoading || albumItems.length === 0"
+            data-testid="album-slideshow"
+            @click="openViewer(albumItems, 0)"
+          >
+            {{ t('gallery.photos.slideshow') }}
+          </button>
         </header>
 
         <div class="min-h-0 flex-1 overflow-y-auto p-2 md:p-3">
@@ -700,6 +725,8 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <p class="mt-2 truncate text-sm font-medium text-ink">{{ album.name }}</p>
+            <!-- 副标题（对齐 v2.9）：数量 + 册内路径，卡片不只剩一个封面和名字 -->
+            <p class="truncate text-[12px] text-muted">{{ albumSubtitle(album) }}</p>
           </button>
         </div>
       </div>

@@ -1154,6 +1154,8 @@ function goHome() {
       void open(home.path)
       return
     }
+    // 已在挂载点根：按文档 3.2.1 单挂载点语义「点第一级回根」，原地不动
+    return
   }
   if (editor.value) closeEditor()
   preview.value = null
@@ -1165,6 +1167,19 @@ function goHome() {
   activeMount.value = null
   // 回到卡片页时 URL 也要跟着回 /files（否则刷新又跳回目录）
   if (route.name !== 'files') void router.replace({ name: 'files' })
+}
+
+/**
+ * 面包屑点击（设计文档 3.2.1 语义）：
+ * - 多挂载点模式：前两级（🏠 与挂载点名）都回 `/files` 卡片页；
+ * - 单挂载点模式：首级回挂载点根目录，其余级打开对应目录。
+ */
+function onCrumbClick(index: number, crumb: { label: string; path: string }) {
+  if (index === 0 && !singleMount.value) {
+    goHome()
+    return
+  }
+  void open(crumb.path)
 }
 
 async function open(
@@ -1813,7 +1828,10 @@ onMounted(boot)
         </button>
         <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
 
-        <nav class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[13px]">
+        <nav
+          class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[13px]"
+          data-testid="breadcrumb"
+        >
           <button
             class="shrink-0 rounded px-1.5 py-1 text-muted transition-colors hover:bg-elevated hover:text-ink"
             :title="t('files.toolbar.home')"
@@ -1833,7 +1851,7 @@ onMounted(boot)
               class="max-w-[160px] shrink-0 truncate rounded px-1.5 py-1 transition-colors hover:bg-elevated"
               :class="index === crumbs.length - 1 ? 'text-ink' : 'text-muted'"
               :title="crumb.label"
-              @click="open(crumb.path)"
+              @click="onCrumbClick(index, crumb)"
             >
               {{ crumb.label }}
             </button>
