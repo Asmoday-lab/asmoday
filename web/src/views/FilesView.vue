@@ -344,6 +344,86 @@ function openTransferDialog(mode: TransferMode, targets?: EntryInfo[]) {
     busy: false,
     error: '',
   }
+  // 目录浏览器从当前目录开始逛，比手填绝对路径友好（v3.5.5）
+  transferPicker.value = {
+    path: currentPath.value,
+    dirs: [],
+    loading: true,
+    error: '',
+    manual: false,
+  }
+  void browsePicker(currentPath.value)
+}
+
+// ---------------- 目标目录浏览器（v3.5.5：点选代替手填绝对路径） ----------------
+const transferPicker = ref<{
+  path: string
+  dirs: { name: string; path: string }[]
+  loading: boolean
+  error: string
+  manual: boolean
+} | null>(null)
+
+/** 挂载点内相对展示：「挂载点名/子路径」；不在任何挂载点时隐藏盘符兜底 */
+function displayPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/')
+  const mount = mountForPath(path)
+  if (mount) {
+    const prefix = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    const rest = normalized.slice(prefix.length).replace(/^\/+/, '')
+    return rest ? `${mount.name}/${rest}` : mount.name
+  }
+  const parts = normalized
+    .split('/')
+    .filter(Boolean)
+    .filter((part) => !/^[a-zA-Z]:$/.test(part))
+  return parts.join('/') || path
+}
+
+/** 浏览器面包屑：挂载点名 + 相对段，点击逐级跳转 */
+const pickerCrumbs = computed(() => {
+  const picker = transferPicker.value
+  if (!picker) return [] as { label: string; path: string }[]
+  const normalized = picker.path.replace(/\\/g, '/')
+  const mount = mountForPath(picker.path)
+  const result: { label: string; path: string }[] = []
+  if (mount) {
+    const prefix = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    result.push({ label: mount.name, path: mount.path })
+    let acc = prefix
+    for (const part of normalized.slice(prefix.length).split('/').filter(Boolean)) {
+      acc = `${acc}/${part}`
+      result.push({ label: part, path: acc })
+    }
+    return result
+  }
+  const parts = normalized.split('/').filter(Boolean)
+  let acc = ''
+  for (const part of parts) {
+    acc = acc ? `${acc}/${part}` : part.endsWith(':') ? `${part}/` : part
+    result.push({ label: part, path: acc })
+  }
+  return result
+})
+
+/** 浏览目标目录：只列子目录，选中即「当前所在」 */
+async function browsePicker(path: string) {
+  const picker = transferPicker.value
+  if (!picker) return
+  picker.loading = true
+  picker.error = ''
+  try {
+    const data = await filesApi.list(path, 1, false, 'name', 'asc')
+    picker.path = data.path
+    picker.dirs = data.entries
+      .filter((entry) => entry.is_dir)
+      .map((entry) => ({ name: entry.name, path: entry.path }))
+    if (transferDialog.value) transferDialog.value.dest = data.path
+  } catch (err) {
+    picker.error = describe(err).message
+  } finally {
+    picker.loading = false
+  }
 }
 
 async function submitTransfer() {
@@ -2449,20 +2529,82 @@ onMounted(boot)
         <p class="mt-0.5 text-[12px] text-muted">
           {{
             transferDialog.targets.length === 1
-              ? transferDialog.targets[0].path
+              ? displayPath(transferDialog.targets[0].path)
               : t('files.select.count', { count: transferDialog.targets.length })
           }}
         </p>
 
         <label class="mt-4 block text-[12px] text-muted">
           {{ t('files.transfer.destination') }}
-          <input
-            v-model="transferDialog.dest"
-            type="text"
-            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[12px] text-ink outline-none focus:border-accent"
-            data-testid="transfer-dest"
-            @keydown.enter="submitTransfer"
-          />
+          <!-- 目录浏览器（v3.5.5）：点选进入代替手填绝对路径；当前所在目录即目标 -->
+          <template v-if="transferPicker && !transferPicker.manual">
+            <nav
+              v-if="pickerCrumbs.length"
+              class="mt-1 flex flex-wrap items-center gap-x-0.5 gap-y-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[12px]"
+              data-testid="transfer-picker-crumb"
+            >
+              <template v-for="(crumb, index) in pickerCrumbs" :key="crumb.path">
+                <span v-if="index > 0" class="text-muted opacity-50">/</span>
+                <button
+                  class="max-w-[160px] truncate rounded px-1 transition-colors hover:text-ink"
+                  :class="index === pickerCrumbs.length - 1 ? 'font-medium text-accent' : 'text-muted'"
+                  :title="crumb.label"
+                  @click="browsePicker(crumb.path)"
+                >
+                  {{ crumb.label }}
+                </button>
+              </template>
+            </nav>
+            <div class="mt-1 max-h-40 overflow-y-auto rounded-lg border border-line bg-elevated">
+              <button
+                v-for="dir in transferPicker.dirs"
+                :key="dir.path"
+                type="button"
+                class="flex w-full items-center gap-2 px-3 py-1.5 text-[12px] text-ink transition-colors hover:bg-panel"
+                @click="browsePicker(dir.path)"
+              >
+                <AppIcon name="folder" :size="14" class="shrink-0 text-muted" />
+                <span class="truncate">{{ dir.name }}</span>
+                <AppIcon name="chevronRight" :size="11" class="ml-auto shrink-0 text-muted opacity-50" />
+              </button>
+              <p
+                v-if="!transferPicker.loading && !transferPicker.dirs.length"
+                class="px-3 py-2 text-[11px] text-muted"
+              >
+                {{ t('files.transfer.emptyDir') }}
+              </p>
+              <p v-if="transferPicker.loading" class="px-3 py-2 text-[11px] text-muted">
+                {{ t('common.action.loading') }}
+              </p>
+              <p v-if="transferPicker.error" class="px-3 py-2 text-[11px] fg-danger">
+                {{ transferPicker.error }}
+              </p>
+            </div>
+            <button
+              type="button"
+              class="mt-1 text-[11px] text-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
+              @click="transferPicker.manual = true"
+            >
+              {{ t('files.transfer.manualInput') }}
+            </button>
+          </template>
+          <template v-else>
+            <input
+              v-model="transferDialog.dest"
+              type="text"
+              class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[12px] text-ink outline-none focus:border-accent"
+              data-testid="transfer-dest"
+              @keydown.enter="submitTransfer"
+            />
+            <button
+              v-if="transferPicker?.manual"
+              type="button"
+              class="mt-1 block text-[11px] text-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
+              @click="transferPicker.manual = false; browsePicker(transferPicker.path)"
+            >
+              {{ t('files.transfer.backToBrowse') }}
+            </button>
+          </template>
           <span class="mt-1 block text-[11px] text-muted">
             {{ t('files.transfer.destinationHint') }}
           </span>
@@ -2556,7 +2698,7 @@ onMounted(boot)
               :key="item.path"
               class="rounded-lg border border-line bg-elevated px-2.5 py-1.5"
             >
-              <p class="break-all text-[12px] text-ink">{{ item.source ?? item.path }}</p>
+              <p class="break-all text-[12px] text-ink">{{ displayPath(item.source ?? item.path) }}</p>
               <p class="mt-0.5 text-[11px] fg-danger">{{ failureText(item) }}</p>
             </li>
           </ul>
@@ -2730,5 +2872,22 @@ onMounted(boot)
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
+}
+
+/* 下拉菜单项（新建/排序）：.menu-item 只在 ContextMenu.vue 的 scoped 样式里，
+   本组件里必须自带一份，否则选项挤成一行、箭头贴在文字后面 */
+.menu-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  text-align: left;
+  color: var(--text-main);
+  transition: background-color 0.15s ease;
+}
+.menu-item:hover {
+  background: var(--bg-elevated);
 }
 </style>

@@ -74,15 +74,18 @@ pub struct BrowseResult {
 #[derive(Debug, Deserialize)]
 pub struct AlbumsQuery {
     pub path: Option<String>,
-    /// 目录树向下钻取的层数（每一层里「直接含图片」的目录都算一本相册）
+    /// 目录树向下钻取的层数（每一层里「直接含媒体文件」的目录都算一本相册）
     pub depth: Option<usize>,
+    /// image / video / audio（默认 image）——影视库与音乐库的「按文件夹」视图共用本接口
+    pub kind: Option<String>,
 }
 
-/// 相册（照片库「相册视图」的卡片，设计文档 3.4.3）。
+/// 相册（媒体库「按文件夹」视图的卡片，设计文档 3.4.3）。
 ///
-/// 与 v2.8 的相册视图同一口径：**有图片的目录就是一本相册**，
+/// 与 v2.8 的相册视图同一口径：**有媒体文件的目录就是一本相册**，
 /// 挂载目录本身也算（根目录里直接放的照片不该凭空消失）。
-/// `count == 0` 的目录绝不出现在结果里 —— 无图文件夹就是空壳卡片。
+/// `count == 0` 的目录绝不出现在结果里 —— 空文件夹就是空壳卡片。
+/// 图片库/影视库/音乐库共用本结构（`/api/media/albums?kind=`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct Album {
     pub name: String,
@@ -300,10 +303,19 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
     }
 
     let depth = query.depth.unwrap_or(3).clamp(1, 4);
+    let wanted: Vec<&'static str> = match query.kind.as_deref() {
+        Some("image") => vec!["image"],
+        Some("video") => vec!["video"],
+        Some("audio") => vec!["audio"],
+        Some(other) => return fs_error(FsError::BadRequest(format!("不支持的 kind：{other}"))),
+        None => vec!["image"],
+    };
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
-    let outcome =
-        tokio::task::spawn_blocking(move || scan_albums(&scan_root, depth, &auth_store)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        scan_albums(&scan_root, depth, &wanted, &auth_store)
+    })
+    .await;
 
     match outcome {
         Ok((items, truncated)) => Json(json!({
@@ -500,6 +512,7 @@ const ALBUM_SCAN_LIMIT: usize = 20_000;
 fn scan_albums(
     root: &Path,
     depth: usize,
+    wanted: &[&str],
     auth: &crate::core::auth::AuthStore,
 ) -> (Vec<Album>, bool) {
     let mut albums: Vec<Album> = Vec::new();
@@ -552,7 +565,7 @@ fn scan_albums(
                 continue;
             }
             let (kind, _) = fs::classify_name(&name, &ext, false);
-            if kind != "image" {
+            if !wanted.contains(&kind) {
                 continue;
             }
             count += 1;
@@ -568,7 +581,7 @@ fn scan_albums(
             }
         }
 
-        // 一张图都没有的目录绝不上架（设计文档 3.4.3）
+        // 一个媒体文件都没有的目录绝不上架（设计文档 3.4.3）
         if count == 0 {
             continue;
         }

@@ -203,10 +203,10 @@ function trackTitle(item: MediaItem): string {
   return stripped || item.name
 }
 
-/** 音乐副标题：歌手 · 专辑，都没有时退回所在目录（裁成相对路径，不暴露服务器位置） */
+/** 音乐副标题：歌手 · 专辑；没有标签就留空——目录位置不上桌面（v3.5.5） */
 function trackSubtitle(item: MediaItem): string {
   const parts = [item.artist, item.album].filter(Boolean) as string[]
-  return parts.length > 0 ? parts.join(' · ') : relativeFolder(item.folder)
+  return parts.join(' · ')
 }
 
 /** 内嵌封面加载失败的曲目（坏标签很常见），记住后不再重复请求 */
@@ -230,6 +230,40 @@ function relativeFolder(folder: string): string {
   }
   return current.split('/').filter(Boolean).pop() ?? folder
 }
+
+/** 按所在目录分组（影视库/音乐库的「按文件夹」分区，v3.5.5） */
+interface FolderGroup {
+  key: string
+  label: string
+  items: MediaItem[]
+}
+function groupByFolder(list: MediaItem[]): FolderGroup[] {
+  const map = new Map<string, FolderGroup>()
+  for (const item of list) {
+    const key = item.folder || '/'
+    let group = map.get(key)
+    if (!group) {
+      group = { key, label: relativeFolder(key), items: [] }
+      map.set(key, group)
+    }
+    group.items.push(item)
+  }
+  // 根目录排最前，其余按目录名排序
+  const rootLabel = t('gallery.photos.rootFolder')
+  return [...map.values()].sort((a, b) => {
+    if (a.label === rootLabel) return -1
+    if (b.label === rootLabel) return 1
+    return a.label.localeCompare(b.label, 'zh-Hans-CN')
+  })
+}
+const videoGroups = computed(() => groupByFolder(videos.value))
+const audioGroups = computed(() => groupByFolder(audios.value))
+/** 曲目在完整列表里的行号（分组渲染后仍按全局序号播放） */
+const audioRowIndex = computed(() => {
+  const map = new Map<string, number>()
+  audios.value.forEach((track, index) => map.set(track.path, index))
+  return map
+})
 
 /** 时间线：按 年-月 分组（图片 + 视频） */
 const timeline = computed(() => {
@@ -799,14 +833,23 @@ onBeforeUnmount(() => {
         v-else
         class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
       >
-        <button
-          v-for="video in videos"
-          :key="video.path"
-          class="group text-left"
-          :data-video="video.path"
-          @click="playing = video"
-          @contextmenu.prevent="openMediaMenu($event, video, 'cinema')"
-        >
+        <template v-for="group in videoGroups" :key="group.key">
+          <!-- 分组标题：多个文件夹时按文件夹分区（v3.5.5） -->
+          <div
+            v-if="videoGroups.length > 1"
+            class="col-span-full mb-1 flex items-baseline gap-2 border-b border-line/60 pb-1.5"
+          >
+            <h2 class="text-sm font-semibold text-ink">{{ group.label }}</h2>
+            <span class="text-xs text-muted">{{ group.items.length }}</span>
+          </div>
+          <button
+            v-for="video in group.items"
+            :key="video.path"
+            class="group text-left"
+            :data-video="video.path"
+            @click="playing = video"
+            @contextmenu.prevent="openMediaMenu($event, video, 'cinema')"
+          >
           <div
             class="relative aspect-video overflow-hidden rounded-xl border border-line bg-black"
             :style="{ backgroundColor: placeholderFor(video) }"
@@ -857,8 +900,8 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p class="mt-2 truncate text-sm font-medium text-ink">{{ video.name }}</p>
-          <p class="truncate text-[12px] text-muted">{{ relativeFolder(video.folder) }}</p>
         </button>
+        </template>
       </div>
     </div>
 
@@ -916,16 +959,24 @@ onBeforeUnmount(() => {
             </tr>
           </thead>
           <tbody>
-            <tr
-              v-for="(track, index) in audios"
-              :key="track.path"
-              class="group cursor-pointer transition-colors hover:bg-elevated/50"
-              @click="player.play(audios, index)"
-              @contextmenu.prevent="openMediaMenu($event, track, 'music')"
-            >
+            <template v-for="group in audioGroups" :key="group.key">
+              <!-- 分组标题：多个文件夹时按文件夹分区（v3.5.5） -->
+              <tr v-if="audioGroups.length > 1">
+                <td colspan="4" class="border-b border-line/60 px-2 pb-1.5 pt-4 md:px-3">
+                  <span class="text-sm font-semibold text-ink">{{ group.label }}</span>
+                  <span class="ml-2 text-xs text-muted">{{ group.items.length }}</span>
+                </td>
+              </tr>
+              <tr
+                v-for="track in group.items"
+                :key="track.path"
+                class="group cursor-pointer transition-colors hover:bg-elevated/50"
+                @click="player.play(audios, audioRowIndex.get(track.path) ?? 0)"
+                @contextmenu.prevent="openMediaMenu($event, track, 'music')"
+              >
               <td class="px-2 py-3 md:px-3">
                 <span class="group-hover:hidden" :class="player.isCurrent(track.path) ? 'text-accent' : ''">
-                  {{ index + 1 }}
+                  {{ (audioRowIndex.get(track.path) ?? 0) + 1 }}
                 </span>
                 <AppIcon
                   v-if="player.isCurrent(track.path) && player.state.playing"
@@ -961,7 +1012,7 @@ onBeforeUnmount(() => {
                         <span /><span /><span />
                       </span>
                     </span>
-                    <span class="block truncate text-xs text-muted">
+                    <span v-if="trackSubtitle(track)" class="block truncate text-xs text-muted">
                       {{ trackSubtitle(track) }}
                     </span>
                   </span>
@@ -981,6 +1032,7 @@ onBeforeUnmount(() => {
                 </button>
               </td>
             </tr>
+            </template>
           </tbody>
         </table>
       </div>
