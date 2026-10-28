@@ -160,16 +160,16 @@ const statusTone: Record<TerminalStatus, string> = {
             ✕
           </span>
         </button>
+        <!-- 新建按钮紧跟最后一个标签页（v2.9），不再孤零零挂在工具栏最右端 -->
+        <button
+          type="button"
+          class="grid size-6 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink"
+          :title="t('terminal.tabs.new')"
+          @click="newTab()"
+        >
+          <AppIcon name="plus" :size="14" />
+        </button>
       </div>
-
-      <button
-        type="button"
-        class="grid size-7 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink"
-        :title="t('terminal.tabs.new')"
-        @click="newTab()"
-      >
-        <AppIcon name="plus" :size="14" />
-      </button>
 
       <button
         type="button"

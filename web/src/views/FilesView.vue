@@ -562,6 +562,35 @@ function formatMode(mode: number | null | undefined) {
   return `0${(mode & 0o7777).toString(8).padStart(3, '0')}`
 }
 
+/**
+ * 属性页的「所在目录」（v2.9）：只显示挂载点内的相对路径，
+ * 不再展示真实路径 —— 既和顶部的完整路径重复，又暴露服务端盘符。
+ */
+const statRelativeDir = computed(() => {
+  const raw = statDialog.value?.data?.path ?? statDialog.value?.entry.path ?? ''
+  if (!raw) return '/'
+  const dir = raw.replace(/[\\/][^\\/]*$/, '') || '/'
+  const normalized = dir.replace(/\\/g, '/')
+  let matchedPrefix = ''
+  for (const root of roots.value) {
+    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (
+      prefix &&
+      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
+      prefix.length > matchedPrefix.length
+    ) {
+      matchedPrefix = prefix
+    }
+  }
+  if (matchedPrefix) {
+    const rest = normalized.slice(matchedPrefix.length).replace(/^\/+/, '')
+    return rest ? `/${rest}` : '/'
+  }
+  // 兜底：不在任何挂载点下（理论上不会发生），按段展示但隐藏盘符
+  const parts = normalized.split('/').filter(Boolean).filter((part) => !/^[a-zA-Z]:$/.test(part))
+  return parts.length ? `/${parts.join('/')}` : '/'
+})
+
 async function copyShareResult() {
   if (!shareResult.value) return
   try {
@@ -2279,7 +2308,8 @@ onMounted(boot)
     >
       <div class="w-full max-w-md rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ t('files.stat.title') }}</p>
-        <p class="mt-0.5 break-all text-[12px] text-muted">{{ statDialog.entry.path }}</p>
+        <!-- 只显示文件名：完整路径（含盘符）不给属性页（v2.9） -->
+        <p class="mt-0.5 truncate text-[12px] text-muted">{{ statDialog.entry.name }}</p>
 
         <p v-if="statDialog.busy" class="mt-4 text-xs text-muted">
           {{ t('common.action.loading') }}
@@ -2289,7 +2319,24 @@ onMounted(boot)
           <div class="flex gap-3">
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.size') }}</dt>
             <dd class="min-w-0 flex-1 break-all text-ink">
-              {{ statDialog.data.is_dir ? '—' : formatSize(statDialog.data.size) }}
+              <template v-if="statDialog.data.is_dir">—</template>
+              <template v-else>
+                {{ formatSize(statDialog.data.size) }}
+                <!-- 精确字节数用浅色小字附带，方便对账 / 校验哈希（v2.9） -->
+                <span class="ml-1 text-[11px] text-muted">
+                  {{ t('files.stat.bytes', { count: statDialog.data.size.toLocaleString() }) }}
+                </span>
+              </template>
+            </dd>
+          </div>
+          <!-- 分辨率只有媒体才有，其余类型不占位（v2.9） -->
+          <div
+            v-if="statDialog.data.width && statDialog.data.height"
+            class="flex gap-3"
+          >
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.resolution') }}</dt>
+            <dd class="min-w-0 flex-1 text-ink">
+              {{ statDialog.data.width }} × {{ statDialog.data.height }}
             </dd>
           </div>
           <div class="flex gap-3">
@@ -2300,21 +2347,30 @@ onMounted(boot)
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.modified') }}</dt>
             <dd class="min-w-0 flex-1 text-ink">{{ formatTime(statDialog.data.mtime) }}</dd>
           </div>
-          <div class="flex gap-3">
+          <!-- Windows 拿不到权限/所有者/inode：整行隐藏，绝不画「—」占位（v2.9） -->
+          <div
+            v-if="statDialog.data.mode !== null && statDialog.data.mode !== undefined"
+            class="flex gap-3"
+          >
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.mode') }}</dt>
             <dd class="min-w-0 flex-1 text-ink">{{ formatMode(statDialog.data.mode) }}</dd>
           </div>
-          <div class="flex gap-3">
+          <div v-if="statDialog.data.owner" class="flex gap-3">
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.owner') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.owner ?? '—' }}</dd>
+            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.owner }}</dd>
           </div>
-          <div class="flex gap-3">
+          <div
+            v-if="statDialog.data.inode !== null && statDialog.data.inode !== undefined"
+            class="flex gap-3"
+          >
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.inode') }}</dt>
-            <dd class="min-w-0 flex-1 text-ink">{{ statDialog.data.inode ?? '—' }}</dd>
+            <dd class="min-w-0 flex-1 text-ink">{{ statDialog.data.inode }}</dd>
           </div>
           <div class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.realPath') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.real_path ?? '—' }}</dd>
+            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.directory') }}</dt>
+            <dd class="min-w-0 flex-1 break-all text-ink" :title="statRelativeDir">
+              {{ statRelativeDir }}
+            </dd>
           </div>
           <div v-if="statDialog.data.is_symlink" class="flex gap-3">
             <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.symlink') }}</dt>

@@ -91,6 +91,10 @@ export interface FileStat {
   mime: string
   real_path: string | null
   readonly: boolean
+  /** 媒体专属（v2.9）：图片/视频的像素尺寸，拿不到为 null（前端隐藏整行） */
+  width: number | null
+  height: number | null
+  /** 以下三项 Windows 下拿不到，后端回 null，前端直接隐藏行而不是画「—」 */
   mode: number | null
   inode: number | null
   owner: string | null

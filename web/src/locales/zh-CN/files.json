@@ -182,10 +182,12 @@
     "mode": "权限",
     "owner": "所有者",
     "inode": "inode",
-    "realPath": "真实路径",
     "symlink": "符号链接目标",
     "readonly": "只读",
-    "failed": "无法读取属性"
+    "failed": "无法读取属性",
+    "directory": "所在目录",
+    "resolution": "分辨率",
+    "bytes": "{count} 字节"
   },
   "select": {
     "count": "已选 {count} 项",

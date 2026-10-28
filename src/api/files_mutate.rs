@@ -726,11 +726,49 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<StatQuery>)
     };
 
     let is_symlink = link_meta.file_type().is_symlink();
-    // 真实路径：软链接给出解析后的目标，普通文件就是自己
+    // 真实路径：软链接给出解析后的目标，普通文件就是自己（只给 WebDAV/内部逻辑用，属性页不展示）
     let real_path = std::fs::canonicalize(&path)
         .ok()
         .map(|p| fs::normalize_display(&p));
     let readonly = set.is_readonly(&path);
+
+    let mime = if link_meta.is_dir() {
+        "inode/directory".to_string()
+    } else {
+        mime_guess::from_path(&path).first_or_octet_stream().to_string()
+    };
+
+    // 媒体分辨率（v2.9）：图片读文件头（不解码），视频交给外部 FFmpeg 探测；
+    // 拿不到就返回 null，前端把这一行整个隐藏，不画「—」占位。
+    let dimensions = if link_meta.is_file() {
+        if mime.starts_with("image/") {
+            let probe_path = path.clone();
+            blocking(move || Ok::<_, FsError>(image::image_dimensions(&probe_path).ok()))
+                .await
+                .ok()
+                .flatten()
+        } else if mime.starts_with("video/") {
+            let configured = crate::api::files::config_snapshot(&state).await.media.ffmpeg_path;
+            let bin = crate::core::ffmpeg::resolve(&configured).path;
+            match bin {
+                Some(bin) => {
+                    let probe_path = path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::core::ffmpeg::probe_video_size(&bin, &probe_path)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (width, height) = dimensions.map_or((None, None), |(w, h)| (Some(w), Some(h)));
 
     let body = json!({
         "path": fs::normalize_display(&path),
@@ -747,13 +785,11 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<StatQuery>)
         "mtime": link_meta.modified().ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs()),
-        "mime": if link_meta.is_dir() {
-            "inode/directory".to_string()
-        } else {
-            mime_guess::from_path(&path).first_or_octet_stream().to_string()
-        },
+        "mime": mime,
         "real_path": real_path,
         "readonly": readonly,
+        "width": width,
+        "height": height,
         "mode": mode_bits(&link_meta),
         "inode": inode_of(&link_meta),
         "owner": owner_of(&link_meta),

@@ -202,10 +202,10 @@ function trackTitle(item: MediaItem): string {
   return stripped || item.name
 }
 
-/** 音乐副标题：歌手 · 专辑，都没有时退回所在目录 */
+/** 音乐副标题：歌手 · 专辑，都没有时退回所在目录（裁成相对路径，不暴露服务器位置） */
 function trackSubtitle(item: MediaItem): string {
   const parts = [item.artist, item.album].filter(Boolean) as string[]
-  return parts.length > 0 ? parts.join(' · ') : item.folder
+  return parts.length > 0 ? parts.join(' · ') : relativeFolder(item.folder)
 }
 
 /** 内嵌封面加载失败的曲目（坏标签很常见），记住后不再重复请求 */
@@ -601,6 +601,18 @@ onBeforeUnmount(() => {
             class="relative aspect-video overflow-hidden rounded-xl border border-line bg-black"
             :style="{ backgroundColor: placeholderFor(video) }"
           >
+            <!-- 视频封面走后端 ffmpeg 首帧（v2.9），拿不到再退回图标占位 -->
+            <img
+              v-if="!failedThumbs.has(video.path)"
+              :src="thumbUrl(video.path, 480)"
+              class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+              loading="lazy"
+              alt=""
+              @error="markThumbFailed(video.path)"
+            />
+            <div v-else class="absolute inset-0 grid place-items-center text-white/40">
+              <AppIcon name="video" :size="30" />
+            </div>
             <div class="absolute inset-0 grid place-items-center">
               <span
                 class="grid size-11 place-items-center rounded-full bg-black/50 text-white backdrop-blur transition-transform group-hover:scale-110"
@@ -627,7 +639,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p class="mt-2 truncate text-sm font-medium text-ink">{{ video.name }}</p>
-          <p class="truncate text-[12px] text-muted">{{ video.folder }}</p>
+          <p class="truncate text-[12px] text-muted">{{ relativeFolder(video.folder) }}</p>
         </button>
       </div>
     </div>

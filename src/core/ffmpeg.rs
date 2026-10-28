@@ -164,6 +164,58 @@ fn parse_version(text: &str) -> Option<String> {
     None
 }
 
+/// 从 `ffmpeg -i` 的输出里抠出视频分辨率 `(宽, 高)`（属性页用，v2.9）。
+///
+/// `ffmpeg -i` 不带输出文件必然以错误码退出，但元数据已经打到了 stderr，
+/// 所以这里按「退出码不看、只认 stderr」来解析。
+///
+/// 同步阻塞（文件大也只是读头部元数据，通常 < 1s），调用方负责放到 `spawn_blocking`。
+pub fn probe_video_size(bin: &Path, input: &Path) -> Option<(u32, u32)> {
+    if !bin.is_file() {
+        return None;
+    }
+    let output = command(bin)
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(input)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    parse_video_size(&text)
+}
+
+/// 从 ffmpeg 的流信息文本里解析 `宽x高`。
+///
+/// 只认 Video 流所在行的第一个合法尺寸；`0x31637661` 这类十六进制副作用
+/// 靠「两边都必须是纯数字 + 合理上下限」排除。
+fn parse_video_size(text: &str) -> Option<(u32, u32)> {
+    for line in text.lines() {
+        if !line.contains("Video:") {
+            continue;
+        }
+        for token in line.split([',', ' ', '[', ']', '(', ')']) {
+            let token = token.trim();
+            let Some((w, h)) = token.split_once('x') else {
+                continue;
+            };
+            if w.is_empty() || h.is_empty() {
+                continue;
+            }
+            if !w.bytes().all(|c| c.is_ascii_digit()) || !h.bytes().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) else {
+                continue;
+            };
+            // 正经视频分辨率下限 16x16，上限挡住 `0x31637661` 这类十六进制
+            if (16..=100_000).contains(&w) && (16..=100_000).contains(&h) {
+                return Some((w, h));
+            }
+        }
+    }
+    None
+}
+
 /// 封面输出格式。
 ///
 /// 优先 WebP（设计文档 3.4：体积比 JPEG 小 30% 左右），该 FFmpeg 构建没有
@@ -409,6 +461,27 @@ mod tests {
             resolved.source,
             FfmpegSource::Env | FfmpegSource::Path | FfmpegSource::None
         ));
+    }
+
+    #[test]
+    fn parses_video_size_from_stream_line() {
+        let text = "Input #0, mov,mp4 from 'x.mp4':\n  Duration: 00:01:00\n  Stream #0:0: Video: h264 (High) (AVC1 / 0x31637661), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9]\n";
+        assert_eq!(parse_video_size(text), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn video_size_rejects_hex_and_garbage() {
+        // 十六进制副作用 0x31637661 不能被当成 0x31637661 的尺寸
+        let text = "Stream #0:0: Video: h264 (AVC1 / 0x31637661), none, 1k";
+        assert_eq!(parse_video_size(text), None);
+        assert_eq!(parse_video_size("no video stream here"), None);
+        assert_eq!(parse_video_size(""), None);
+    }
+
+    #[test]
+    fn parses_vertical_video_size() {
+        let text = "Stream #0:0[0x1](und): Video: hevc (Main), yuv420p(tv), 1080x1920, 30 fps";
+        assert_eq!(parse_video_size(text), Some((1080, 1920)));
     }
 
     #[test]
