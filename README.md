@@ -2,7 +2,7 @@
 
 个人媒体与设备控制中枢 · Rust(Axum) + Vue 3(Vite) + TailwindCSS v4 · **单二进制发布**。
 
-当前状态：对齐设计文档 **v2.5.0**。除认证、配置双模编辑与热重载、上传与搜索、分享/图床、收藏与续播外，本版新增**文件变更操作全链路**（新建/重命名/移动/复制/删除 + 多选批量 + 一次性令牌）、挂载点模型与单挂载点直达、统一错误码与日志规范、软链接与并发安全、危险配置自检、缩略图批量重建与三类清理入口。
+当前状态：对齐设计文档 **v2.7.0**。v2.6→v2.7 新增：监听地址策略（`[server].host` + `-H`/`ASMODAY_HOST`）、0.0.0.0 无 SSL 启动警告与设置页自检警告条（`GET /api/config/safety`）、未初始化时 WebDAV 一并 503、文件列表排序（`sort=name|mtime|size&order=asc|desc`）、工具栏排序菜单与无限滚动、网格缩略图 ≥100x100 与列表表头、终端强制深色 + 外壳跟随主题、设置页 `max-w-5xl` 布局规范与 Token 列表表头。除认证、配置双模编辑与热重载、上传与搜索、分享/图床、收藏与续播外，本版新增**文件变更操作全链路**（新建/重命名/移动/复制/删除 + 多选批量 + 一次性令牌）、挂载点模型与单挂载点直达、统一错误码与日志规范、软链接与并发安全、危险配置自检、缩略图批量重建与三类清理入口。
 
 ## 一、启动
 
@@ -45,7 +45,7 @@ npm run dev     # http://localhost:5173，/api 与 WS 自动代理到 4242
 | 媒体 | 缩略图**WebP 优先**（有 libwebp 编码器的 FFmpeg 时输出 WebP，无则降级 JPEG/PNG；按实际格式回 Content-Type）+ 信号量（并发 2）+ 磁盘缓存 + `[media]` 可配置淘汰（`thumb_cache_max_size_mb` 默认 1024 MiB LRU + `thumb_cache_max_age_days` 默认 90 天过期，每 30 分钟后台清理，设置页可查看用量并手动清空）+ **ThumbHash 占位**（扫描时返回平均色，图未加载前不白屏）；相册/时间线（虚拟列表）；影视墙（**外部可选 FFmpeg 截首帧作封面**，WebP 优先 → JPEG → PNG 逐级降级，与缩略图共用 LRU 缓存；**路径可填可执行文件或安装目录**）+ Video.js 10（`@videojs/html` 自定义元素，neutral 皮肤）+ **外挂字幕**（同目录同名 `.srt/.vtt`，后端统一转 WebVTT）+ 原生播放器降级开关 + 播放进度续播；音乐 **ID3 标签与内嵌封面**（`APIC/PIC`，`GET /api/media/cover`）+ 全局悬浮播放条（循环/单曲/随机 + 进度拖拽 + **音量记忆**（默认 35%、`asm_volume` 持久化、静音恢复静音前音量、移动端隐藏滑块）+ **播放列表抽屉**（PC 贴条上方/移动端占下半屏，切歌/清空/高亮））+ `.lrc` 歌词滚动；收藏与「只看收藏」 |
 | 分享与图床 | 文件右键「分享…」（口令/有效期/允许下载）与「复制图床直链」；公开页 `/s/{token}`（口令解锁、内联预览、目录浏览与子文件下载）；独立「分享与图床」管理页；`[shares].referer_allowlist` 防盗链 |
 | 反代网关 | `[[services]]` 驱动的 `/proxy/<id>/…` 透传：剥离 X-Frame-Options/CSP、WebSocket 升级、Header 注入、绝对链接改写、忽略证书 |
-| WebDAV | `/dav/<mount_id>/*` 挂载（设计文档 v2.5.0 3.10）：Basic Auth（用户名=Token 名，密码=`asm_` 明文）+ SHA-1 存库 + 过期校验；OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/MOVE/COPY/LOCK/UNLOCK；只读 Token 与只读挂载点双重 403；PUT 流式落盘（`.asmoday-part` 临时文件 + 原子重命名，绝不 to_bytes）；GET/HEAD 支持 Range；LOCK/UNLOCK 为伪锁；失败计入独立防爆破池 |
+| WebDAV | `/dav/<mount_id>/*` 挂载（设计文档 v2.5.0 3.10）：Basic Auth（用户名=Token 名，密码=`asm_` 明文）+ SHA-1 存库 + 过期校验；OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/MOVE/COPY/LOCK/UNLOCK；只读 Token 与只读挂载点双重 403；PUT 流式落盘（`.asmoday-part` 临时文件 + 原子重命名，绝不 to_bytes）；GET/HEAD 支持 Range；LOCK/UNLOCK 为伪锁；失败计入独立防爆破池；初始化完成前一律 503 |
 | 单二进制 | `rust-embed` 内嵌 dist，非 `/api`、`/proxy`、`/dav` 路径回落 `index.html`（History 路由），`/assets/*` 强缓存；**子路径部署**：`[server.proxy].base_url` 非空时整站挂到该前缀（`/` 重定向过去，index.html 运行时注入 `window.__ASMODAY_BASE__`，JS/CSS 资源引用构建期即为相对路径，任意前缀下都成立） |
 | 运行日志 | `data/logs/asmoday.log`（INFO/WARN/ERROR，UTC ISO8601），单文件 10 MiB、保留 5 份轮转，防撑爆 |
 
@@ -70,6 +70,7 @@ npm run dev     # http://localhost:5173，/api 与 WS 自动代理到 4242
 | GET/POST | `/api/auth/totp/setup` `/enable` `/disable` | 双因素 |
 | GET/POST | `/api/config` | 解析后的配置 |
 | GET/POST | `/api/config/raw` | config.toml 原文 |
+| GET | `/api/config/safety` | 危险配置自检结果（`{ issues: [{ level, code }] }`，前端渲染设置页警告条，i18n key `settings.safety.<code>`） |
 | GET | `/api/files/roots` | 挂载点（未配置时为工作目录） |
 | GET | `/api/files/mounts` | 挂载点 `{id,name,path,readonly,online,implicit}`（只读置灰、单挂载点直达的依据） |
 | POST | `/api/files/mkdir` `/touch` `/rename` | 新建目录/空文件、重命名；目标已存在一律 `E_CONFLICT`，绝不静默覆盖 |
@@ -79,7 +80,7 @@ npm run dev     # http://localhost:5173，/api 与 WS 自动代理到 4242
 | POST | `/api/files/delete` | 删除 `{paths[], confirm_name? \| confirm_token?}`；逐项结果，不回滚 |
 | GET | `/api/files/stat?path=` | 属性（lstat 不跟随软链接；含 mode/inode/owner/real_path/symlink_target） |
 | POST | `/api/files/hash` | 按需哈希（<64 MiB，并发 2，超出 `E_BUSY`） |
-| GET | `/api/files/list?path=&page=&show_hidden=false` | 目录列表，单页 1000，`has_more`；`show_hidden=true` 返回 `.` 开头隐藏项 |
+| GET | `/api/files/list?path=&page=&show_hidden=&sort=&order=` | 目录列表，单页 1000，`has_more`；`show_hidden=true` 返回 `.` 开头隐藏项；`sort=name|mtime|size` + `order=asc|desc`（目录恒排前，同键并列按名称兜底，mtime/size 服务端全量 lstat 后排序） |
 | GET/PUT/DELETE | `/api/files/raw?path=` | 流式读取（Range）/ 编辑器写回 / 删除（目录递归，挂载点根 403） |
 | PUT | `/api/files/upload?dir=&name=` | 单文件上传（≤512 MiB） |
 | GET | `/api/files/search?path=&q=` | 当前目录模糊搜索 |
@@ -106,7 +107,7 @@ npm run dev     # http://localhost:5173，/api 与 WS 自动代理到 4242
 
 **文件路径三道闸**：挂载点白名单 → 显式拒绝 `..` 组件 → `canonicalize` 后做 `starts_with` 包含性校验。
 
-**WebDAV**（设计文档 v2.5.0 3.10）：Basic 用户名必须是 Token 名、密码是 `asm_` 明文（不是主密码）；令牌只存摘要、可设只读与有效期；认证失败计入独立防爆破池（5 次封 15 分钟，与登录/分享互不影响）。
+**WebDAV**（设计文档 v2.5.0 3.10）：Basic 用户名必须是 Token 名、密码是 `asm_` 明文（不是主密码）；令牌只存摘要、可设只读与有效期；认证失败计入独立防爆破池（5 次封 15 分钟，与登录/分享互不影响）；未初始化实例一律 503（设计文档 v2.7.0 3.1.1）。
 
 **代理**：只允许配置里声明的 `[[services]]`，路径不可拼接到任意主机。
 

@@ -197,5 +197,18 @@
     "noDownloadable": "None of the selected items is a file",
     "downloadConfirm": "About to download {count} files",
     "downloadHint": "Your browser may block multiple downloads; allow them for this site"
+  },
+  "sort": {
+    "label": "Sort",
+    "name": "Name",
+    "mtime": "Modified",
+    "size": "Size",
+    "asc": "Ascending",
+    "desc": "Descending"
+  },
+  "header": {
+    "name": "Name",
+    "size": "Size",
+    "time": "Modified"
   }
 }

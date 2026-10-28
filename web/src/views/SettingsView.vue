@@ -490,15 +490,51 @@ watch(tab, (value) => {
   if (value === 'media') void loadFfmpeg()
 })
 
+// ---------------- 危险配置自检警告条（设计文档 3.5 / 9.3） ----------------
+interface SafetyIssue {
+  level: string
+  code: string
+}
+const safetyIssues = ref<SafetyIssue[]>([])
+
+async function loadSafety() {
+  try {
+    const res = await fetch('/api/config/safety')
+    if (!res.ok) return
+    const data = (await res.json()) as { issues: SafetyIssue[] }
+    safetyIssues.value = data.issues
+  } catch {
+    // 警告条拉取失败不打扰用户
+  }
+}
+
+// ---------------- WebDAV 地址复制（8.1.2：只读框 + 复制按钮） ----------------
+const davCopied = ref(false)
+let davCopyTimer: number | null = null
+
+async function copyDavUrl() {
+  try {
+    await navigator.clipboard.writeText(davUrl)
+    davCopied.value = true
+    if (davCopyTimer !== null) window.clearTimeout(davCopyTimer)
+    davCopyTimer = window.setTimeout(() => {
+      davCopied.value = false
+    }, 2000)
+  } catch {
+    // 剪贴板不可用（非安全上下文）
+  }
+}
+
 onMounted(() => {
   void loadConfig()
   void loadCache()
   void loadFfmpeg()
+  void loadSafety()
 })
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-4xl px-4 py-6 md:px-8 md:py-10">
+  <section class="mx-auto w-full max-w-5xl px-4 py-6 md:px-8 md:py-10">
     <!-- 分区切换 -->
     <nav class="mb-6 flex flex-wrap items-center gap-4 border-b border-line pb-2 text-sm">
       <button
@@ -524,9 +560,24 @@ onMounted(() => {
       {{ error }}
     </p>
 
+    <!-- 危险配置自检警告条（设计文档 3.5 / 9.3） -->
+    <p
+      v-for="issue in safetyIssues"
+      :key="issue.code"
+      class="mb-4 rounded-lg px-3 py-2 text-xs"
+      :class="
+        issue.level === 'error'
+          ? 'border border-red-500/30 bg-red-500/10 text-red-400'
+          : 'border border-amber-500/30 bg-amber-500/10 text-amber-500'
+      "
+      :data-safety="issue.code"
+    >
+      {{ t(`settings.safety.${issue.code}`) }}
+    </p>
+
     <!-- ================= 通用 ================= -->
-    <div v-if="tab === 'general'" class="space-y-4">
-      <div class="rounded-xl border border-line p-4">
+    <div v-if="tab === 'general'" class="space-y-6">
+      <div class="rounded-xl border border-line p-6">
         <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
           {{ t('settings.general.appearance') }}
         </p>
@@ -554,7 +605,7 @@ onMounted(() => {
             }}</span>
             <select
               :value="locale"
-              class="w-full rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+              class="w-full rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
               @change="pickLocale(($event.target as HTMLSelectElement).value as Locale)"
             >
               <option v-for="item in SUPPORTED_LOCALES" :key="item" :value="item">
@@ -566,7 +617,7 @@ onMounted(() => {
         <p class="mt-2 text-[11px] text-muted">{{ t('settings.general.languageHint') }}</p>
       </div>
 
-      <div class="rounded-xl border border-line p-4">
+      <div class="rounded-xl border border-line p-6">
         <div class="mb-3 flex items-center justify-between">
           <p class="text-xs font-semibold tracking-wider text-muted uppercase">
             {{ t('settings.general.overview') }}
@@ -606,7 +657,7 @@ onMounted(() => {
         <AppIcon name="arrowRight" :size="14" class="shrink-0 text-muted" />
       </button>
 
-      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-4">
+      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-6">
         <div class="min-w-0">
           <p class="text-[11px] text-muted">{{ t('settings.general.resetHint') }}</p>
         </div>
@@ -620,8 +671,8 @@ onMounted(() => {
     </div>
 
     <!-- ================= 媒体 ================= -->
-    <div v-else-if="tab === 'media'" class="space-y-4">
-      <div class="rounded-xl border border-line p-4">
+    <div v-else-if="tab === 'media'" class="space-y-6">
+      <div class="rounded-xl border border-line p-6">
         <div class="mb-3 flex items-center justify-between gap-3">
           <p class="text-xs font-semibold tracking-wider text-muted uppercase">
             {{ t('settings.media.cache') }}
@@ -653,7 +704,7 @@ onMounted(() => {
               v-model.number="draft.media.thumb_cache_max_size_mb"
               type="number"
               min="16"
-              class="w-full rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+              class="w-full rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
             />
           </label>
           <label class="block">
@@ -662,14 +713,14 @@ onMounted(() => {
               v-model.number="draft.media.thumb_cache_max_age_days"
               type="number"
               min="1"
-              class="w-full rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+              class="w-full rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
             />
           </label>
         </div>
       </div>
 
       <!-- FFmpeg：三层优先级 + 状态检测 + 测试连通性 -->
-      <div class="rounded-xl border border-line p-4">
+      <div class="rounded-xl border border-line p-6">
         <div class="mb-3 flex flex-wrap items-center gap-2">
           <p class="text-xs font-semibold tracking-wider text-muted uppercase">
             {{ t('settings.media.ffmpeg') }}
@@ -704,7 +755,7 @@ onMounted(() => {
               v-if="draft"
               v-model="draft.media.ffmpeg_path"
               placeholder="/usr/bin/ffmpeg 或 C:/AimerFiles/ffmpeg-n9.0/bin"
-              class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-3 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
+              class="min-w-0 flex-1 rounded-lg h-10 border border-line bg-elevated px-3 font-mono text-xs text-ink outline-none focus:border-accent"
             />
             <button
               class="shrink-0 rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:opacity-50"
@@ -719,7 +770,7 @@ onMounted(() => {
         <p class="mt-1 text-[11px] text-amber-400/80">{{ t('settings.media.note') }}</p>
       </div>
 
-      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-4">
+      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-6">
         <p class="text-[11px] text-muted">{{ t('settings.media.resetHint') }}</p>
         <div class="flex shrink-0 items-center gap-2">
           <button
@@ -729,7 +780,7 @@ onMounted(() => {
             {{ t('settings.media.reset') }}
           </button>
           <button
-            class="rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+            class="h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
             :disabled="saving"
             @click="saveForm()"
           >
@@ -740,34 +791,34 @@ onMounted(() => {
     </div>
 
     <!-- ================= 安全 ================= -->
-    <div v-else-if="tab === 'security'" class="space-y-4">
-      <div class="rounded-xl border border-line p-4">
+    <div v-else-if="tab === 'security'" class="space-y-6">
+      <div class="rounded-xl border border-line p-6">
         <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
           {{ t('settings.security.password') }}
         </p>
-        <div class="grid gap-2 sm:grid-cols-3">
+        <div class="grid gap-4 md:grid-cols-3">
           <input
             v-model="currentPassword"
             type="password"
             :placeholder="t('settings.security.current')"
-            class="rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+            class="rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
           <input
             v-model="nextPassword"
             type="password"
             :placeholder="t('settings.security.next')"
-            class="rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+            class="rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
           <input
             v-model="confirmPassword"
             type="password"
             :placeholder="t('settings.security.confirm')"
-            class="rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+            class="rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
         </div>
         <div class="mt-3 flex items-center gap-3">
           <button
-            class="rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+            class="h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
             :disabled="securityBusy"
             @click="changePassword"
           >
@@ -777,7 +828,7 @@ onMounted(() => {
         </div>
       </div>
 
-      <div class="rounded-xl border border-line p-4">
+      <div class="rounded-xl border border-line p-6">
         <div class="mb-3 flex items-center gap-2">
           <p class="text-xs font-semibold tracking-wider text-muted uppercase">
             {{ t('settings.security.totp') }}
@@ -805,7 +856,7 @@ onMounted(() => {
                 :placeholder="t('settings.security.totpCode')"
                 class="w-32 rounded-lg border border-line bg-elevated px-2 py-1.5 text-center text-sm tracking-[0.25em] text-ink outline-none focus:border-accent"
               />
-              <button class="rounded-md bg-accent px-3 py-1.5 text-xs text-white" @click="enableTotp">
+              <button class="h-10 rounded-md bg-accent px-4 text-xs text-white" @click="enableTotp">
                 {{ t('settings.security.totpEnable') }}
               </button>
             </div>
@@ -838,23 +889,41 @@ onMounted(() => {
       </p>
 
       <!-- WebDAV 令牌 -->
-      <div class="rounded-xl border border-line p-4">
+      <div class="rounded-xl border border-line p-6">
         <p class="mb-1 text-xs font-semibold tracking-wider text-muted uppercase">
           {{ t('settings.security.davUrl') }}
         </p>
-        <p class="mb-2 font-mono text-xs break-all text-ink">{{ davUrl }}</p>
+        <div class="mb-2 flex items-center gap-2">
+          <code
+            class="min-w-0 flex-1 truncate rounded-md bg-elevated px-3 py-2 font-mono text-xs text-ink"
+            :title="davUrl"
+          >{{ davUrl }}</code>
+          <button
+            class="grid h-10 w-10 shrink-0 place-items-center rounded-md border transition-colors"
+            :class="
+              davCopied
+                ? 'border-emerald-500/40 text-emerald-400'
+                : 'border-line text-muted hover:text-ink'
+            "
+            :title="davCopied ? t('settings.security.davCopied') : t('settings.security.copyDav')"
+            data-testid="copy-dav-url"
+            @click="copyDavUrl"
+          >
+            <AppIcon :name="davCopied ? 'check' : 'copy'" :size="14" />
+          </button>
+        </div>
         <p class="text-[11px] leading-relaxed text-muted">{{ t('settings.security.davHint') }}</p>
       </div>
 
-      <div class="rounded-xl border border-line p-4">
+      <div class="rounded-xl border border-line p-6">
         <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
           {{ t('settings.security.createToken') }}
         </p>
-        <div class="flex flex-wrap items-center gap-2">
+        <div class="flex flex-wrap items-center gap-4">
           <input
             v-model="tokenName"
             :placeholder="t('settings.security.tokenName')"
-            class="w-40 rounded-lg border border-line bg-elevated px-3 py-1.5 text-xs text-ink outline-none focus:border-accent"
+            class="h-10 w-40 rounded-lg border border-line bg-elevated px-3 text-xs text-ink outline-none focus:border-accent"
           />
           <label class="flex items-center gap-1 text-[11px] text-muted">
             <input v-model="tokenReadonly" type="checkbox" /> {{ t('settings.security.readonly') }}
@@ -865,11 +934,11 @@ onMounted(() => {
               v-model.number="tokenDays"
               type="number"
               min="0"
-              class="w-16 rounded border border-line bg-elevated px-2 py-1 text-xs text-ink outline-none focus:border-accent"
+              class="h-10 w-16 rounded border border-line bg-elevated px-2 text-xs text-ink outline-none focus:border-accent"
             />
             {{ t('settings.security.tokenDaysUnit') }}
           </label>
-          <button class="rounded-md bg-accent px-3 py-1.5 text-xs text-white" @click="createToken">
+          <button class="h-10 rounded-md bg-accent px-4 text-xs text-white" @click="createToken">
             {{ t('settings.security.generate') }}
           </button>
         </div>
@@ -883,21 +952,31 @@ onMounted(() => {
       </div>
 
       <div class="overflow-hidden rounded-xl border border-line">
+        <!-- 表头与数据列严格对齐，行高统一 h-12（8.4.2） -->
+        <div
+          class="flex h-10 items-center gap-4 border-b border-line bg-elevated/60 px-4 text-[11px] font-medium text-muted"
+        >
+          <span class="min-w-0 flex-1">{{ t('settings.security.colName') }}</span>
+          <span class="w-14 shrink-0 text-center">{{ t('settings.security.colPerm') }}</span>
+          <span class="w-24 shrink-0 text-right">{{ t('settings.security.colExpiry') }}</span>
+          <span class="w-6 shrink-0"></span>
+        </div>
         <div
           v-for="(token, index) in tokens"
           :key="token.id"
-          class="flex items-center gap-3 px-4 py-2.5 text-xs"
+          class="flex h-12 items-center gap-4 px-4 text-xs"
           :class="index % 2 === 1 ? 'bg-elevated/40' : ''"
         >
           <span class="min-w-0 flex-1 truncate text-ink">{{ token.name }}</span>
-          <span class="rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted">
+          <span class="w-14 shrink-0 rounded bg-elevated px-1.5 py-0.5 text-center text-[10px] text-muted">
             {{ token.readonly ? t('settings.security.readonly') : t('settings.security.readwrite') }}
           </span>
-          <span class="w-24 text-right text-[11px] text-muted">{{
+          <span class="w-24 shrink-0 text-right text-[11px] text-muted">{{
             formatExpiry(token.expires_at)
           }}</span>
+          <!-- 危险操作固定在行末，hover 变红（8.4.2） -->
           <button
-            class="text-muted hover:text-red-400"
+            class="flex w-6 shrink-0 justify-end text-muted transition-colors hover:text-red-500"
             :title="t('settings.security.deleteToken')"
             @click="deleteToken(token.id)"
           >
@@ -916,7 +995,7 @@ onMounted(() => {
         {{ tokenError }}
       </p>
 
-      <div class="rounded-xl border border-line p-4 text-[11px] leading-relaxed text-muted">
+      <div class="rounded-xl border border-line p-6 text-[11px] leading-relaxed text-muted">
         <p class="mb-1 font-medium text-ink">{{ t('settings.security.forgotTitle') }}</p>
         {{ t('settings.security.forgotBody') }}
         <code class="rounded bg-elevated px-1 py-0.5">asmoday --reset-password</code>
@@ -925,7 +1004,7 @@ onMounted(() => {
     </div>
 
     <!-- ================= 高级 ================= -->
-    <div v-else-if="tab === 'advanced'" class="space-y-4">
+    <div v-else-if="tab === 'advanced'" class="space-y-6">
       <div class="flex flex-wrap items-center gap-2">
         <div class="flex items-center rounded-lg border border-line p-0.5 text-xs">
           <button
@@ -953,7 +1032,7 @@ onMounted(() => {
 
         <button
           v-if="configMode === 'form'"
-          class="ml-auto flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+          class="ml-auto flex items-center gap-1.5 h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
           :disabled="saving"
           @click="saveForm()"
         >
@@ -962,7 +1041,7 @@ onMounted(() => {
         </button>
         <button
           v-else
-          class="ml-auto flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+          class="ml-auto flex items-center gap-1.5 h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
           :disabled="saving || !rawDirty"
           @click="saveRaw"
         >
@@ -972,8 +1051,8 @@ onMounted(() => {
       </div>
 
       <!-- 表单模式 -->
-      <div v-if="configMode === 'form' && draft" class="space-y-4">
-        <div class="rounded-xl border border-line p-4">
+      <div v-if="configMode === 'form' && draft" class="space-y-6">
+        <div class="rounded-xl border border-line p-6">
           <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
             {{ t('settings.advanced.server') }}
           </p>
@@ -985,14 +1064,14 @@ onMounted(() => {
                 type="number"
                 min="1"
                 max="65535"
-                class="w-full rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+                class="w-full rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
               />
             </label>
             <label class="block">
               <span class="mb-1 block text-[11px] text-muted">{{ t('settings.advanced.baseUrl') }}</span>
               <input
                 v-model="draft.server.proxy.base_url"
-                class="w-full rounded-lg border border-line bg-elevated px-3 py-1.5 text-sm text-ink outline-none focus:border-accent"
+                class="w-full rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
                 :placeholder="t('settings.advanced.baseUrlPlaceholder')"
               />
             </label>
@@ -1008,7 +1087,7 @@ onMounted(() => {
           {{ t('settings.advanced.protected') }}
         </p>
 
-        <div class="rounded-xl border border-line p-4">
+        <div class="rounded-xl border border-line p-6">
           <div class="mb-3 flex items-center justify-between">
             <p class="text-xs font-semibold tracking-wider text-muted uppercase">
               {{ t('settings.advanced.mounts') }}
@@ -1037,7 +1116,7 @@ onMounted(() => {
           </div>
         </div>
 
-        <div class="rounded-xl border border-line p-4">
+        <div class="rounded-xl border border-line p-6">
           <div class="mb-3 flex items-center justify-between">
             <p class="text-xs font-semibold tracking-wider text-muted uppercase">
               {{ t('settings.advanced.services') }}

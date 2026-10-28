@@ -19,6 +19,12 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Config> {
     Json(config.clone())
 }
 
+/// GET /api/config/safety：危险配置自检结果（设置页警告条，设计文档 3.5 / 9.3）
+pub async fn get_safety(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let config = state.config.read().await;
+    Json(serde_json::json!({ "issues": config.safety_issues() }))
+}
+
 /// POST /api/config
 pub async fn update_config(
     State(state): State<AppState>,

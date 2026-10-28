@@ -31,6 +31,12 @@ pub struct ListQuery {
     /// 是否返回以 `.` 开头的隐藏项（设计文档 3.2，默认关闭）
     #[serde(default)]
     pub show_hidden: Option<bool>,
+    /// 排序键：name（默认）/ mtime / size（设计文档 v2.7.0 3.2.1）
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// 升降序：asc（默认）/ desc
+    #[serde(default)]
+    pub order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +129,8 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         query.page.unwrap_or(1),
         query.show_hidden.unwrap_or(false),
         readonly,
+        fs::ListSort::parse(query.sort.as_deref()),
+        fs::ListOrder::parse(query.order.as_deref()),
     )
     .await
     {

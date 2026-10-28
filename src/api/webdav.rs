@@ -280,6 +280,16 @@ pub async fn handle(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    // 未初始化严防死守：初始化完成前 WebDAV 一律 503，与 /api/* 同口径
+    // （设计文档 v2.7.0 3.1.1，防止未鉴权实例被扫描器探测）
+    if state.auth.user_count().unwrap_or(0) == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Instance is not initialized yet",
+        )
+            .into_response();
+    }
+
     // ---- 认证（独立防爆破池，设计文档 3.1.5 / 3.10）----
     let Some(creds) = basic_credentials(&headers) else {
         return unauthorized();

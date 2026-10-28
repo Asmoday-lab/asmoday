@@ -521,7 +521,7 @@ pub async fn list_entries(
         .to_string();
 
     // 分享页同样默认不暴露隐藏项（与文件管理口径一致）
-    match fs::list_dir(&target, 1, false, true).await {
+    match fs::list_dir(&target, 1, false, true, fs::ListSort::Name, fs::ListOrder::Asc).await {
         Ok(listing) => {
             let entries: Vec<_> = listing
                 .entries

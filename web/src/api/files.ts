@@ -121,9 +121,9 @@ export const filesApi = {
   roots: () => getJson<RootsResponse>('/api/files/roots'),
 
   /** `showHidden` 对应后端 `show_hidden`（设计文档 3.2 / 6.1） */
-  list: (path: string, page = 1, showHidden = false) =>
+  list: (path: string, page = 1, showHidden = false, sort = 'name', order = 'asc') =>
     getJson<Listing>(
-      `/api/files/list?path=${encodePath(path)}&page=${page}&show_hidden=${showHidden}`,
+      `/api/files/list?path=${encodePath(path)}&page=${page}&show_hidden=${showHidden}&sort=${sort}&order=${order}`,
     ),
 
   /** 直接给 <img>/<video> 用；同样走挂载点校验 */

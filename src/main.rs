@@ -85,6 +85,9 @@ struct Cli {
     /// 强制覆盖监听端口
     #[arg(short, long)]
     port: Option<u16>,
+    /// 强制覆盖监听地址（如 0.0.0.0 / 127.0.0.1）
+    #[arg(short = 'H', long)]
+    host: Option<String>,
     /// 生成默认配置与数据目录，并输出一次性管理员密码
     #[arg(long)]
     init: bool,
@@ -124,6 +127,18 @@ async fn run(cli: Cli) -> Result<(), String> {
     let (mut config, created) = core::config::load_or_create(&config_path).await?;
     if created {
         println!("[asmoday] default config created: {}", config_path.display());
+    }
+    if let Ok(host) = std::env::var("ASMODAY_HOST") {
+        let host = host.trim().to_string();
+        if !host.is_empty() {
+            config.server.host = host;
+        }
+    }
+    if let Some(host) = cli.host.as_deref() {
+        let host = host.trim().to_string();
+        if !host.is_empty() {
+            config.server.host = host;
+        }
     }
     if let Ok(port) = std::env::var("ASMODAY_PORT") {
         if let Ok(port) = port.trim().parse::<u16>() {
@@ -200,6 +215,7 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     // ---- 共享状态 ----
     let media = config.media.clone();
+    let listen = (config.server.host.clone(), config.server.ssl.enabled);
     let state = AppState {
         config_path: config_path.clone(),
         data_dir: data_dir.clone(),
@@ -263,16 +279,31 @@ async fn run(cli: Cli) -> Result<(), String> {
     // `.asmoday-part` 残留清理：不阻塞启动（设计文档 3.2.6.4）
     spawn_part_cleanup(state.clone());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // 监听地址：配置校验已保证是合法 IP 字面量（设计文档 v2.7.0 3.1.1 / 5）
+    let host_ip: std::net::IpAddr = listen
+        .0
+        .parse()
+        .map_err(|e| format!("invalid server.host {}: {e}", listen.0))?;
+    let addr = SocketAddr::new(host_ip, port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| format!("failed to bind port {port}: {e}"))?;
+        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
 
     crate::log_info!("config file: {}", config_path.display());
     crate::log_info!("data directory: {}", data_dir.display());
-    crate::log_info!(
-        "listening on 0.0.0.0:{port} (all interfaces; put a reverse proxy in front for public access)"
-    );
+    if addr.ip().is_unspecified() {
+        crate::log_info!(
+            "listening on {addr} (all interfaces; put a reverse proxy in front for public access)"
+        );
+        // 设计文档 v2.7.0 6.x：0.0.0.0 且未启用 SSL 必须输出规范 WARN
+        if !listen.1 {
+            crate::log_warn!(
+                "listening on 0.0.0.0 without SSL. If you plan to expose this to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS."
+            );
+        }
+    } else {
+        crate::log_info!("listening on {addr} (local interface only)");
+    }
     crate::log_info!(
         "frontend build: {}",
         option_env!("ASMODAY_BUILD_ID").unwrap_or("dev")
@@ -324,6 +355,8 @@ fn protected_routes() -> Router<AppState> {
             "/api/config",
             get(api::config::get_config).post(api::config::update_config),
         )
+        // 危险配置自检结果（设置页警告条，设计文档 3.5 / 9.3）
+        .route("/api/config/safety", get(api::config::get_safety))
         .route(
             "/api/config/raw",
             get(api::config::get_config_raw).post(api::config::update_config_raw),

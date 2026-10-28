@@ -16,7 +16,6 @@ import { withBase } from '../lib/base'
 const props = defineProps<{
   tab: TerminalTab
   active: boolean
-  dark: boolean
   ctrl: boolean
   alt: boolean
 }>()
@@ -56,10 +55,14 @@ function clearRetry() {
 
 const encoder = new TextEncoder()
 
+// 终端渲染区恒为深色：ANSI 高亮（ls 目录、vim 语法色）只在深底上可读，
+// 不跟随全局浅色主题（设计文档 v2.7.0 3.3.5）。
+// 蓝紫均取亮色变体，避免深底上过暗看不清。
 const darkTheme = {
   background: '#101216',
   foreground: '#e2e8f0',
   cursor: '#6366f1',
+  cursorAccent: '#101216',
   selectionBackground: 'rgba(99,102,241,0.35)',
   black: '#1f2330',
   red: '#f87171',
@@ -69,21 +72,14 @@ const darkTheme = {
   magenta: '#c084fc',
   cyan: '#22d3ee',
   white: '#e2e8f0',
-}
-
-const lightTheme = {
-  background: '#ffffff',
-  foreground: '#0f172a',
-  cursor: '#4f46e5',
-  selectionBackground: 'rgba(79,70,229,0.2)',
-  black: '#0f172a',
-  red: '#dc2626',
-  green: '#059669',
-  yellow: '#b45309',
-  blue: '#2563eb',
-  magenta: '#7c3aed',
-  cyan: '#0891b2',
-  white: '#f8fafc',
+  brightBlack: '#9aa3b2',
+  brightRed: '#fca5a5',
+  brightGreen: '#6ee7b7',
+  brightYellow: '#fde68a',
+  brightBlue: '#93c5fd',
+  brightMagenta: '#d8b4fe',
+  brightCyan: '#67e8f9',
+  brightWhite: '#f8fafc',
 }
 
 /** 前端绝不自作聪明传 `~` / `%USERPROFILE%`：未指定目录时后端用 dirs::home_dir() 兜底 */
@@ -257,7 +253,7 @@ onMounted(() => {
     fontFamily: "'Cascadia Code', Consolas, 'Courier New', monospace",
     lineHeight: 1.35,
     scrollback: 5000,
-    theme: props.dark ? darkTheme : lightTheme,
+    theme: darkTheme,
     allowProposedApi: true,
   })
 
@@ -306,13 +302,6 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  () => props.dark,
-  (dark) => {
-    if (term) term.options.theme = dark ? darkTheme : lightTheme
-  },
-)
-
-watch(
   () => props.active,
   (active) => {
     if (!active) return
@@ -332,5 +321,5 @@ defineExpose({ sendRaw, reconnect, focus: () => term?.focus() })
 </script>
 
 <template>
-  <div ref="host" class="h-full w-full overflow-hidden px-2 py-1" />
+  <div ref="host" class="h-full w-full overflow-hidden px-3 py-2" />
 </template>

@@ -197,5 +197,18 @@
     "noDownloadable": "所选项目中没有可下载的文件",
     "downloadConfirm": "将下载 {count} 个文件",
     "downloadHint": "浏览器可能拦截多个并发下载，请允许本站的自动下载"
+  },
+  "sort": {
+    "label": "排序",
+    "name": "名称",
+    "mtime": "修改时间",
+    "size": "大小",
+    "asc": "升序",
+    "desc": "降序"
+  },
+  "header": {
+    "name": "名称",
+    "size": "大小",
+    "time": "修改时间"
   }
 }

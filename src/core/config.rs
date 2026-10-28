@@ -20,6 +20,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Asmoday 配置文件 — TOML 格式
 # 本文件由程序首次启动时自动生成；也可在“系统设置”页面通过可视化表单或源码模式修改。
 
 [server]
+# 监听地址。默认为 "0.0.0.0"（方便局域网访问及 Docker 映射）。
+# 若仅本机使用或已前置 Nginx/Caddy 反代，建议改为 "127.0.0.1"。
+# 命令行 -H / 环境变量 ASMODAY_HOST 优先级更高。
+host = "0.0.0.0"
 # 监听端口（1-65535）。命令行 -p / 环境变量 ASMODAY_PORT 优先级更高。
 port = 4242
 
@@ -177,6 +181,8 @@ pub struct SharesConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
+    /// 监听地址（IPv4/IPv6 字面量）。默认 "0.0.0.0"（设计文档 v2.7.0 3.1.1）
+    pub host: String,
     pub port: u16,
     pub ssl: SslConfig,
     pub proxy: ProxyConfig,
@@ -185,6 +191,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            host: "0.0.0.0".to_string(),
             port: DEFAULT_PORT,
             ssl: SslConfig::default(),
             proxy: ProxyConfig::default(),
@@ -382,6 +389,12 @@ impl Config {
         if self.server.port == 0 {
             return Err("server.port 必须在 1-65535 之间".to_string());
         }
+        if self.server.host.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "server.host 必须是合法 IP 地址（如 0.0.0.0 / 127.0.0.1 / ::），当前为 {:?}",
+                self.server.host
+            ));
+        }
 
         // 红线：不允许把认证整体关掉（配置里没有免密开关，这里再兜一层）
         if !self.auth.local_enabled && !self.auth.proxy_trust.enabled {
@@ -490,6 +503,12 @@ impl Config {
                 code: "PROXY_TRUST_SKIP_2FA",
             });
         }
+        if self.server.host == "0.0.0.0" && !self.server.ssl.enabled {
+            issues.push(SafetyIssue {
+                level: "warn",
+                code: "HOST_ALL_INTERFACES_NO_SSL",
+            });
+        }
         let base = proxy.base_url.trim();
         if !self.server.ssl.enabled && base.starts_with("https://") {
             issues.push(SafetyIssue {
@@ -536,6 +555,9 @@ impl Config {
                 }
                 "SSL_DISABLED_WITH_HTTPS_BASE" => {
                     "server.ssl.enabled=false but base_url looks like an https URL"
+                }
+                "HOST_ALL_INTERFACES_NO_SSL" => {
+                    "listening on 0.0.0.0 without SSL. If you plan to expose this to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS."
                 }
                 "RESET_PASSWORD_ENV_PRESENT" => {
                     "ASMODAY_RESET_PASSWORD is set: it takes effect on every start, remove it after resetting"

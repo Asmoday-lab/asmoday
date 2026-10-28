@@ -7,7 +7,7 @@
  * - 双击按类型分流到**全局**预览：图片/音视频→MediaLightbox，Markdown/CSV/PDF→只读预览面板，
  *   纯文本/代码→CodeMirror，Office/压缩包→提示下载（3.2 文件预览矩阵）。
  */
-import { computed, defineAsyncComponent, onMounted, reactive, ref } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -569,6 +569,72 @@ const viewMode = ref<ViewMode>(
   (localStorage.getItem('asmoday.files.view') as ViewMode | null) === 'list' ? 'list' : 'grid',
 )
 
+// ---------------- 排序（设计文档 v2.7.0 3.2.1 / 8.4.5） ----------------
+type SortKey = 'name' | 'mtime' | 'size'
+type SortDir = 'asc' | 'desc'
+const SORT_OPTIONS: { key: SortKey }[] = [{ key: 'name' }, { key: 'mtime' }, { key: 'size' }]
+
+/** 排序偏好持久化到 localStorage，刷新后保持 */
+function loadSortPref(): { key: SortKey; dir: SortDir } {
+  try {
+    const raw = JSON.parse(localStorage.getItem('asmoday.files.sort') ?? '{}') as {
+      key?: string
+      dir?: string
+    }
+    if (
+      SORT_OPTIONS.some((option) => option.key === raw.key) &&
+      (raw.dir === 'asc' || raw.dir === 'desc')
+    ) {
+      return { key: raw.key as SortKey, dir: raw.dir }
+    }
+  } catch {
+    // 损坏的本地值直接回落默认
+  }
+  return { key: 'name', dir: 'asc' }
+}
+
+const sortKey = ref<SortKey>(loadSortPref().key)
+const sortDir = ref<SortDir>(loadSortPref().dir)
+const sortMenuOpen = ref(false)
+/** 工具栏上的当前排序摘要（如「名称 ↑」） */
+const sortLabel = computed(
+  () => `${t(`files.sort.${sortKey.value}`)} ${sortDir.value === 'asc' ? '↑' : '↓'}`,
+)
+
+/** 同键点击切换升降序；变更后必须清空列表重新拉取（8.4.5 第 4 条） */
+async function applySort(key: SortKey) {
+  if (key === sortKey.value) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortKey.value = key
+    sortDir.value = 'asc'
+  }
+  localStorage.setItem(
+    'asmoday.files.sort',
+    JSON.stringify({ key: sortKey.value, dir: sortDir.value }),
+  )
+  sortMenuOpen.value = false
+  thumbFailed.value = new Set()
+  if (currentPath.value) await open(currentPath.value)
+  if (searchTerm.value) void runSearch()
+}
+
+// ---------------- 无限滚动（8.4.5 第 4 条：到底自动加载 + 骨架屏） ----------------
+const sentinelEl = ref<HTMLElement | null>(null)
+let scrollObserver: IntersectionObserver | null = null
+watch(sentinelEl, (el) => {
+  scrollObserver?.disconnect()
+  if (!el) return
+  scrollObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void loadMore()
+    },
+    { rootMargin: '160px' },
+  )
+  scrollObserver.observe(el)
+})
+onBeforeUnmount(() => scrollObserver?.disconnect())
+
 /** 触屏设备没有双击语义，单击即打开 */
 const coarsePointer = window.matchMedia?.('(hover: none)').matches ?? false
 
@@ -868,7 +934,7 @@ async function open(path: string, pageNo = 1) {
   selected.value = null
   preview.value = null
   try {
-    const data = await filesApi.list(path, pageNo, showHidden.value)
+    const data = await filesApi.list(path, pageNo, showHidden.value, sortKey.value, sortDir.value)
     listing.value = data
     currentPath.value = data.path
     page.value = data.page
@@ -883,7 +949,13 @@ async function loadMore() {
   if (!hasMore.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const next = await filesApi.list(currentPath.value, page.value + 1, showHidden.value)
+    const next = await filesApi.list(
+      currentPath.value,
+      page.value + 1,
+      showHidden.value,
+      sortKey.value,
+      sortDir.value,
+    )
     if (listing.value) {
       listing.value = { ...next, entries: [...listing.value.entries, ...next.entries] }
     }
@@ -1050,7 +1122,7 @@ async function saveEditor() {
     showToast(t('files.editor.saved'))
     // 目录里的体积/时间需要刷新
     if (listing.value) {
-      const data = await filesApi.list(currentPath.value, 1, showHidden.value)
+      const data = await filesApi.list(currentPath.value, 1, showHidden.value, sortKey.value, sortDir.value)
       listing.value = { ...data, entries: [...data.entries] }
     }
   } catch (err) {
@@ -1289,14 +1361,55 @@ onMounted(boot)
 
       <template v-else>
       <!-- 工具栏 -->
-      <header class="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-panel px-2 md:px-3">
+            <header class="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-panel px-2 md:px-3">
         <button
           class="grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
           :title="t('files.toolbar.refresh')"
+          data-testid="toolbar-refresh"
           @click="open(currentPath)"
         >
           <AppIcon name="refresh" :size="15" />
         </button>
+
+        <!-- 新建（设计文档 3.2 工具栏 / 3.2.6.1） -->
+        <div class="relative shrink-0">
+          <button
+            class="flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
+            :disabled="readonly"
+            :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
+            data-testid="new-entry"
+            :aria-expanded="newMenuOpen"
+            @click="newMenuOpen = !newMenuOpen"
+          >
+            <AppIcon name="plus" :size="13" />
+            <span class="hidden sm:inline">{{ t('files.toolbar.new') }}</span>
+          </button>
+          <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
+          <div
+            v-if="newMenuOpen"
+            class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+          >
+            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
+              <AppIcon name="folder" :size="14" />
+              {{ t('files.toolbar.newFolder') }}
+            </button>
+            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
+              <AppIcon name="file" :size="14" />
+              {{ t('files.toolbar.newFile') }}
+            </button>
+          </div>
+        </div>
+
+        <button
+          class="flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+          :disabled="readonly"
+          :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
+          @click="pickFiles"
+        >
+          <AppIcon name="upload" :size="13" />
+          <span class="hidden sm:inline">{{ t('files.toolbar.upload') }}</span>
+        </button>
+        <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
 
         <nav class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[12px]">
           <button
@@ -1357,6 +1470,44 @@ onMounted(boot)
           </button>
         </div>
 
+        <!-- 排序（设计文档 v2.7.0 3.2.1：名称/修改时间/大小 + 升降序，状态持久化） -->
+        <div class="relative shrink-0">
+          <button
+            class="flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+            :title="t('files.sort.label')"
+            data-testid="sort-menu"
+            :aria-expanded="sortMenuOpen"
+            @click="sortMenuOpen = !sortMenuOpen"
+          >
+            <AppIcon name="sort" :size="13" />
+            <span class="hidden md:inline">{{ sortLabel }}</span>
+          </button>
+          <div v-if="sortMenuOpen" class="fixed inset-0 z-40" @click="sortMenuOpen = false" />
+          <div
+            v-if="sortMenuOpen"
+            class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+          >
+            <button
+              v-for="option in SORT_OPTIONS"
+              :key="option.key"
+              class="menu-item"
+              :data-sort="option.key"
+              @click="applySort(option.key)"
+            >
+              <AppIcon
+                name="check"
+                :size="14"
+                :class="sortKey === option.key ? 'text-accent' : 'opacity-0'"
+              />
+              {{ t(`files.sort.${option.key}`) }}
+              <span
+                v-if="sortKey === option.key"
+                class="ml-auto text-[10px] text-muted"
+              >{{ sortDir === 'asc' ? '↑' : '↓' }}</span>
+            </button>
+          </div>
+        </div>
+
         <button
           class="grid size-7 shrink-0 place-items-center rounded-md transition-colors"
           :class="showHidden ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-elevated hover:text-ink'"
@@ -1386,46 +1537,6 @@ onMounted(boot)
             <AppIcon name="rows" :size="13" />
           </button>
         </div>
-
-        <!-- 新建（设计文档 3.2 工具栏 / 3.2.6.1） -->
-        <div class="relative shrink-0">
-          <button
-            class="flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
-            :disabled="readonly"
-            :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
-            data-testid="new-entry"
-            :aria-expanded="newMenuOpen"
-            @click="newMenuOpen = !newMenuOpen"
-          >
-            <AppIcon name="plus" :size="13" />
-            <span class="hidden sm:inline">{{ t('files.toolbar.new') }}</span>
-          </button>
-          <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
-          <div
-            v-if="newMenuOpen"
-            class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
-          >
-            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
-              <AppIcon name="folder" :size="14" />
-              {{ t('files.toolbar.newFolder') }}
-            </button>
-            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
-              <AppIcon name="file" :size="14" />
-              {{ t('files.toolbar.newFile') }}
-            </button>
-          </div>
-        </div>
-
-        <button
-          class="flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-          :disabled="readonly"
-          :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
-          @click="pickFiles"
-        >
-          <AppIcon name="upload" :size="13" />
-          <span class="hidden sm:inline">{{ t('files.toolbar.upload') }}</span>
-        </button>
-        <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
       </header>
 
       <!-- 内容 -->
@@ -1486,14 +1597,14 @@ onMounted(boot)
         <VirtualGrid
           v-else-if="viewMode === 'grid'"
           :items="displayEntries"
-          :min-width="98"
-          :gap="6"
+          :min-width="132"
+          :gap="8"
           :ratio="1.42"
         >
           <template #default="{ item: entry }">
             <button
               type="button"
-              class="entry-tile group relative flex size-full flex-col items-center gap-1.5 rounded-xl border border-transparent px-1.5 py-2.5 transition-colors hover:border-line hover:bg-panel"
+              class="entry-tile group relative flex size-full flex-col items-center gap-2 rounded-xl border border-transparent p-3 transition-colors hover:border-line hover:bg-panel"
               :class="[
                 selected === entry.path ? 'border-accent/50 bg-panel' : '',
                 selectMode && isSelected(entry.path) ? 'border-accent bg-accent-soft' : '',
@@ -1521,19 +1632,20 @@ onMounted(boot)
               >
                 <AppIcon name="check" :size="11" />
               </span>
+              <!-- 缩略图随格宽放大（≥100x100，设计文档 v2.7.0 3.2.1 / 8.4.5） -->
               <span
-                class="grid size-11 place-items-center overflow-hidden rounded-lg bg-elevated/60 transition-transform group-hover:scale-105 md:size-12"
+                class="grid aspect-square w-full place-items-center overflow-hidden rounded-lg bg-elevated/60 transition-transform group-hover:scale-105"
                 :class="toneFor(entry)"
               >
                 <img
                   v-if="entry.kind === 'image' && !thumbFailed.has(entry.path)"
-                  :src="thumbUrl(entry.path, 160)"
+                  :src="thumbUrl(entry.path, 240)"
                   class="size-full object-cover"
                   loading="lazy"
                   alt=""
                   @error="markThumbFailed(entry.path)"
                 />
-                <AppIcon v-else :name="iconFor(entry)" :size="22" />
+                <AppIcon v-else :name="iconFor(entry)" :size="34" />
               </span>
               <span class="w-full truncate text-center text-[11px] leading-tight text-ink">
                 {{ entry.name }}
@@ -1542,8 +1654,18 @@ onMounted(boot)
           </template>
         </VirtualGrid>
 
-        <!-- 列表视图（定高虚拟列表） -->
-        <VirtualList v-else :items="displayEntries" :row-height="40">
+        <!-- 列表视图（定高虚拟列表，设计文档 v2.7.0 3.2.1：表头行 + h-12 行高） -->
+        <template v-else>
+          <div
+            class="sticky top-0 z-10 flex h-10 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[11px] font-medium text-muted"
+          >
+            <span class="min-w-0 flex-1">{{ t('files.header.name') }}</span>
+            <span class="w-24 shrink-0 text-right">{{ t('files.header.size') }}</span>
+            <span class="hidden w-36 shrink-0 text-right sm:block">{{
+              t('files.header.time')
+            }}</span>
+          </div>
+          <VirtualList :items="displayEntries" :row-height="48">
           <template #default="{ item: entry }">
             <div
               class="entry-tile flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[12px] transition-colors hover:bg-elevated/60"
@@ -1575,7 +1697,7 @@ onMounted(boot)
               </span>
               <span :class="toneFor(entry)"><AppIcon :name="iconFor(entry)" :size="15" /></span>
               <span class="min-w-0 flex-1 truncate text-ink">{{ entry.name }}</span>
-              <span class="w-20 shrink-0 text-right text-muted whitespace-nowrap">
+              <span class="w-24 shrink-0 text-right text-muted whitespace-nowrap">
                 {{ entry.is_dir ? '—' : formatSize(entry.size) }}
               </span>
               <span class="hidden w-36 shrink-0 text-right text-muted whitespace-nowrap sm:block">
@@ -1583,7 +1705,15 @@ onMounted(boot)
               </span>
             </div>
           </template>
-        </VirtualList>
+          </VirtualList>
+        </template>
+
+        <!-- 无限滚动哨兵 + 加载骨架（8.4.5 第 4 条） -->
+        <div v-if="hasMore && !loading && !error" ref="sentinelEl" class="h-px" />
+        <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4">
+          <span class="skeleton size-3.5 rounded-full" />
+          <span class="skeleton h-2.5 w-24 rounded" />
+        </div>
       </div>
 
       <!-- 底栏 / 分页 -->
@@ -1601,14 +1731,6 @@ onMounted(boot)
             · {{ t('files.list.shown', { shown: displayEntries.length }) }}
           </span>
         </span>
-        <button
-          v-if="hasMore"
-          class="rounded-md border border-line px-2 py-1 text-[11px] text-ink transition-colors hover:border-accent/50"
-          :disabled="loadingMore"
-          @click="loadMore"
-        >
-          {{ loadingMore ? t('common.action.loadingMore') : t('common.action.loadMore') }}
-        </button>
       </footer>
 
       <!-- 多选操作栏（设计文档 8.6 第 2 条：安全区 + 列表底部补等量 padding） -->

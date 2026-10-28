@@ -237,15 +237,55 @@ pub struct Listing {
 /// 单目录扫描上限：超出截断并标记 `truncated`（设计文档 3.2.4）
 pub const SCAN_LIMIT: usize = 10_000;
 
+/// 列表排序键（设计文档 v2.7.0 3.2.1：名称 / 修改时间 / 大小）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListSort {
+    #[default]
+    Name,
+    Mtime,
+    Size,
+}
+
+impl ListSort {
+    /// `?sort=` 参数解析；非法值回落默认（不报错，前端永远拿得到列表）
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("").to_ascii_lowercase().as_str() {
+            "mtime" => Self::Mtime,
+            "size" => Self::Size,
+            _ => Self::Name,
+        }
+    }
+}
+
+/// 升 / 降序
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl ListOrder {
+    /// `?order=` 参数解析
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("").to_ascii_lowercase().as_str() {
+            "desc" => Self::Desc,
+            _ => Self::Asc,
+        }
+    }
+}
+
 /// 读取目录第一层并分页。
 ///
-/// 排序固定为「目录优先 + 名称自然序（大小写不敏感）」——分页结果必须可重现，
-/// 所以不能依赖 `readdir` 的返回顺序。
+/// 排序固定「目录优先」，其余按指定键升降序；分页结果必须可重现，
+/// 所以不能依赖 `readdir` 的返回顺序，同键并列时以名称（大小写不敏感）兜底。
 pub async fn list_dir(
     dir: &Path,
     page: usize,
     show_hidden: bool,
     readonly: bool,
+    sort: ListSort,
+    order: ListOrder,
 ) -> Result<Listing, FsError> {
     let page = page.max(1);
 
@@ -253,7 +293,7 @@ pub async fn list_dir(
         .await
         .map_err(|e| FsError::Io(format!("读取目录失败：{e}")))?;
 
-    let mut items: Vec<(String, bool)> = Vec::new();
+    let mut items: Vec<(String, bool, Option<std::fs::Metadata>)> = Vec::new();
     let mut truncated = false;
     while let Some(entry) = reader
         .next_entry()
@@ -280,13 +320,35 @@ pub async fn list_dir(
             .await
             .map(|t| t.is_dir())
             .unwrap_or(false);
-        items.push((name, is_dir));
+        items.push((name, is_dir, None));
     }
 
-    // 目录在前，其余按名称不区分大小写排序
+    // 按 mtime / size 排序必须先拿到全部元数据（Name 排序免 stat）
+    if sort != ListSort::Name {
+        for (name, _, meta) in items.iter_mut() {
+            *meta = tokio::fs::symlink_metadata(dir.join(&name)).await.ok();
+        }
+    }
+
+    // 目录在前；同组内按指定键排序，并列以名称（大小写不敏感）兜底
     items.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        let dir_cmp = b.1.cmp(&a.1);
+        if dir_cmp != std::cmp::Ordering::Equal {
+            return dir_cmp;
+        }
+        let key_cmp = match sort {
+            ListSort::Name => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+            ListSort::Size => a.2.as_ref().map(|m| m.len()).cmp(&b.2.as_ref().map(|m| m.len())),
+            ListSort::Mtime => a
+                .2
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .cmp(&b.2.as_ref().and_then(|m| m.modified().ok())),
+        };
+        if key_cmp != std::cmp::Ordering::Equal {
+            return if order == ListOrder::Desc { key_cmp.reverse() } else { key_cmp };
+        }
+        a.0.to_lowercase().cmp(&b.0.to_lowercase())
     });
 
     let total = items.len();
@@ -295,10 +357,13 @@ pub async fn list_dir(
 
     let mut entries = Vec::new();
     if start < total {
-        for (name, is_dir) in &items[start..end] {
+        for (name, is_dir, cached) in &items[start..end] {
             let full = dir.join(name);
-            // lstat：软链接只报告链接本身，不 stat 目标
-            let link_meta = tokio::fs::symlink_metadata(&full).await;
+            // lstat：软链接只报告链接本身，不 stat 目标（排序阶段已 stat 的直接复用）
+            let link_meta = match cached {
+                Some(meta) => Ok(meta.clone()),
+                None => tokio::fs::symlink_metadata(&full).await,
+            };
             let stat_error = link_meta.is_err();
             let is_symlink = link_meta
                 .as_ref()
@@ -485,6 +550,17 @@ pub fn parse_range(header: &str, file_len: u64) -> Result<Option<ByteRange>, ()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_sort_and_order_parse() {
+        assert_eq!(ListSort::parse(None), ListSort::Name);
+        assert_eq!(ListSort::parse(Some("mtime")), ListSort::Mtime);
+        assert_eq!(ListSort::parse(Some("SIZE")), ListSort::Size);
+        assert_eq!(ListSort::parse(Some("bogus")), ListSort::Name);
+        assert_eq!(ListOrder::parse(Some("desc")), ListOrder::Desc);
+        assert_eq!(ListOrder::parse(None), ListOrder::Asc);
+    }
+
 
     #[test]
     fn rejects_parent_dir_traversal() {

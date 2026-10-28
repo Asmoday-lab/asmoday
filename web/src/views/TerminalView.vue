@@ -11,10 +11,8 @@ import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import TerminalPane from '../components/TerminalPane.vue'
 import { useTerminalStore, type TerminalStatus } from '../stores/terminal'
-import { useTheme } from '../composables/useTheme'
 
 const { tabs, activeId, active, openTab, closeTab, setActive, updateTab } = useTerminalStore()
-const { isDark } = useTheme()
 const { t } = useI18n()
 const route = useRoute()
 
@@ -130,10 +128,11 @@ const statusTone: Record<TerminalStatus, string> = {
 </script>
 
 <template>
-  <section class="flex h-full min-h-0 flex-col bg-[#101216] text-slate-200">
+  <!-- 外壳（标签栏/键盘/状态栏）跟随全局主题；只有 xterm 渲染区恒为深色（v2.7.0 3.3.5 / 8.4.4） -->
+  <section class="flex h-full min-h-0 flex-col bg-panel text-ink">
     <!-- 标签栏 -->
     <header
-      class="flex h-10 shrink-0 items-center gap-1 border-b border-white/10 bg-[#16181d] px-2"
+      class="flex h-10 shrink-0 items-center gap-1 border-b border-line bg-panel px-2"
     >
       <div class="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
         <button
@@ -143,8 +142,8 @@ const statusTone: Record<TerminalStatus, string> = {
           class="group flex shrink-0 items-center gap-2 rounded-t-md border-t-2 px-3 py-1.5 text-xs transition-colors"
           :class="
             tab.id === activeId
-              ? 'border-accent bg-[#101216] text-slate-100'
-              : 'border-transparent bg-[#1d2027] text-slate-400 hover:text-slate-200'
+              ? 'border-accent bg-elevated text-ink'
+              : 'border-transparent text-muted hover:text-ink'
           "
           :title="tab.cwd || t('terminal.tabs.defaultDir')"
           @click="setActive(tab.id)"
@@ -153,7 +152,7 @@ const statusTone: Record<TerminalStatus, string> = {
           <AppIcon name="terminal" :size="13" />
           <span class="max-w-[140px] truncate">{{ tab.title }}</span>
           <span
-            class="ml-1 rounded px-1 text-[10px] text-slate-500 opacity-0 transition-opacity group-hover:opacity-100"
+            class="ml-1 rounded px-1 text-[10px] text-muted opacity-0 transition-opacity group-hover:opacity-100"
             role="button"
             :title="t('terminal.tabs.close')"
             @click.stop="closeTab(tab.id)"
@@ -165,7 +164,7 @@ const statusTone: Record<TerminalStatus, string> = {
 
       <button
         type="button"
-        class="grid size-7 shrink-0 place-items-center rounded text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+        class="grid size-7 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink"
         :title="t('terminal.tabs.new')"
         @click="newTab()"
       >
@@ -174,7 +173,7 @@ const statusTone: Record<TerminalStatus, string> = {
 
       <button
         type="button"
-        class="grid size-7 shrink-0 place-items-center rounded text-slate-400 transition-colors hover:bg-white/10 hover:text-white md:hidden"
+        class="grid size-7 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink md:hidden"
         :title="t('terminal.tabs.toggleKeys')"
         @click="showKeys = !showKeys"
       >
@@ -186,8 +185,8 @@ const statusTone: Record<TerminalStatus, string> = {
     <div class="relative min-h-0 flex-1">
       <div v-if="tabs.length === 0" class="grid h-full place-items-center">
         <div class="text-center">
-          <p class="text-sm text-slate-400">{{ t('terminal.empty.title') }}</p>
-          <p class="mt-1 text-xs text-slate-500">{{ t('terminal.empty.hint') }}</p>
+          <p class="text-sm text-muted">{{ t('terminal.empty.title') }}</p>
+          <p class="mt-1 text-xs text-muted opacity-80">{{ t('terminal.empty.hint') }}</p>
           <button
             class="mt-4 rounded-md bg-accent px-4 py-2 text-xs text-white hover:opacity-90"
             @click="newTab()"
@@ -201,31 +200,35 @@ const statusTone: Record<TerminalStatus, string> = {
         v-for="tab in tabs"
         v-show="tab.id === activeId"
         :key="tab.id"
-        class="absolute inset-0"
-        :class="{ 'pb-[72px] md:pb-0': showKeys }"
+        class="absolute inset-0 p-2 md:p-3"
+        :class="{ 'pb-[80px] md:pb-3': showKeys }"
       >
-        <TerminalPane
-          :ref="(el) => setPane(tab.id, el)"
-          :tab="tab"
-          :active="tab.id === activeId"
-          :dark="isDark"
-          :ctrl="ctrl"
-          :alt="alt"
-          @status="onStatus"
-          @session="onSession"
-          @consumed="ctrl = false; alt = false"
-          @error="onError"
-        />
+        <!-- 浅色主题下的「画中画」缓冲：主区域浅色，终端壳圆角 + 阴影（8.4.4 第 2 条） -->
+        <div
+          class="h-full w-full overflow-hidden rounded-xl border border-line bg-[#101216] shadow-sm"
+        >
+          <TerminalPane
+            :ref="(el) => setPane(tab.id, el)"
+            :tab="tab"
+            :active="tab.id === activeId"
+            :ctrl="ctrl"
+            :alt="alt"
+            @status="onStatus"
+            @session="onSession"
+            @consumed="ctrl = false; alt = false"
+            @error="onError"
+          />
+        </div>
       </div>
     </div>
 
     <!-- 移动端 Termux 两行键盘 -->
     <div
       v-if="showKeys && tabs.length > 0"
-      class="absolute bottom-0 left-0 right-0 z-30 h-[72px] border-t border-white/10 bg-[#101216] md:hidden"
+      class="absolute bottom-0 left-0 right-0 z-30 h-[72px] border-t border-line bg-panel md:hidden"
       style="padding-bottom: env(safe-area-inset-bottom, 0px); height: calc(72px + env(safe-area-inset-bottom, 0px))"
     >
-      <div class="grid h-1/2 grid-cols-7 border-b border-white/10 bg-[#16181d]">
+      <div class="grid h-1/2 grid-cols-7 border-b border-line bg-elevated">
         <button class="term-key" @click="sendKey('\x1b')">ESC</button>
         <button class="term-key" @click="sendKey('/')">/</button>
         <button class="term-key" @click="sendKey('-')">-</button>
@@ -252,7 +255,7 @@ const statusTone: Record<TerminalStatus, string> = {
     <!-- 底部状态提示 -->
     <footer
       v-if="tabs.length > 0"
-      class="flex h-6 shrink-0 items-center justify-between border-t border-white/10 bg-[#16181d] px-3 text-[10px] text-slate-500"
+      class="flex h-6 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[10px] text-muted"
     >
       <span class="truncate">{{ active?.cwd || t('terminal.tabs.defaultDir') }}</span>
       <span class="ml-3 flex shrink-0 items-center gap-2">
@@ -268,7 +271,7 @@ const statusTone: Record<TerminalStatus, string> = {
         <button
           v-if="active && (active.status === 'closed' || active.status === 'error')"
           type="button"
-          class="flex items-center gap-1 rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-slate-200 transition-colors hover:bg-white/20"
+          class="flex items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-ink transition-colors hover:bg-elevated/80"
           :title="t('terminal.reconnect.title')"
           @click="reconnectActive"
         >
@@ -281,7 +284,7 @@ const statusTone: Record<TerminalStatus, string> = {
     <Transition name="fade">
       <div
         v-if="toast"
-        class="pointer-events-none absolute bottom-20 left-1/2 z-40 -translate-x-1/2 rounded-full border border-white/15 bg-[#1d2027] px-4 py-2 text-xs text-slate-100 shadow-lg"
+        class="pointer-events-none absolute bottom-20 left-1/2 z-40 -translate-x-1/2 rounded-full border border-line bg-elevated px-4 py-2 text-xs text-ink shadow-lg"
       >
         {{ toast }}
       </div>
@@ -294,8 +297,8 @@ const statusTone: Record<TerminalStatus, string> = {
   display: flex;
   align-items: center;
   justify-content: center;
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
-  color: #e5e7eb;
+  border-right: 1px solid var(--border-color);
+  color: var(--text-main);
   font-family: var(--font-app-mono);
   font-size: 12px;
   user-select: none;
@@ -304,10 +307,10 @@ const statusTone: Record<TerminalStatus, string> = {
   border-right: none;
 }
 .term-key:active {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--bg-elevated);
 }
 .term-key-active {
-  background: rgba(99, 102, 241, 0.35);
-  color: #c7d2fe;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 </style>

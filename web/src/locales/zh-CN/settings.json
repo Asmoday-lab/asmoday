@@ -106,7 +106,12 @@
     "tokenCreateFailed": "创建失败",
     "tokenDeleteFailed": "删除失败",
     "tokenNameRequired": "请填写令牌名称",
-    "deleteToken": "删除令牌"
+    "deleteToken": "删除令牌",
+    "copyDav": "复制 WebDAV 地址",
+    "davCopied": "已复制",
+    "colName": "名称",
+    "colPerm": "权限",
+    "colExpiry": "有效期"
   },
   "advanced": {
     "form": "可视化表单",
@@ -145,5 +150,13 @@
     "newMount": "新挂载点",
     "newService": "新服务",
     "resetHint": "恢复默认值只会作用于通用与媒体面板；挂载点、外部服务需手动修改。"
+  },
+  "safety": {
+    "HOST_ALL_INTERFACES_NO_SSL": "监听地址为 0.0.0.0 且未启用 SSL：服务暴露在所有网卡上。若要暴露到公网，请前置 Caddy/Nginx 等 HTTPS 反向代理。",
+    "PROXY_TRUST_NO_TRUSTED_IPS": "auth.proxy_trust.enabled 已开启但 trusted_ips 为空：任何人都能伪造头冒充管理员，已强制关闭。",
+    "PROXY_HEADERS_NO_TRUSTED_IPS": "server.proxy.trust_proxy_headers 已开启但 trusted_ips 为空：所有客户端共享同一个代理 IP。",
+    "PROXY_TRUST_SKIP_2FA": "auth.proxy_trust.skip_2fa 已开启：SSO 登录将跳过两步验证。",
+    "SSL_DISABLED_WITH_HTTPS_BASE": "server.ssl.enabled=false 但 base_url 是 https 地址：请确认部署方式。",
+    "RESET_PASSWORD_ENV_PRESENT": "检测到 ASMODAY_RESET_PASSWORD 环境变量：每次启动都会生效，重置完成后请移除。"
   }
 }
