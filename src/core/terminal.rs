@@ -457,8 +457,16 @@ fn apply_shell_args(
 ///
 /// 历史重定向（`HISTFILE`）不在这里注入——它挪到了 `create()`，
 /// 因为 `[terminal].args` 自定义参数会整段替换这里的参数，而历史隔离必须永远生效。
+///
+/// 与 Windows 版保持相同的四参签名（调用点是平台共用的）：类 Unix 的历史走
+/// `HISTFILE` 环境变量而非命令行参数，这里收下但忽略。
 #[cfg(not(windows))]
-fn apply_shell_args(command: &mut CommandBuilder, shell: &str, options: &ShellOptions) {
+fn apply_shell_args(
+    command: &mut CommandBuilder,
+    shell: &str,
+    options: &ShellOptions,
+    _history_path: Option<&str>,
+) {
     let name = Path::new(shell)
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
