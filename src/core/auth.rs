@@ -327,6 +327,22 @@ impl AuthStore {
         }
     }
 
+    /// 删除指定键的 ThumbHash（文件删除 / 改名后调用，避免库里留死行）
+    pub fn thumb_hashes_forget(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let Ok(conn) = self.connect() else {
+            return;
+        };
+        let Ok(mut stmt) = conn.prepare("DELETE FROM thumb_hashes WHERE key = ?1") else {
+            return;
+        };
+        for key in keys {
+            let _ = stmt.execute(params![key]);
+        }
+    }
+
     /// 清空 ThumbHash 表（设置页「清理媒体缓存」联动：缓存图都删了，色值也没意义了）
     pub fn thumb_hashes_clear(&self) {
         let Ok(conn) = self.connect() else {

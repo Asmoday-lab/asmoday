@@ -10,14 +10,14 @@
 //! 红线：图片走内置解码器；视频只允许经**外部可选** FFmpeg 截取首帧当封面，
 //! 自身绝不链接 libav*，也绝不参与任何转码（设计文档 3.4 / 3.5）。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_encoding::BASE64;
+use sha1::{Digest, Sha1};
 use tokio::sync::Semaphore;
 
 use crate::core::ffmpeg::{self, Capabilities, PosterFormat};
@@ -54,6 +54,9 @@ const FRESH_WINDOW: Duration = Duration::from_secs(60);
 /// 刚上传的照片写盘是毫秒级，如果按 mtime 一刀切，用户上传完会先看到一堆占位图，
 /// 以为缩略图坏了。真正会反复重绘的是几百兆的影视文件，所以用体积当第二道判据。
 const FRESH_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 版本戳文件名：内容为 `长度:mtime`，源文件一变缓存即失效。
+const STAMP_FILE: &str = "stamp";
 
 /// 文件是否可能仍在写盘（mtime 极新且体积可观）。
 fn is_fresh_write(path: &Path) -> bool {
@@ -117,6 +120,9 @@ pub struct Thumbnailer {
     max_age_secs: AtomicU64,
     /// FFmpeg 编码能力缓存（键 = 可执行文件路径），避免每张缩略图都跑一次 `-encoders`
     caps: Arc<Mutex<Option<(PathBuf, Capabilities)>>>,
+    /// 每个缓存单元一把异步锁：同一张图被 320 / 960 同时请求时只解码一次，
+    /// 也避免两个线程同时写同一份 stamp（FileBrowser 的 scoped lock 同思路）。
+    locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Thumbnailer {
@@ -129,6 +135,7 @@ impl Thumbnailer {
             limit_bytes: AtomicU64::new(defaults.limit_bytes()),
             max_age_secs: AtomicU64::new(defaults.max_age_secs()),
             caps: Arc::new(Mutex::new(None)),
+            locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,41 +150,90 @@ impl Thumbnailer {
         self.max_age_secs.store(max_age_secs, Ordering::Relaxed);
     }
 
-    /// 图片缩略图的缓存基名（不带扩展名：实际后缀由编码结果决定，WebP / JPEG 都要能命中）
-    fn cache_base(path: &Path, width: u32) -> String {
-        let (len, mtime) = Self::source_stamp(path);
-
-        let mut hasher = DefaultHasher::new();
-        path.to_string_lossy().hash(&mut hasher);
-        len.hash(&mut hasher);
-        mtime.hash(&mut hasher);
-        width.hash(&mut hasher);
-        format!("{:016x}-{width}", hasher.finish())
-    }
-
-    /// 视频首帧封面的缓存键（不带扩展名，实际扩展名由输出格式决定）
-    fn poster_key(path: &Path, width: u32) -> String {
-        let (len, mtime) = Self::source_stamp(path);
-
-        let mut hasher = DefaultHasher::new();
-        path.to_string_lossy().hash(&mut hasher);
-        len.hash(&mut hasher);
-        mtime.hash(&mut hasher);
-        width.hash(&mut hasher);
-        format!("{:016x}-{width}p", hasher.finish())
-    }
-
-    /// ThumbHash 的库键：与宽度无关，任何尺寸生成一次即可复用。
+    /// 源路径的稳定摘要（sha1 十六进制 40 字符）。
     ///
-    /// **v2.8.2 起只作 SQLite `thumb_hashes` 表的主键**，不再生成同名旁路文件；
-    /// 存量部署的 `<key>.th` 文件由媒体扫描惰性搬进库后删除。
+    /// 缓存文件名一律只用它，绝不带源文件名或扩展名 —— FileBrowser 的
+    /// diskcache 也是 `sha1(key)` 的无扩展名文件。这样即使缓存目录被误暴露成
+    /// 普通目录，也不会被识别成图片、更不会「缓存给自己再缓存一遍」。
+    ///
+    /// 摘要用的是 `normalize_display` 之后的写法：同一个文件可能以
+    /// `C:/x/y.jpg`（接口入参）或 `\\?\C://x//y.jpg`（canonicalize 结果）出现，
+    /// 不归一化就会算出两个键、缓存和 ThumbHash 全都对不上。
+    fn digest(path: &Path) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(crate::core::fs::normalize_display(path).as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// 单个源文件的缓存单元目录：`<cache>/<digest[..2]>/<digest>`。
+    ///
+    /// 一级两字符扇出（同 FileBrowser）：几十万张图也不会让单目录堆到上百万项；
+    /// 删除一个源文件的缓存也只需要删掉这一个目录。
+    fn entry_dir(&self, path: &Path) -> PathBuf {
+        let digest = Self::digest(path);
+        self.cache_dir.join(&digest[..2]).join(digest)
+    }
+
+    /// ThumbHash 的库键：**只跟路径有关，不含 mtime**。
+    ///
+    /// 旧实现把 mtime 混进键里，改一次图就多一行，库随编辑次数膨胀；
+    /// 现在键稳定，值由每次成功生成覆盖（缩略图本身靠 `stamp` 判过期）。
     pub fn hash_key(path: &Path) -> String {
+        Self::digest(path)
+    }
+
+    /// 源文件的版本戳：长度 + mtime 秒。变了就说明源文件被改过，缓存作废。
+    fn stamp_of(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
-        let mut hasher = DefaultHasher::new();
-        path.to_string_lossy().hash(&mut hasher);
-        len.hash(&mut hasher);
-        mtime.hash(&mut hasher);
-        format!("{:016x}.th", hasher.finish())
+        format!("{len}:{mtime}")
+    }
+
+    fn read_stamp(dir: &Path) -> Option<String> {
+        std::fs::read_to_string(dir.join(STAMP_FILE))
+            .ok()
+            .map(|text| text.trim().to_string())
+    }
+
+    /// 取某个缓存单元里已生成好的图（stamp 必须与当前源文件一致）。
+    async fn cached(dir: &Path, stamp: &str, width: u32) -> Option<ThumbOutcome> {
+        if Self::read_stamp(dir).as_deref() != Some(stamp) {
+            return None;
+        }
+        for (codec, mime) in [("webp", "image/webp"), ("jpg", "image/jpeg")] {
+            let file = dir.join(format!("{width}-{codec}"));
+            if let Ok(bytes) = tokio::fs::read(&file).await {
+                // 触碰 mtime，参与 LRU 排序
+                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
+                return Some(ThumbOutcome::Ready(Rendered { bytes, mime }));
+            }
+        }
+        None
+    }
+
+    /// 取缓存单元里的视频首帧（同样先验 stamp）。
+    async fn cached_poster(dir: &Path, stamp: &str, width: u32) -> Option<ThumbOutcome> {
+        if Self::read_stamp(dir).as_deref() != Some(stamp) {
+            return None;
+        }
+        for format in ffmpeg::POSTER_FORMATS {
+            let file = dir.join(format!("{width}p-{}", format.extension()));
+            if let Ok(bytes) = tokio::fs::read(&file).await {
+                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
+                return Some(ThumbOutcome::Ready(Rendered {
+                    bytes,
+                    mime: format.mime(),
+                }));
+            }
+        }
+        None
+    }
+
+    /// 取该缓存单元的异步锁（同一源文件串行生成）。
+    fn key_lock(&self, key: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.locks.lock().unwrap_or_else(|err| err.into_inner());
+        map.entry(key.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn source_stamp(path: &Path) -> (u64, u64) {
@@ -197,8 +253,9 @@ impl Thumbnailer {
     /// 返回 `(结果, 新鲜 ThumbHash)`：缓存命中时第二个值为 None；
     /// 生成成功时带上 hash 由调用方入库，本模块**不再**写任何 `.th` 文件。
     ///
-    /// `webp_bin` 为可用的 FFmpeg；给了且该构建支持 libwebp 时输出 WebP（设计文档 3.4），
-    /// 否则退回内置 JPEG 编码器。缓存里同时兼容两种后缀，换构建也不会重复生成。
+    /// 缓存布局对齐 FileBrowser 的 diskcache：`<digest[..2]>/<digest>/<width>-<codec>`，
+    /// 同目录 `stamp` 记源文件的 len+mtime。**同一路径永远落在同一个目录里**，
+    /// 源文件改了就原地覆盖，不会因为 mtime 变化不断堆出新文件。
     pub async fn get(
         &self,
         path: &Path,
@@ -206,22 +263,24 @@ impl Thumbnailer {
         webp_bin: Option<&Path>,
     ) -> (ThumbOutcome, Option<FreshHash>) {
         let width = width.clamp(64, 1024);
-        let base = self.cache_dir.join(Self::cache_base(path, width));
+        let dir = self.entry_dir(path);
+        let stamp = Self::stamp_of(path);
 
-        for (ext, mime) in [("webp", "image/webp"), ("jpg", "image/jpeg")] {
-            let file = base.with_extension(ext);
-            if let Ok(bytes) = tokio::fs::read(&file).await {
-                // 触碰 mtime，参与 LRU 排序
-                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
-                return (ThumbOutcome::Ready(Rendered { bytes, mime }), None);
-            }
+        if let Some(outcome) = Self::cached(&dir, &stamp, width).await {
+            return (outcome, None);
         }
 
         // 下载中的大文件先不生成（设计文档 3.4.1）：写盘还没结束，
         // 这一秒生成的图下一秒就因 mtime 变化失效，纯属白烧 CPU。
-        // 缓存命中已在上方返回，所以「已下完的文件」不受影响。
         if is_fresh_write(path) {
             return (ThumbOutcome::Placeholder, None);
+        }
+
+        // 同一源文件串行：320 / 960 同时请求只解码一次，也不会两份 stamp 互相踩
+        let lock = self.key_lock(&dir);
+        let _serial = lock.lock().await;
+        if let Some(outcome) = Self::cached(&dir, &stamp, width).await {
+            return (outcome, None);
         }
 
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
@@ -232,7 +291,9 @@ impl Thumbnailer {
 
         let source = path.to_path_buf();
         let hash_key = Self::hash_key(&source);
+        let target_dir = dir.clone();
         let cache_dir = self.cache_dir.clone();
+        let stamp_for_task = stamp.clone();
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
         let caps = Arc::clone(&self.caps);
@@ -240,14 +301,18 @@ impl Thumbnailer {
 
         let result = tokio::task::spawn_blocking(move || {
             let (thumb, hash) = render_thumbnail(&source, width)?;
-            let (bytes, mime) = encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &base)?;
+            let (bytes, mime, codec) =
+                encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &target_dir)?;
+            if write_atomic(&target_dir.join(format!("{width}-{codec}")), &bytes).is_err() {
+                return None;
+            }
+            // stamp 最后写：中途失败最多下次重做，不会留下「有戳没图」的死缓存
+            let _ = write_atomic(&target_dir.join(STAMP_FILE), stamp_for_task.as_bytes());
             let fresh = FreshHash {
                 key: hash_key,
                 value: BASE64.encode(&hash),
             };
-            if cache_dir.exists() {
-                let _ = cleanup_cache(&cache_dir, limit, max_age);
-            }
+            let _ = cleanup_cache(&cache_dir, limit, max_age);
             Some((bytes, mime, fresh))
         })
         .await;
@@ -269,6 +334,7 @@ impl Thumbnailer {
         if !count.is_multiple_of(CLEANUP_EVERY) {
             return;
         }
+        self.prune_locks();
         let dir = self.cache_dir.clone();
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
@@ -277,30 +343,46 @@ impl Thumbnailer {
         });
     }
 
+    /// 丢掉没有请求在用的 per-key 锁，避免长期运行后 map 无限长。
+    fn prune_locks(&self) {
+        if let Ok(mut map) = self.locks.lock()
+            && map.len() > 256
+        {
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+    }
+
+    /// 删除某个源文件的全部缓存（缩略图 + 版本戳）。
+    ///
+    /// 删除 / 改名 / 移动后调用：FileBrowser 在 `delThumbs` 里做同样的事，
+    /// 否则被删掉的文件会永远留一份缓存，只能等 LRU 慢慢淘汰。
+    pub fn purge(&self, path: &Path) -> bool {
+        std::fs::remove_dir_all(self.entry_dir(path)).is_ok()
+    }
+
     /// 视频首帧封面（设计文档 3.4：影视库不联网刮削，靠外部 FFmpeg 截首帧）。
     ///
-    /// 与图片缩略图共用同一个缓存目录、信号量和 LRU 策略；没有 FFmpeg 时直接回占位图。
-    /// 输出格式优先 WebP → JPEG → PNG，按该构建实际拥有的编码器逐级降级；
-    /// 缓存查找三种后缀都试一遍，换过构建也能复用旧图。
+    /// 与图片缩略图共用缓存目录、`stamp` 判据、per-key 锁和信号量；
+    /// 输出格式优先 WebP → JPEG → PNG，按该构建实际拥有的编码器逐级降级。
     pub async fn video_poster(&self, path: &Path, bin: &Path, width: u32) -> ThumbOutcome {
         let width = width.clamp(64, 1024);
-        let base = self.cache_dir.join(Self::poster_key(path, width));
+        let dir = self.entry_dir(path);
+        let stamp = Self::stamp_of(path);
 
-        for format in ffmpeg::POSTER_FORMATS {
-            let file = base.with_extension(format.extension());
-            if let Ok(bytes) = tokio::fs::read(&file).await {
-                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
-                return ThumbOutcome::Ready(Rendered {
-                    bytes,
-                    mime: format.mime(),
-                });
-            }
+        if let Some(outcome) = Self::cached_poster(&dir, &stamp, width).await {
+            return outcome;
         }
 
         // 正在下载的影视文件：截帧要拉起 FFmpeg 进程，比解图更贵，
         // 更要等写盘结束（设计文档 3.4.1）。缓存命中已在上面返回。
         if is_fresh_write(path) {
             return ThumbOutcome::Placeholder;
+        }
+
+        let lock = self.key_lock(&dir);
+        let _serial = lock.lock().await;
+        if let Some(outcome) = Self::cached_poster(&dir, &stamp, width).await {
+            return outcome;
         }
 
         // 共享同一个信号量：截帧比解 JPEG 更吃 CPU，绝不允许并发打满
@@ -310,39 +392,40 @@ impl Thumbnailer {
         };
 
         let source = path.to_path_buf();
-        let stem = base.clone();
-        let ffmpeg_bin = bin.to_path_buf();
+        let target_dir = dir.clone();
         let cache_dir = self.cache_dir.clone();
+        let stamp_for_task = stamp.clone();
+        let ffmpeg_bin = bin.to_path_buf();
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
         let caps = Arc::clone(&self.caps);
 
         let result = tokio::task::spawn_blocking(move || {
             let supports = capabilities(&caps, &ffmpeg_bin);
+            std::fs::create_dir_all(&target_dir).ok()?;
             for format in ffmpeg::POSTER_FORMATS {
                 // 没有 libwebp 就别浪费一次进程启动
                 if format == PosterFormat::Webp && !supports.webp {
                     continue;
                 }
-                let destination = stem.with_extension(format.extension());
+                // FFmpeg 靠扩展名判封装格式：只能先写带扩展名的临时文件，成功后再改名成
+                // 无扩展名的缓存名（`960p-webp`），避免缓存文件被当成图片再次缩略。
+                let tmp = temp_path(&target_dir, format.extension());
                 // 先试 1 秒（避开片头黑帧），极短视频截不到就退回第 0 帧
-                let ok =
-                    ffmpeg::extract_poster(&ffmpeg_bin, &source, &destination, 1, width, format)
-                        || ffmpeg::extract_poster(
-                            &ffmpeg_bin,
-                            &source,
-                            &destination,
-                            0,
-                            width,
-                            format,
-                        );
+                let ok = ffmpeg::extract_poster(&ffmpeg_bin, &source, &tmp, 1, width, format)
+                    || ffmpeg::extract_poster(&ffmpeg_bin, &source, &tmp, 0, width, format);
                 if !ok {
+                    let _ = std::fs::remove_file(&tmp);
                     continue;
                 }
-                if cache_dir.exists() {
-                    let _ = cleanup_cache(&cache_dir, limit, max_age);
+                let final_path = target_dir.join(format!("{width}p-{}", format.extension()));
+                if std::fs::rename(&tmp, &final_path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    continue;
                 }
-                if let Ok(bytes) = std::fs::read(&destination) {
+                let _ = write_atomic(&target_dir.join(STAMP_FILE), stamp_for_task.as_bytes());
+                let _ = cleanup_cache(&cache_dir, limit, max_age);
+                if let Ok(bytes) = std::fs::read(&final_path) {
                     return Some((bytes, format.mime()));
                 }
             }
@@ -396,32 +479,28 @@ fn render_thumbnail(path: &Path, width: u32) -> Option<(image::RgbaImage, Vec<u8
 
 /// 编码缩略图：WebP 优先（外部 FFmpeg 的 libwebp），不可用则内置 JPEG。
 ///
-/// 成功时字节已落盘（`<base>.webp` 或 `<base>.jpg`），返回 (字节, MIME)；
-/// 全部失败返回 None，由调用方回占位图。
+/// 返回 `(字节, MIME, 缓存名后缀)`。**只编码、不写最终文件**：落盘由调用方
+/// 原子写 `<width>-<codec>`，既不会有半张图被读到，缓存文件名也不带图片扩展名。
 fn encode_thumbnail(
     thumb: &image::RgbaImage,
     webp_bin: Option<&Path>,
     caps: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>,
-    base: &Path,
-) -> Option<(Vec<u8>, &'static str)> {
+    work_dir: &Path,
+) -> Option<(Vec<u8>, &'static str, &'static str)> {
     if let Some(bin) = webp_bin
         && capabilities(caps, bin).webp
     {
-        let target = base.with_extension("webp");
-        if ffmpeg::encode_webp_rgba(
-            bin,
-            thumb.as_raw(),
-            thumb.width(),
-            thumb.height(),
-            82,
-            &target,
-        ) {
-            match std::fs::read(&target) {
-                Ok(bytes) => return Some((bytes, "image/webp")),
-                Err(_) => {
-                    let _ = std::fs::remove_file(&target);
-                }
+        // FFmpeg 靠扩展名判输出格式，只能先落到同目录临时文件再读回来
+        let _ = std::fs::create_dir_all(work_dir);
+        let tmp = temp_path(work_dir, "webp");
+        if ffmpeg::encode_webp_rgba(bin, thumb.as_raw(), thumb.width(), thumb.height(), 82, &tmp) {
+            let bytes = std::fs::read(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            if let Ok(bytes) = bytes {
+                return Some((bytes, "image/webp", "webp"));
             }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -429,11 +508,35 @@ fn encode_thumbnail(
     let mut buffer = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 82);
     encoder.encode_image(&rgb).ok()?;
-    if let Some(parent) = base.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(base.with_extension("jpg"), &buffer);
-    Some((buffer, "image/jpeg"))
+    Some((buffer, "image/jpeg", "jpg"))
+}
+
+/// 同目录唯一临时文件名。
+///
+/// `.` 开头 + `.tmp-` 前缀：列表默认隐藏，清理时也认得这个前缀，
+/// 进程被强杀留下的残片会在下次清理时被收走。
+fn temp_path(dir: &Path, ext: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|delta| delta.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(".tmp-{}-{nanos}-{seq}.{ext}", std::process::id()))
+}
+
+/// 原子写：先写同目录临时文件，再 rename 覆盖目标。
+///
+/// 直接 `write` 目标文件的话，并发读可能读到写了一半的图（客户端拿到破图）；
+/// rename 在同一文件系统上是原子的，读侧只会看到旧版或新版。
+fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = temp_path(parent, "bin");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, target).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// FFmpeg 能力探测结果缓存：同一路径只探测一次，换路径（改配置）才重探。
@@ -449,7 +552,44 @@ fn capabilities(cache: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>, bin: &Path)
     caps
 }
 
+/// 统计一个缓存单元目录里的文件数、总字节、最近一次写入时间。
+fn unit_stats(dir: &Path) -> (u64, u64, SystemTime) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut newest = UNIX_EPOCH;
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return (0, 0, newest);
+    };
+    for entry in reader.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            let (sub_files, sub_bytes, sub_newest) = unit_stats(&entry.path());
+            files += sub_files;
+            bytes += sub_bytes;
+            oldest(&mut newest, sub_newest);
+            continue;
+        }
+        files += 1;
+        bytes += meta.len();
+        oldest(&mut newest, meta.modified().unwrap_or(UNIX_EPOCH));
+    }
+    (files, bytes, newest)
+}
+
+fn oldest(current: &mut SystemTime, candidate: SystemTime) {
+    if candidate > *current {
+        *current = candidate;
+    }
+}
+
 /// 先按过期天数删，再按最久未访问淘汰，直到低于容量上限。
+///
+/// 淘汰单位是「一个源文件的缓存单元目录」（`<digest>`），不是单个文件 ——
+/// 同一张图的多个宽度必须同生共死，否则会留下永远命不中的孤儿。
+/// 旧版扁平布局（`<hash>-320.webp` / `<sha>.th`）一律直接删：新版不会在
+/// 顶层放文件，留着只会占空间。
 ///
 /// `max_age_secs == 0` 表示不做过期淘汰（仅测试用）。
 pub fn cleanup_cache(dir: &Path, limit: u64, max_age_secs: u64) -> std::io::Result<u64> {
@@ -458,59 +598,77 @@ pub fn cleanup_cache(dir: &Path, limit: u64, max_age_secs: u64) -> std::io::Resu
     if !dir.exists() {
         return Ok(0);
     }
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let now = SystemTime::now();
+    let mut units: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
     let mut total: u64 = 0;
     let mut removed: u64 = 0;
-    let now = SystemTime::now();
 
-    for entry in std::fs::read_dir(dir)? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
+    for bucket in std::fs::read_dir(dir)? {
+        let Ok(bucket) = bucket else {
+            continue;
         };
-        let path = entry.path();
-        if !path.is_file() {
+        let bucket_path = bucket.path();
+        let Ok(meta) = bucket.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            // 旧版扁平布局 / 残留临时文件：升级即清
+            if std::fs::remove_file(&bucket_path).is_ok() {
+                removed += meta.len();
+            }
             continue;
         }
-        let meta = match entry.metadata() {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-
-        // 过期淘汰：长期没人看过的缩略图直接删（删失败则留待 LRU 再试一次）
-        if max_age_secs > 0
-            && let Ok(age) = now.duration_since(modified)
-            && age >= Duration::from_secs(max_age_secs)
-            && std::fs::remove_file(&path).is_ok()
-        {
-            removed += meta.len();
+        let Ok(children) = std::fs::read_dir(&bucket_path) else {
             continue;
+        };
+        for child in children.flatten() {
+            let unit_path = child.path();
+            let Ok(unit_meta) = child.metadata() else {
+                continue;
+            };
+            if unit_meta.is_file() {
+                let _ = std::fs::remove_file(&unit_path);
+                continue;
+            }
+            let (_, bytes, newest) = unit_stats(&unit_path);
+            let expired = max_age_secs > 0
+                && now
+                    .duration_since(newest)
+                    .map(|age| age >= Duration::from_secs(max_age_secs))
+                    .unwrap_or(false);
+            if expired && std::fs::remove_dir_all(&unit_path).is_ok() {
+                removed += bytes;
+                continue;
+            }
+            total += bytes;
+            units.push((unit_path, bytes, newest));
         }
-
-        total += meta.len();
-        let accessed = meta.accessed().unwrap_or(modified);
-        files.push((path, meta.len(), accessed));
     }
 
     if total <= limit {
         return Ok(removed);
     }
 
-    // 最久未访问的排前面
-    files.sort_by_key(|(_, _, accessed)| *accessed);
-
-    for (path, size, _) in files {
+    // 最久没被访问的排前面
+    units.sort_by_key(|(_, _, newest)| *newest);
+    for (path, bytes, _) in units {
         if total <= limit {
             break;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(size);
-            removed += size;
+        if std::fs::remove_dir_all(&path).is_ok() {
+            total = total.saturating_sub(bytes);
+            removed += bytes;
         }
     }
 
     Ok(removed)
+}
+
+/// 缓存目录的实际占用（文件数, 字节）：设置页展示用，必须递归统计
+/// （新版是两级扇出目录，只数顶层会永远显示 0）。
+pub fn cache_usage(dir: &Path) -> (usize, u64) {
+    let (files, bytes, _) = unit_stats(dir);
+    (files as usize, bytes)
 }
 
 /// 清空缓存目录，返回 (删除文件数, 释放字节数)。
@@ -518,22 +676,10 @@ pub fn clear_cache(dir: &Path) -> std::io::Result<(usize, u64)> {
     if !dir.exists() {
         return Ok((0, 0));
     }
-    let mut count = 0;
-    let mut freed = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata()
-            && std::fs::remove_file(&path).is_ok()
-        {
-            count += 1;
-            freed += meta.len();
-        }
-    }
-    Ok((count, freed))
+    let (files, bytes, _) = unit_stats(dir);
+    std::fs::remove_dir_all(dir)?;
+    std::fs::create_dir_all(dir)?;
+    Ok((files as usize, bytes))
 }
 
 #[cfg(test)]
@@ -561,24 +707,58 @@ mod tests {
         );
     }
 
+    /// 收集目录下的所有文件（递归）。
+    fn collect_files(dir: &Path) -> Vec<PathBuf> {
+        let Ok(reader) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        for entry in reader.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(collect_files(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// 缓存键只由源路径决定：同一文件永远落在同一个单元目录里。
+    /// 旧实现把 mtime 混进文件名，改一次图就多一个文件 —— 「越用越多」的根源。
     #[test]
-    fn cache_base_changes_with_width_and_path() {
-        let dir = scratch_dir("thumb-key");
+    fn entry_dir_is_stable_per_path_and_fanned_out() {
+        let dir = scratch_dir("thumb-entry");
         let file = dir.join("a.jpg");
         fs::write(&file, b"x").unwrap();
 
-        let a = Thumbnailer::cache_base(&file, 320);
-        let b = Thumbnailer::cache_base(&file, 640);
-        assert_ne!(a, b);
-        assert_eq!(a, Thumbnailer::cache_base(&file, 320));
-        // 基名不带扩展名：WebP / JPEG 两种缓存靠 with_extension 派生
-        assert!(!a.contains('.'), "基名不应含扩展名：{a}");
-        assert!(
-            Path::new(&a)
-                .with_extension("webp")
-                .ends_with(format!("{a}.webp"))
+        let cache = scratch_dir("thumb-entry-cache");
+        let thumbnails = Thumbnailer::new(cache.clone());
+        let first = thumbnails.entry_dir(&file);
+        // 改了内容（长度 / mtime 变化）之后仍是同一个目录：覆盖写，不新增
+        fs::write(&file, b"xxxx").unwrap();
+        assert_eq!(first, thumbnails.entry_dir(&file));
+
+        let unit = first.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(unit.len(), 40, "sha1 十六进制应为 40 字符：{unit}");
+        assert!(unit.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        // 一级两字符扇出，避免单目录堆到上百万项
+        let bucket = first.parent().unwrap();
+        assert_eq!(bucket.parent().unwrap(), cache);
+        assert_eq!(bucket.file_name().unwrap().to_string_lossy(), &unit[..2]);
+
+        // 缓存名不带图片扩展名：媒体扫描 / 列表都不会把它当图片
+        let name = first.join("320-webp");
+        let text = name.to_string_lossy().to_string();
+        assert_eq!(
+            crate::core::fs::extension_of_name(&text),
+            "",
+            "缓存文件名不能带扩展名：{text}"
         );
+
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&cache);
     }
 
     /// 带透明通道的 PNG 也要能落到 JPEG（JPEG 无 alpha，必须先降为 RGB）
@@ -597,11 +777,17 @@ mod tests {
         assert!(!hash.is_empty(), "ThumbHash 不能为空");
 
         let caps = Arc::new(Mutex::new(None));
-        let base = dir.join("out");
-        let (bytes, mime) = encode_thumbnail(&thumb, None, &caps, &base).unwrap();
+        let work = dir.join("work");
+        let (bytes, mime, codec) = encode_thumbnail(&thumb, None, &caps, &work).unwrap();
         assert_eq!(mime, "image/jpeg");
+        assert_eq!(codec, "jpg");
         assert_eq!(&bytes[..2], &[0xff, 0xd8], "应输出 JPEG 魔数");
-        assert!(base.with_extension("jpg").is_file());
+        // 只编码不落盘：最终文件由调用方原子写，临时文件也必须清干净
+        assert!(
+            collect_files(&work).is_empty(),
+            "编码阶段不应留下任何文件：{:?}",
+            collect_files(&work)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -633,55 +819,171 @@ mod tests {
             "hash 必须是合法 Base64"
         );
 
-        // 缓存目录里只允许有缩略图本体，不允许任何 .th 旁路文件
-        let entries: Vec<_> = std::fs::read_dir(&cache)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        assert!(!entries.is_empty(), "缩略图本体应已落盘");
-        assert!(
-            entries.iter().all(|name| !name.ends_with(".th")),
-            "不应出现 .th 旁路文件：{entries:?}"
-        );
+        // 缓存里只允许「扇出目录 / 单元目录 / 无扩展名文件」。
+        // 任何带 `.jpg` / `.webp` 的文件都会让它自己被再缩略图一遍 —— 指数增殖的根源。
+        let files = collect_files(&cache);
+        assert!(!files.is_empty(), "缩略图本体应已落盘");
+        for file in &files {
+            let name = file.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                name == STAMP_FILE || !name.contains('.'),
+                "缓存文件名不能带扩展名：{name}"
+            );
+            assert!(!name.ends_with(".th"), "不应出现 .th 旁路文件：{name}");
+        }
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&cache);
     }
 
-    #[test]
-    fn cleanup_drops_oldest_until_under_limit() {
-        let dir = scratch_dir("thumb-cleanup");
-        for i in 0..10 {
-            fs::write(dir.join(format!("f{i}.jpg")), vec![0u8; 1024]).unwrap();
+    /// 在缓存里放一个「单元目录」：`<cache>/<xx>/<40 位 digest>/<文件…>`
+    fn put_unit(cache: &Path, tag: &str, files: &[(&str, usize)]) -> PathBuf {
+        let digest = format!("{tag:0>40}");
+        let unit = cache.join(&digest[..2]).join(&digest);
+        fs::create_dir_all(&unit).unwrap();
+        for (name, len) in files {
+            fs::write(unit.join(name), vec![0u8; *len]).unwrap();
         }
-        // 10 KiB 总量，限制到 5 KiB → 至少删一半（不启用过期淘汰）
-        let removed = cleanup_cache(&dir, 5 * 1024, 0).unwrap();
-        assert!(removed >= 4 * 1024, "应淘汰足够文件，实际 {removed}");
-        let _ = fs::remove_dir_all(&dir);
+        unit
+    }
+
+    fn backdate(dir: &Path, age: Duration) {
+        let when = SystemTime::now() - age;
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let handle = fs::File::options().write(true).open(entry.path()).unwrap();
+            handle
+                .set_times(fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
     }
 
     #[test]
-    fn cleanup_drops_expired_entries() {
-        let dir = scratch_dir("thumb-expire");
-        fs::write(dir.join("old.jpg"), vec![0u8; 2048]).unwrap();
-        // 过期阈值 1 秒 + 等 1.1 秒，把刚写的文件判为过期
-        std::thread::sleep(Duration::from_millis(1100));
-        let removed = cleanup_cache(&dir, 10 * 1024 * 1024, 1).unwrap();
+    fn cleanup_evicts_whole_units_oldest_first() {
+        let cache = scratch_dir("thumb-cleanup");
+        let a = put_unit(&cache, "aa1", &[("320-jpg", 512), (STAMP_FILE, 8)]);
+        let b = put_unit(&cache, "bb2", &[("320-jpg", 512)]);
+        let c = put_unit(&cache, "cc3", &[("320-jpg", 512)]);
+        backdate(&a, Duration::from_secs(3 * 3600));
+        backdate(&b, Duration::from_secs(2 * 3600));
+
+        // 3 个单元约 1.5 KiB，限制 1 KiB → 先淘汰 a（剩 1 KiB 刚好达标）
+        let removed = cleanup_cache(&cache, 1024, 0).unwrap();
+        assert!(removed >= 520, "应按单元淘汰，实际 {removed}");
+        assert!(!a.exists(), "最旧的单元要先删");
+        assert!(b.exists() && c.exists(), "没超限的单元不能动");
+
+        // 再收紧到 512 字节：连 b 一起淘汰，只留最新的 c（整单元删，不拆单文件）
+        let removed_more = cleanup_cache(&cache, 512, 0).unwrap();
+        assert!(
+            removed_more >= 512,
+            "继续收紧要再淘汰一个单元，实际 {removed_more}"
+        );
+        assert!(!b.exists(), "次旧的单元跟着删");
+        assert!(c.exists(), "最新的单元必须留着");
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn cleanup_drops_expired_unit() {
+        let cache = scratch_dir("thumb-expire");
+        let unit = put_unit(&cache, "dd4", &[("320-jpg", 2048)]);
+        backdate(&unit, Duration::from_secs(3600));
+        // 过期阈值 1 秒：一小时前的单元整目录删除
+        let removed = cleanup_cache(&cache, 10 * 1024 * 1024, 1).unwrap();
         assert_eq!(removed, 2048);
-        assert!(!dir.join("old.jpg").exists());
-        let _ = fs::remove_dir_all(&dir);
+        assert!(!unit.exists());
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn cleanup_purges_legacy_flat_layout() {
+        // 旧版把 `<hash>-320.webp` 直接摊在顶层：升级后必须一次清掉，
+        // 否则这些带图片扩展名的文件会永远占地方，也还有被当图片的风险
+        let cache = scratch_dir("thumb-legacy");
+        fs::write(cache.join("0123456789abcdef-320.webp"), vec![0u8; 256]).unwrap();
+        let removed = cleanup_cache(&cache, 10 * 1024, 0).unwrap();
+        assert_eq!(removed, 256);
+        assert!(collect_files(&cache).is_empty());
+        let _ = fs::remove_dir_all(&cache);
     }
 
     #[test]
     fn clear_cache_removes_everything() {
-        let dir = scratch_dir("thumb-clear");
-        for i in 0..3 {
-            fs::write(dir.join(format!("c{i}.jpg")), vec![0u8; 100]).unwrap();
+        let cache = scratch_dir("thumb-clear");
+        put_unit(&cache, "ee5", &[("320-jpg", 100)]);
+        put_unit(&cache, "ff6", &[("960-webp", 100)]);
+        let (count, freed) = clear_cache(&cache).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(freed, 200);
+        assert!(collect_files(&cache).is_empty());
+        assert!(cache.exists(), "清空后目录要留着，下次直接写");
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 回归（指数增殖）：同一张图反复请求（含多个宽度）后，
+    /// 缓存文件数必须只随「宽度种类」增长，绝不随请求次数增长。
+    #[test]
+    fn repeated_requests_do_not_grow_cache() {
+        let dir = scratch_dir("thumb-repeat");
+        let source = dir.join("a.png");
+        let mut image = image::RgbaImage::new(40, 30);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([10, 20, 200, 255]);
         }
-        let (count, freed) = clear_cache(&dir).unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(freed, 300);
+        image.save(&source).unwrap();
+
+        let cache = scratch_dir("thumb-repeat-cache");
+        let thumbnails = Thumbnailer::new(cache.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for _ in 0..3 {
+            let (outcome, _) = rt.block_on(thumbnails.get(&source, 64, None));
+            assert!(matches!(outcome, ThumbOutcome::Ready(_)));
+        }
+        let after_first = collect_files(&cache).len();
+        assert_eq!(after_first, 2, "一个宽度 = 图 + stamp：{after_first}");
+
+        // 换宽度：只多一个文件（同一单元目录内）
+        let (wide, _) = rt.block_on(thumbnails.get(&source, 96, None));
+        assert!(matches!(wide, ThumbOutcome::Ready(_)));
+        assert_eq!(collect_files(&cache).len(), after_first + 1);
+
+        // 再取一遍：全部命中，一个文件都不新增
+        for _ in 0..3 {
+            let _ = rt.block_on(thumbnails.get(&source, 64, None));
+            let _ = rt.block_on(thumbnails.get(&source, 96, None));
+        }
+        assert_eq!(
+            collect_files(&cache).len(),
+            after_first + 1,
+            "命中缓存不能再落任何文件"
+        );
+
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 删除源文件后，它的缓存单元必须能整目录清掉（只影响它自己）。
+    #[test]
+    fn purge_removes_only_that_source() {
+        let cache = scratch_dir("thumb-purge");
+        let thumbnails = Thumbnailer::new(cache.clone());
+        let keep = PathBuf::from("C:/photos/keep.jpg");
+        let gone = PathBuf::from("C:/photos/gone.jpg");
+        let keep_unit = thumbnails.entry_dir(&keep);
+        let gone_unit = thumbnails.entry_dir(&gone);
+        fs::create_dir_all(&keep_unit).unwrap();
+        fs::create_dir_all(&gone_unit).unwrap();
+        fs::write(gone_unit.join("320-jpg"), b"x").unwrap();
+
+        assert!(thumbnails.purge(&gone));
+        assert!(!gone_unit.exists());
+        assert!(keep_unit.exists(), "不能误删其它图片的缓存");
+        assert_eq!(Thumbnailer::hash_key(&keep), Thumbnailer::hash_key(&keep));
+
+        let _ = fs::remove_dir_all(&cache);
     }
 
     #[test]

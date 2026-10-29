@@ -297,6 +297,11 @@ pub fn resolve_existing(mount: &MountEntry, raw: &str) -> Result<PathBuf, FsErro
     let candidate = absolute(mount, raw)?;
     let canon = std::fs::canonicalize(&candidate)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
+    if crate::core::reserved::is_reserved(&canon) {
+        return Err(FsError::Forbidden(
+            "该路径属于应用数据目录，不对外开放".to_string(),
+        ));
+    }
     if canon.starts_with(root) {
         return Ok(canon);
     }
@@ -327,6 +332,11 @@ pub fn resolve_existing_nofollow(mount: &MountEntry, raw: &str) -> Result<PathBu
     };
     let parent_canon = std::fs::canonicalize(parent)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
+    if crate::core::reserved::is_reserved(&parent_canon) {
+        return Err(FsError::Forbidden(
+            "该路径属于应用数据目录，不对外开放".to_string(),
+        ));
+    }
     if !parent_canon.starts_with(root) {
         // 父目录经软链接逃出挂载点：配置允许时继续按**链接前缀**寻址
         // （最后一段仍不跟随，删除/重命名作用于链接路径本身指向的条目）。
@@ -353,6 +363,11 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
     let parent_raw = absolute(mount, parent)?;
     let parent_canon = std::fs::canonicalize(&parent_raw)
         .map_err(|_| FsError::NotFound(format!("目录不存在：{parent}")))?;
+    if crate::core::reserved::is_reserved(&parent_canon) {
+        return Err(FsError::Forbidden(
+            "该目录属于应用数据目录，不对外开放".to_string(),
+        ));
+    }
     if !parent_canon.starts_with(root) {
         if mount.info.follow_symlinks
             && escaped_via_symlink_in(&parent_raw, root)

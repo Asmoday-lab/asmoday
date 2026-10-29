@@ -726,6 +726,10 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
         if !name.to_lowercase().contains(&keyword) {
             continue;
         }
+        // 应用数据目录不参与搜索（缩略图缓存里有成千上万个条目，搜出来也没意义）
+        if crate::core::reserved::is_reserved_lexical(&entry.path()) {
+            continue;
+        }
         if items.len() >= LIMIT {
             truncated = true;
             break;

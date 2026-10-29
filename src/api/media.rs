@@ -282,12 +282,9 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
     let depth = query.depth.unwrap_or(DEFAULT_DEPTH).clamp(0, 4);
 
     let scan_root = root.clone();
-    let thumbnails = Arc::clone(&state.thumbnails);
     let auth_store = Arc::clone(&state.auth);
-    let outcome = tokio::task::spawn_blocking(move || {
-        scan(&scan_root, &wanted, depth, &thumbnails, &auth_store)
-    })
-    .await;
+    let outcome =
+        tokio::task::spawn_blocking(move || scan(&scan_root, &wanted, depth, &auth_store)).await;
 
     match outcome {
         Ok((items, scanned, truncated)) => Json(BrowseResult {
@@ -384,7 +381,6 @@ fn scan(
     root: &Path,
     wanted: &[&str],
     depth: usize,
-    thumbnails: &crate::core::thumbnail::Thumbnailer,
     auth: &crate::core::auth::AuthStore,
 ) -> (Vec<MediaItem>, usize, bool) {
     let mut out = Vec::new();
@@ -419,9 +415,12 @@ fn scan(
             }
 
             if file_type.is_dir() {
+                // 应用数据目录（缩略图缓存就在里面）绝不进媒体库：
+                // 缓存里的图会被再缩略图一遍，产物写回同一目录，越扫越多。
                 if level < depth
                     && !name.starts_with('.')
                     && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
+                    && !crate::core::reserved::is_reserved_lexical(&path)
                 {
                     queue.push((path, level + 1));
                 }
@@ -480,37 +479,21 @@ fn scan(
         }
     }
 
-    // 批量取 ThumbHash：一次连接逐键查 SQLite；库未命中的话顺手把存量 .th
-    // 旁路文件搬进库（v2.8.2 升级路径），搬完即删，老部署零手工迁移。
+    // 批量取 ThumbHash：一次连接逐键查 SQLite（v2.8.2 起只存库，不落旁路文件）
     if !hash_candidates.is_empty() {
         let keys: Vec<String> = hash_candidates
             .iter()
             .map(|(_, path)| crate::core::thumbnail::Thumbnailer::hash_key(path))
             .collect();
-        let mut hits = auth.thumb_hashes_get_many(&keys);
-        let mut migrated: Vec<(String, String)> = Vec::new();
+        let hits = auth.thumb_hashes_get_many(&keys);
         for ((index, _), key) in hash_candidates.iter().zip(keys.iter()) {
-            let mut value = hits.remove(key);
-            if value.is_none() {
-                // 键名本身就是旁路文件名（`<hash>.th`）
-                let sidecar = thumbnails.cache_dir().join(key);
-                if let Ok(raw) = std::fs::read_to_string(&sidecar) {
-                    let trimmed = raw.trim();
-                    if !trimmed.is_empty() {
-                        value = Some(trimmed.to_string());
-                        migrated.push((key.clone(), trimmed.to_string()));
-                        let _ = std::fs::remove_file(&sidecar);
-                    }
-                }
-            }
-            if let Some(hash) = value
+            if let Some(hash) = hits.get(key)
                 && let Some(item) = out.get_mut(*index)
             {
                 item.hash = Some(hash.clone());
-                item.color = average_color(&hash);
+                item.color = average_color(hash);
             }
         }
-        auth.thumb_hashes_set_many(&migrated);
     }
 
     // 新的在前
@@ -567,9 +550,11 @@ fn scan_albums(
             }
 
             if file_type.is_dir() {
+                // 同上：数据目录不是相册
                 if level < depth
                     && !name.starts_with('.')
                     && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
+                    && !crate::core::reserved::is_reserved_lexical(&entry.path())
                 {
                     stack.push((entry.path(), level + 1, false));
                 }
@@ -805,23 +790,11 @@ pub async fn favorites(State(state): State<AppState>) -> Response {
 /// GET /api/media/cache：缓存占用与当前策略
 pub async fn cache_stats(State(state): State<AppState>) -> Response {
     let dir = state.thumbnails.cache_dir().to_path_buf();
-    let (files, bytes) = tokio::task::spawn_blocking(move || {
-        let mut files = 0usize;
-        let mut bytes = 0u64;
-        if let Ok(reader) = std::fs::read_dir(&dir) {
-            for entry in reader.flatten() {
-                if let Ok(meta) = entry.metadata()
-                    && meta.is_file()
-                {
-                    files += 1;
-                    bytes += meta.len();
-                }
-            }
-        }
-        (files, bytes)
-    })
-    .await
-    .unwrap_or((0, 0));
+    // 新版缓存是 `<sha1[..2]>/<sha1>/<width>-<codec>`，必须递归统计
+    let (files, bytes) =
+        tokio::task::spawn_blocking(move || crate::core::thumbnail::cache_usage(&dir))
+            .await
+            .unwrap_or((0, 0));
 
     let config = state.config.read().await;
     Json(json!({

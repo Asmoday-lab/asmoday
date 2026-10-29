@@ -247,6 +247,11 @@ async fn rename_inner(state: &AppState, body: RenameBody) -> Result<Value, FsErr
     {
         crate::log_error!("failed to sync metadata after rename: {err}");
     }
+    // 旧路径的缩略图缓存按路径寻址，改名后必然命中不了：直接清掉，
+    // 新路径首次预览时重生成（FileBrowser 在 rename 后同样销毁缓存）
+    if old_display != new_display {
+        purge_thumb_cache(state, &old_display);
+    }
 
     Ok(json!({
         "ok": true,
@@ -460,6 +465,8 @@ async fn transfer_inner(
     // ---- 元数据联动（仅移动）----
     if is_move {
         for item in results.iter().filter(|item| item.ok) {
+            // 源路径变了：旧路径的缩略图缓存再也命中不了，直接清掉
+            purge_thumb_cache(state, &item.path);
             let Some(new_path) = item.new_path.clone() else {
                 continue;
             };
@@ -485,6 +492,17 @@ async fn transfer_inner(
         "results": all,
         "summary": summary,
     }))
+}
+
+/// 清掉某个路径（display 写法）的缩略图缓存与 ThumbHash 行。
+///
+/// 缓存键 = `normalize_display(path)` 的 sha1，所以传列表里的展示路径即可，
+/// 不需要先 canonicalize（删除后源文件已不存在，也 canonicalize 不了）。
+fn purge_thumb_cache(state: &AppState, display_path: &str) {
+    let path = Path::new(display_path);
+    state.thumbnails.purge(path);
+    let key = crate::core::thumbnail::Thumbnailer::hash_key(path);
+    state.auth.thumb_hashes_forget(&[key]);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +686,9 @@ async fn delete_inner(state: &AppState, body: DeleteBody) -> Result<Value, FsErr
 
     let now = now_secs();
     for item in results.iter().filter(|item| item.ok) {
+        // 缩略图缓存与色值跟着源文件一起清（FileBrowser 的 delThumbs 同语义），
+        // 否则被删的图会永远留一份缓存，只能等 LRU 慢慢淘汰。
+        purge_thumb_cache(state, &item.path);
         if let Err(err) = state.auth.forget_meta_paths(&item.path, now) {
             crate::log_error!("failed to purge metadata after delete: {err}");
         }

@@ -172,10 +172,12 @@ pub fn resolve_existing(
     let candidate = parse_candidate(raw)?;
     let canon = std::fs::canonicalize(&candidate)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
+    ensure_not_reserved(&canon)?;
     if ensure_within(&canon, allowed).is_ok() {
         return Ok(canon);
     }
     if follow_symlinks && crate::core::path_guard::escaped_via_symlink(&candidate, allowed) {
+        ensure_not_reserved(&candidate)?;
         return Ok(candidate);
     }
     Err(FsError::Forbidden("该路径不在已授权的挂载点内".to_string()))
@@ -201,6 +203,20 @@ fn parse_candidate(raw: &str) -> Result<PathBuf, FsError> {
     }
 
     Ok(path.to_path_buf())
+}
+
+/// 应用数据目录（SQLite / 日志 / 缩略图缓存）不对任何接口开放。
+///
+/// 默认数据目录 `<cwd>/data` 通常就在挂载点里，缩略图缓存一旦可浏览、
+/// 可缩略，就会自己给自己生成缓存而无限增殖（FileBrowser 把缓存放在
+/// 可浏览根之外，我们靠这道闸达到同样效果）。
+fn ensure_not_reserved(path: &Path) -> Result<(), FsError> {
+    if crate::core::reserved::is_reserved(path) {
+        return Err(FsError::Forbidden(
+            "该路径属于应用数据目录，不对外开放".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// 第二道闸：真实路径必须落在允许根之内。
@@ -446,6 +462,12 @@ pub async fn list_dir(
         // 跨平台系统垃圾（desktop.ini / Thumbs.db / .DS_Store / ._* / ~$*）
         // 优先级高于 show_hidden：开关打开也不返回（设计文档 3.3.7）
         if crate::core::junk::is_system_junk(&name) {
+            continue;
+        }
+        // 应用数据目录（SQLite / 日志 / 缩略图缓存）永不出现在列表里。
+        // 缩略图缓存若被当普通图片列出来，浏览器会把缓存再缩略图一遍 ——
+        // 产物写回同一目录，下一轮又成了新的「图片」，大小按倍数膨胀。
+        if crate::core::reserved::is_reserved_lexical(&dir.join(&name)) {
             continue;
         }
         // 设计文档 3.2：默认隐藏以 `.` 开头的系统项（.git / .env …），

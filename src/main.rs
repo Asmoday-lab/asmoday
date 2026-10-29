@@ -216,6 +216,12 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
 
+    // 应用数据目录（SQLite / 日志 / 缩略图缓存）登记为「保留目录」：
+    // 列表里不出现，接口一律 403。默认挂载点是 cwd、默认数据目录是 cwd/data，
+    // 两者天生重叠 —— 不拦的话缩略图缓存会作为普通图片被再次缩略图，
+    // 产物写回同一目录，下一轮又成新图片，按宽度倍数指数增殖。
+    core::reserved::register(&data_dir);
+
     // `--backup PATH`：热备份后直接退出（设计文档 4.1）。
     // 刻意放在单实例锁**之前** —— 备份是只读操作，服务正在跑的时候也要能备份，
     // 否则「先停服再备份」意味着一次意外停机窗口。VACUUM INTO 走独立连接，
@@ -357,6 +363,17 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     crate::log_info!("config file: {}", config_path.display());
     crate::log_info!("data directory: {}", data_dir.display());
+    // 显式把数据目录（或它的子目录）挂出来时，该挂载点会整体不可见 —— 明确告知，
+    // 免得用户以为「挂载点掉了」。数据目录永远不对外，这是安全红线。
+    for mount in &state.config.read().await.system.mounts {
+        if core::reserved::is_reserved(std::path::Path::new(&mount.path)) {
+            crate::log_warn!(
+                "mount '{}' ({}) is inside the application data directory and will be hidden",
+                mount.name,
+                mount.path
+            );
+        }
+    }
     if addr.ip().is_unspecified() {
         let stack = if addr.is_ipv6() {
             " (dual stack: IPv4 + IPv6)"

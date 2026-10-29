@@ -10,6 +10,7 @@
 //! 创建 `.DS_Store`；只拒绝写而不过滤，历史遗留的垃圾会一直出现在列表里。
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use bytes::{Buf, Bytes};
 use dav_server::davpath::DavPath;
@@ -19,28 +20,42 @@ use dav_server::fs::{
 };
 use futures_util::StreamExt;
 
-use crate::core::{junk, path_guard};
+use crate::core::{junk, path_guard, reserved};
+
+/// 只按最后一段名字判定（临时文件 / 系统垃圾）。
+fn hidden_by_name(path: &DavPath) -> bool {
+    path.file_name().is_some_and(is_hidden)
+}
 
 /// 客户端不该看见、也不该写入的名字。
 fn is_hidden(name: &str) -> bool {
     name.is_empty() || path_guard::is_part_file(name) || junk::is_system_junk(name)
 }
 
-fn denied(path: &DavPath) -> bool {
-    path.file_name().is_some_and(is_hidden)
-}
-
 /// 把任意 `DavFileSystem` 包成「隐藏临时文件与系统垃圾」的版本。
 #[derive(Clone)]
 pub struct CleanFs {
     inner: std::sync::Arc<dyn DavFileSystem + Send + Sync>,
+    /// 该 handler 对应的挂载点根：用来把 DavPath 还原成绝对路径，
+    /// 判断是否落在应用数据目录里（缩略图缓存就在其中）。
+    root: PathBuf,
 }
 
 impl CleanFs {
-    pub fn new(inner: Box<dyn DavFileSystem + Send + Sync>) -> Box<Self> {
+    pub fn new(inner: Box<dyn DavFileSystem + Send + Sync>, root: &Path) -> Box<Self> {
         Box::new(Self {
             inner: std::sync::Arc::from(inner),
+            root: root.to_path_buf(),
         })
+    }
+
+    /// 该 DavPath 是否指向应用数据目录（或其中任何位置）。
+    fn is_reserved(&self, path: &DavPath) -> bool {
+        reserved::is_reserved_lexical(&self.root.join(path.as_rel_ospath()))
+    }
+
+    fn denied(&self, path: &DavPath) -> bool {
+        hidden_by_name(path) || self.is_reserved(path)
     }
 }
 
@@ -57,7 +72,7 @@ impl DavFileSystem for CleanFs {
         options: OpenOptions,
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
-            if denied(path) {
+            if self.denied(path) {
                 // 读：当作不存在；写：直接拒绝（客户端会看到 403，而不是「写成功但看不见」）
                 return Err(if options.write {
                     FsError::Forbidden
@@ -77,9 +92,16 @@ impl DavFileSystem for CleanFs {
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
             let stream = self.inner.read_dir(path, meta).await?;
-            let filtered = stream.filter(|entry| {
+            let base = self.root.join(path.as_rel_ospath());
+            let filtered = stream.filter(move |entry| {
                 let keep = match entry {
-                    Ok(entry) => !is_hidden(&String::from_utf8_lossy(&entry.name())),
+                    Ok(entry) => {
+                        let name = String::from_utf8_lossy(&entry.name()).to_string();
+                        // 名字过滤 + 保留目录过滤：
+                        // 应用数据目录对 WebDAV 客户端也必须是「不存在」，
+                        // 否则客户端会去同步一个永远 403 的目录。
+                        !is_hidden(&name) && !reserved::is_reserved_lexical(&base.join(&name))
+                    }
                     // 出错项原样放行，交给上层决定怎么回（通常直接跳过）
                     Err(_) => true,
                 };
@@ -91,7 +113,7 @@ impl DavFileSystem for CleanFs {
 
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
-            if denied(path) {
+            if self.denied(path) {
                 return Err(FsError::NotFound);
             }
             self.inner.metadata(path).await
@@ -100,7 +122,7 @@ impl DavFileSystem for CleanFs {
 
     fn symlink_metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
-            if denied(path) {
+            if self.denied(path) {
                 return Err(FsError::NotFound);
             }
             self.inner.symlink_metadata(path).await
@@ -109,7 +131,7 @@ impl DavFileSystem for CleanFs {
 
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if denied(path) {
+            if self.denied(path) {
                 return Err(FsError::Forbidden);
             }
             // Windows 上对已存在的目录调 `create_dir` 得到的是 Win32 错误码 183
@@ -133,7 +155,7 @@ impl DavFileSystem for CleanFs {
 
     fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if denied(to) {
+            if self.denied(to) {
                 return Err(FsError::Forbidden);
             }
             self.inner.rename(from, to).await
@@ -142,7 +164,7 @@ impl DavFileSystem for CleanFs {
 
     fn copy<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if denied(to) {
+            if self.denied(to) {
                 return Err(FsError::Forbidden);
             }
             self.inner.copy(from, to).await
@@ -260,11 +282,41 @@ mod tests {
     #[test]
     fn denied_uses_last_segment() {
         let path = DavPath::new("/docs/.DS_Store").unwrap();
-        assert!(denied(&path));
+        assert!(hidden_by_name(&path));
         let ok = DavPath::new("/docs/a.txt").unwrap();
-        assert!(!denied(&ok));
+        assert!(!hidden_by_name(&ok));
         // 目录请求的 file_name 可能是空，不能被误判成「隐藏」
         let root = DavPath::new("/").unwrap();
-        assert!(!denied(&root));
+        assert!(!hidden_by_name(&root));
+    }
+
+    /// 应用数据目录对 WebDAV 也必须「不存在」：
+    /// 不拦的话客户端会去同步一个永远 403 的目录，缩略图缓存也会被当成普通图片。
+    #[test]
+    fn reserved_dir_is_denied_for_dav() {
+        use dav_server::localfs::LocalFs;
+
+        let base = std::env::temp_dir().join(format!(
+            "asmoday-dav-reserved-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(base.join("data").join("thumbnails")).unwrap();
+        std::fs::create_dir_all(base.join("photos")).unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        crate::core::reserved::register(&root.join("data"));
+
+        let fs = CleanFs::new(
+            LocalFs::new(&root, true, cfg!(windows), cfg!(target_os = "macos")),
+            &root,
+        );
+        assert!(fs.is_reserved(&DavPath::new("/data/thumbnails/a.webp").unwrap()));
+        assert!(fs.is_reserved(&DavPath::new("/data").unwrap()));
+        assert!(!fs.is_reserved(&DavPath::new("/photos/a.jpg").unwrap()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -242,14 +242,17 @@ impl DavCache {
 }
 
 fn build_handler(root: &Path, strip_prefix: &str, readonly: bool) -> DavHandler {
-    let fs = CleanFs::new(LocalFs::new(
+    let fs = CleanFs::new(
+        LocalFs::new(
+            root,
+            // public=true：新建文件 0644 / 目录 0755。媒体库常被其它进程（转码、相册）
+            // 读取，0600 会让它们全部 permission denied。
+            true,
+            cfg!(windows),
+            cfg!(target_os = "macos"),
+        ),
         root,
-        // public=true：新建文件 0644 / 目录 0755。媒体库常被其它进程（转码、相册）
-        // 读取，0600 会让它们全部 permission denied。
-        true,
-        cfg!(windows),
-        cfg!(target_os = "macos"),
-    ));
+    );
     DavHandler::builder()
         .filesystem(fs)
         .locksystem(MemLs::new())
@@ -331,6 +334,8 @@ fn guard_path(mount: &path_guard::MountEntry, rest: &str, writing: bool) -> Resu
             dav_error(StatusCode::FORBIDDEN, "禁止路径穿越")
         }
         crate::core::fs::FsError::Readonly(_) => dav_error(StatusCode::FORBIDDEN, "挂载点为只读"),
+        // 应用数据目录（SQLite / 缩略图缓存）：对客户端一律 403
+        crate::core::fs::FsError::Forbidden(message) => dav_error(StatusCode::FORBIDDEN, &message),
         other => dav_error(StatusCode::BAD_REQUEST, &other.message()),
     })
 }

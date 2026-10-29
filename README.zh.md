@@ -148,6 +148,8 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 <details>
 <summary><b>点击展开查看历史更新日志</b></summary>
 
+- **v4.2.3 (缩略图缓存重构，修指数增殖)**：`data/thumbnails/` 里的图片被当普通图片反复缩略图、产物又写回同一目录，导致缓存按宽度倍数指数增长（默认配置「挂载 cwd + 数据目录 cwd/data」必现）。按 FileBrowser 的 diskcache 重构：缓存键只由路径决定（改图原地覆盖，不再每次多一个文件）、文件名不带扩展名（`320-jpg`）、`<sha1[..2]>/<sha1>/` 两级扇出、同目录临时文件 + rename 原子落盘、同一源文件 per-key 串行；删除 / 改名 / 移动自动清掉该文件的缓存单元与 ThumbHash 行。同时把整个应用数据目录登记为「保留目录」：列表不显示，`/api/files/*`、WebDAV、媒体扫描、搜索一律不碰，顺手堵住「通过文件管理删掉 `asmoday.db`」这个更大隐患。
+
 - **v4.2.2 (软链接逃逸可配置)**：新增 `[system].follow_symlinks`（默认 `true`，与 FileBrowser 行为一致）——挂载点内指向其它位置（含跨盘）的符号链接 / junction 现在能点进去浏览、预览、上传、改名，**寻址始终以链接路径为前缀**；直接访问挂载点外的绝对路径依旧 403（放开的只有「链接解析」，判定条件是「字面上在挂载点内 + 沿途至少一段是链接」）。改为 `false` 恢复严格边界（逃逸按断链处理，跨盘链接不可用）。设置页「高级 → 挂载点」提供开关，配置渲染保持幂等：等于默认值的键不写盘，改成非默认值才落文件。Windows 上 `mklink /J` 建的 junction 与目录符号链接同等对待。
 
 - **v4.2.1 (可用性修复与工程收口)**：**修 WebDAV 客户端「全不可用」**——浏览器/客户端打开目录页是空响应（`ERR_EMPTY_RESPONSE`）、服务端日志却记 200/207，根因是全局压缩层把 `dav-server` 的流式 body 压坏了（带 `Accept-Encoding: gzip/br` 才触发，curl 不带所以回归测不出来），DAV 出口改标 `Cache-Control: no-transform` 跳过压缩；**2FA 开启页补上二维码**（后端用 `qrcode` 直接下发 SVG，深色主题固定白底，附解码往返测试）；修 `apply_shell_args` 两个平台签名不一致导致的 Linux 编译失败（本机 Windows 全绿、CI 必炸）。工程上：**GitHub Actions 只保留发版**——删掉每次 push 都跑一遍的 `ci.yml` 与每周开依赖 PR 的 Dependabot，`fmt`/`clippy`/`test`/前端构建改回提交前在本机做（本地已经编译过，云端重复装依赖没有收益）。
