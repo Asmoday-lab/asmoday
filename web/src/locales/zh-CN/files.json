@@ -45,8 +45,7 @@
     "found": "搜索到 {count} 项",
     "escToClear": "按 Esc 清除",
     "uploadFirst": "请先进入一个挂载点再上传",
-    "searchFailed": "搜索失败",
-    "truncated": "目录项过多，仅显示前 10000 条，请缩小范围"
+    "searchFailed": "搜索失败"
   },
   "editor": {
     "back": "返回",

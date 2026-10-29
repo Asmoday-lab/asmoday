@@ -239,6 +239,23 @@ fn path_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// 归一化后的段（就地折叠 `..`）：链接目标里带 `..` 时，字面前缀比较会被骗过，
+/// `D:/root/sub/../../../etc` 逐段比前缀仍然是 `D:/root`，必须先折叠再比。
+fn folded_segments(path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for segment in path_segments(path) {
+        if segment == ".." {
+            // 绝对路径的锚（盘符 / 根）不可上跳
+            if out.len() > 1 {
+                out.pop();
+            }
+        } else {
+            out.push(segment);
+        }
+    }
+    out
+}
+
 /// 段的相等判定：Windows 大小写不敏感（`D:/Media` 与 `d:/media` 是同一条），
 /// 其它平台按字节比较。
 fn same_segment(a: &str, b: &str) -> bool {
@@ -254,14 +271,37 @@ fn same_segment(a: &str, b: &str) -> bool {
 /// 不能直接用 `Path::starts_with`：`std::fs::canonicalize` 在 Windows 上回
 /// `\\?\C:\...` 前缀形式，而用户/前端传来的是 `C:/...`，逐组件比较必然不匹配。
 fn lexical_inside(candidate: &Path, root: &Path) -> bool {
-    let cand = path_segments(candidate);
-    let base = path_segments(root);
+    let cand = folded_segments(candidate);
+    let base = folded_segments(root);
     !base.is_empty()
         && cand.len() >= base.len()
         && base
             .iter()
             .zip(cand.iter())
             .all(|(a, b)| same_segment(a, b))
+}
+
+/// 沿软链接链走到尽头（最多 32 跳），返回它**本应指向**的字面路径。
+///
+/// 断链（终点不存在）时同样返回那个字面路径 —— 这正是用来堵「顺着悬空链接
+/// 把新文件写到挂载点外」的关键：FileBrowser 的 `within()` 对悬空链接也逐跳
+/// 跟随，按它指向的位置判定归属，而不是「解析失败就放行」。
+fn resolve_link_chain(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..32 {
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            match current.parent() {
+                Some(parent) => parent.join(&target),
+                None => target,
+            }
+        };
+    }
+    current
 }
 
 /// 从挂载点根开始逐段下探，任一段是链接即返回 true。
@@ -383,7 +423,45 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
             "目标是文件，不能作为父目录".to_string(),
         ));
     }
-    Ok(parent_canon.join(name))
+    let target = parent_canon.join(name);
+    ensure_child_link_safe(&target, root, mount.info.follow_symlinks)?;
+    Ok(target)
+}
+
+/// 待创建路径的最后一段若**已经存在且是软链接**，必须再判一次归属。
+///
+/// `resolve_child` 只 canonicalize 了父目录，名字本身不碰磁盘。父目录在挂载点内、
+/// 名字恰好是一个指向外面的链接（尤其是**悬空**链接，`canonicalize` 会直接
+/// ENOENT 被当成「新建」）时，`touch` / 上传 / 覆盖写会顺着链接落到挂载点外。
+/// 这一条与 `follow_symlinks` 无关：配置放开的是「读链接」，不是「借链接写到外面」——
+/// 关闭时必须拒，打开时按链接目标是否仍在本挂载点内判定。
+fn ensure_child_link_safe(
+    target: &Path,
+    root: &Path,
+    follow_symlinks: bool,
+) -> Result<(), FsError> {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        // 不存在：正常新建，没有链接可跟
+        return Ok(());
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    let resolved = resolve_link_chain(target);
+    if crate::core::reserved::is_reserved(&resolved) {
+        return Err(FsError::Forbidden(
+            "该路径属于应用数据目录，不对外开放".to_string(),
+        ));
+    }
+    if lexical_inside(&resolved, root) {
+        return Ok(());
+    }
+    if follow_symlinks {
+        return Ok(());
+    }
+    Err(FsError::SymlinkEscape(
+        "目标是一个指向挂载点外的软链接，已拒绝写入".to_string(),
+    ))
 }
 
 /// 把用户传入的路径变成绝对路径：绝对路径原样，相对路径按挂载点根拼接。
@@ -929,6 +1007,76 @@ mod symlink_escape_tests {
             format!("{link_dir_raw}/new.txt")
         );
         assert!(resolve_child(&strict, &link_dir_raw, "new.txt").is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 最后一段本身是逃逸链接：新建 / 覆盖写必须按链接目标判归属，不能只看父目录。
+    #[test]
+    fn child_that_is_an_escaping_link_is_rejected_for_writes() {
+        let base = unique_dir("child-link");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = root.join("link");
+        if !link_dir(&outside, &link) {
+            eprintln!("环境不支持创建目录链接，跳过");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let root_raw = crate::core::fs::normalize_display(&root);
+        let strict = mount_at(&root, false);
+        let err = resolve_child(&strict, &root_raw, "link").unwrap_err();
+        assert!(
+            matches!(err, FsError::SymlinkEscape(_)),
+            "同名的逃逸链接必须拒绝写入，实得 {err:?}"
+        );
+
+        // 普通新名字不受影响
+        assert!(resolve_child(&strict, &root_raw, "fresh.txt").is_ok());
+        // 放宽模式维持既有口径：链接可跟随
+        let open = mount_at(&root, true);
+        assert!(resolve_child(&open, &root_raw, "link").is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 悬空链接（终点不存在）同样要按它**指向的位置**判定，否则新建会写到外面。
+    #[cfg(not(windows))]
+    #[test]
+    fn dangling_link_cannot_be_a_write_target() {
+        let base = unique_dir("dangling");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("escape.txt");
+        // 相对目标 + `..`：字面前缀比较会被骗过，必须先折叠
+        std::os::unix::fs::symlink("../../etc/asmoday-escape.txt", &link).unwrap();
+
+        let strict = mount_at(&root, false);
+        let err = resolve_child(
+            &strict,
+            &crate::core::fs::normalize_display(&root),
+            "escape.txt",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FsError::SymlinkEscape(_)),
+            "悬空的外向链接必须拒绝写入，实得 {err:?}"
+        );
+
+        // 指向挂载点内部的悬空链接仍可写（链接本身合法）
+        let inner = root.join("inner.txt");
+        std::os::unix::fs::symlink("inside-not-created-yet.txt", &inner).unwrap();
+        assert!(
+            resolve_child(
+                &strict,
+                &crate::core::fs::normalize_display(&root),
+                "inner.txt"
+            )
+            .is_ok()
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

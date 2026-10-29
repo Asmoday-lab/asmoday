@@ -272,15 +272,32 @@ pub struct Listing {
     /// 下一页游标（设计文档 3.2.4：固定排序 + 游标分页，不用 offset）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// 扫描超过 `SCAN_LIMIT` 被强制截断（设计文档 3.2.4）
-    pub truncated: bool,
     /// 所在挂载点是否只读：前端据此置灰全部变更入口
     pub readonly: bool,
     pub entries: Vec<EntryInfo>,
 }
 
-/// 单目录扫描上限：超出截断并标记 `truncated`（设计文档 3.2.4）
-pub const SCAN_LIMIT: usize = 10_000;
+/// 目录扫描阶段的轻量条目：只保留排序需要的东西。
+///
+/// 旧实现直接存 `std::fs::Metadata`（Windows 上接近 160 字节），十万条的目录
+/// 光排序容器就要十几 MB；排序键其实只有一个 `i64`，拆开存能省下大部分内存。
+/// `key` 的取值口径同时被比较、游标、游标解码共用，三处必须一致。
+struct RawEntry {
+    name: String,
+    is_dir: bool,
+    /// name 排序固定 0；size 用字节数；mtime 用 Unix 秒；拿不到元数据用 -1
+    key: i64,
+}
+
+/// 排序键补全的并发度。
+///
+/// 目录里每个条目一次 stat 是纯 IO 等待，串行做两万次在 Windows 上要好几秒；
+/// 这也是旧实现不得不设「单目录扫一万条」上限的直接原因。并发 24 路之后
+/// 同样的目录压到百毫秒级，上限就可以拿掉了。
+const META_CONCURRENCY: usize = 24;
+
+/// 单页条目组装（lstat + 软链接解析）的并发度
+const PAGE_CONCURRENCY: usize = 16;
 
 /// 列表排序键（设计文档 v2.7.0 3.2.1：名称 / 修改时间 / 大小）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -354,31 +371,26 @@ fn order_name(order: ListOrder) -> &'static str {
 }
 
 /// 取排序键的数值形式（与 `list_dir` 里的比较逻辑一一对应）
-fn sort_key(item: &(String, bool, Option<std::fs::Metadata>), sort: ListSort) -> i64 {
+fn sort_key_of(meta: &std::fs::Metadata, sort: ListSort) -> i64 {
     match sort {
         ListSort::Name => 0,
-        ListSort::Size => item.2.as_ref().map(|meta| meta.len() as i64).unwrap_or(-1),
-        ListSort::Mtime => item
-            .2
-            .as_ref()
-            .and_then(|meta| meta.modified().ok())
+        ListSort::Size => meta.len() as i64,
+        ListSort::Mtime => meta
+            .modified()
+            .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(-1),
     }
 }
 
-fn encode_cursor(
-    sort: ListSort,
-    order: ListOrder,
-    item: &(String, bool, Option<std::fs::Metadata>),
-) -> String {
+fn encode_cursor(sort: ListSort, order: ListOrder, item: &RawEntry) -> String {
     let cursor = Cursor {
         sort: sort_name(sort).to_string(),
         order: order_name(order).to_string(),
-        is_dir: item.1,
-        key: sort_key(item, sort),
-        name: item.0.to_lowercase(),
+        is_dir: item.is_dir,
+        key: item.key,
+        name: item.name.to_lowercase(),
     };
     let json = serde_json::to_vec(&cursor).unwrap_or_default();
     data_encoding::BASE64URL_NOPAD.encode(&json)
@@ -395,19 +407,14 @@ fn decode_cursor(raw: &str, sort: ListSort, order: ListOrder) -> Option<Cursor> 
 }
 
 /// 条目相对游标的位置：`Greater` 表示它在游标之后（下一页从这里开始）
-fn cursor_cmp(
-    item: &(String, bool, Option<std::fs::Metadata>),
-    sort: ListSort,
-    order: ListOrder,
-    cursor: &Cursor,
-) -> std::cmp::Ordering {
+fn cursor_cmp(item: &RawEntry, order: ListOrder, cursor: &Cursor) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    match (item.1, cursor.is_dir) {
+    match (item.is_dir, cursor.is_dir) {
         (true, false) => return Ordering::Less,
         (false, true) => return Ordering::Greater,
         _ => {}
     }
-    let key_cmp = sort_key(item, sort).cmp(&cursor.key);
+    let key_cmp = item.key.cmp(&cursor.key);
     let key_cmp = if order == ListOrder::Desc {
         key_cmp.reverse()
     } else {
@@ -416,7 +423,88 @@ fn cursor_cmp(
     if key_cmp != Ordering::Equal {
         return key_cmp;
     }
-    item.0.to_lowercase().cmp(&cursor.name)
+    item.name.to_lowercase().cmp(&cursor.name)
+}
+
+/// 并发补全排序键（`size` / `mtime` 排序才需要；`name` 排序不 stat，省一次遍历）。
+///
+/// 分批 `join_all` 而不是把整目录的 future 一次摊开：十万条目录一次摊开会瞬间
+/// 把 tokio 的 blocking 线程池塞满，反而比串行更慢（调度开销远大于 syscall）。
+async fn fill_sort_keys(dir: &Path, sort: ListSort, items: &mut [RawEntry]) {
+    for chunk in items.chunks_mut(META_CONCURRENCY) {
+        let futures = chunk.iter_mut().map(|item| async move {
+            item.key = match tokio::fs::symlink_metadata(dir.join(&item.name)).await {
+                Ok(meta) => sort_key_of(&meta, sort),
+                Err(_) => -1,
+            };
+        });
+        futures_util::future::join_all(futures).await;
+    }
+}
+
+/// 组装一条对外条目（lstat + 软链接目标解析）。
+async fn build_entry(
+    dir: &Path,
+    item: &RawEntry,
+    mount_root: Option<&Path>,
+    follow_symlinks: bool,
+) -> EntryInfo {
+    let full = dir.join(&item.name);
+    // lstat：软链接只报告链接本身，不 stat 目标
+    let link_meta = tokio::fs::symlink_metadata(&full).await;
+    let stat_error = link_meta.is_err();
+    let is_symlink = link_meta
+        .as_ref()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let size = link_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified = link_meta
+        .as_ref()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let ext = extension_of_name(&item.name);
+    let (kind, editable) = classify_name(&item.name, ext.as_str(), item.is_dir);
+
+    // 软链接：跟随解析目标（设计文档 3.2.7）。
+    // - 目标信息只对当前页的软链接条目 stat，数量少，不拖累整页性能；
+    // - canonicalize 成功且未越出挂载点 → target_is_dir 给真实判定；
+    // - 越出挂载点时：`follow_symlinks = false` 记 None（前端标断链置灰），
+    //   为 true 则照常给目标类型，与后端放行口径保持一致；
+    // - 断链（ENOENT / 循环链接）恒为 None。
+    let (symlink_target, target_is_dir) = if is_symlink {
+        let raw = tokio::fs::read_link(&full)
+            .await
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned());
+        let resolved = tokio::fs::canonicalize(&full).await.ok().and_then(|canon| {
+            let inside = mount_root.is_none_or(|root| {
+                canon.starts_with(root)
+                    || (follow_symlinks
+                        && crate::core::path_guard::escaped_via_symlink_in(&full, root))
+            });
+            inside.then(|| canon.is_dir())
+        });
+        (raw, resolved)
+    } else {
+        (None, None)
+    };
+
+    EntryInfo {
+        name: item.name.clone(),
+        path: normalize_display(&full),
+        is_dir: item.is_dir,
+        is_symlink,
+        size,
+        modified,
+        kind,
+        ext,
+        editable,
+        stat_error,
+        symlink_target,
+        target_is_dir,
+    }
 }
 
 /// 读取目录第一层并分页。
@@ -426,6 +514,11 @@ fn cursor_cmp(
 ///
 /// 分页方式（设计文档 3.2.4）：**优先用游标**，`cursor` 为空时才回落到 `page`
 /// （仅为老客户端保留；新前端一律传游标，目录内容变化也不会重复/漏项）。
+///
+/// **没有扫描上限**：目录里有十万条就遍历十万条。文件管理要和本地管理器
+/// 一样「翻得到最后一条」，用截断换性能等于把后半截目录藏起来；真正的
+/// 性能问题出在「串行 stat」和「全量 Metadata 常驻」上，前者用并发解决，
+/// 后者用轻量条目解决 —— 都不需要用「看不见」来换。
 #[allow(clippy::too_many_arguments)]
 pub async fn list_dir(
     dir: &Path,
@@ -447,8 +540,7 @@ pub async fn list_dir(
         .await
         .map_err(|e| FsError::Io(format!("读取目录失败：{e}")))?;
 
-    let mut items: Vec<(String, bool, Option<std::fs::Metadata>)> = Vec::new();
-    let mut truncated = false;
+    let mut items: Vec<RawEntry> = Vec::new();
     while let Some(entry) = reader
         .next_entry()
         .await
@@ -475,57 +567,41 @@ pub async fn list_dir(
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        if items.len() >= SCAN_LIMIT {
-            truncated = true;
-            break;
-        }
         // file_type() 不跟随软链接，避免指向目录的链接被当作目录递归进去
         let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-        items.push((name, is_dir, None));
+        items.push(RawEntry {
+            name,
+            is_dir,
+            key: 0,
+        });
     }
 
-    // 按 mtime / size 排序必须先拿到全部元数据（Name 排序免 stat）
+    // 按 mtime / size 排序必须先拿到全部排序键（Name 排序免 stat）
     if sort != ListSort::Name {
-        for (name, _, meta) in items.iter_mut() {
-            *meta = tokio::fs::symlink_metadata(dir.join(&name)).await.ok();
-        }
+        fill_sort_keys(dir, sort, &mut items).await;
     }
 
-    // 目录在前；同组内按指定键排序，并列以名称（大小写不敏感）兜底
-    items.sort_by(|a, b| {
-        let dir_cmp = b.1.cmp(&a.1);
-        if dir_cmp != std::cmp::Ordering::Equal {
-            return dir_cmp;
+    // 目录在前；同组内按指定键排序，并列以名称（大小写不敏感）兜底。
+    // 名称小写只算一次（sort_by_cached_key），否则十万条目录光比较就要百万次分配。
+    match order {
+        ListOrder::Desc => items.sort_by_cached_key(|item| {
+            (
+                !item.is_dir,
+                std::cmp::Reverse(item.key),
+                item.name.to_lowercase(),
+            )
+        }),
+        ListOrder::Asc => {
+            items.sort_by_cached_key(|item| (!item.is_dir, item.key, item.name.to_lowercase()))
         }
-        let key_cmp = match sort {
-            ListSort::Name => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-            ListSort::Size => {
-                a.2.as_ref()
-                    .map(|m| m.len())
-                    .cmp(&b.2.as_ref().map(|m| m.len()))
-            }
-            ListSort::Mtime => {
-                a.2.as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .cmp(&b.2.as_ref().and_then(|m| m.modified().ok()))
-            }
-        };
-        if key_cmp != std::cmp::Ordering::Equal {
-            return if order == ListOrder::Desc {
-                key_cmp.reverse()
-            } else {
-                key_cmp
-            };
-        }
-        a.0.to_lowercase().cmp(&b.0.to_lowercase())
-    });
+    }
 
     let total = items.len();
     // 游标优先；游标无效（排序变了 / 手工改坏）就退回第一页，不报错
     let start = match cursor.and_then(|raw| decode_cursor(raw, sort, order)) {
         Some(cur) => items
             .iter()
-            .position(|item| cursor_cmp(item, sort, order, &cur) == std::cmp::Ordering::Greater)
+            .position(|item| cursor_cmp(item, order, &cur) == std::cmp::Ordering::Greater)
             .unwrap_or(total),
         None => (page - 1).saturating_mul(PAGE_SIZE),
     };
@@ -539,71 +615,17 @@ pub async fn list_dir(
         None
     };
 
-    let mut entries = Vec::new();
-    if start < total {
-        for (name, is_dir, cached) in &items[start..end] {
-            let full = dir.join(name);
-            // lstat：软链接只报告链接本身，不 stat 目标（排序阶段已 stat 的直接复用）
-            let link_meta = match cached {
-                Some(meta) => Ok(meta.clone()),
-                None => tokio::fs::symlink_metadata(&full).await,
-            };
-            let stat_error = link_meta.is_err();
-            let is_symlink = link_meta
-                .as_ref()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
-            let size = link_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = link_meta
-                .as_ref()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-            let ext = extension_of_name(name);
-            let (kind, editable) = classify_name(name, ext.as_str(), *is_dir);
-
-            // 软链接：跟随解析目标（设计文档 3.2.7）。
-            // - 目标信息只对当前页的软链接条目 stat，数量少，不拖累整页性能；
-            // - canonicalize 成功且未越出挂载点 → target_is_dir 给真实判定；
-            // - 越出挂载点时：`follow_symlinks = false` 记 None（前端标断链置灰），
-            //   为 true 则照常给目标类型，与后端放行口径保持一致；
-            // - 断链（ENOENT / 循环链接）恒为 None。
-            let (symlink_target, target_is_dir) = if is_symlink {
-                let raw = tokio::fs::read_link(&full)
-                    .await
-                    .ok()
-                    .map(|target| target.to_string_lossy().into_owned());
-                let resolved = std::fs::canonicalize(&full)
-                    .map(|canon| {
-                        let inside = mount_root.is_none_or(|root| {
-                            canon.starts_with(root)
-                                || (follow_symlinks
-                                    && crate::core::path_guard::escaped_via_symlink_in(&full, root))
-                        });
-                        inside.then(|| canon.is_dir())
-                    })
-                    .unwrap_or(None);
-                (raw, resolved)
-            } else {
-                (None, None)
-            };
-
-            entries.push(EntryInfo {
-                name: name.clone(),
-                path: normalize_display(&full),
-                is_dir: *is_dir,
-                is_symlink,
-                size,
-                modified,
-                kind,
-                ext,
-                editable,
-                stat_error,
-                symlink_target,
-                target_is_dir,
-            });
-        }
+    // 只对当前页做 lstat / 软链接解析：按批并发，结果顺序与排序一致
+    let mut entries: Vec<EntryInfo> = Vec::with_capacity(end.saturating_sub(start));
+    for chunk in items
+        .get(start..end)
+        .unwrap_or(&[])
+        .chunks(PAGE_CONCURRENCY)
+    {
+        let futures = chunk
+            .iter()
+            .map(|item| build_entry(dir, item, mount_root, follow_symlinks));
+        entries.extend(futures_util::future::join_all(futures).await);
     }
 
     let parent = dir
@@ -619,7 +641,6 @@ pub async fn list_dir(
         total,
         has_more,
         next_cursor,
-        truncated,
         readonly,
         entries,
     })
@@ -817,6 +838,117 @@ pub fn parse_range(header: &str, file_len: u64) -> Result<Option<ByteRange>, ()>
 mod tests {
     use super::*;
 
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("asmoday-fs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 目录不再有扫描上限：两页拼起来必须等于目录真实条数（不重、不漏、能翻到最后一条）
+    #[tokio::test]
+    async fn list_dir_pages_to_the_very_last_entry() {
+        let dir = scratch("paging");
+        let count = PAGE_SIZE + 100;
+        for index in 0..count {
+            std::fs::write(dir.join(format!("f{index:04}.txt")), b"x").unwrap();
+        }
+
+        let first = list_dir(
+            &dir,
+            1,
+            false,
+            false,
+            ListSort::Name,
+            ListOrder::Asc,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.total, count);
+        assert_eq!(first.entries.len(), PAGE_SIZE);
+        assert!(first.has_more);
+        let cursor = first.next_cursor.clone().expect("第一页必须给游标");
+
+        let second = list_dir(
+            &dir,
+            1,
+            false,
+            false,
+            ListSort::Name,
+            ListOrder::Asc,
+            Some(&cursor),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.total, count);
+        assert_eq!(second.entries.len(), 100);
+        assert!(!second.has_more);
+        assert!(second.next_cursor.is_none());
+
+        let mut names: Vec<String> = first
+            .entries
+            .iter()
+            .chain(second.entries.iter())
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(names.len(), count);
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), count, "跨页出现重复或漏项");
+        assert_eq!(names[0], "f0000.txt");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// size / mtime 排序走并发补键，结果必须与串行口径一致：目录在前，键序稳定
+    #[tokio::test]
+    async fn list_dir_sorts_by_size_with_dirs_first() {
+        let dir = scratch("sort-size");
+        for (name, size) in [("a.bin", 10), ("b.bin", 30), ("c.bin", 20)] {
+            std::fs::write(dir.join(name), vec![0u8; size]).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+
+        let asc = list_dir(
+            &dir,
+            1,
+            false,
+            false,
+            ListSort::Size,
+            ListOrder::Asc,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = asc.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "a.bin", "c.bin", "b.bin"]);
+
+        let desc = list_dir(
+            &dir,
+            1,
+            false,
+            false,
+            ListSort::Size,
+            ListOrder::Desc,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = desc.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "b.bin", "c.bin", "a.bin"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn list_sort_and_order_parse() {
         assert_eq!(ListSort::parse(None), ListSort::Name);
@@ -909,8 +1041,12 @@ mod tests {
         assert_eq!(classify_name("router.ts", "ts", false), ("text", true));
     }
 
-    fn plain(name: &str, is_dir: bool) -> (String, bool, Option<std::fs::Metadata>) {
-        (name.to_string(), is_dir, None)
+    fn plain(name: &str, is_dir: bool) -> RawEntry {
+        RawEntry {
+            name: name.to_string(),
+            is_dir,
+            key: 0,
+        }
     }
 
     #[test]
@@ -939,16 +1075,16 @@ mod tests {
         };
         // 同为目录：按名称排在 `b` 之后的才是下一页
         assert_eq!(
-            cursor_cmp(&plain("c", true), ListSort::Name, ListOrder::Asc, &cur),
+            cursor_cmp(&plain("c", true), ListOrder::Asc, &cur),
             Ordering::Greater
         );
         assert_eq!(
-            cursor_cmp(&plain("a", true), ListSort::Name, ListOrder::Asc, &cur),
+            cursor_cmp(&plain("a", true), ListOrder::Asc, &cur),
             Ordering::Less
         );
         // 文件全部排在目录之后
         assert_eq!(
-            cursor_cmp(&plain("a", false), ListSort::Name, ListOrder::Asc, &cur),
+            cursor_cmp(&plain("a", false), ListOrder::Asc, &cur),
             Ordering::Greater
         );
         // 反向：游标是文件时，目录都在它前面
@@ -958,7 +1094,7 @@ mod tests {
             ..cur
         };
         assert_eq!(
-            cursor_cmp(&plain("a", true), ListSort::Name, ListOrder::Asc, &file_cur),
+            cursor_cmp(&plain("a", true), ListOrder::Asc, &file_cur),
             Ordering::Less
         );
     }
@@ -974,10 +1110,11 @@ mod tests {
             name: "a".into(),
         };
         // 降序时更小的文件在游标之后
-        let item = ("b".to_string(), false, None);
-        assert_eq!(
-            cursor_cmp(&item, ListSort::Size, ListOrder::Desc, &cur),
-            Ordering::Greater
-        );
+        let item = RawEntry {
+            name: "b".to_string(),
+            is_dir: false,
+            key: 50,
+        };
+        assert_eq!(cursor_cmp(&item, ListOrder::Desc, &cur), Ordering::Greater);
     }
 }

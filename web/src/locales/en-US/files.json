@@ -45,8 +45,7 @@
     "found": "{count} results",
     "escToClear": "Press Esc to clear",
     "uploadFirst": "Open a mount before uploading",
-    "searchFailed": "Search failed",
-    "truncated": "Too many entries: showing the first 10000, narrow the folder to see more"
+    "searchFailed": "Search failed"
   },
   "editor": {
     "back": "Back",

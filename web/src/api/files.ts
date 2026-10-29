@@ -61,8 +61,6 @@ export interface Listing {
   has_more: boolean
   /** 下一页游标（设计文档 3.2.4：固定排序 + 游标分页） */
   next_cursor?: string
-  /** 目录条目超过后端扫描上限被截断（设计文档 3.2.4） */
-  truncated?: boolean
   /** 所在挂载点只读：全部变更入口置灰 */
   readonly?: boolean
   entries: EntryInfo[]

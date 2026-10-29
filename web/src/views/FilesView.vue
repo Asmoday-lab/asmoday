@@ -2309,14 +2309,6 @@ onBeforeUnmount(() => {
 
       <!-- 内容 -->
       <div class="relative min-h-0 flex-1 overflow-y-auto" :class="selectMode ? 'pb-20' : ''">
-        <!-- 单目录扫描上限 10000 条（设计文档 3.2.4） -->
-        <p
-          v-if="listing?.truncated"
-          class="border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[12px] fg-warn"
-        >
-          {{ t('files.list.truncated') }}
-        </p>
-
         <div v-if="loading" class="p-3">
           <div class="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2">
             <div v-for="i in 12" :key="i" class="flex flex-col items-center gap-2 p-3">
