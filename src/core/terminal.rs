@@ -176,10 +176,25 @@ impl Session {
 }
 
 /// 会话池。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TerminalManager {
     inner: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     counter: Arc<AtomicUsize>,
+    /// 单用户并发上限（`[terminal].max_sessions`）
+    max_sessions: usize,
+    /// 断线保活时长（`[terminal].idle_kill_seconds`）
+    reap_delay: Duration,
+}
+
+impl Default for TerminalManager {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            counter: Arc::new(AtomicUsize::new(0)),
+            max_sessions: MAX_SESSIONS,
+            reap_delay: REAP_DELAY,
+        }
+    }
 }
 
 /// 一条会话的对外快照（设计文档 3.3.6：前端「活动会话」面板据此展示与强制关闭）。
@@ -481,6 +496,19 @@ impl TerminalManager {
         Self::default()
     }
 
+    /// 按 `[terminal]` 配置构造：并发上限至少 1，保活时长 0 视为「立即回收」。
+    pub fn with_limits(max_sessions: usize, reap_delay: Duration) -> Self {
+        Self {
+            max_sessions: max_sessions.max(1),
+            reap_delay,
+            ..Self::default()
+        }
+    }
+
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
     fn next_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         // 必须带进程级时间戳：前端会把 session_id 存进标签页，后端重启后
@@ -494,7 +522,8 @@ impl TerminalManager {
 
     /// 在指定目录拉起一条新会话。
     ///
-    /// 超过 [`MAX_SESSIONS`] 时先回收已经断线（无连接）的会话，仍然超限就拒绝。
+    /// 超过 [`TerminalManager::max_sessions`]（`[terminal].max_sessions`）时先回收
+    /// 已经断线（无连接）的会话，仍然超限就拒绝。
     /// `env` 是 [`prepare_env`] 的结果：历史文件已隔离到数据目录。
     pub fn create(
         &self,
@@ -504,7 +533,7 @@ impl TerminalManager {
         options: ShellOptions,
         env: &TerminalEnv,
     ) -> Result<Arc<Session>, String> {
-        if self.len() >= MAX_SESSIONS {
+        if self.len() >= self.max_sessions {
             let idle: Vec<String> = self
                 .inner
                 .lock()
@@ -518,9 +547,10 @@ impl TerminalManager {
             for id in idle {
                 self.kill(&id);
             }
-            if self.len() >= MAX_SESSIONS {
+            if self.len() >= self.max_sessions {
                 return Err(format!(
-                    "终端会话数已达上限（{MAX_SESSIONS} 个），请关闭不用的标签后再试"
+                    "终端会话数已达上限（{} 个），请关闭不用的标签后再试",
+                    self.max_sessions
                 ));
             }
         }
@@ -651,7 +681,7 @@ impl TerminalManager {
     pub fn schedule_reap(&self, id: String) {
         let manager = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(REAP_DELAY).await;
+            tokio::time::sleep(manager.reap_delay).await;
             let should_kill = match manager.get(&id) {
                 Some(session) => session.clients.load(Ordering::SeqCst) == 0,
                 None => false,
@@ -705,6 +735,16 @@ fn session_display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_limits_are_honoured() {
+        // [terminal] 的 max_sessions 直接决定并发闸门，0 也要兜成 1（否则一个都开不了）
+        let manager = TerminalManager::with_limits(3, Duration::from_secs(42));
+        assert_eq!(manager.max_sessions(), 3);
+        assert_eq!(TerminalManager::with_limits(0, Duration::ZERO).max_sessions(), 1);
+        // 缺省值必须与设计文档 3.3 一致（10 并发 / 180 秒保活）
+        assert_eq!(TerminalManager::default().max_sessions(), MAX_SESSIONS);
+    }
 
     #[test]
     fn history_is_always_isolated_under_data_dir() {

@@ -15,6 +15,7 @@ import { authApi } from '../api/auth'
 import { cacheApi, type CacheStats } from '../api/media'
 import { systemApi, type FfmpegInfo, type FfmpegSource } from '../api/system'
 import { ApiError, readApiError } from '../lib/errors'
+import { ensureVerified } from '../stores/reauth'
 import { filesApi, type MountPoint } from '../api/files'
 import { APP_BASE } from '../lib/base'
 import { formatSize } from '../lib/format'
@@ -222,12 +223,16 @@ interface AccessToken {
   name: string
   readonly: boolean
   expires_at: number | null
+  /** 限定挂载点（null = 全部挂载点） */
+  mount_id?: string | null
 }
 
 const tokens = ref<AccessToken[]>([])
 const tokenName = ref('')
 const tokenReadonly = ref(false)
 const tokenDays = ref(0)
+/// 可选：把令牌限制在某个挂载点（WebDAV 挂载通常只需要一个目录）
+const tokenMountId = ref('')
 const newToken = ref('')
 const tokenError = ref('')
 
@@ -283,6 +288,8 @@ async function createToken() {
     tokenError.value = t('settings.security.tokenNameRequired')
     return
   }
+  // 建令牌 = 造一把能进全库的钥匙：先过二次验证
+  if (!(await ensureVerified())) return
   try {
     const res = await fetch('/api/tokens', {
       method: 'POST',
@@ -291,6 +298,7 @@ async function createToken() {
         name: tokenName.value.trim(),
         readonly: tokenReadonly.value,
         days: tokenDays.value,
+        mount_id: tokenMountId.value || undefined,
       }),
     })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
@@ -304,6 +312,7 @@ async function createToken() {
 }
 
 async function deleteToken(id: number) {
+  if (!(await ensureVerified())) return
   try {
     const res = await fetch(`/api/tokens/${id}`, { method: 'DELETE' })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
@@ -316,6 +325,40 @@ async function deleteToken(id: number) {
 function formatExpiry(value: number | null) {
   if (!value) return t('common.time.permanent')
   return new Date(value * 1000).toLocaleDateString()
+}
+
+// ---------------- 安全：数据库热备份 ----------------
+const backupBusy = ref(false)
+
+/** 下载一份 SQLite 热备份（后端 `VACUUM INTO`，服务运行中也能备）。 */
+async function downloadBackup() {
+  if (backupBusy.value) return
+  // 备份里是密码哈希与会话：与令牌同级敏感，先过二次验证
+  if (!(await ensureVerified())) return
+  backupBusy.value = true
+  try {
+    const res = await fetch('/api/system/backup')
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    const blob = await res.blob()
+    // 文件名优先用后端给的 Content-Disposition（带 UTC 时间戳），拿不到再兜底
+    const disposition = res.headers.get('content-disposition') ?? ''
+    const matched = /filename="([^"]+)"/.exec(disposition)
+    const name = matched?.[1] || `asmoday-backup-${Date.now()}.db`
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = name
+    document.body.append(link)
+    link.click()
+    link.remove()
+    // 立刻回收：blob URL 不释放会一直占着这份内存
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    showToast(t('settings.security.backupDone'))
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('settings.security.backupFailed'))
+  } finally {
+    backupBusy.value = false
+  }
 }
 
 async function loadConfig() {
@@ -362,6 +405,7 @@ function onRawChange(value: string) {
 /** 保存整份配置（表单模式）。媒体面板的复位也走这里，保证只改 `[media]`。 */
 async function saveForm(successMessage?: string) {
   if (!draft.value) return
+  if (!(await ensureVerified())) return
   saving.value = true
   error.value = ''
   try {
@@ -382,6 +426,7 @@ async function saveForm(successMessage?: string) {
 }
 
 async function saveRaw() {
+  if (!(await ensureVerified())) return
   saving.value = true
   error.value = ''
   try {
@@ -1029,6 +1074,19 @@ onMounted(() => {
             <input v-model="tokenReadonly" type="checkbox" /> {{ t('settings.security.readonly') }}
           </label>
           <label class="flex items-center gap-1 text-[12px] text-muted">
+            {{ t('settings.security.tokenScope') }}
+            <select
+              v-model="tokenMountId"
+              class="h-10 max-w-40 rounded border border-line bg-elevated px-2 text-xs text-ink outline-none focus:border-accent"
+              data-testid="token-scope"
+            >
+              <option value="">{{ t('settings.security.tokenScopeAll') }}</option>
+              <option v-for="mount in davMounts" :key="mount.id" :value="mount.id">
+                {{ mount.name }}
+              </option>
+            </select>
+          </label>
+          <label class="flex items-center gap-1 text-[12px] text-muted">
             {{ t('settings.security.tokenDays') }}
             <input
               v-model.number="tokenDays"
@@ -1067,7 +1125,14 @@ onMounted(() => {
           class="flex h-12 items-center gap-4 px-4 text-xs"
           :class="index % 2 === 1 ? 'bg-elevated/40' : ''"
         >
-          <span class="min-w-0 flex-1 truncate text-ink">{{ token.name }}</span>
+          <span class="min-w-0 flex-1 truncate text-ink">
+            {{ token.name }}
+            <span
+              v-if="token.mount_id"
+              class="ml-1 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted"
+              >{{ token.mount_id }}</span
+            >
+          </span>
           <span class="w-14 shrink-0 rounded bg-elevated px-1.5 py-0.5 text-center text-[11px] text-muted">
             {{ token.readonly ? t('settings.security.readonly') : t('settings.security.readwrite') }}
           </span>
@@ -1094,6 +1159,28 @@ onMounted(() => {
       >
         {{ tokenError }}
       </p>
+
+      <div class="rounded-xl border border-line p-6">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="min-w-0">
+            <p class="text-xs font-semibold tracking-wider text-muted uppercase">
+              {{ t('settings.security.backupTitle') }}
+            </p>
+            <p class="mt-1 text-[12px] leading-relaxed text-muted">
+              {{ t('settings.security.backupHint') }}
+            </p>
+          </div>
+          <button
+            class="flex h-10 shrink-0 items-center gap-1.5 rounded-md border border-line px-4 text-xs text-ink transition-colors hover:border-accent/60 disabled:opacity-50"
+            :disabled="backupBusy"
+            data-testid="download-backup"
+            @click="downloadBackup"
+          >
+            <AppIcon name="download" :size="13" />
+            {{ backupBusy ? t('settings.security.backupBusy') : t('settings.security.backupNow') }}
+          </button>
+        </div>
+      </div>
 
       <div class="rounded-xl border border-line p-6 text-[12px] leading-relaxed text-muted">
         <p class="mb-1 font-medium text-ink">{{ t('settings.security.forgotTitle') }}</p>

@@ -120,7 +120,15 @@
     "recoveryCopied": "恢复码已复制",
     "totpDisableCodePlaceholder": "TOTP 或恢复码",
     "davNoMounts": "暂无挂载点，请先创建",
-    "davReadonly": "只读"
+    "davReadonly": "只读",
+    "tokenScope": "范围",
+    "tokenScopeAll": "全部挂载点",
+    "backupTitle": "数据库备份",
+    "backupHint": "下载一份 SQLite 热备份（含账号、令牌与设置）。导入前请先停服，直接替换 data/asmoday.db 同名文件即可。",
+    "backupNow": "下载备份",
+    "backupBusy": "正在打包…",
+    "backupDone": "备份已开始下载",
+    "backupFailed": "备份失败"
   },
   "advanced": {
     "form": "可视化表单",

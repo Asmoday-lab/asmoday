@@ -7,6 +7,7 @@
  */
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { ensureVerified } from '../stores/reauth'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -177,6 +178,18 @@ function connect() {
   }
 
   emit('status', { id: props.tab.id, status: 'connecting' })
+  // 终端是系统级权限：后端要求最近 5 分钟内验证过密码，
+  // 没验证先弹一次窗（用户取消则不开 socket，避免手握手 403 后一脸茫然）
+  void (async () => {
+    if (!(await ensureVerified())) {
+      emit('status', { id: props.tab.id, status: 'closed' })
+      return
+    }
+    openSocket()
+  })()
+}
+
+function openSocket() {
   const current = new WebSocket(wsUrl())
   current.binaryType = 'arraybuffer'
   socket = current

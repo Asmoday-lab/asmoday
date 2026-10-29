@@ -3,16 +3,19 @@
 //! - `/assets/*` 走长期强缓存（文件名带内容哈希）；
 //! - `index.html` 强制 `no-cache`，避免前端更新后浏览器跑旧代码白屏；
 //! - 其余非 `/api`、非 `/proxy` 的 GET 请求回落到 `index.html`，支持前端 History 路由；
-//! - 子路径部署（`[server.proxy].base_url`）时，index.html 里的绝对路径会被重写成
-//!   `/base/assets/...`，并注入 `window.__ASMODAY_BASE__` 供前端 Router / fetch 使用。
+//! - 子路径部署时，index.html 里的绝对路径会被重写成 `/base/assets/...`，并注入
+//!   `window.__ASMODAY_BASE__` 供前端 Router / fetch 使用。前缀来源见
+//!   [`crate::api::prefix`]：`[server.proxy].base_url` 优先，其次可信反代的
+//!   `X-Forwarded-Prefix`。
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
 use crate::AppState;
+use crate::core::prefix::RuntimePrefix;
 
 #[derive(RustEmbed)]
 #[folder = "dist/"]
@@ -69,19 +72,27 @@ fn index(base: &str) -> Response {
 }
 
 /// SPA / 静态资源统一入口。
-pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
-    let base = {
-        let config = state.config.read().await;
-        config.server.proxy.base_url.trim().to_string()
+///
+/// `prefix` 由 [`crate::api::prefix::apply`] 解析后下发：可能是配置的 `base_url`，
+/// 也可能是可信反代的 `X-Forwarded-Prefix`（此时配置为空，用户没写也能用）。
+pub async fn serve(
+    State(state): State<AppState>,
+    prefix: Option<Extension<RuntimePrefix>>,
+    uri: Uri,
+) -> Response {
+    // 中间件已把前缀剥掉；这里再兜一次是为了兼容直连调用（无中间件）与旧行为
+    let base = match prefix.map(|Extension(prefix)| prefix) {
+        Some(prefix) if !prefix.is_empty() => prefix.as_str().to_string(),
+        _ => {
+            let config = state.config.read().await;
+            config.server.proxy.base_url.trim().to_string()
+        }
     };
 
-    // 嵌套路由在个别版本里不会剥掉前缀，这里统一兜一层（幂等）
+    // 中间件已把前缀剥掉，这里统一兜一层（幂等）；按**段边界**匹配，
+    // 否则前缀 `/app` 会把 `/application.js` 切成 `lication.js`
     let raw = uri.path();
-    let stripped = if base.is_empty() {
-        raw
-    } else {
-        raw.strip_prefix(base.as_str()).unwrap_or(raw)
-    };
+    let stripped = RuntimePrefix::new(base.clone()).strip(raw);
     let path = stripped.trim_start_matches('/');
 
     // 空路径 = 首屏

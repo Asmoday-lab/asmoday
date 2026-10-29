@@ -120,7 +120,15 @@
     "recoveryCopied": "Recovery codes copied",
     "totpDisableCodePlaceholder": "TOTP or recovery code",
     "davNoMounts": "No mounts yet, create one first",
-    "davReadonly": "read-only"
+    "davReadonly": "read-only",
+    "tokenScope": "Scope",
+    "tokenScopeAll": "All mounts",
+    "backupTitle": "Database backup",
+    "backupHint": "Download a hot SQLite backup (accounts, tokens and settings included). To restore, stop the service and replace data/asmoday.db with it.",
+    "backupNow": "Download backup",
+    "backupBusy": "Packing…",
+    "backupDone": "Backup download started",
+    "backupFailed": "Backup failed"
   },
   "advanced": {
     "form": "Form",

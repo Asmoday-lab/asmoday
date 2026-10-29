@@ -124,6 +124,18 @@ async fn roots_for(state: &AppState) -> crate::core::fs::RootSet {
     fs::load_roots(&config, &state.cwd)
 }
 
+/// 路径所属挂载点的 id（收藏 / 播放历史的分区键，设计文档 4.1）。
+///
+/// 找不到归属时回空串 —— 那代表「进程 cwd 兜底」的隐式根，也是老库迁移过来的
+/// 记录的取值，两者必须一致，否则同一个路径会分裂成两条记录。
+async fn mount_of(state: &AppState, display: &str) -> String {
+    let config = state.config.read().await;
+    crate::core::path_guard::load(&config, &state.cwd)
+        .find_by_path_text(display)
+        .map(|mount| mount.info.id.clone())
+        .unwrap_or_default()
+}
+
 async fn resolve_default(state: &AppState, requested: Option<&str>) -> Result<PathBuf, FsError> {
     let roots = roots_for(state).await;
     match requested.map(str::trim).filter(|p| !p.is_empty()) {
@@ -660,15 +672,17 @@ pub async fn progress(State(state): State<AppState>, Json(body): Json<ProgressBo
         Err(err) => return fs_error(err),
     };
     let display = fs::normalize_display(&target);
+    let mount_id = mount_of(&state, &display).await;
 
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return fs_error(FsError::Io(err)),
     };
     let result = conn.execute(
-        "INSERT INTO play_history (file_path, last_played_at, progress) VALUES (?1, ?2, ?3)
-         ON CONFLICT(file_path) DO UPDATE SET last_played_at = ?2, progress = ?3",
-        rusqlite::params![display, crate::core::auth::now_secs(), body.progress.max(0)],
+        "INSERT INTO play_history (mount_id, file_path, last_played_at, progress)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(mount_id, file_path) DO UPDATE SET last_played_at = ?3, progress = ?4",
+        rusqlite::params![mount_id, display, crate::core::auth::now_secs(), body.progress.max(0)],
     );
     match result {
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
@@ -683,7 +697,7 @@ pub async fn history(State(state): State<AppState>) -> Response {
         Err(err) => return fs_error(FsError::Io(err)),
     };
     let mut statement = match conn.prepare(
-        "SELECT file_path, last_played_at, progress FROM play_history
+        "SELECT mount_id, file_path, last_played_at, progress FROM play_history
          ORDER BY last_played_at DESC LIMIT 200",
     ) {
         Ok(statement) => statement,
@@ -691,9 +705,10 @@ pub async fn history(State(state): State<AppState>) -> Response {
     };
     let rows = statement.query_map([], |row| {
         Ok(json!({
-            "path": row.get::<_, String>(0)?,
-            "last_played_at": row.get::<_, Option<i64>>(1)?,
-            "progress": row.get::<_, Option<i64>>(2)?,
+            "mount_id": row.get::<_, String>(0)?,
+            "path": row.get::<_, String>(1)?,
+            "last_played_at": row.get::<_, Option<i64>>(2)?,
+            "progress": row.get::<_, Option<i64>>(3)?,
         }))
     });
     match rows {
@@ -710,6 +725,7 @@ pub async fn favorite(State(state): State<AppState>, Json(body): Json<FavoriteBo
         Err(err) => return fs_error(err),
     };
     let display = fs::normalize_display(&target);
+    let mount_id = mount_of(&state, &display).await;
 
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
@@ -717,11 +733,14 @@ pub async fn favorite(State(state): State<AppState>, Json(body): Json<FavoriteBo
     };
     let result = if body.favorite {
         conn.execute(
-            "INSERT OR IGNORE INTO favorites (file_path, created_at) VALUES (?1, ?2)",
-            rusqlite::params![display, crate::core::auth::now_secs()],
+            "INSERT OR IGNORE INTO favorites (mount_id, file_path, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![mount_id, display, crate::core::auth::now_secs()],
         )
     } else {
-        conn.execute("DELETE FROM favorites WHERE file_path = ?1", [&display])
+        conn.execute(
+            "DELETE FROM favorites WHERE mount_id = ?1 AND file_path = ?2",
+            rusqlite::params![mount_id, display],
+        )
     };
     match result {
         Ok(_) => Json(json!({ "status": "ok", "favorite": body.favorite })).into_response(),
@@ -736,15 +755,16 @@ pub async fn favorites(State(state): State<AppState>) -> Response {
         Err(err) => return fs_error(FsError::Io(err)),
     };
     let mut statement = match conn
-        .prepare("SELECT file_path, created_at FROM favorites ORDER BY created_at DESC")
+        .prepare("SELECT mount_id, file_path, created_at FROM favorites ORDER BY created_at DESC")
     {
         Ok(statement) => statement,
         Err(err) => return fs_error(FsError::Io(format!("查询收藏失败：{err}"))),
     };
     let rows = statement.query_map([], |row| {
         Ok(json!({
-            "path": row.get::<_, String>(0)?,
-            "created_at": row.get::<_, Option<i64>>(1)?,
+            "mount_id": row.get::<_, String>(0)?,
+            "path": row.get::<_, String>(1)?,
+            "created_at": row.get::<_, Option<i64>>(2)?,
         }))
     });
     match rows {

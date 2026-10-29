@@ -142,33 +142,24 @@ body,
    不内嵌的话这些字形全部渲染成豆腐块。
    用相对路径经 Vite 打包（hashed asset），子路径部署下也能正确解析；
    放 public/ 绝对路径在 base_url 子路径部署时会 404。
+
+   只保留 Regular / Bold 两个 woff2：
+   - woff2 比 ttf 小约 60%（2.5MB → 1.0MB/字重），二进制里少塞 5MB；
+   - 斜体在终端里几乎不出现，缺字形时浏览器自动做合成倾斜（font-synthesis），
+     为它多背 5MB 不值得。
    ============================================================ */
 @font-face {
   font-family: 'JetBrainsMono Nerd Font';
-  src: url('./assets/fonts/JetBrainsMonoNerdFont-Regular.ttf') format('truetype');
+  src: url('./assets/fonts/JetBrainsMonoNerdFont-Regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: 'JetBrainsMono Nerd Font';
-  src: url('./assets/fonts/JetBrainsMonoNerdFont-Bold.ttf') format('truetype');
+  src: url('./assets/fonts/JetBrainsMonoNerdFont-Bold.woff2') format('woff2');
   font-weight: 700;
   font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'JetBrainsMono Nerd Font';
-  src: url('./assets/fonts/JetBrainsMonoNerdFont-Italic.ttf') format('truetype');
-  font-weight: 400;
-  font-style: italic;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'JetBrainsMono Nerd Font';
-  src: url('./assets/fonts/JetBrainsMonoNerdFont-BoldItalic.ttf') format('truetype');
-  font-weight: 700;
-  font-style: italic;
   font-display: swap;
 }
 

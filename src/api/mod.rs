@@ -7,6 +7,7 @@ pub mod error;
 pub mod files;
 pub mod files_mutate;
 pub mod media;
+pub mod prefix;
 pub mod proxy;
 pub mod security;
 pub mod shares;

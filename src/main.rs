@@ -51,6 +51,8 @@ pub struct AppState {
     pub dav_guard: Arc<core::auth::LoginGuard>,
     /// per-path 并发锁（设计文档 3.2.8）
     pub path_locks: Arc<core::locks::PathLocks>,
+    /// WebDAV 写锁表（LOCK/UNLOCK + If 头校验，防两端同时编辑互相覆盖）
+    pub dav_locks: Arc<core::dav_locks::DavLockTable>,
     /// 批量删除的一次性令牌
     pub delete_tickets: Arc<api::files_mutate::DeleteTickets>,
     /// 哈希并发槽位（上限 2，设计文档 6.2）
@@ -100,6 +102,9 @@ struct Cli {
     /// 只校验配置文件语法与危险配置，不启动服务
     #[arg(long = "check-config")]
     check_config: bool,
+    /// 把数据库热备份到指定文件后退出（不启动服务；服务在跑时也能执行）
+    #[arg(long, value_name = "PATH")]
+    backup: Option<PathBuf>,
 }
 
 async fn status() -> Json<Value> {
@@ -189,6 +194,34 @@ async fn run(cli: Cli) -> Result<(), String> {
     // ---- 危险配置自检（只 WARN，proxy_trust 无白名单时强制关闭）----
     config.apply_safety();
 
+    // ---- 单实例锁 ----
+    // 必须在打开数据库之前：`--init` / `--reset-password` 也会写库，同样不能并发。
+    // 内存 per-path 锁与 `.asmoday-part` 启动清理都隐含「只有一个进程」的假设。
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+
+    // `--backup PATH`：热备份后直接退出（设计文档 4.1）。
+    // 刻意放在单实例锁**之前** —— 备份是只读操作，服务正在跑的时候也要能备份，
+    // 否则「先停服再备份」意味着一次意外停机窗口。VACUUM INTO 走独立连接，
+    // 与线上 WAL 的读写互不阻塞。
+    if let Some(target) = cli.backup.clone() {
+        let db_path = data_dir.join("asmoday.db");
+        if !db_path.is_file() {
+            return Err(format!("database not found: {}", db_path.display()));
+        }
+        let auth = AuthStore::new(db_path);
+        let bytes = tokio::task::spawn_blocking(move || auth.backup_to(&target))
+            .await
+            .map_err(|e| format!("backup task failed: {e}"))??;
+        println!(
+            "[asmoday] database backed up to {} ({bytes} bytes)",
+            cli.backup.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    core::instance_lock::acquire(&data_dir)?;
+
     // ---- 数据库 / 认证 ----
     let auth = Arc::new(AuthStore::new(data_dir.join("asmoday.db")));
     auth.init()?;
@@ -217,6 +250,7 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     // ---- 共享状态 ----
     let media = config.media.clone();
+    let terminal = config.terminal.clone();
     let listen = (config.server.host.clone(), config.server.ssl.enabled);
     let state = AppState {
         config_path: config_path.clone(),
@@ -227,12 +261,16 @@ async fn run(cli: Cli) -> Result<(), String> {
             .user_agent("Asmoday/0.1 (reverse-proxy)")
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?,
-        terminals: TerminalManager::new(),
+        terminals: TerminalManager::with_limits(
+            terminal.max_sessions,
+            std::time::Duration::from_secs(terminal.idle_kill_seconds),
+        ),
         auth: Arc::clone(&auth),
         login_guard: Arc::new(core::auth::LoginGuard::new()),
         share_guard: Arc::new(core::auth::LoginGuard::new()),
         dav_guard: Arc::new(core::auth::LoginGuard::new()),
         path_locks: Arc::new(core::locks::PathLocks::new()),
+        dav_locks: Arc::new(core::dav_locks::DavLockTable::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         started,
@@ -247,7 +285,16 @@ async fn run(cli: Cli) -> Result<(), String> {
     let port = state.config.read().await.server.port;
     let base_url = state.config.read().await.server.proxy.base_url.clone();
 
-    let mut app = build_router(state.clone());
+    // 子路径前缀（设计文档 3.1 / 4.2）：解析 base_url / X-Forwarded-Prefix，并在
+    // 路由匹配**之前**把路径上的前缀剥掉。
+    //
+    // 必须包在 Router 外面：axum 的 `Router::layer` 是「路由之后」执行的中间件，
+    // 在里面改 uri 只会影响处理器看到的路径，不会重新匹配路由 —— 表现就是
+    // `/asmoday/api/...` 全部落到静态回落（回 `{"error":"接口不存在"}`）。
+    let mut app = Router::new().fallback_service(tower::Layer::layer(
+        &middleware::from_fn_with_state(state.clone(), api::prefix::apply),
+        build_router(state.clone()),
+    ));
     // 子路径部署：整站挂到 base_url 下，根路径跳转到前缀（设计文档 3.1 / 4.2）
     if !base_url.is_empty() {
         let base = base_url.clone();
@@ -395,6 +442,8 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/auth/me", get(api::auth::me))
         .route("/api/system/health", get(api::system::health))
+        // 数据库热备下载（设计文档 4.1）：高敏，需近期验证过密码
+        .route("/api/system/backup", get(api::system::backup))
         .route("/api/system/ffmpeg-status", get(api::system::ffmpeg_status))
         .route(
             "/api/system/cleanup/thumbnails",
@@ -418,6 +467,9 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/system/test-ffmpeg", post(api::system::test_ffmpeg))
         .route("/api/auth/password", post(api::auth::change_password))
+        // 敏感操作前的二次验证（终端 / 令牌 / 配置写操作要求 5 分钟内验证过）
+        .route("/api/auth/reauth", get(api::auth::reauth_status))
+        .route("/api/auth/verify", post(api::auth::verify_recent))
         .route("/api/auth/totp/setup", get(api::auth::totp_setup))
         .route("/api/auth/totp/enable", post(api::auth::totp_enable))
         .route("/api/auth/totp/disable", post(api::auth::totp_disable))

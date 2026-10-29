@@ -33,6 +33,18 @@ pub struct CreateToken {
     /// 有效天数，0 或省略表示永久
     #[serde(default)]
     pub days: u32,
+    /// 可选：把令牌限制在某个挂载点内（WebDAV 挂载通常只需要一个目录）。
+    /// 省略 = 全部挂载点；填了不存在的 id 直接拒绝，避免造出「看起来能用」的令牌。
+    #[serde(default)]
+    pub mount_id: Option<String>,
+}
+
+/// 令牌校验结果：只读标记 + 挂载点范围
+#[derive(Debug, Clone)]
+pub struct TokenAccess {
+    pub readonly: bool,
+    /// `None` = 全部挂载点
+    pub mount_scope: Option<String>,
 }
 
 fn default_readonly() -> bool {
@@ -57,7 +69,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
     };
 
     let mut statement = match conn.prepare(
-        "SELECT id, token_name, is_readonly, expires_at, created_at FROM access_tokens ORDER BY id DESC",
+        "SELECT id, token_name, is_readonly, expires_at, created_at, mount_scope FROM access_tokens ORDER BY id DESC",
     ) {
         Ok(statement) => statement,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败：{err}")),
@@ -70,6 +82,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
             "readonly": row.get::<_, i64>(2)? != 0,
             "expires_at": row.get::<_, Option<i64>>(3)?,
             "created_at": row.get::<_, Option<i64>>(4)?,
+            "mount_id": row.get::<_, Option<String>>(5)?,
         }))
     });
 
@@ -94,21 +107,43 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>
         Some(now_secs() + i64::from(body.days) * 86_400)
     };
 
+    // 挂载点范围：填了就必须真实存在，否则令牌会「永远 403」且用户不知道原因
+    let scope = body
+        .mount_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if let Some(id) = &scope {
+        let set = {
+            let config = state.config.read().await;
+            crate::core::path_guard::load(&config, &state.cwd)
+        };
+        if set.find(id).is_none() {
+            return error_code(
+                StatusCode::BAD_REQUEST,
+                "E_NOT_FOUND",
+                "Mount point does not exist",
+            );
+        }
+    }
+
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
     let result = conn.execute(
-        "INSERT INTO access_tokens (user_id, token_name, token_hash, is_readonly, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO access_tokens (user_id, token_name, token_hash, is_readonly, expires_at, created_at, mount_scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             1,
             name,
             hashed,
             if body.readonly { 1 } else { 0 },
             expires_at,
-            now_secs()
+            now_secs(),
+            scope
         ],
     );
 
@@ -120,6 +155,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>
             "name": name,
             "readonly": body.readonly,
             "expires_at": expires_at,
+            "mount_id": scope,
         }))
         .into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("创建失败：{err}")),
@@ -142,19 +178,19 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
 
 /// 校验 WebDAV Basic 凭证（设计文档 v2.5.0 3.10）：
 /// 用户名必须是 Token 名，密码是 `asm_` 明文；哈希匹配且未过期才放行。
-/// 返回只读标记。
-pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<bool> {
+/// 返回只读标记与挂载点范围。
+pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<TokenAccess> {
     let conn = state.auth_connection().ok()?;
     let hashed = hash_token(token);
-    let row: Option<(String, i64, Option<i64>)> = conn
+    let row: Option<(String, i64, Option<i64>, Option<String>)> = conn
         .query_row(
-            "SELECT token_name, is_readonly, expires_at FROM access_tokens WHERE token_hash = ?1",
+            "SELECT token_name, is_readonly, expires_at, mount_scope FROM access_tokens WHERE token_hash = ?1",
             [hashed],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .ok();
 
-    let (token_name, readonly, expires_at) = row?;
+    let (token_name, readonly, expires_at, mount_scope) = row?;
     if token_name != username {
         return None;
     }
@@ -163,5 +199,8 @@ pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<boo
             return None;
         }
     }
-    Some(readonly != 0)
+    Some(TokenAccess {
+        readonly: readonly != 0,
+        mount_scope,
+    })
 }

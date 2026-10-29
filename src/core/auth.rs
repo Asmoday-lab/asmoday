@@ -7,7 +7,7 @@
 //! - 忘记密码只能走 CLI（`--reset-password`）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,16 @@ use serde::Serialize;
 pub const SESSION_TTL: i64 = 7 * 24 * 3600;
 /// 会话绝对上限：30 天（无论怎么续期都不能超过，设计文档 3.1.3）
 pub const SESSION_ABSOLUTE_TTL: i64 = 30 * 86_400;
+/// 敏感操作的时间闸门：最近一次输密码必须在 5 分钟内
+pub const REAUTH_WINDOW: i64 = 5 * 60;
+
+/// 会话的服务端状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionState {
+    pub user_id: i64,
+    /// 最近一次「重新输入密码」的时间戳（登录时等于 created_at）
+    pub verified_at: i64,
+}
 /// 连续失败次数上限
 pub const MAX_ATTEMPTS: u32 = 5;
 /// 封禁时长
@@ -47,7 +57,10 @@ CREATE TABLE IF NOT EXISTS access_tokens (
     token_hash TEXT UNIQUE,
     is_readonly BOOLEAN DEFAULT 1,
     expires_at DATETIME,
-    created_at DATETIME
+    created_at DATETIME,
+    -- 令牌限定挂载点（NULL = 全部）：WebDAV 挂载通常只需要一个目录，
+    -- 泄漏时影响面从「全库」缩到一个挂载点
+    mount_scope TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shares (
@@ -61,15 +74,22 @@ CREATE TABLE IF NOT EXISTS shares (
     deleted_at INTEGER
 );
 
+-- 收藏与播放历史（设计文档 4.1）：主键是 (mount_id, file_path)。
+-- file_path 一直是绝对路径，单主键其实不会撞；带 mount_id 是为了「按挂载点
+-- 批量清理 / 分组展示」，也让将来改成挂载点内相对路径时不用再迁一次表。
 CREATE TABLE IF NOT EXISTS favorites (
-    file_path TEXT PRIMARY KEY,
-    created_at INTEGER
+    mount_id TEXT NOT NULL DEFAULT '',
+    file_path TEXT NOT NULL,
+    created_at INTEGER,
+    PRIMARY KEY (mount_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS play_history (
-    file_path TEXT PRIMARY KEY,
+    mount_id TEXT NOT NULL DEFAULT '',
+    file_path TEXT NOT NULL,
     last_played_at INTEGER,
-    progress INTEGER
+    progress INTEGER,
+    PRIMARY KEY (mount_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -81,7 +101,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    -- 最近一次「重新输入密码」的时刻：敏感操作（终端/令牌/配置）要求它足够新，
+    -- 防止一个 30 天的会话被 XSS 或借用浏览器后直接拿到系统级权限
+    verified_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS thumb_hashes (
@@ -111,6 +134,61 @@ pub fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 表里是否已有某一列（用于判定老库要不要迁移）。
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({table})");
+    let Ok(mut statement) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+        return false;
+    };
+    rows.filter_map(Result::ok).any(|name| name == column)
+}
+
+/// `favorites` / `play_history` 主键升级：`file_path` → `(mount_id, file_path)`。
+///
+/// SQLite 不支持改主键，只能「建新表 → 抄数据 → 删旧表 → 改名」。
+/// 只跑一次（老库没有 `mount_id` 列时才动），新库的 `CREATE TABLE` 已经是新结构。
+fn rebuild_media_tables(conn: &Connection) -> Result<(), String> {
+    if !table_has_column(conn, "favorites", "mount_id") {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE favorites_v2 (
+                 mount_id TEXT NOT NULL DEFAULT '',
+                 file_path TEXT NOT NULL,
+                 created_at INTEGER,
+                 PRIMARY KEY (mount_id, file_path)
+             );
+             INSERT OR IGNORE INTO favorites_v2 (mount_id, file_path, created_at)
+                 SELECT '', file_path, created_at FROM favorites;
+             DROP TABLE favorites;
+             ALTER TABLE favorites_v2 RENAME TO favorites;
+             COMMIT;",
+        )
+        .map_err(|e| format!("迁移 favorites 主键失败：{e}"))?;
+    }
+    if !table_has_column(conn, "play_history", "mount_id") {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE play_history_v2 (
+                 mount_id TEXT NOT NULL DEFAULT '',
+                 file_path TEXT NOT NULL,
+                 last_played_at INTEGER,
+                 progress INTEGER,
+                 PRIMARY KEY (mount_id, file_path)
+             );
+             INSERT OR IGNORE INTO play_history_v2 (mount_id, file_path, last_played_at, progress)
+                 SELECT '', file_path, last_played_at, progress FROM play_history;
+             DROP TABLE play_history;
+             ALTER TABLE play_history_v2 RENAME TO play_history;
+             COMMIT;",
+        )
+        .map_err(|e| format!("迁移 play_history 主键失败：{e}"))?;
+    }
+    Ok(())
 }
 
 impl AuthStore {
@@ -244,6 +322,16 @@ impl AuthStore {
         // 分享 tombstone（设计文档 3.2.6.7 / 4.1）：文件被删后分享不连带消失，
         // 而是置 deleted_at，访问时返回 410，30 天后物理清除
         let _ = conn.execute("ALTER TABLE shares ADD COLUMN deleted_at INTEGER", []);
+        // 令牌限定挂载点（老库补列）
+        let _ = conn.execute("ALTER TABLE access_tokens ADD COLUMN mount_scope TEXT", []);
+        // 敏感操作二次验证时间戳（老库补列；默认 0 = 从未验证）
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN verified_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // 收藏 / 播放历史改复合主键（设计文档 4.1）：SQLite 不能原地改主键，
+        // 只能重建表；只在老库（缺 mount_id 列）上跑一次。
+        rebuild_media_tables(&conn)?;
         Ok(())
     }
 
@@ -373,6 +461,34 @@ impl AuthStore {
             [cutoff],
         )
         .map_err(|e| format!("清理分享 tombstone 失败：{e}"))
+    }
+
+    /// 热备份数据库到指定文件，返回备份大小（字节）。
+    ///
+    /// 用 `VACUUM INTO`（SQLite 官方的单文件热备手段）而不是复制 `.db`：
+    /// WAL 模式下最近的事务还在 `-wal` 里，只拷主文件会得到一个「少了最近写入」
+    /// 的库，而且不会有任何报错 —— 这种备份比没有备份更危险。
+    ///
+    /// 服务运行中也能执行：它走独立连接，只需读锁，不会阻塞线上读写。
+    pub fn backup_to(&self, target: &Path) -> Result<u64, String> {
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建备份目录失败：{e}"))?;
+        }
+        // VACUUM INTO 遇到已存在的文件会直接报错，先给出更好懂的提示
+        if target.exists() {
+            return Err(format!("备份目标已存在，拒绝覆盖：{}", target.display()));
+        }
+        let conn = self.connect()?;
+        // `VACUUM INTO` 的目标只能是字面量（不接受绑定参数），单引号按 SQL 规则双写
+        let literal = target.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{literal}'"))
+            .map_err(|e| format!("备份数据库失败：{e}"))?;
+        std::fs::metadata(target)
+            .map(|meta| meta.len())
+            .map_err(|e| format!("备份文件不可读：{e}"))
     }
 
     /// 数据库状态摘要（启动日志用）：WAL 是否开启 + 表数量
@@ -601,32 +717,44 @@ impl AuthStore {
         let conn = self.connect()?;
         let now = now_secs();
         conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-            params![token, user_id, now, now + SESSION_TTL],
+            "INSERT INTO sessions (token, user_id, created_at, expires_at, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![token, user_id, now, now + SESSION_TTL, now],
         )
         .map_err(|e| format!("创建会话失败：{e}"))?;
         Ok(token)
     }
 
-    /// 返回 user_id —— 过期会话视为无效并顺手清理。
+    /// 记下「刚刚重新验证过密码」：敏感操作的时间闸门依据。
+    pub fn mark_verified(&self, token: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE sessions SET verified_at = ?1 WHERE token = ?2",
+            params![now_secs(), token],
+        )
+        .map_err(|e| format!("更新验证时间失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 会话的完整状态（user_id + 最近验证时间）。
     ///
     /// 滑动续期（设计文档 3.1.3）：剩余不足半个 TTL 时把过期时间往后推，
     /// 但**不超过** `created_at + SESSION_ABSOLUTE_TTL`（绝对上限 30 天）。
     /// 只在临近过期时写库，避免每个请求都产生一次 UPDATE。
-    pub fn session_user(&self, token: &str) -> Result<Option<i64>, String> {
+    pub fn session_state(&self, token: &str) -> Result<Option<SessionState>, String> {
         let conn = self.connect()?;
-        let row: Option<(i64, i64, i64)> = conn
+        let row: Option<(i64, i64, i64, i64)> = conn
             .query_row(
-                "SELECT user_id, expires_at, created_at FROM sessions WHERE token = ?1",
+                "SELECT user_id, expires_at, created_at, verified_at FROM sessions WHERE token = ?1",
                 params![token],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| format!("查询会话失败：{e}"))?;
 
         let now = now_secs();
         match row {
-            Some((user_id, expires_at, created_at)) if expires_at > now => {
+            Some((user_id, expires_at, created_at, verified_at)) if expires_at > now => {
                 if expires_at - now <= SESSION_TTL / 2 {
                     let ceiling = created_at.saturating_add(SESSION_ABSOLUTE_TTL);
                     let renewed = (now + SESSION_TTL).min(ceiling);
@@ -637,7 +765,10 @@ impl AuthStore {
                         );
                     }
                 }
-                Ok(Some(user_id))
+                Ok(Some(SessionState {
+                    user_id,
+                    verified_at,
+                }))
             }
             Some(_) => {
                 let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);
@@ -645,6 +776,11 @@ impl AuthStore {
             }
             None => Ok(None),
         }
+    }
+
+    /// 返回 user_id —— 过期会话视为无效并顺手清理（`session_state` 的薄包装）
+    pub fn session_user(&self, token: &str) -> Result<Option<i64>, String> {
+        Ok(self.session_state(token)?.map(|state| state.user_id))
     }
 
     pub fn delete_session(&self, token: &str) -> Result<(), String> {
@@ -827,6 +963,78 @@ mod tests {
         let store = AuthStore::new(path);
         store.init().unwrap();
         store
+    }
+
+    #[test]
+    fn media_tables_upgrade_to_composite_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE favorites (file_path TEXT PRIMARY KEY, created_at INTEGER);
+             CREATE TABLE play_history (
+                 file_path TEXT PRIMARY KEY,
+                 last_played_at INTEGER,
+                 progress INTEGER
+             );
+             INSERT INTO favorites VALUES ('/m/a.mp4', 1);
+             INSERT INTO play_history VALUES ('/m/b.mp4', 2, 3);",
+        )
+        .unwrap();
+
+        rebuild_media_tables(&conn).unwrap();
+        assert!(table_has_column(&conn, "favorites", "mount_id"));
+        assert!(table_has_column(&conn, "play_history", "mount_id"));
+
+        // 存量记录迁到空串挂载点（= 隐式根），路径与原值一字不差
+        let (mount, path, created): (String, String, i64) = conn
+            .query_row("SELECT mount_id, file_path, created_at FROM favorites", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((mount.as_str(), path.as_str(), created), ("", "/m/a.mp4", 1));
+        let progress: i64 = conn
+            .query_row("SELECT progress FROM play_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(progress, 3);
+
+        // 复合主键：同一个绝对路径可以同时挂在两个挂载点下
+        conn.execute(
+            "INSERT INTO favorites (mount_id, file_path, created_at) VALUES ('nas', '/m/a.mp4', 2)",
+            [],
+        )
+        .unwrap();
+
+        // 幂等：再跑一次不能丢数据
+        rebuild_media_tables(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM favorites", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn backup_writes_a_usable_copy_and_never_overwrites() {
+        let store = temp_store("backup");
+        store.create_user("admin", "Asmoday#2026").unwrap();
+
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join("auth-backup-copy.db");
+        let _ = std::fs::remove_file(&out);
+
+        let bytes = store.backup_to(&out).unwrap();
+        assert!(bytes > 0, "备份必须真有内容");
+
+        // 备份是完整可用的库，不是空壳
+        let copy = Connection::open(&out).unwrap();
+        let count: i64 = copy
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // 已存在的目标拒绝覆盖：静默冲掉上一份备份等于丢数据
+        assert!(store.backup_to(&out).is_err());
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

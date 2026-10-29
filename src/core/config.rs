@@ -36,12 +36,24 @@ key_path = ""
 
 # 反向代理兼容性
 [server.proxy]
-# 是否信任 X-Forwarded-For / X-Real-IP / X-Forwarded-Proto / X-Forwarded-Host
-trust_proxy_headers = true
-# 仅信任来自这些地址的转发头（支持 CIDR 写法，按字符串匹配）
-trusted_ips = ["127.0.0.1", "172.16.0.0/12"]
+# 是否信任 X-Forwarded-For / X-Real-IP / X-Forwarded-Proto / X-Forwarded-Host。
+# 默认关闭：开着的代价是同网段任何设备（含同一 Docker 网络里的其它容器）都能伪造
+# 来源 IP，绕过按 IP 的防爆破白名单、污染访问日志。前置了 Nginx/Caddy 再打开。
+trust_proxy_headers = false
+# 仅信任来自这些地址的转发头（支持 IPv4/IPv6 CIDR 写法）。
+# Docker 里 asmoday 常与反代同网，按需补 "172.16.0.0/12"；不要为了省事写 0.0.0.0/0。
+trusted_ips = ["127.0.0.1", "::1"]
 # 子路径部署前缀，如挂载在 /asmoday 则填 "/asmoday"，根路径留空
 base_url = ""
+
+# 批量文件操作上限（copy / move / delete）
+[server.limits]
+# 单次操作的顶层条目数上限，0 = 不限。
+# 注意：这里数的是「选中的条目」，不是目录里的文件总数——删/搬一个装着一万张照片的
+# 目录只算 1 项。目录内部的大小只在复制/跨盘移动时按需累加。
+batch_max_items = 100
+# 单次复制/跨盘移动的总字节上限（MiB），0 = 不限。删除不受此项约束。
+batch_max_bytes_mb = 2048
 
 [auth]
 # 本地账号密码登录开关。
@@ -82,6 +94,11 @@ upload_max_size_mb = 0
 # 注意：历史记录隔离依赖 shell 自身的 HISTFILE / PSReadLine 配置，
 # 走自定义参数时这部分由你自己的配置负责。
 # args = []
+# 断线后 PTY 保活秒数（默认 180）。手机切网 / 锁屏回来不该直接丢 shell，
+# 低功耗设备又不能让僵尸终端常驻——按需调大即可。
+# idle_kill_seconds = 180
+# 单用户并发 PTY 上限（默认 10）。超限时前端会弹出「活动会话」面板让你强制关闭。
+# max_sessions = 10
 
 # 日志策略（设计文档 3.7）：默认生产级克制，排障时分级开启，结构化可选。
 [log]
@@ -157,13 +174,29 @@ impl Default for Config {
 /// 两项都缺省时走自动探测；`shell` 非空则优先于 `$SHELL` 与平台探测；
 /// `args` 非空则**完全替换**内置启动参数（`-l` / `-NoExit` 等一律不再追加），
 /// 供 `["-c", "tmux new -A -s asmoday"]` 这类自定义接入。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TerminalConfig {
     /// 覆盖自动探测的 shell（绝对路径或 PATH 内可执行名；空 = 自动探测）
     pub shell: String,
     /// 覆盖默认启动参数（空 = 用内置参数）
     pub args: Vec<String>,
+    /// 断线后 PTY 保活秒数（默认 180）。手机切网 / 锁屏回来不该直接丢 shell，
+    /// 低功耗设备又不能让僵尸终端常驻，所以做成可调。
+    pub idle_kill_seconds: u64,
+    /// 单用户并发 PTY 上限（默认 10）
+    pub max_sessions: usize,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            shell: String::new(),
+            args: Vec::new(),
+            idle_kill_seconds: 180,
+            max_sessions: 10,
+        }
+    }
 }
 
 /// 危险配置自检结果（设置页警告条 / 启动日志共用）
@@ -258,6 +291,8 @@ pub struct ServerConfig {
     pub port: u16,
     pub ssl: SslConfig,
     pub proxy: ProxyConfig,
+    /// 批量文件操作上限（设计文档 1.3 第 7 条，可用 `0` 关闭）
+    pub limits: LimitsConfig,
 }
 
 impl Default for ServerConfig {
@@ -267,6 +302,26 @@ impl Default for ServerConfig {
             port: DEFAULT_PORT,
             ssl: SslConfig::default(),
             proxy: ProxyConfig::default(),
+            limits: LimitsConfig::default(),
+        }
+    }
+}
+
+/// `[server.limits]`：批量 copy / move / delete 的规模闸门。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// 单次操作的顶层条目数上限，0 = 不限
+    pub batch_max_items: usize,
+    /// 单次复制 / 跨盘移动的总字节上限（MiB），0 = 不限
+    pub batch_max_bytes_mb: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            batch_max_items: 100,
+            batch_max_bytes_mb: 2048,
         }
     }
 }
@@ -292,8 +347,10 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            trust_proxy_headers: true,
-            trusted_ips: vec!["127.0.0.1".to_string(), "172.16.0.0/12".to_string()],
+            // 默认不信任转发头：信任的代价是同网段任意主机可伪造来源 IP。
+            // 需要反代时用户在配置里显式打开，并自行收紧 trusted_ips。
+            trust_proxy_headers: false,
+            trusted_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
             base_url: String::new(),
         }
     }
@@ -1163,7 +1220,7 @@ mod tests {
         assert!(text.contains("port = 5000"), "值没写进去：\n{text}");
         // 数组要摊成单行：序列化产物是多行格式，直接搬会把用户原有的一行撑开
         assert!(
-            text.contains(r#"trusted_ips = ["127.0.0.1", "172.16.0.0/12"]"#),
+            text.contains(r#"trusted_ips = ["127.0.0.1", "::1"]"#),
             "数组被拆成多行了：\n{text}"
         );
         assert_eq!(parsed(&text), config);
@@ -1319,5 +1376,42 @@ thumb_cache_max_size_mb = 512
         assert_eq!(parsed(&text), config);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dangerous_proxy_defaults_are_off() {
+        // 默认不信任转发头：信任的代价是同网段任意主机可伪造来源 IP，
+        // 绕过按 IP 的防爆破与访问日志（设计文档 3.1.5 / 5）。
+        let config = Config::default();
+        assert!(!config.server.proxy.trust_proxy_headers);
+        assert_eq!(
+            config.server.proxy.trusted_ips,
+            vec!["127.0.0.1".to_string(), "::1".to_string()]
+        );
+    }
+
+    #[test]
+    fn limits_accept_zero_and_round_trip() {
+        let text = r#"
+[server]
+port = 4242
+
+[server.limits]
+batch_max_items = 0
+batch_max_bytes_mb = 0
+"#;
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config.server.limits.batch_max_items, 0);
+        assert_eq!(config.server.limits.batch_max_bytes_mb, 0);
+
+        let rendered = parsed(&rendered(&config));
+        assert_eq!(rendered.server.limits, config.server.limits);
+    }
+
+    #[test]
+    fn limits_have_conservative_defaults() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.batch_max_items, 100);
+        assert_eq!(limits.batch_max_bytes_mb, 2048);
     }
 }

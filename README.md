@@ -68,6 +68,9 @@ asmoday --reset-password
 
 # Custom config & data directory
 asmoday -c ./config.toml -d ./data -p 4242
+
+# Hot backup the database (works while the server is running; VACUUM INTO keeps it consistent)
+asmoday --backup ./asmoday-backup.db
 ```
 
 ## 🏗️ Development
@@ -126,6 +129,7 @@ If this project helps you, please give it a ⭐️ Star!
 | GET/POST | `/api/auth/totp` | 2FA setup |
 | any | `/proxy/{id}/*` | Reverse proxy |
 | any | `/dav/<mount_id>/*` | WebDAV server (Token required) |
+| GET | `/api/system/backup` | Download a hot DB backup (requires a recent password check) |
 
 </details>
 

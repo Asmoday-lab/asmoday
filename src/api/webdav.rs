@@ -243,8 +243,40 @@ fn ensure_writable(
         .map_err(|_| dav_error(StatusCode::FORBIDDEN, "挂载点为只读"))
 }
 
-fn reject_mount_root(target: &Path, root: &Path) -> Result<(), Response> {
-    if target == root {
+/// 读 `If` 头（RFC 4918 的条件请求；Office / Finder 用它在锁保护下写文件）
+fn if_header(headers: &HeaderMap) -> Option<&str> {
+    headers.get("if").and_then(|value| value.to_str().ok())
+}
+
+/// 写操作前的锁校验：被别的客户端锁住且没带 token → 423 Locked。
+///
+/// 不校验会怎样：两个人同时用 Word 打开同一个文档，后保存的直接覆盖前一个，
+/// 且双方都不会收到任何提示——这是「伪锁」最实际的伤害。
+fn ensure_not_locked(
+    state: &AppState,
+    key: &str,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    match state.dav_locks.check_write(key, if_header(headers)) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(dav_error(
+            StatusCode::LOCKED,
+            "资源已被其它客户端锁定，请稍后重试",
+        )),
+    }
+}
+
+/// 锁键：`/dav/<mount_id>/<相对路径>`，和对外 URL 同形，便于排障。
+fn dav_key(mount_id: &str, rel: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        PREFIX,
+        percent_encode_segment(mount_id),
+        fs::normalize_display(Path::new(rel)).trim_start_matches('/')
+    )
+}
+
+fn reject_mount_root(target: &Path, root: &Path) -> Result<(), Response> {    if target == root {
         return Err(dav_error(
             StatusCode::FORBIDDEN,
             "挂载点根目录不可执行该操作",
@@ -305,12 +337,13 @@ pub async fn handle(
             &format!("Too many failed attempts, retry in {remaining}s"),
         );
     }
-    let Some(readonly) = crate::api::tokens::verify_token(&state, &creds.username, &creds.token)
+    let Some(access) = crate::api::tokens::verify_token(&state, &creds.username, &creds.token)
     else {
         state.dav_guard.record_failure(&guard_key);
         return unauthorized();
     };
     state.dav_guard.record_success(&guard_key);
+    let readonly = access.readonly;
 
     // ---- 路由与挂载点 ----
     let (mount_id, rest) = match split_route(uri.path()) {
@@ -323,6 +356,15 @@ pub async fn handle(
             "Use /dav/<mount_id>/<path>; see GET /api/files/mounts",
         );
     };
+    // 令牌限定挂载点：泄漏的令牌只影响一个目录，而不是全库
+    if let Some(scope) = access.mount_scope.as_deref()
+        && scope != mount_id
+    {
+        return dav_error(
+            StatusCode::FORBIDDEN,
+            "This token is restricted to another mount point",
+        );
+    }
     let set = mount_load(&state).await;
     let Some(mount) = set.find(&mount_id) else {
         return dav_error(StatusCode::NOT_FOUND, "挂载点不存在");
@@ -359,13 +401,32 @@ pub async fn handle(
             StatusCode::OK,
             [
                 (HeaderName::from_static("dav"), "1, 2".to_string()),
+                // Windows 资源管理器 / Office 认这个头才肯把共享当「可写 WebDAV」，
+                // 否则映射网络驱动器后只能浏览、保存直接报只读
+                (
+                    HeaderName::from_static("ms-author-via"),
+                    "DAV".to_string(),
+                ),
                 (
                     header::ALLOW,
-                    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, MOVE, COPY, LOCK, UNLOCK"
+                    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY, LOCK, UNLOCK"
                         .to_string(),
                 ),
                 (header::ACCEPT_RANGES, "bytes".to_string()),
             ],
+        )
+            .into_response(),
+
+        // Windows 客户端挂载后会先 PROPPATCH 设置 Win32 文件属性（只读/隐藏/时间）。
+        // 我们不做属性持久化，但必须回一个 RFC 合规的 207，否则客户端认为共享不可写。
+        "PROPPATCH" => (
+            StatusCode::MULTI_STATUS,
+            [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<D:multistatus xmlns:D=\"DAV:\">\
+<D:response><D:href></D:href><D:propstat><D:prop/>\
+<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+</D:multistatus>",
         )
             .into_response(),
 
@@ -569,6 +630,9 @@ pub async fn handle(
                     };
                 }
             };
+            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
+                return response;
+            }
             let existed = path_guard::symlink_exists(&target);
             let part_path = target.with_file_name(path_guard::part_name(&file_name));
 
@@ -681,6 +745,9 @@ pub async fn handle(
             if path_guard::symlink_exists(&target) {
                 return dav_error(StatusCode::METHOD_NOT_ALLOWED, "目标已存在");
             }
+            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
+                return response;
+            }
             match tokio::fs::create_dir(&target).await {
                 Ok(_) => StatusCode::CREATED.into_response(),
                 Err(err) => dav_error(StatusCode::CONFLICT, &format!("创建目录失败：{err}")),
@@ -696,6 +763,9 @@ pub async fn handle(
                 Err(response) => return response,
             };
             if let Err(response) = reject_mount_root(&target, &root) {
+                return response;
+            }
+            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
                 return response;
             }
             let state = state.clone();
@@ -747,6 +817,15 @@ pub async fn handle(
             }
             if std::fs::symlink_metadata(&source).is_err() {
                 return dav_error(StatusCode::NOT_FOUND, "源路径不存在");
+            }
+            // 源被别的客户端锁着（正在编辑）就不能搬走；目标被锁同样拒绝
+            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
+                return response;
+            }
+            if let Err(response) =
+                ensure_not_locked(&state, &dav_key(&mount_id, &dest_rest), &headers)
+            {
+                return response;
             }
 
             // 目标语义：dest 存在且为目录 → 拷/移进该目录；dest 不存在 → 父目录必须存在；
@@ -837,17 +916,24 @@ pub async fn handle(
         }
 
         "LOCK" => {
-            // 伪锁（设计文档 3.10 / 9.4）：只发随机 token，不维护超时表
-            let token = format!("opaquelocktoken:{}", crate::core::auth::random_token());
+            // 真锁（内存表 + 30 分钟过期）：两个客户端同时编辑同一文件时，
+            // 后者拿到 423，而不是静默覆盖前者的保存。
+            let token = match state.dav_locks.lock(&display_path, if_header(&headers)) {
+                Ok(token) => token,
+                Err(_) => {
+                    return dav_error(StatusCode::LOCKED, "资源已被其它客户端锁定");
+                }
+            };
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
 <D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>\
 <D:locktype><D:write/></D:locktype>\
 <D:lockscope><D:exclusive/></D:lockscope>\
 <D:depth>0</D:depth>\
-<D:timeout>Second-3600</D:timeout>\
+<D:timeout>Second-{ttl}</D:timeout>\
 <D:locktoken><D:href>{token}</D:href></D:locktoken>\
-</D:activelock></D:lockdiscovery></D:prop>"
+</D:activelock></D:lockdiscovery></D:prop>",
+                ttl = crate::core::dav_locks::LOCK_TTL.as_secs()
             );
             (
                 StatusCode::OK,
@@ -863,7 +949,20 @@ pub async fn handle(
                 .into_response()
         }
 
-        "UNLOCK" => StatusCode::NO_CONTENT.into_response(),
+        "UNLOCK" => {
+            let token = headers
+                .get("lock-token")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().trim_start_matches('<').trim_end_matches('>'))
+                .unwrap_or_default();
+            match state.dav_locks.unlock(&display_path, token) {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => dav_error(
+                    StatusCode::CONFLICT,
+                    "Lock-Token 与当前锁不匹配（或锁已过期）",
+                ),
+            }
+        }
 
         _ => dav_error(StatusCode::METHOD_NOT_ALLOWED, "不支持的方法"),
     }

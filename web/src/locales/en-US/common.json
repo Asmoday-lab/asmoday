@@ -108,5 +108,12 @@
     "expand": "Expand sidebar",
     "openMenu": "Open menu",
     "closeMenu": "Close menu"
+  },
+  "reauth": {
+    "title": "Confirm it is you",
+    "hint": "Opening a terminal, creating tokens and saving config are sensitive. Please confirm your password (once every 5 minutes).",
+    "placeholder": "Current password",
+    "checking": "Verifying…",
+    "failed": "Incorrect password"
   }
 }

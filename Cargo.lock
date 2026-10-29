@@ -120,6 +120,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "tower",
  "windows-sys 0.61.2",
 ]
 

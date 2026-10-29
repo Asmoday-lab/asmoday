@@ -61,6 +61,17 @@ async fn mounts_of(state: &AppState) -> MountSet {
     path_guard::load(&config, &state.cwd)
 }
 
+/// `[server.limits]` → 运行期闸门（`0` 表示不限）。
+async fn limits_of(state: &AppState) -> fs_ops::BatchLimits {
+    let config = state.config.read().await;
+    let limits = &config.server.limits;
+    fs_ops::BatchLimits {
+        max_items: limits.batch_max_items,
+        // 配置单位是 MiB，内部统一按字节比较
+        max_bytes: limits.batch_max_bytes_mb.saturating_mul(1024 * 1024),
+    }
+}
+
 /// 定位挂载点：优先 `mount_id`，否则按路径前缀反查，最后退化到默认挂载点
 fn pick_mount<'a>(
     set: &'a MountSet,
@@ -285,10 +296,11 @@ async fn transfer_inner(
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
-    if body.paths.len() > fs_ops::MAX_ITEMS {
+    let limits = limits_of(state).await;
+    if limits.max_items > 0 && body.paths.len() > limits.max_items {
         return Err(FsError::TooMany(format!(
             "单次最多 {} 项",
-            fs_ops::MAX_ITEMS
+            limits.max_items
         )));
     }
 
@@ -350,7 +362,20 @@ async fn transfer_inner(
     }
 
     // ---- 上限统计（操作开始前完成，遍历中一旦超限立即中止）----
-    let (_, total_bytes) = fs_ops::measure(&sources)?;
+    //
+    // 同挂载点移动走原子 rename：不搬数据、不占新空间，统计整棵树纯属浪费
+    // （机械盘上搬一个十万文件的目录，光统计就要几十秒），因此直接跳过。
+    let cross_mount = sources
+        .iter()
+        .any(|source| !source.starts_with(&dest_root));
+    let needs_bytes = !is_move || cross_mount;
+
+    // 先做浅层统计：选中 300 项时一秒内就能拒掉，不用等整棵树遍历完
+    let mut total_bytes = fs_ops::measure_shallow(&sources, limits)?.1;
+    // 真正要复制时才递归累加字节（删除完全不走这条路）
+    if needs_bytes && !limits.unlimited() {
+        total_bytes = fs_ops::measure(&sources, limits)?.1;
+    }
 
     // ---- 分享记录冲突预检查（设计文档 3.2.6.7）----
     // 覆盖式移动会改写既有分享记录；若目标位置本来就有分享，改写后无法判断
@@ -373,10 +398,7 @@ async fn transfer_inner(
     }
 
     // ---- 空间检查 ----
-    let cross_mount = sources
-        .iter()
-        .any(|source| !source.starts_with(&dest_root));
-    if !is_move || cross_mount {
+    if needs_bytes {
         fs_ops::ensure_space(&dest_dir, total_bytes)?;
     }
 
@@ -608,8 +630,16 @@ async fn delete_inner(state: &AppState, body: DeleteBody) -> Result<Value, FsErr
         }
     }
 
-    // 上限统计（删除同样受 100 项 / 2GB 约束，超限请去终端 rm）
-    let _ = fs_ops::measure(&targets)?;
+    // 删除只校验「本批选中了多少项」，不再统计目录内部的项数与字节：
+    // remove_dir_all 是 O(1) 起步的元数据操作，为了拒绝它先扫完整棵树
+    // （几万文件要几十秒）毫无意义，反而让「删一个相册目录」变成不可能。
+    let limits = limits_of(state).await;
+    if limits.max_items > 0 && targets.len() > limits.max_items {
+        return Err(FsError::TooMany(format!(
+            "单次最多删除 {} 项，请分批进行",
+            limits.max_items
+        )));
+    }
 
     let _guard = state.path_locks.acquire(&targets)?;
     let work = targets.clone();
@@ -688,10 +718,11 @@ async fn measure_inner(state: &AppState, body: MeasureBody) -> Result<Value, FsE
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
-    if body.paths.len() > fs_ops::MAX_ITEMS {
+    let limits = limits_of(state).await;
+    if limits.max_items > 0 && body.paths.len() > limits.max_items {
         return Err(FsError::TooMany(format!(
             "单次最多 {} 项",
-            fs_ops::MAX_ITEMS
+            limits.max_items
         )));
     }
 

@@ -2,14 +2,17 @@
 
 pub mod auth;
 pub mod config;
+pub mod dav_locks;
 pub mod ffmpeg;
 pub mod fs;
 pub mod fs_ops;
 pub mod id3;
+pub mod instance_lock;
 pub mod junk;
 pub mod locks;
 pub mod logging;
 pub mod path_guard;
+pub mod prefix;
 pub mod terminal;
 pub mod text_codec;
 pub mod thumbnail;

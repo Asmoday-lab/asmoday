@@ -68,6 +68,9 @@ asmoday --reset-password
 
 # 自定义配置与数据目录
 asmoday -c ./config.toml -d ./data -p 4242
+
+# 热备份数据库到指定文件（服务运行中也能执行，VACUUM INTO 保证一致）
+asmoday --backup ./asmoday-backup.db
 ```
 
 ## 🏗️ 开发与构建
@@ -134,6 +137,8 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/api/config` | 读写解析后的配置 |
+| GET | `/api/system/backup` | 下载数据库热备份（需 5 分钟内验证过密码） |
+| GET/POST | `/api/auth/reauth` `/verify` | 敏感操作二次验证状态与验证入口 |
 | GET/POST | `/api/auth/totp` | 2FA 动态验证码设置 |
 | any | `/proxy/{id}/*` | 外部服务反向代理透传 |
 | any | `/dav/<mount_id>/*` | 标准 WebDAV 服务 (需独立 Token) |
@@ -142,6 +147,8 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 
 <details>
 <summary><b>点击展开查看历史更新日志</b></summary>
+
+- **v4.0.0 (安全与运维补强)**：文件操作语义纠偏（删除不再为拒绝先扫全树、条目数只数选中项、同挂载点移动零统计、阈值可配 `[server.limits]`）、默认不信任 `X-Forwarded-Proto`（改由 `trusted_ips` 白名单）、单实例锁（SQLite 排他锁，防双开互删 `.part`）、`.part` 启动清理留 10 分钟宽限期、WebDAV 真锁（30 分钟内存锁 + `If` 头校验，`MS-Author-Via`/`PROPPATCH` 补齐 Windows 映射可写）、令牌可限定挂载点（`mount_scope`）、敏感操作二次验证（终端/令牌/配置写入/备份下载，5 分钟窗口）、数据库热备（设置页一键下载 + `--backup`）、`X-Forwarded-Prefix` 支持（反代带前缀但没配 `base_url` 也能跑）、收藏/播放历史上复合主键 `(mount_id, file_path)`、终端保活与并发可配、缩略图并发按 CPU 自适应、字体瘦身为两个 woff2（省约 5MB）。
 
 - **v3.15.0 (文档对齐)**：PTY 尺寸强制钳制（0/超大值不再击穿 ConPTY）、访问日志查询串按需脱敏、跨挂载移动「删源失败」独立错误码 `E_SOURCE_DELETE_FAILED`、垃圾文件补 `.crdownload/.part/.!ut/.tmp`、Termux `$PREFIX/bin/bash` 兼容、终端活动会话面板与强制关闭、编辑器语言矩阵扩至 30+ 语言、挂载点动态移除/离线兜底、缩略图下载中跳过、配置热重载四重防死循环、批量失败项防呆重试、配置表单保存改为 AST 级局部改写（`toml_edit`，用户手写的注释/空行/键序原样保留）、反代不再把 asmoday 会话 Cookie 透给上游（上游同名 `Set-Cookie` 同样丢弃）、终端 WebSocket 强制 Origin 同源（防 CSWSH）、一次性密码会话的后端强制改密拦截、**IPv6 支持**（`host = "::"` 双栈监听，显式关 `IPV6_V6ONLY`，Windows 默认 on 会挡掉 IPv4；`trusted_ips` 支持 IPv6 CIDR；`::ffff:x.x.x.x` 归一回 IPv4，防限流/白名单键分裂；CSRF/CSWSH 同源判定理解 `[::1]` 写法）、**终端体验对齐 ttyd**（`[terminal].shell/args` 覆盖与 tmux 接入、zsh 探测回退 `$SHELL → zsh → bash`、WS 支持 `mount_id` 定位 CWD、打包 JetBrainsMono Nerd Font 修图标豆腐块、VS Code Dark+ 16 色板、Tab 键拦截进 PTY、`nextTick` 后 fit 防列错位）、**软链接全链路修复**（目录列表返回 `symlink_target`/`target_is_dir`，目标逃出挂载点或断链标记为断链；删除/改名/移动改走 nofollow——删链接只删链接本身，绝不递归删目标实体；前端软链接带快捷方式箭头角标、悬停显示目标、断链置灰并提示）、**WebDAV 路由容错与设置页联动**（`GET /dav/<mount_id>` 无尾斜杠 301 到带斜杠形式，认证仍 401 优先；设置页动态拉取挂载点下拉、URL 完整拼接 `origin + base_url + /dav/<id>/` 强制尾斜杠、无挂载点置灰提示）。
 - **v3.5.9 (路径复制)**：右键菜单新增复制相对/绝对路径，修复分享页路径泄露漏洞。

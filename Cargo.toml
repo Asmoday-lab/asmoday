@@ -55,6 +55,8 @@ notify = "8"
 encoding_rs = "0.8"
 # WebDAV PROPFIND 的 RFC1123 时间格式（axum 内部同款，不新增传递依赖）
 httpdate = "1"
+# 把中间件包在 Router 外面需要用到 tower::Layer（axum 内部本来就用它，这里只是显式声明）
+tower = "0.5"
 
 # TLS 平台分流（注释见上方 reqwest）。必须放在 [dependencies] 全部键之后。
 [target.'cfg(not(target_os = "linux"))'.dependencies]

@@ -407,7 +407,7 @@ pub async fn list_sessions(State(state): State<AppState>) -> Response {
     let sessions = manager.snapshot();
     axum::Json(json!({
         "count": sessions.len(),
-        "limit": crate::core::terminal::MAX_SESSIONS,
+        "limit": manager.max_sessions(),
         "sessions": sessions,
     }))
     .into_response()

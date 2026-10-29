@@ -22,8 +22,25 @@ use tokio::sync::Semaphore;
 
 use crate::core::ffmpeg::{self, Capabilities, PosterFormat};
 
-/// 同时生成的缩略图数量上限
-pub const MAX_CONCURRENT: usize = 2;
+/// 缩略图并发生成的硬上限。
+///
+/// 解码 + 缩放是纯 CPU 密集、全程占满一个核，并发开太大只会互相抢核并把
+/// 峰值内存（一张 4K 图解码后约 30MB）乘上去，所以在小机器上也不能压到 2 以下。
+const MAX_CONCURRENT_CAP: usize = 8;
+/// 探测不到 CPU 数时的兜底并发（与旧版固定值一致）
+const MAX_CONCURRENT_FALLBACK: usize = 2;
+
+/// 按机器能力决定同时生成的缩略图数量：留一个核给 HTTP / PTY，至少 2、最多 8。
+///
+/// 旧版固定 2 —— 在 16 核 NAS 上滚动图库要排队到回占位图，在 2 核小机器上又刚好。
+/// 现在按 `available_parallelism` 自适应：4 核 → 3，8 核及以上 → 8。
+pub fn max_concurrent() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(MAX_CONCURRENT_FALLBACK + 1);
+    cores.saturating_sub(1).clamp(MAX_CONCURRENT_FALLBACK, MAX_CONCURRENT_CAP)
+}
+
 /// 等待信号量的最长时间，超时回占位图
 const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 每隔多少次生成跑一次淘汰
@@ -104,7 +121,7 @@ impl Thumbnailer {
     pub fn new(cache_dir: PathBuf) -> Self {
         let defaults = crate::core::config::MediaConfig::default();
         Self {
-            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            semaphore: Arc::new(Semaphore::new(max_concurrent())),
             cache_dir,
             generated: AtomicUsize::new(0),
             limit_bytes: AtomicU64::new(defaults.limit_bytes()),
@@ -538,6 +555,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn concurrency_scales_with_cores_within_bounds() {
+        let n = max_concurrent();
+        assert!(
+            (MAX_CONCURRENT_FALLBACK..=MAX_CONCURRENT_CAP).contains(&n),
+            "并发必须落在 [2, 8]，实际 {n}"
+        );
     }
 
     #[test]

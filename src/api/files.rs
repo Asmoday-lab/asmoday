@@ -321,13 +321,13 @@ pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQu
         Err(e) => return fs_error(FsError::Io(format!("读取文件信息失败：{e}"))),
     };
     if meta.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "目标是目录，无法用编辑器打开");
+        return fail(StatusCode::BAD_REQUEST, "The target is a directory, it cannot be opened in the editor");
     }
     if meta.len() as usize > MAX_EDIT_BYTES {
         return fail_code(
             StatusCode::PAYLOAD_TOO_LARGE,
             "E_TOO_LARGE",
-            format!("文件超过编辑器上限（{} MiB）", MAX_EDIT_BYTES / 1024 / 1024),
+            format!("File exceeds the editor limit ({} MiB)", MAX_EDIT_BYTES / 1024 / 1024),
         );
     }
 
@@ -341,7 +341,7 @@ pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQu
         return fail_code(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "E_NOT_TEXT",
-            "内置编辑器只支持文本类文件",
+            "The built-in editor only supports text files",
         );
     }
 
@@ -387,7 +387,7 @@ pub async fn write_text(
     if body.len() > MAX_EDIT_BYTES {
         return fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("文件超过编辑器上限（{} MiB）", MAX_EDIT_BYTES / 1024 / 1024),
+            format!("File exceeds the editor limit ({} MiB)", MAX_EDIT_BYTES / 1024 / 1024),
         );
     }
 
@@ -411,7 +411,7 @@ pub async fn write_text(
         Err(e) => return fs_error(FsError::Io(format!("读取文件信息失败：{e}"))),
     };
     if meta.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "目标是目录，无法写入");
+        return fail(StatusCode::BAD_REQUEST, "The target is a directory, it cannot be written");
     }
 
     let name = path
@@ -421,9 +421,11 @@ pub async fn write_text(
     let ext = fs::extension_of_name(&name);
     let (kind, editable) = fs::classify_name(&name, &ext, false);
     if kind != "text" || !editable {
-        return fail(
+        // 与读接口同一个码：前端只需一条 i18n 文案
+        return fail_code(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "内置编辑器只允许写回文本类文件",
+            "E_NOT_TEXT",
+            "The built-in editor only writes text files",
         );
     }
 
@@ -439,14 +441,14 @@ pub async fn write_text(
     let encoding = match query.encoding.as_deref() {
         Some(raw) => match crate::core::text_codec::TextEncoding::parse(raw) {
             Some(encoding) => encoding,
-            None => return fail(StatusCode::BAD_REQUEST, format!("不支持的编码：{raw}")),
+            None => return fail(StatusCode::BAD_REQUEST, format!("Unsupported encoding: {raw}")),
         },
         None => existing.0,
     };
     let eol = match query.eol.as_deref() {
         Some(raw) => match crate::core::text_codec::Eol::parse(raw) {
             Some(eol) => eol,
-            None => return fail(StatusCode::BAD_REQUEST, format!("不支持的换行符：{raw}")),
+            None => return fail(StatusCode::BAD_REQUEST, format!("Unsupported line ending: {raw}")),
         },
         None => existing.1,
     };
@@ -454,7 +456,7 @@ pub async fn write_text(
         Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => true,
             "0" | "false" | "no" | "off" => false,
-            other => return fail(StatusCode::BAD_REQUEST, format!("bom 参数不合法：{other}")),
+            other => return fail(StatusCode::BAD_REQUEST, format!("Invalid bom parameter: {other}")),
         },
         None => existing.2,
     };
@@ -564,7 +566,7 @@ pub async fn upload(
         || name.contains("..")
         || name.contains('\0')
     {
-        return fail(StatusCode::BAD_REQUEST, "文件名不合法");
+        return fail(StatusCode::BAD_REQUEST, "Invalid file name");
     }
 
     let roots = roots_for(&state).await;
@@ -573,7 +575,7 @@ pub async fn upload(
         Err(err) => return fs_error(err),
     };
     if !dir.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "上传目标不是目录");
+        return fail(StatusCode::BAD_REQUEST, "Upload target is not a directory");
     }
 
     let target = dir.join(name);
@@ -649,7 +651,7 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
     };
 
     if !target.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "搜索目标不是目录");
+        return fail(StatusCode::BAD_REQUEST, "Search target is not a directory");
     }
 
     const LIMIT: usize = 200;

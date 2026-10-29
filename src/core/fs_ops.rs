@@ -24,10 +24,56 @@ use crate::core::path_guard::{
     validate_name,
 };
 
-/// 单次 copy / move / delete 的文件数上限（设计文档 1.3 第 7 条）
+/// 单次 copy / move 的默认规模上限（设计文档 1.3 第 7 条）。
+///
+/// 运行期以 `[server.limits]` 为准，这里只是配置缺省值；`0` 表示不限。
 pub const MAX_ITEMS: usize = 100;
-/// 单次 copy / move / delete 的总字节上限：2 GiB
+/// 默认总字节上限：2 GiB
 pub const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 批量操作的规模闸门（来自 `[server.limits]`，`0` = 不限）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    pub max_items: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            max_items: MAX_ITEMS,
+            max_bytes: MAX_BYTES,
+        }
+    }
+}
+
+impl BatchLimits {
+    /// 两项都不限时，任何统计都可以直接跳过（省掉整棵树的遍历）。
+    pub fn unlimited(&self) -> bool {
+        self.max_items == 0 && self.max_bytes == 0
+    }
+
+    /// 只限字节时仍可跳过项数检查，反之亦然。
+    fn check_items(&self, items: usize) -> Result<(), FsError> {
+        if self.max_items > 0 && items > self.max_items {
+            return Err(FsError::TooMany(format!(
+                "单次操作最多 {} 项，请分批进行或改用终端",
+                self.max_items
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_bytes(&self, bytes: u64) -> Result<(), FsError> {
+        if self.max_bytes > 0 && bytes > self.max_bytes {
+            return Err(FsError::TooLarge(format!(
+                "单次操作最多 {} MiB，请分批进行或改用终端",
+                self.max_bytes / 1024 / 1024
+            )));
+        }
+        Ok(())
+    }
+}
 /// 自动命名最大序号
 pub const MAX_NUMBER: usize = 999;
 /// `.part` → 正式名的占位重试次数
@@ -126,11 +172,16 @@ pub fn summarize(results: &[ItemResult]) -> Summary {
 // 上限统计
 // ---------------------------------------------------------------------------
 
-/// 统计一批路径的「项数 + 总字节」。
+/// 递归统计一批路径的「项数 + 总字节」，用于**复制 / 跨盘移动**的上限与空间预检。
 ///
-/// 遍历中一旦超限**立即中止**并返回对应错误 —— 不能先把 50 万文件数完再告诉用户
-/// 「太多了」，那台低功耗设备已经卡死了。符号链接按链接本身计（不跟随）。
-pub fn measure(paths: &[PathBuf]) -> Result<(usize, u64), FsError> {
+/// 遍历中一旦超过字节上限**立即中止**并返回错误 —— 不能先把 50 万文件数完再告诉
+/// 用户「太大了」，那台低功耗设备已经卡死了。符号链接按链接本身计（不跟随）。
+///
+/// 项数上限只数**用户选中的条目**（`measure_shallow`），不数目录内部的文件：
+/// 选一个装着一万张照片的目录仍然只算 1 项，否则「搬一个相册」会被误判成重任务。
+///
+/// **删除不走这里**：删除是 O(1) 元数据操作，没有理由为了拒绝它先把整棵树数一遍。
+pub fn measure(paths: &[PathBuf], limits: BatchLimits) -> Result<(usize, u64), FsError> {
     let mut items = 0usize;
     let mut bytes = 0u64;
 
@@ -138,35 +189,59 @@ pub fn measure(paths: &[PathBuf]) -> Result<(usize, u64), FsError> {
         let meta = std::fs::symlink_metadata(path)
             .map_err(|_| FsError::NotFound(format!("路径不存在：{}", normalize_display(path))))?;
         if meta.is_dir() {
-            measure_dir(path, &mut items, &mut bytes)?;
+            measure_dir(path, &mut items, &mut bytes, limits)?;
         } else {
             items += 1;
             bytes = bytes.saturating_add(meta.len());
-            check_limits(items, bytes)?;
+            limits.check_bytes(bytes)?;
         }
     }
     Ok((items, bytes))
 }
 
-fn measure_dir(dir: &Path, items: &mut usize, bytes: &mut u64) -> Result<(), FsError> {
+fn measure_dir(
+    dir: &Path,
+    items: &mut usize,
+    bytes: &mut u64,
+    limits: BatchLimits,
+) -> Result<(), FsError> {
     let reader = std::fs::read_dir(dir)
         .map_err(|e| FsError::Io(format!("读取目录失败 {}：{e}", normalize_display(dir))))?;
     for entry in reader {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.file_type() else { continue };
         *items += 1;
-        check_limits(*items, *bytes)?;
 
         if meta.is_dir() {
-            measure_dir(&entry.path(), items, bytes)?;
+            measure_dir(&entry.path(), items, bytes, limits)?;
         } else if meta.is_file() {
             if let Ok(meta) = entry.metadata() {
                 *bytes = bytes.saturating_add(meta.len());
-                check_limits(*items, *bytes)?;
+                limits.check_bytes(*bytes)?;
             }
         }
     }
     Ok(())
+}
+
+/// 只数**顶层**条目、只累加顶层文件的大小（目录不展开）。
+///
+/// 用于「先把明显超批量级的请求一秒内拒掉」：选中 300 项时不必等整棵树遍历完；
+/// 目录内部的大小交给 [`measure`] 在真正需要时按需累加。
+pub fn measure_shallow(paths: &[PathBuf], limits: BatchLimits) -> Result<(usize, u64), FsError> {
+    let mut items = 0usize;
+    let mut bytes = 0u64;
+    for path in paths {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|_| FsError::NotFound(format!("路径不存在：{}", normalize_display(path))))?;
+        items += 1;
+        if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+        }
+        limits.check_items(items)?;
+        limits.check_bytes(bytes)?;
+    }
+    Ok((items, bytes))
 }
 
 /// 「删除确认」用的**不失败**统计（设计文档 3.2.6.5）。
@@ -224,21 +299,6 @@ fn survey_dir(dir: &Path, acc: &mut (usize, u64), cap: usize) -> bool {
         }
     }
     true
-}
-
-fn check_limits(items: usize, bytes: u64) -> Result<(), FsError> {
-    if items > MAX_ITEMS {
-        return Err(FsError::TooMany(format!(
-            "单次操作最多 {MAX_ITEMS} 项，请改用终端 cp / mv"
-        )));
-    }
-    if bytes > MAX_BYTES {
-        return Err(FsError::TooLarge(format!(
-            "单次操作最多 {} GiB，请改用终端 cp / mv",
-            MAX_BYTES / 1024 / 1024 / 1024
-        )));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -750,8 +810,14 @@ pub fn remove_path(path: &Path) -> Result<(), FsError> {
 /// 同步操作不跨重启，启动瞬间存在的 `.part` 一定是异常终止留下的垃圾。
 /// 运行期的「清理临时文件」按钮才按 24 小时阈值过滤，避免误删进行中的复制。
 pub fn cleanup_parts(root: &Path) -> (usize, u64) {
-    cleanup_parts_older_than(root, Duration::ZERO)
+    // 启动清理留 10 分钟宽限期：另一个实例可能正在写这些文件（单实例锁已经拦了
+    // 大部分情况，但锁在异常场景下可能被用户绕过——比如换 --data-dir 又指向同一
+    // 个挂载点）；宽限期也让「刚重启完、浏览器还在续传」的临时文件不被误删。
+    cleanup_parts_older_than(root, PART_CLEANUP_GRACE)
 }
+
+/// 启动清理宽限期：比它新的 `.part` 一律不动。
+pub const PART_CLEANUP_GRACE: Duration = Duration::from_secs(600);
 
 /// 运行期「清理临时文件」：只删最后修改时间早于 `min_age` 的 `.part`，
 /// 避免误删正在进行中的复制（设计文档 3.2.6.4）。
@@ -1016,13 +1082,71 @@ mod tests {
 
     #[test]
     fn limits_abort_early() {
-        // 101 个小文件即可触发数量上限
+        // 字节上限：写到超过 1 KiB 立刻中止，不必把整棵树数完
         let dir = scratch("limits");
-        for i in 0..(MAX_ITEMS + 1) {
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("f{i}")), vec![0u8; 256]).unwrap();
+        }
+        let by_bytes = BatchLimits {
+            max_items: 0,
+            max_bytes: 1024,
+        };
+        assert!(matches!(
+            measure(&[dir.clone()], by_bytes).unwrap_err(),
+            FsError::TooLarge(_)
+        ));
+
+        // 项数上限只数「选中的条目」：101 个顶层路径触发，1 个目录不触发
+        let by_items = BatchLimits {
+            max_items: MAX_ITEMS,
+            max_bytes: 0,
+        };
+        let many: Vec<PathBuf> = (0..=MAX_ITEMS)
+            .map(|i| dir.join(format!("f{}", i % 8)))
+            .collect();
+        assert!(matches!(
+            measure_shallow(&many, by_items).unwrap_err(),
+            FsError::TooMany(_)
+        ));
+        let (items, _) = measure(&[dir.clone()], by_items).unwrap();
+        assert_eq!(items, 8, "8 个文件都该数到，且不因项数上限被拒");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unlimited_limits_never_reject() {
+        // 0 = 不限：删/搬一个大目录不该因为「项数」被拒
+        let dir = scratch("nolimit");
+        for i in 0..150 {
             std::fs::write(dir.join(format!("f{i}")), b"x").unwrap();
         }
-        let err = measure(&[dir.clone()]).unwrap_err();
-        assert!(matches!(err, FsError::TooMany(_)));
+        let limits = BatchLimits {
+            max_items: 0,
+            max_bytes: 0,
+        };
+        assert!(limits.unlimited());
+        let (items, _) = measure(&[dir.clone()], limits).unwrap();
+        assert_eq!(items, 150);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shallow_measure_ignores_directory_contents() {
+        // 顶层只有 1 个目录：深度统计会数到 5 项，浅统计只算 1 项
+        let dir = scratch("shallow");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join("sub").join(format!("f{i}")), b"12345").unwrap();
+        }
+        std::fs::write(dir.join("top.bin"), b"123").unwrap();
+
+        let limits = BatchLimits {
+            max_items: 2,
+            max_bytes: 0,
+        };
+        let (items, bytes) = measure_shallow(&[dir.clone(), dir.join("top.bin")], limits).unwrap();
+        assert_eq!(items, 2);
+        assert_eq!(bytes, 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1060,7 +1184,13 @@ mod tests {
         std::fs::write(dir.join("keep.txt"), b"x").unwrap();
         std::fs::write(dir.join(format!("keep.txt{}aaaaaaaa", crate::core::path_guard::PART_MARK)), b"y")
             .unwrap();
-        let (removed, _) = cleanup_parts(&dir);
+
+        // 启动清理有 10 分钟宽限期：刚写的 .part 可能是另一个进程正在传的文件
+        assert_eq!(cleanup_parts(&dir).0, 0);
+        assert!(dir.join("keep.txt").exists());
+
+        // 手动「立即清理」不带宽限，孤儿必须清掉
+        let (removed, _) = cleanup_parts_older_than(&dir, Duration::ZERO);
         assert_eq!(removed, 1);
         assert!(dir.join("keep.txt").exists());
         std::fs::remove_dir_all(&dir).ok();

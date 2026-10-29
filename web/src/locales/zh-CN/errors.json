@@ -44,11 +44,13 @@
   "E_FORBIDDEN": "没有权限执行该操作",
   "E_READONLY": "该挂载点为只读",
   "E_NOT_FOUND": "目标不存在",
+  "E_NOT_TEXT": "该文件不是文本，无法在编辑器里打开",
+  "E_ENCODING": "文件编码无法识别，或无法按原编码保存",
   "E_GONE": "分享的文件已被删除",
   "E_CONFLICT": "目标已存在",
   "E_DIR_CONFLICT": "目标目录已存在，不能覆盖",
   "E_CONFLICT_RETRY_EXHAUSTED": "自动重命名次数用尽",
-  "E_TOO_MANY": "单次操作项数超过 100，请改用终端",
+  "E_TOO_MANY": "单次操作项数超过上限，请分批进行",
   "E_TOO_LARGE": "单次操作总量超过 2 GB，请改用终端",
   "E_NO_SPACE": "目标磁盘空间不足",
   "E_PATH_TRAVERSAL": "路径包含非法的上跳",
@@ -62,5 +64,8 @@
   "E_UNSUPPORTED_PREVIEW": "该格式无法在线预览，请允许下载后再分享",
   "E_INTERNAL": "服务器内部错误",
   "E_INIT_REQUIRED": "系统尚未初始化",
-  "SHARE_RATE_LIMITED": "口令尝试过于频繁，请稍后再试"
+  "SHARE_RATE_LIMITED": "口令尝试过于频繁，请稍后再试",
+  "E_REAUTH_REQUIRED": "该操作需要重新验证密码（5 分钟内有效）",
+  "E_REAUTH_FAILED": "密码不正确",
+  "E_TOO_MANY_REQUESTS": "尝试过于频繁，请稍后再试"
 }

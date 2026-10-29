@@ -44,11 +44,13 @@
   "E_FORBIDDEN": "You are not allowed to do that",
   "E_READONLY": "This mount is read-only",
   "E_NOT_FOUND": "Target not found",
+  "E_NOT_TEXT": "This file is not text and cannot be opened in the editor",
+  "E_ENCODING": "The file encoding cannot be detected or preserved on save",
   "E_GONE": "The shared file has been deleted",
   "E_CONFLICT": "Target already exists",
   "E_DIR_CONFLICT": "A folder with that name exists; it cannot be overwritten",
   "E_CONFLICT_RETRY_EXHAUSTED": "Auto-rename ran out of numbers",
-  "E_TOO_MANY": "More than 100 items in one operation; use the terminal instead",
+  "E_TOO_MANY": "Too many items in one operation; split it into smaller batches",
   "E_TOO_LARGE": "More than 2 GB in one operation; use the terminal instead",
   "E_NO_SPACE": "Not enough space on the target disk",
   "E_PATH_TRAVERSAL": "The path contains an illegal parent reference",
@@ -62,5 +64,8 @@
   "E_UNSUPPORTED_PREVIEW": "This format cannot be previewed; allow download to share it",
   "E_INTERNAL": "Internal server error",
   "E_INIT_REQUIRED": "The instance is not initialized yet",
-  "SHARE_RATE_LIMITED": "Too many password attempts, please retry later"
+  "SHARE_RATE_LIMITED": "Too many password attempts, please retry later",
+  "E_REAUTH_REQUIRED": "Please confirm your password again for this action (valid for 5 minutes)",
+  "E_REAUTH_FAILED": "Incorrect password",
+  "E_TOO_MANY_REQUESTS": "Too many attempts, please try again later"
 }
