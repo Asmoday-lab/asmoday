@@ -148,6 +148,8 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 <details>
 <summary><b>点击展开查看历史更新日志</b></summary>
 
+- **v4.2.0 (WebDAV 客户端兼容修复 + 全面拥抱成熟方案)**：**WebDAV 协议栈换成 `dav-server`**——自研实现里客户端实测加不上（`/dav`、`/dav/` 虚拟根直接 404，`PROPFIND` 缺 `getetag`/`creationdate`/`supportedlock`，目录 href 无尾斜杠，全是客户端判断「能不能用」的判据）；现在协议全套交给社区实现（多段 Range、ETag 条件请求、真锁 `MemLs`、`PROPPATCH`、autoindex），`/dav/` 成为虚拟根（`PROPFIND` 列出全部挂载点，客户端只需填这一个地址），令牌限定挂载点时只列可见项；安全边界（软链接逃逸、`Destination` 头、系统垃圾、只读、防爆破池）全部保留在入口层；Windows 适配：`MKCOL` 尾斜杠与 `ERROR_ALREADY_EXISTS`→405 两处 dav-server 的坑已修。同时：数据库迁移换成 `rusqlite_migration`（`PRAGMA user_version` 版本化，每步只跑一次，以后加列只追加 `M::up`）、全局分配器换 `mimalloc`（musl 目标除外）、前端状态管理收口到 `pinia`（5 个全局 store：播放器 / 灯箱 / 二次验证 / 分享 / 终端标签）并用 `@vueuse/core` 替掉手写的 `addEventListener` 与偏好持久化。
+
 - **v4.1.0 (依赖与工程基线：换成社区成熟方案)**：新增 HTTP 压缩（`tower-http`，br 优先 gzip 兜底，只压文本类、206 不压；实测主包 89 KB → 30 KB）、单实例锁改用标准库文件锁（`File::try_lock`，1.89+，替掉会漏锁的 SQLite 排他锁写法）、音频标签改用 `lofty`（FLAC / M4A / OGG 也有标签与封面了，扫描时关掉 `read_properties` 不再为算时长把整首歌读一遍）、补 CI（fmt + `clippy -D warnings` + test + 前端构建）与 Dependabot，全仓 rustfmt 化并清零 clippy 警告。
 
 - **v4.0.0 (安全与运维补强)**：文件操作语义纠偏（删除不再为拒绝先扫全树、条目数只数选中项、同挂载点移动零统计、阈值可配 `[server.limits]`）、默认不信任 `X-Forwarded-Proto`（改由 `trusted_ips` 白名单）、单实例锁（SQLite 排他锁，防双开互删 `.part`）、`.part` 启动清理留 10 分钟宽限期、WebDAV 真锁（30 分钟内存锁 + `If` 头校验，`MS-Author-Via`/`PROPPATCH` 补齐 Windows 映射可写）、令牌可限定挂载点（`mount_scope`）、敏感操作二次验证（终端/令牌/配置写入/备份下载，5 分钟窗口）、数据库热备（设置页一键下载 + `--backup`）、`X-Forwarded-Prefix` 支持（反代带前缀但没配 `base_url` 也能跑）、收藏/播放历史上复合主键 `(mount_id, file_path)`、终端保活与并发可配、缩略图并发按 CPU 自适应、字体瘦身为两个 woff2（省约 5MB）。

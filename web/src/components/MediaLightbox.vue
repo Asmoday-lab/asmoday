@@ -10,7 +10,8 @@
  * - 视频缩略图用后端抽取的首帧，播放器传 `poster`，点开即有画面而不是一片黑；
  * - 关闭时整块 `v-if` 卸载，MediaPlayer 内部会 `pause(); src=''; load()` 彻底销毁。
  */
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useEventListener } from '@vueuse/core'
+import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from './ContextMenu.vue'
@@ -189,8 +190,8 @@ async function onMenuSelect(id: string) {
 
 const copiedPath = ref<string | null>(null)
 
-onMounted(() => window.addEventListener('keydown', onKey))
-onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
+// 键盘导航：useEventListener 负责挂载/卸载成对处理（离开灯箱不会留下悬挂监听）
+useEventListener(window, 'keydown', onKey)
 </script>
 
 <template>

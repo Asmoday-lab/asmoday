@@ -1,11 +1,18 @@
 /**
  * 全局音乐播放器状态：底部悬浮播放条跨页面常驻（设计文档 3.4 音乐库）。
  * 播放模式：列表循环 / 单曲循环 / 随机。
+ *
+ * 状态放在 Pinia store 里；播放模式用 `useStorage` 直接与 localStorage 双向绑定，
+ * 不再手写「读一次 + 每次 setMode 手动写回」。
  */
-import { computed, reactive } from 'vue'
+import { useStorage } from '@vueuse/core'
+import { defineStore } from 'pinia'
+import { computed, ref } from 'vue'
+
 import type { MediaItem } from '../api/media'
 import { lrcUrl } from '../api/media'
 import { i18n } from '../lib/i18n'
+import { pinia } from './pinia'
 
 export type PlayMode = 'loop' | 'one' | 'shuffle'
 
@@ -14,123 +21,178 @@ export interface LyricLine {
   text: string
 }
 
-interface PlayerState {
-  queue: MediaItem[]
-  index: number
-  playing: boolean
-  mode: PlayMode
-  currentTime: number
-  duration: number
+export const usePlayerStore = defineStore('player', () => {
+  const queue = ref<MediaItem[]>([])
+  const index = ref(-1)
+  const playing = ref(false)
+  /** 播放模式跨会话保留（旧值就是这三个字符串，迁移无缝） */
+  const mode = useStorage<PlayMode>('asmoday.player.mode', 'loop')
+  const currentTime = ref(0)
+  const duration = ref(0)
   /** 展开歌词面板 */
-  expanded: boolean
-  lyrics: LyricLine[] | null
-  lyricError: string
-}
+  const expanded = ref(false)
+  const lyrics = ref<LyricLine[] | null>(null)
+  const lyricError = ref('')
 
-const state = reactive<PlayerState>({
-  queue: [],
-  index: -1,
-  playing: false,
-  mode: (localStorage.getItem('asmoday.player.mode') as PlayMode | null) ?? 'loop',
-  currentTime: 0,
-  duration: 0,
-  expanded: false,
-  lyrics: null,
-  lyricError: '',
-})
+  /** 面板展示用：当前曲目（优先 ID3 标题） */
+  const currentTrack = computed(() => queue.value[index.value] ?? null)
 
-/** 面板展示用：当前曲目（优先 ID3 标题） */
-export const currentTrack = computed(() => state.queue[state.index] ?? null)
-
-export const player = {
-  state,
-  currentTrack,
+  async function loadLyrics() {
+    lyrics.value = null
+    lyricError.value = ''
+    const track = currentTrack.value
+    if (!track) return
+    try {
+      const res = await fetch(lrcUrl(track.path))
+      if (!res.ok) {
+        lyricError.value = i18n.global.t('gallery.player.noLyrics')
+        return
+      }
+      const text = await res.text()
+      const lines = parseLrc(text)
+      if (lines.length === 0) {
+        lyricError.value = i18n.global.t('gallery.player.noTimeline')
+        return
+      }
+      lyrics.value = lines
+    } catch {
+      lyricError.value = i18n.global.t('gallery.player.lyricsFailed')
+    }
+  }
 
   /** 播放 tracks 中的第 index 首 */
-  play(tracks: MediaItem[], index: number) {
-    state.queue = [...tracks]
-    state.index = index
-    state.playing = true
+  function play(tracks: MediaItem[], start: number) {
+    queue.value = [...tracks]
+    index.value = start
+    playing.value = true
     void loadLyrics()
-  },
+  }
 
-  toggle() {
-    if (state.index < 0 && state.queue.length > 0) {
-      state.index = 0
-      state.playing = true
+  function toggle() {
+    if (index.value < 0 && queue.value.length > 0) {
+      index.value = 0
+      playing.value = true
       void loadLyrics()
       return
     }
-    state.playing = !state.playing
-  },
+    playing.value = !playing.value
+  }
 
-  next(manual = true) {
-    if (state.queue.length === 0) return
-    if (state.mode === 'one' && !manual) return // 单曲循环：换源交给 <audio loop>
-    if (state.mode === 'shuffle' && state.queue.length > 1) {
-      let next = state.index
-      while (next === state.index) {
-        next = Math.floor(Math.random() * state.queue.length)
+  function next(manual = true) {
+    if (queue.value.length === 0) return
+    if (mode.value === 'one' && !manual) return // 单曲循环：换源交给 <audio loop>
+    if (mode.value === 'shuffle' && queue.value.length > 1) {
+      let pick = index.value
+      while (pick === index.value) {
+        pick = Math.floor(Math.random() * queue.value.length)
       }
-      state.index = next
+      index.value = pick
     } else {
-      state.index = (state.index + 1) % state.queue.length
+      index.value = (index.value + 1) % queue.value.length
     }
-    state.playing = true
+    playing.value = true
     void loadLyrics()
-  },
+  }
 
-  prev() {
-    if (state.queue.length === 0) return
-    state.index = (state.index - 1 + state.queue.length) % state.queue.length
-    state.playing = true
+  function prev() {
+    if (queue.value.length === 0) return
+    index.value = (index.value - 1 + queue.value.length) % queue.value.length
+    playing.value = true
     void loadLyrics()
-  },
+  }
 
   /** 播放列表抽屉里点某一首：直接跳到它，不改动队列 */
-  jump(index: number) {
-    if (index < 0 || index >= state.queue.length) return
-    if (index === state.index) {
-      state.playing = !state.playing
+  function jump(target: number) {
+    if (target < 0 || target >= queue.value.length) return
+    if (target === index.value) {
+      playing.value = !playing.value
       return
     }
-    state.index = index
-    state.currentTime = 0
-    state.playing = true
+    index.value = target
+    currentTime.value = 0
+    playing.value = true
     void loadLyrics()
-  },
+  }
 
   /** 清空播放队列（播放条随之收起） */
-  clearQueue() {
-    state.queue = []
-    state.index = -1
-    state.playing = false
-    state.currentTime = 0
-    state.duration = 0
-    state.lyrics = null
-    state.lyricError = ''
-    state.expanded = false
-  },
+  function clearQueue() {
+    queue.value = []
+    index.value = -1
+    playing.value = false
+    currentTime.value = 0
+    duration.value = 0
+    lyrics.value = null
+    lyricError.value = ''
+    expanded.value = false
+  }
 
-  setMode(mode: PlayMode) {
-    state.mode = mode
-    localStorage.setItem('asmoday.player.mode', mode)
-  },
+  function setMode(value: PlayMode) {
+    // useStorage 会自动写回 localStorage，不再手动 setItem
+    mode.value = value
+  }
 
-  seek(time: number) {
-    state.currentTime = time
+  function seek(time: number) {
+    currentTime.value = time
     return time
-  },
+  }
 
-  stop() {
-    state.playing = false
-    state.expanded = false
-  },
+  function stop() {
+    playing.value = false
+    expanded.value = false
+  }
 
-  /** 是否正在播放某个路径（收藏高亮等场景不用，播放列表高亮用） */
-  isCurrent(path: string) {
-    return state.queue[state.index]?.path === path
-  },
+  /** 是否正在播放某个路径（播放列表高亮用） */
+  function isCurrent(path: string) {
+    return queue.value[index.value]?.path === path
+  }
+
+  return {
+    queue,
+    index,
+    playing,
+    mode,
+    currentTime,
+    duration,
+    expanded,
+    lyrics,
+    lyricError,
+    currentTrack,
+    play,
+    toggle,
+    next,
+    prev,
+    jump,
+    clearQueue,
+    setMode,
+    seek,
+    stop,
+    isCurrent,
+  }
+})
+
+/**
+ * 组件外使用的门面。
+ *
+ * `state` 指向 store 本身——Pinia store 是 reactive 代理，所以老的
+ * `player.state.playing` 写法语义不变；其余方法逐一转发。
+ */
+const store = usePlayerStore(pinia)
+
+export const currentTrack = computed(() => store.currentTrack)
+
+export const player = {
+  state: store,
+  currentTrack,
+  play: store.play,
+  toggle: store.toggle,
+  next: store.next,
+  prev: store.prev,
+  jump: store.jump,
+  clearQueue: store.clearQueue,
+  setMode: store.setMode,
+  seek: store.seek,
+  stop: store.stop,
+  isCurrent: store.isCurrent,
 }
 
 /** [mm:ss.xx] 多时间戳 LRC 解析 */
@@ -148,27 +210,4 @@ export function parseLrc(text: string): LyricLine[] {
     }
   }
   return lines.sort((a, b) => a.time - b.time)
-}
-
-async function loadLyrics() {
-  state.lyrics = null
-  state.lyricError = ''
-  const track = currentTrack.value
-  if (!track) return
-  try {
-    const res = await fetch(lrcUrl(track.path))
-    if (!res.ok) {
-      state.lyricError = i18n.global.t('gallery.player.noLyrics')
-      return
-    }
-    const text = await res.text()
-    const lines = parseLrc(text)
-    if (lines.length === 0) {
-      state.lyricError = i18n.global.t('gallery.player.noTimeline')
-      return
-    }
-    state.lyrics = lines
-  } catch {
-    state.lyricError = i18n.global.t('gallery.player.lyricsFailed')
-  }
 }

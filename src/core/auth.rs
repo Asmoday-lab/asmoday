@@ -16,6 +16,7 @@ use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite_migration::{M, Migrations};
 use serde::Serialize;
 
 /// 会话有效期：7 天（滑动续期的步长）
@@ -151,12 +152,14 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
 /// `favorites` / `play_history` 主键升级：`file_path` → `(mount_id, file_path)`。
 ///
 /// SQLite 不支持改主键，只能「建新表 → 抄数据 → 删旧表 → 改名」。
-/// 只跑一次（老库没有 `mount_id` 列时才动），新库的 `CREATE TABLE` 已经是新结构。
-fn rebuild_media_tables(conn: &Connection) -> Result<(), String> {
+/// 只在老库（缺 `mount_id` 列）上真的动；新库的 `CREATE TABLE` 已经是新结构。
+///
+/// **不要**在这里写 `BEGIN`/`COMMIT`：迁移钩子本身已经跑在事务里，
+/// 嵌套事务会直接 `cannot start a transaction within a transaction`。
+fn rebuild_media_tables(conn: &Connection) -> rusqlite::Result<()> {
     if !table_has_column(conn, "favorites", "mount_id") {
         conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE favorites_v2 (
+            "CREATE TABLE favorites_v2 (
                  mount_id TEXT NOT NULL DEFAULT '',
                  file_path TEXT NOT NULL,
                  created_at INTEGER,
@@ -165,15 +168,12 @@ fn rebuild_media_tables(conn: &Connection) -> Result<(), String> {
              INSERT OR IGNORE INTO favorites_v2 (mount_id, file_path, created_at)
                  SELECT '', file_path, created_at FROM favorites;
              DROP TABLE favorites;
-             ALTER TABLE favorites_v2 RENAME TO favorites;
-             COMMIT;",
-        )
-        .map_err(|e| format!("迁移 favorites 主键失败：{e}"))?;
+             ALTER TABLE favorites_v2 RENAME TO favorites;",
+        )?;
     }
     if !table_has_column(conn, "play_history", "mount_id") {
         conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE play_history_v2 (
+            "CREATE TABLE play_history_v2 (
                  mount_id TEXT NOT NULL DEFAULT '',
                  file_path TEXT NOT NULL,
                  last_played_at INTEGER,
@@ -183,12 +183,71 @@ fn rebuild_media_tables(conn: &Connection) -> Result<(), String> {
              INSERT OR IGNORE INTO play_history_v2 (mount_id, file_path, last_played_at, progress)
                  SELECT '', file_path, last_played_at, progress FROM play_history;
              DROP TABLE play_history;
-             ALTER TABLE play_history_v2 RENAME TO play_history;
-             COMMIT;",
-        )
-        .map_err(|e| format!("迁移 play_history 主键失败：{e}"))?;
+             ALTER TABLE play_history_v2 RENAME TO play_history;",
+        )?;
     }
     Ok(())
+}
+
+/// 存量库补列（设计文档 4.1）。
+///
+/// `CREATE TABLE IF NOT EXISTS` 对**已存在**的表不生效，所以老库缺的列只能 ALTER 补。
+/// 放在迁移的 v1 钩子里做，是因为 v1 对存量库同样会跑（user_version 从 0 开始），
+/// 而「列是否已存在」必须自己判断——ALTER 不幂等。
+const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "users",
+        "must_change_password",
+        "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",
+    ),
+    // 2FA 一次性恢复码：只存 SHA-1 指纹的 JSON 数组
+    (
+        "users",
+        "totp_recovery_codes",
+        "ALTER TABLE users ADD COLUMN totp_recovery_codes TEXT",
+    ),
+    // 分享 tombstone：文件删掉后分享不连带消失，访问返回 410，30 天后物理清除
+    (
+        "shares",
+        "deleted_at",
+        "ALTER TABLE shares ADD COLUMN deleted_at INTEGER",
+    ),
+    // 令牌限定挂载点
+    (
+        "access_tokens",
+        "mount_scope",
+        "ALTER TABLE access_tokens ADD COLUMN mount_scope TEXT",
+    ),
+    // 敏感操作二次验证时间戳（默认 0 = 从未验证）
+    (
+        "sessions",
+        "verified_at",
+        "ALTER TABLE sessions ADD COLUMN verified_at INTEGER NOT NULL DEFAULT 0",
+    ),
+];
+
+/// schema 迁移序列（`PRAGMA user_version` 记录进度）。
+///
+/// - **v1** 基线：全部 `CREATE TABLE IF NOT EXISTS` + 缺列才补的钩子。新库和存量库
+///   （user_version 都是 0）走同一段，幂等由钩子里的列判断保证。
+/// - **v2** 收藏/播放历史主键升级成 `(mount_id, file_path)`。
+///
+/// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
+fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up_with_hook(SCHEMA, |tx: &rusqlite::Transaction| {
+            for (table, column, ddl) in BACKFILL_COLUMNS {
+                if !table_has_column(tx, table, column) {
+                    tx.execute_batch(ddl)?;
+                }
+            }
+            Ok(())
+        }),
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            rebuild_media_tables(tx)?;
+            Ok(())
+        }),
+    ])
 }
 
 impl AuthStore {
@@ -296,9 +355,11 @@ impl AuthStore {
     }
 
     pub fn init(&self) -> Result<(), String> {
-        let conn = self.connect()?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| format!("初始化数据库结构失败：{e}"))?;
+        let mut conn = self.connect()?;
+        // 版本化的 schema 升级：每步只跑一次，失败能定位到具体版本（见 `migrations`）
+        migrations()
+            .to_latest(&mut conn)
+            .map_err(|e| format!("迁移数据库结构失败：{e}"))?;
         // 数据库文件权限 0600（设计文档 4.1）：里面是密码哈希、TOTP 密钥与会话，
         // 绝不能给同机其他用户可读
         #[cfg(unix)]
@@ -313,26 +374,6 @@ impl AuthStore {
                 }
             }
         }
-        // 存量库补列：CREATE TABLE IF NOT EXISTS 对老库不生效
-        let _ = conn.execute(
-            "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",
-            [],
-        );
-        // 2FA 一次性恢复码（设计文档 3.1.4）：只存 SHA-1 指纹的 JSON 数组
-        let _ = conn.execute("ALTER TABLE users ADD COLUMN totp_recovery_codes TEXT", []);
-        // 分享 tombstone（设计文档 3.2.6.7 / 4.1）：文件被删后分享不连带消失，
-        // 而是置 deleted_at，访问时返回 410，30 天后物理清除
-        let _ = conn.execute("ALTER TABLE shares ADD COLUMN deleted_at INTEGER", []);
-        // 令牌限定挂载点（老库补列）
-        let _ = conn.execute("ALTER TABLE access_tokens ADD COLUMN mount_scope TEXT", []);
-        // 敏感操作二次验证时间戳（老库补列；默认 0 = 从未验证）
-        let _ = conn.execute(
-            "ALTER TABLE sessions ADD COLUMN verified_at INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        // 收藏 / 播放历史改复合主键（设计文档 4.1）：SQLite 不能原地改主键，
-        // 只能重建表；只在老库（缺 mount_id 列）上跑一次。
-        rebuild_media_tables(&conn)?;
         Ok(())
     }
 

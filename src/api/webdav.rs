@@ -1,32 +1,48 @@
-//! WebDAV 服务端（设计文档 v2.5.0 3.10 / 6.6）。
+//! WebDAV 服务端（设计文档 3.10 / 6.6）。
 //!
-//! - 认证：HTTP Basic，用户名 = Token 名，密码 = `asm_` 前缀的 App Token 明文；
-//!   校验哈希 + 过期，失败计入**独立**防爆破池（与登录 / 分享互相隔离）；
-//! - 路由：`/dav/<mount_id>/<path>`，路径经 `path_guard` canonicalize，禁止逃逸与跨挂载点；
-//! - 方法：OPTIONS / PROPFIND / GET / HEAD / PUT / DELETE / MKCOL / MOVE / COPY / LOCK / UNLOCK；
-//! - 写方法被只读 Token 与只读挂载点双重拦截（403）；
-//! - PUT 流式落盘（`.asmoday-part.<8位随机>` 临时文件 + 原子重命名，绝不 `to_bytes`）；
-//! - GET/HEAD 支持 Range 分段（视频拖拽），流式回传；
-//! - LOCK/UNLOCK 为伪锁：只回随机 Lock-Token，串行化依托 per-path 锁。
+//! **协议由 [`dav_server`] 实现，本文件只做三件事**：Basic 认证、挂载点路由、
+//! 安全边界（路径逃逸 / 系统垃圾 / 只读 / 令牌范围）。
+//!
+//! 为什么不再手写：自研那版把 `PROPFIND` / `PUT` / `MOVE` 都实现了，但客户端实测
+//! 加不上——`/dav`、`/dav/` 这种「虚拟根」直接 404，`PROPFIND` 又缺 `getetag` /
+//! `creationdate` / `supportedlock`，目录 href 没有尾斜杠。这些全是 RFC 4918 的边角，
+//! 客户端却恰好拿它们当「是不是一个可用的 WebDAV 服务器」的判据。
+//!
+//! 分工：
+//! - `dav_server::localfs::LocalFs` 负责文件系统语义（含多段 Range、原子 rename、ETag）；
+//! - `dav_server::memls::MemLs` 负责真锁（替换原先手写的 `core::dav_locks`）；
+//! - [`crate::api::dav_fs::CleanFs`] 在 `LocalFs` 外面挡掉 `.part` 与系统垃圾；
+//! - 本文件负责认证与 `path_guard` 的逃逸校验，然后按挂载点把请求转给对应的 handler。
+//!
+//! URL 形态：`/dav/<mount_id>/<path>`。`/dav/` 是虚拟根，`PROPFIND` 列出所有挂载点
+//! ——客户端只要填 `http://host:port/dav/` 就能添加，不必先知道 `mount_id`。
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use data_encoding::BASE64;
-use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, SeekFrom};
-use tokio_util::io::ReaderStream;
+use dav_server::localfs::LocalFs;
+use dav_server::memls::MemLs;
+use dav_server::{DavHandler, DavMethodSet};
 
 use crate::AppState;
-use crate::core::fs;
-use crate::core::{fs_ops, path_guard};
+use crate::api::dav_fs::CleanFs;
+use crate::core::prefix::RuntimePrefix;
+use crate::core::{junk, path_guard};
 
 const PREFIX: &str = "/dav";
-/// PROPFIND 单层条目上限（防客户端一次拉爆 CPU/IO，设计文档 3.10）
-const PROPFIND_LIMIT: usize = 1000;
+
+/// `OPTIONS` / `Allow` 里列出的方法：与 dav-server 的全量实现对齐。
+const DAV_ALLOW: &str =
+    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY, LOCK, UNLOCK";
+const RO_METHODS: DavMethodSet = DavMethodSet::WEBDAV_RO;
+const RW_METHODS: DavMethodSet = DavMethodSet::WEBDAV_RW;
 
 fn unauthorized() -> Response {
     (
@@ -113,15 +129,6 @@ fn split_route(uri_path: &str) -> Result<(Option<String>, String), Response> {
     Ok((Some(segments.into_iter().next().unwrap_or_default()), tail))
 }
 
-/// 解析 Destination 头：绝对 URL 或绝对路径 → 同 `split_route`
-fn parse_destination(value: &str) -> Result<(Option<String>, String), Response> {
-    let path = match value.split_once("://") {
-        Some((_, rest)) => rest.find('/').map(|idx| &rest[idx..]).unwrap_or("/"),
-        None => value,
-    };
-    split_route(path)
-}
-
 fn escape_xml(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -130,96 +137,168 @@ fn escape_xml(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn entry_xml(href: &str, name: &str, is_dir: bool, size: u64, mtime: i64) -> String {
+/// 虚拟根 / 挂载点在 `multistatus` 里的一条 `<response>`。
+fn collection_xml(href: &str, name: &str, mtime: i64) -> String {
     let rfc1123 = httpdate::fmt_http_date(
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.max(0) as u64),
     );
     format!(
         "<D:response><D:href>{}</D:href><D:propstat><D:prop>\
 <D:displayname>{}</D:displayname>\
-<D:resourcetype>{}</D:resourcetype>\
-<D:getcontentlength>{}</D:getcontentlength>\
-<D:getcontenttype>{}</D:getcontenttype>\
+<D:resourcetype><D:collection/></D:resourcetype>\
+<D:getcontenttype>httpd/unix-directory</D:getcontenttype>\
 <D:getlastmodified>{}</D:getlastmodified>\
+<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope>\
+<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>\
 </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
         escape_xml(href),
         escape_xml(name),
-        if is_dir { "<D:collection/>" } else { "" },
-        size,
-        if is_dir {
-            "httpd/unix-directory".to_string()
-        } else {
-            mime_guess::from_path(name)
-                .first_or_octet_stream()
-                .to_string()
-        },
         rfc1123,
     )
 }
 
-/// 解析单段 `Range: bytes=a-b`（含 `bytes=-n` 后缀式）。成功返回闭区间 (start, end)。
-fn parse_range(header_value: Option<&str>, len: u64) -> Result<Option<(u64, u64)>, Response> {
-    let Some(value) = header_value else {
-        return Ok(None);
-    };
-    if len == 0 {
-        return Err(dav_error(
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            "空文件无法分段",
-        ));
-    }
-    let spec = value
-        .trim()
-        .strip_prefix("bytes=")
-        .ok_or_else(|| dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "仅支持 bytes 单段范围"))?;
-    // 多段范围直接按不支持处理（客户端会回退整文件）
-    if spec.contains(',') {
-        return Err(dav_error(
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            "不支持多段 Range",
-        ));
-    }
-    let (start_s, end_s) = spec
-        .split_once('-')
-        .ok_or_else(|| dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "Range 格式非法"))?;
-    let (start, end) = if start_s.is_empty() {
-        // bytes=-n：最后 n 字节
-        let n: u64 = end_s
-            .parse()
-            .map_err(|_| dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "Range 格式非法"))?;
-        if n == 0 || len == 0 {
-            return Err(dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "范围无法满足"));
-        }
-        let start = len.saturating_sub(n);
-        (start, len - 1)
-    } else {
-        let start: u64 = start_s
-            .parse()
-            .map_err(|_| dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "Range 格式非法"))?;
-        let end = if end_s.is_empty() {
-            len - 1
-        } else {
-            end_s
-                .parse::<u64>()
-                .map_err(|_| dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "Range 格式非法"))?
-                .min(len - 1)
-        };
-        if len == 0 || start > end || start >= len {
-            return Err(dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "范围无法满足"));
-        }
-        (start, end)
-    };
-    Ok(Some((start, end)))
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
+
+fn mtime_of(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(now_secs)
+}
+
+// ---------------------------------------------------------------------------
+// 每个挂载点一个 handler（LocalFs + MemLs），按配置指纹缓存
+// ---------------------------------------------------------------------------
+
+/// `DavHandler` 持有 `LocalFs` 与 `MemLs`（锁表必须跨请求存活，否则 LOCK 立刻失效），
+/// 所以不能每次请求都新建。
+///
+/// 缓存键含 `root` / `readonly` / `prefix`：配置热重载换了路径或权限，会自然落到新条目；
+/// 旧条目留着无害，超过上限时整体清空（这时丢锁也是合理的——挂载点都变了）。
+#[derive(Default)]
+pub struct DavCache {
+    inner: tokio::sync::RwLock<HashMap<String, Arc<DavHandler>>>,
+}
+
+impl std::fmt::Debug for DavCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DavCache")
+    }
+}
+
+impl DavCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn get_or_build(
+        &self,
+        key: String,
+        root: &Path,
+        prefix: &str,
+        readonly: bool,
+    ) -> Arc<DavHandler> {
+        if let Some(existing) = self.inner.read().await.get(&key) {
+            return Arc::clone(existing);
+        }
+        let handler = Arc::new(build_handler(root, prefix, readonly));
+        let mut guard = self.inner.write().await;
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        Arc::clone(guard.entry(key).or_insert(handler))
+    }
+}
+
+fn build_handler(root: &Path, strip_prefix: &str, readonly: bool) -> DavHandler {
+    let fs = CleanFs::new(LocalFs::new(
+        root,
+        // public=true：新建文件 0644 / 目录 0755。媒体库常被其它进程（转码、相册）
+        // 读取，0600 会让它们全部 permission denied。
+        true,
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+    ));
+    DavHandler::builder()
+        .filesystem(fs)
+        .locksystem(MemLs::new())
+        .strip_prefix(strip_prefix)
+        // 软链接当普通条目：逃逸防护由 path_guard 在入口做（跟随后 canonicalize 校验根）
+        .hide_symlinks(false)
+        // 浏览器直接打开目录能看到文件列表，省掉「装个客户端才能看」的门槛。
+        // 注意**不能**同时设 `indexfile`：dav-server 里设了 indexfile 就只找那一个文件，
+        // 找不到直接 404，不会回落到 autoindex（目录页于是打不开）。
+        .autoindex(true)
+        // 目录请求缺尾斜杠时 302 补上：客户端靠它判断「这是集合不是文件」
+        .redirect(true)
+        .methods(if readonly { RO_METHODS } else { RW_METHODS })
+        .build_handler()
+}
+
+// ---------------------------------------------------------------------------
+// 安全边界
+// ---------------------------------------------------------------------------
 
 async fn mount_load(state: &AppState) -> path_guard::MountSet {
     let config = state.config.read().await;
     path_guard::load(&config, &state.cwd)
 }
 
-/// 把请求里挂载点内的相对路径解析成存在的绝对路径（canonicalize，防逃逸）。
-fn resolve(mount: &path_guard::MountEntry, rest: &str) -> Result<PathBuf, Response> {
-    path_guard::resolve_existing(mount, rest).map_err(|err| match err {
+/// 请求路径的逃逸 / 垃圾文件校验（同步实现，调用方包 `spawn_blocking`）。
+///
+/// - 已存在的路径：`resolve_existing`（canonicalize 后必须仍在挂载点内）；
+/// - 待创建的目标：`resolve_child`（父目录必须存在，名字逐条校验）。
+fn guard_path(mount: &path_guard::MountEntry, rest: &str, writing: bool) -> Result<(), Response> {
+    // 目录请求常带尾斜杠（`MKCOL /dav/m0/newdir/`）：去掉再做名字校验，
+    // 否则最后一段会变成空串，被当成「名字含 /」直接 400。
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let (parent, name) = match rest.rsplit_once('/') {
+        Some((parent, name)) if !name.is_empty() => (parent.to_string(), name.to_string()),
+        _ => (String::new(), rest.to_string()),
+    };
+
+    // 系统垃圾与运行期临时文件：读侧当不存在（404），写侧明确拒绝（403）
+    if path_guard::is_part_file(&name) || junk::is_system_junk(&name) {
+        return Err(dav_error(
+            if writing {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            "该文件名属于系统垃圾或运行期临时文件，已被服务器拒绝",
+        ));
+    }
+
+    let root = mount.canon_root().map_err(|err| {
+        dav_error(
+            StatusCode::NOT_FOUND,
+            &format!("挂载点不可用：{}", err.message()),
+        )
+    })?;
+    let candidate = root.join(rest);
+    let outcome = if path_guard::symlink_exists(&candidate) {
+        path_guard::resolve_existing(mount, rest)
+    } else if writing {
+        path_guard::resolve_child(mount, &parent, &name)
+    } else {
+        // 读一个不存在的路径：不用再 canonicalize，交给 dav-server 回 404
+        return Ok(());
+    };
+    outcome.map(|_| ()).map_err(|err| match err {
+        // 写操作的父目录不存在：RFC 4918 要求 409 Conflict（客户端据此提示「目录已不在」）
+        crate::core::fs::FsError::NotFound(_) if writing => {
+            dav_error(StatusCode::CONFLICT, "父目录不存在")
+        }
         crate::core::fs::FsError::NotFound(_) => dav_error(StatusCode::NOT_FOUND, "路径不存在"),
         crate::core::fs::FsError::SymlinkEscape(_) => {
             dav_error(StatusCode::FORBIDDEN, "禁止经软链接逃逸")
@@ -227,91 +306,161 @@ fn resolve(mount: &path_guard::MountEntry, rest: &str) -> Result<PathBuf, Respon
         crate::core::fs::FsError::PathTraversal(_) => {
             dav_error(StatusCode::FORBIDDEN, "禁止路径穿越")
         }
-        other => dav_error(StatusCode::INTERNAL_SERVER_ERROR, &other.message()),
+        crate::core::fs::FsError::Readonly(_) => dav_error(StatusCode::FORBIDDEN, "挂载点为只读"),
+        other => dav_error(StatusCode::BAD_REQUEST, &other.message()),
     })
 }
 
-/// 写方法统一拦截：只读 Token 与只读挂载点双重 403
-fn ensure_writable(readonly: bool, mount: &path_guard::MountEntry) -> Result<(), Response> {
-    if readonly {
-        return Err(dav_error(StatusCode::FORBIDDEN, "该令牌为只读"));
-    }
-    mount
-        .ensure_writable()
-        .map_err(|_| dav_error(StatusCode::FORBIDDEN, "挂载点为只读"))
-}
-
-/// 读 `If` 头（RFC 4918 的条件请求；Office / Finder 用它在锁保护下写文件）
-fn if_header(headers: &HeaderMap) -> Option<&str> {
-    headers.get("if").and_then(|value| value.to_str().ok())
-}
-
-/// 写操作前的锁校验：被别的客户端锁住且没带 token → 423 Locked。
-///
-/// 不校验会怎样：两个人同时用 Word 打开同一个文档，后保存的直接覆盖前一个，
-/// 且双方都不会收到任何提示——这是「伪锁」最实际的伤害。
-fn ensure_not_locked(state: &AppState, key: &str, headers: &HeaderMap) -> Result<(), Response> {
-    match state.dav_locks.check_write(key, if_header(headers)) {
-        Ok(()) => Ok(()),
-        Err(_) => Err(dav_error(
-            StatusCode::LOCKED,
-            "资源已被其它客户端锁定，请稍后重试",
-        )),
-    }
-}
-
-/// 锁键：`/dav/<mount_id>/<相对路径>`，和对外 URL 同形，便于排障。
-fn dav_key(mount_id: &str, rel: &str) -> String {
-    format!(
-        "{}/{}/{}",
-        PREFIX,
-        percent_encode_segment(mount_id),
-        fs::normalize_display(Path::new(rel)).trim_start_matches('/')
-    )
-}
-
-fn reject_mount_root(target: &Path, root: &Path) -> Result<(), Response> {
-    if target == root {
+/// `MOVE` / `COPY` 的 `Destination` 头也要过同一道闸——
+/// 否则客户端可以用 `/dav/m0/指向外部的软链接/x.txt` 把文件写到挂载点外面。
+async fn guard_destination(
+    mount: &path_guard::MountEntry,
+    mount_id: &str,
+    prefix: &RuntimePrefix,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let Some(value) = headers
+        .get("destination")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    let path = match value.split_once("://") {
+        Some((_, rest)) => rest.find('/').map(|idx| &rest[idx..]).unwrap_or("/"),
+        None => value,
+    };
+    // 子路径部署时客户端发的 Destination 带 `/asmoday`，先剥掉再解析，
+    // 否则会被当成「另一个挂载点」直接 403。
+    let path = prefix.strip(path);
+    let (dest_mount, dest_rest) = split_route(path)?;
+    if dest_mount.as_deref() != Some(mount_id) {
         return Err(dav_error(
             StatusCode::FORBIDDEN,
-            "挂载点根目录不可执行该操作",
+            "禁止跨挂载点操作（Destination 必须指向同一挂载点）",
         ));
     }
-    Ok(())
+    let mount = mount.clone();
+    tokio::task::spawn_blocking(move || guard_path(&mount, &dest_rest, true))
+        .await
+        .unwrap_or_else(|err| {
+            Err(dav_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("task failed: {err}"),
+            ))
+        })
 }
 
-/// 递归复制（同步实现，调用方包 spawn_blocking）。软链接按目标内容复制。
-fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
-    if meta.is_dir() {
-        std::fs::create_dir(dst).map_err(|e| e.to_string())?;
-        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path_guard::is_part_file(&name) {
-                continue;
+// ---------------------------------------------------------------------------
+// 虚拟根：`/dav` 与 `/dav/`
+// ---------------------------------------------------------------------------
+
+async fn virtual_root(
+    state: &AppState,
+    access: &crate::api::tokens::TokenAccess,
+    prefix: &RuntimePrefix,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    let base = format!("{}/dav/", prefix.as_str().trim_end_matches('/'));
+    match method.as_str() {
+        "OPTIONS" => (
+            StatusCode::OK,
+            [
+                (HeaderName::from_static("dav"), "1, 2".to_string()),
+                // Windows 资源管理器 / Office 认这个头才肯把共享当「可写 WebDAV」
+                (HeaderName::from_static("ms-author-via"), "DAV".to_string()),
+                (header::ALLOW, DAV_ALLOW.to_string()),
+            ],
+        )
+            .into_response(),
+        "PROPFIND" => {
+            let depth = headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("1");
+            let set = mount_load(state).await;
+            let mut xml = String::from(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">",
+            );
+            xml.push_str(&collection_xml(&base, "Asmoday", now_secs()));
+            if depth != "0" {
+                for mount in &set.mounts {
+                    // 令牌限定挂载点时，列表里也不该出现别的目录
+                    if access
+                        .mount_scope
+                        .as_deref()
+                        .is_some_and(|scope| scope != mount.info.id)
+                    {
+                        continue;
+                    }
+                    let href = format!("{}{}/", base, percent_encode_segment(&mount.info.id));
+                    let mtime = mount.root.as_deref().map(mtime_of).unwrap_or_else(now_secs);
+                    xml.push_str(&collection_xml(&href, &mount.info.name, mtime));
+                }
             }
-            // 复制目录时把系统垃圾一起搬过去毫无意义，还会让目标端再被同步污染
-            if crate::core::junk::is_system_junk(&name) {
-                continue;
-            }
-            copy_recursive(&entry.path(), &dst.join(&name))?;
+            xml.push_str("</D:multistatus>");
+            (
+                StatusCode::MULTI_STATUS,
+                [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
         }
-        Ok(())
-    } else {
-        std::fs::copy(src, dst)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        "GET" | "HEAD" => {
+            // 浏览器直接打开 `/dav/` 时的落地页：列出可挂载的目录
+            let set = mount_load(state).await;
+            let mut html = String::from(
+                "<!doctype html><meta charset=\"utf-8\"><title>Asmoday WebDAV</title>\
+<style>body{font:15px/1.6 system-ui,sans-serif;margin:2.5rem auto;max-width:38rem;padding:0 1rem}\
+a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}li{margin:.35rem 0}</style>\
+<h1>Asmoday WebDAV</h1><p>把下面的地址添加为 WebDAV 服务器（用户名 = 令牌名，密码 = 令牌）。</p><ul>",
+            );
+            for mount in &set.mounts {
+                if access
+                    .mount_scope
+                    .as_deref()
+                    .is_some_and(|scope| scope != mount.info.id)
+                {
+                    continue;
+                }
+                html.push_str(&format!(
+                    "<li><a href=\"{}{}/\">{}</a> <small>{}</small></li>",
+                    base,
+                    percent_encode_segment(&mount.info.id),
+                    escape_xml(&mount.info.name),
+                    if mount.info.readonly {
+                        "只读"
+                    } else {
+                        "读写"
+                    }
+                ));
+            }
+            html.push_str("</ul>");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                html,
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, DAV_ALLOW.to_string())],
+            "请在挂载点地址上使用 WebDAV 方法，例如 /dav/<mount_id>/",
+        )
+            .into_response(),
     }
 }
 
-/// WebDAV 统一入口：`/dav` 与 `/dav/*`（设计文档 v2.5.0 6.6）
+// ---------------------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------------------
+
+/// WebDAV 统一入口（`nest("/dav")` 之后，任何 `/dav` 下的路径都会到这里）。
 pub async fn handle(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Body,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
 ) -> Response {
     // 未初始化严防死守：初始化完成前 WebDAV 一律 503，与 /api/* 同口径
     // （设计文档 v2.7.0 3.1.1，防止未鉴权实例被扫描器探测）
@@ -324,7 +473,7 @@ pub async fn handle(
     }
 
     // ---- 认证（独立防爆破池，设计文档 3.1.5 / 3.10）----
-    let Some(creds) = basic_credentials(&headers) else {
+    let Some(creds) = basic_credentials(req.headers()) else {
         return unauthorized();
     };
     let guard_key = format!("{}|{}", crate::api::auth::peer_ip(peer), creds.username);
@@ -340,18 +489,42 @@ pub async fn handle(
         return unauthorized();
     };
     state.dav_guard.record_success(&guard_key);
-    let readonly = access.readonly;
+
+    let prefix = req
+        .extensions()
+        .get::<RuntimePrefix>()
+        .cloned()
+        .unwrap_or_default();
+    let method = req.method().clone();
 
     // ---- 路由与挂载点 ----
-    let (mount_id, rest) = match split_route(uri.path()) {
+    // 路径来源：`nest("/dav")` 已经把前缀剥掉，`req.uri().path()` 是 `/` 或 `/m0/...`，
+    // 拼回 `/dav` 才是对外 URL 形态。
+    //
+    // 不能用 `OriginalUri`：它由**最外层** Router 插入，子路径部署时带的是
+    // `/asmoday/dav/...`，`strip_prefix("/dav")` 直接失败，所有请求会被当成
+    // 虚拟根（GET 看似 200，其实回的是目录页；MOVE 则 405）。
+    // 两个入口的路径形态不同：
+    // - `nest("/dav")` 命中时 axum 已把 `/dav` 剥掉（`/m0/x`）；
+    // - `route("/dav/")` 命中时路径原样保留（`/dav/`）。
+    // 统一成对外形态后再解析，否则尾斜杠那条会拼成 `/dav/dav/`。
+    let inner_path = req.uri().path();
+    let dav_path = if inner_path == PREFIX
+        || inner_path
+            .strip_prefix(PREFIX)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        inner_path.to_string()
+    } else {
+        format!("{PREFIX}{inner_path}")
+    };
+    let (mount_id, rest) = match split_route(&dav_path) {
         Ok(pair) => pair,
         Err(response) => return response,
     };
+    let set = mount_load(&state).await;
     let Some(mount_id) = mount_id else {
-        return dav_error(
-            StatusCode::NOT_FOUND,
-            "Use /dav/<mount_id>/<path>; see GET /api/files/mounts",
-        );
+        return virtual_root(&state, &access, &prefix, &method, req.headers()).await;
     };
     // 令牌限定挂载点：泄漏的令牌只影响一个目录，而不是全库
     if let Some(scope) = access.mount_scope.as_deref()
@@ -362,7 +535,6 @@ pub async fn handle(
             "This token is restricted to another mount point",
         );
     }
-    let set = mount_load(&state).await;
     let Some(mount) = set.find(&mount_id) else {
         return dav_error(StatusCode::NOT_FOUND, "挂载点不存在");
     };
@@ -370,596 +542,97 @@ pub async fn handle(
         return dav_error(StatusCode::NOT_FOUND, "挂载点当前不可用");
     };
     let root = root.clone();
+    let mount_owned = mount.clone();
+    let readonly = access.readonly || mount.info.readonly;
 
-    // 路由容错：GET/HEAD `/dav/<mount_id>`（无尾斜杠）且挂载点存在 → 301 到带斜杠形式。
-    // 浏览器地址栏和部分客户端把目录 URL 当规范入口，重定向后相对路径的子资源
-    // 解析才不会丢一层；`/dav/<mount_id>/`（带斜杠）维持原行为（GET 目录 → 405 请用 PROPFIND）。
-    if matches!(method.as_str(), "GET" | "HEAD") && rest.is_empty() && !uri.path().ends_with('/') {
-        let location = format!("{}/{}/", PREFIX, percent_encode_segment(&mount_id));
-        return (
-            StatusCode::MOVED_PERMANENTLY,
-            [(header::LOCATION, location)],
-        )
-            .into_response();
+    // 只读令牌：写方法直接 403，不让 dav-server 先落盘再报错
+    if readonly && !matches!(method.as_str(), "OPTIONS" | "GET" | "HEAD" | "PROPFIND") {
+        return dav_error(
+            StatusCode::FORBIDDEN,
+            if access.readonly {
+                "该令牌为只读"
+            } else {
+                "挂载点为只读"
+            },
+        );
     }
 
-    let display_path = format!(
-        "{}/{}/{}",
-        PREFIX,
-        percent_encode_segment(&mount_id),
-        fs::normalize_display(Path::new(&rest)).trim_start_matches('/')
+    // 挂载点根不可删除 / 移动：dav-server 会把 `/` 当成目录，真删了就是整盘消失
+    if rest.is_empty() && matches!(method.as_str(), "DELETE" | "MOVE") {
+        return dav_error(StatusCode::FORBIDDEN, "挂载点根目录不可执行该操作");
+    }
+
+    // 路径逃逸校验（含 Destination）。
+    // `writing` 看**方法**而不是挂载点权限：可写挂载点上的 GET 不能被当成写请求，
+    // 否则读一个已存在的 `.part` 临时文件会回 403 而不是「不存在」。
+    let writing = matches!(
+        method.as_str(),
+        "PUT" | "POST" | "MKCOL" | "DELETE" | "MOVE" | "COPY" | "PROPPATCH" | "LOCK"
     );
-
-    match method.as_str() {
-        "OPTIONS" => (
-            StatusCode::OK,
-            [
-                (HeaderName::from_static("dav"), "1, 2".to_string()),
-                // Windows 资源管理器 / Office 认这个头才肯把共享当「可写 WebDAV」，
-                // 否则映射网络驱动器后只能浏览、保存直接报只读
-                (
-                    HeaderName::from_static("ms-author-via"),
-                    "DAV".to_string(),
-                ),
-                (
-                    header::ALLOW,
-                    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY, LOCK, UNLOCK"
-                        .to_string(),
-                ),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-            ],
-        )
-            .into_response(),
-
-        // Windows 客户端挂载后会先 PROPPATCH 设置 Win32 文件属性（只读/隐藏/时间）。
-        // 我们不做属性持久化，但必须回一个 RFC 合规的 207，否则客户端认为共享不可写。
-        "PROPPATCH" => (
-            StatusCode::MULTI_STATUS,
-            [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
-<D:multistatus xmlns:D=\"DAV:\">\
-<D:response><D:href></D:href><D:propstat><D:prop/>\
-<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
-</D:multistatus>",
-        )
-            .into_response(),
-
-        "PROPFIND" => {
-            let depth = headers
-                .get("depth")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("1")
-                .to_string();
-            let target = match resolve(mount, &rest) {
-                Ok(path) => path,
-                Err(response) => return response,
-            };
-            let Ok(meta) = std::fs::symlink_metadata(&target) else {
-                return dav_error(StatusCode::NOT_FOUND, "路径不存在");
-            };
-
-            let name = target
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| mount.info.name.clone());
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let mut body_xml = String::from(
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">",
-            );
-            body_xml.push_str(&entry_xml(&display_path, &name, meta.is_dir(), meta.len(), mtime));
-
-            let mut truncated = false;
-            if meta.is_dir() && depth != "0" {
-                let mut count = 0usize;
-                if let Ok(reader) = std::fs::read_dir(&target) {
-                    for entry in reader.flatten() {
-                        let child_name = entry.file_name().to_string_lossy().to_string();
-                        // 运行期 .part 临时文件对外不可见
-                        if path_guard::is_part_file(&child_name) {
-                            continue;
-                        }
-                        // 系统垃圾不进 PROPFIND：macOS 客户端看到 .DS_Store / ._*
-                        // 就会当作普通文件往回写，形成同步死循环（设计文档 3.3.7）
-                        if crate::core::junk::is_system_junk(&child_name) {
-                            continue;
-                        }
-                        count += 1;
-                        if count > PROPFIND_LIMIT {
-                            truncated = true;
-                            break;
-                        }
-                        let Ok(child_meta) = entry.metadata() else {
-                            continue;
-                        };
-                        let child_display = format!(
-                            "{}/{}",
-                            display_path.trim_end_matches('/'),
-                            percent_encode_segment(&child_name)
-                        );
-                        let child_mtime = child_meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        body_xml.push_str(&entry_xml(
-                            &child_display,
-                            &child_name,
-                            child_meta.is_dir(),
-                            child_meta.len(),
-                            child_mtime,
-                        ));
-                    }
-                }
-            }
-            body_xml.push_str("</D:multistatus>");
-
-            let mut response = (
-                StatusCode::MULTI_STATUS,
-                [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
-                body_xml,
-            )
-                .into_response();
-            if truncated {
-                response.headers_mut().insert(
-                    HeaderName::from_static("x-truncated"),
-                    header::HeaderValue::from_static("true"),
-                );
-            }
-            response
-        }
-
-        "GET" | "HEAD" => {
-            let target = match resolve(mount, &rest) {
-                Ok(path) => path,
-                Err(response) => return response,
-            };
-            let Ok(meta) = std::fs::metadata(&target) else {
-                return dav_error(StatusCode::NOT_FOUND, "文件不存在");
-            };
-            if meta.is_dir() {
-                return dav_error(StatusCode::METHOD_NOT_ALLOWED, "目录请用 PROPFIND");
-            }
-            let len = meta.len();
-            let range = match parse_range(headers.get(header::RANGE).and_then(|v| v.to_str().ok()), len)
-            {
-                Ok(range) => range,
-                Err(response) => return response,
-            };
-
-            let mime = mime_guess::from_path(&target)
-                .first_or_octet_stream()
-                .to_string();
-            let mut builder = axum::response::Response::builder()
-                .header(header::CONTENT_TYPE, mime)
-                .header(header::ACCEPT_RANGES, "bytes");
-            let body = match range {
-                None => {
-                    builder = builder.header(header::CONTENT_LENGTH, len.to_string());
-                    if method.as_str() == "HEAD" {
-                        Body::empty()
-                    } else {
-                        match tokio::fs::File::open(&target).await {
-                            Ok(file) => Body::from_stream(ReaderStream::new(file)),
-                            Err(_) => {
-                                return dav_error(StatusCode::NOT_FOUND, "文件不存在");
-                            }
-                        }
-                    }
-                }
-                Some((start, end)) => {
-                    let slice_len = end - start + 1;
-                    builder = builder
-                        .header(header::CONTENT_LENGTH, slice_len.to_string())
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {start}-{end}/{len}"),
-                        )
-                        .status(StatusCode::PARTIAL_CONTENT);
-                    if method.as_str() == "HEAD" {
-                        Body::empty()
-                    } else {
-                        match tokio::fs::File::open(&target).await {
-                            Ok(mut file) => {
-                                use tokio::io::AsyncSeekExt;
-                                if let Err(err) = file.seek(SeekFrom::Start(start)).await {
-                                    return dav_error(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        &format!("seek failed: {err}"),
-                                    );
-                                }
-                                Body::from_stream(ReaderStream::new(file.take(slice_len)))
-                            }
-                            Err(_) => {
-                                return dav_error(StatusCode::NOT_FOUND, "文件不存在");
-                            }
-                        }
-                    }
-                }
-            };
-            builder.body(body).unwrap_or_else(|_| {
-                dav_error(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-            })
-        }
-
-        "PUT" => {
-            if let Err(response) = ensure_writable(readonly, mount) {
-                return response;
-            }
-            // 目标 = 父目录 canonicalize + 校验过的名字（设计文档 3.10「复用 path_guard」）
-            let (parent_text, file_name) = match rest.rsplit_once('/') {
-                Some((parent, name)) if !name.is_empty() => (parent.to_string(), name.to_string()),
-                _ => (String::new(), rest.clone()),
-            };
-            if file_name.is_empty() {
-                return dav_error(StatusCode::FORBIDDEN, "挂载点根目录不可覆盖");
-            }
-            // 拦截系统垃圾写入：`.DS_Store` / `._*` / `Thumbs.db` 这类文件
-            // 一旦允许落盘，macOS + Windows 双端挂载会互相触发无限同步（设计文档 3.3.7）
-            if crate::core::junk::is_system_junk(&file_name) {
-                crate::log_info!(
-                    "webdav rejected junk upload '{}' on mount {}",
-                    file_name,
-                    mount.info.id
-                );
-                return dav_error(StatusCode::FORBIDDEN, "该文件名属于系统垃圾文件，已被服务器拒绝");
-            }
-            let target = match path_guard::resolve_child(mount, &parent_text, &file_name) {
-                Ok(path) => path,
-                Err(err) => {
-                    return match err {
-                        crate::core::fs::FsError::NotFound(_) => {
-                            dav_error(StatusCode::CONFLICT, "父目录不存在")
-                        }
-                        crate::core::fs::FsError::PathTraversal(_)
-                        | crate::core::fs::FsError::SymlinkEscape(_) => {
-                            dav_error(StatusCode::FORBIDDEN, "禁止路径穿越")
-                        }
-                        other => dav_error(StatusCode::BAD_REQUEST, &other.message()),
-                    };
-                }
-            };
-            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
-                return response;
-            }
-            let existed = path_guard::symlink_exists(&target);
-            let part_path = target.with_file_name(path_guard::part_name(&file_name));
-
-            // 流式写入临时文件（绝不 to_bytes，设计文档 3.10「防 OOM」）
-            let mut stream = body.into_data_stream();
-            let write_result: Result<(), Response> = async {
-                let created = tokio::fs::File::create(&part_path).await;
-                let mut file = match created {
-                    Ok(file) => file,
-                    Err(e) => {
-                        return Err(dav_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &format!("create failed: {e}"),
-                        ));
-                    }
-                };
-                while let Some(chunk) = stream.next().await {
-                    let bytes = match chunk {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            return Err(dav_error(
-                                StatusCode::BAD_REQUEST,
-                                "request body aborted",
-                            ));
-                        }
-                    };
-                    if let Err(e) = file.write_all(&bytes).await {
-                        return Err(dav_error(
-                            StatusCode::INSUFFICIENT_STORAGE,
-                            &format!("write failed: {e}"),
-                        ));
-                    }
-                }
-                if let Err(e) = file.flush().await {
-                    return Err(dav_error(
-                        StatusCode::INSUFFICIENT_STORAGE,
-                        &format!("flush failed: {e}"),
-                    ));
-                }
-                drop(file);
-                Ok(())
-            }
-            .await;
-
-            if let Err(response) = write_result {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                return response;
-            }
-
-            // per-path 锁串行化最终重命名（设计文档 3.10「依托底层 per-path 互斥」）
-            let lock_target = target.clone();
-            let rename_result = {
-                let state = state.clone();
-                let part = part_path.clone();
-                let dest = target.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _guard = state.path_locks.acquire(&[lock_target]);
-                    path_guard::rename_replace(&part, &dest)
-                })
-                .await
-            };
-            match rename_result {
-                Ok(Ok(())) => {
-                    if existed {
-                        StatusCode::NO_CONTENT.into_response()
-                    } else {
-                        StatusCode::CREATED.into_response()
-                    }
-                }
-                Ok(Err(err)) => {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    dav_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("rename failed: {}", err.message()))
-                }
-                Err(err) => {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    dav_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("task failed: {err}"))
-                }
-            }
-        }
-
-        "MKCOL" => {
-            if let Err(response) = ensure_writable(readonly, mount) {
-                return response;
-            }
-            if rest.is_empty() {
-                return dav_error(StatusCode::FORBIDDEN, "挂载点根目录已存在");
-            }
-            let (parent_text, name) = match rest.rsplit_once('/') {
-                Some((parent, name)) if !name.is_empty() => (parent.to_string(), name.to_string()),
-                _ => (String::new(), rest.clone()),
-            };
-            // 与 PUT 同口径：系统垃圾目录（.Trashes / $RECYCLE.BIN 等）不允许新建
-            if crate::core::junk::is_system_junk(&name) {
-                return dav_error(StatusCode::FORBIDDEN, "该名称属于系统目录，已被服务器拒绝");
-            }
-            let target = match path_guard::resolve_child(mount, &parent_text, &name) {
-                Ok(path) => path,
-                Err(err) => {
-                    return match err {
-                        crate::core::fs::FsError::NotFound(_) => {
-                            dav_error(StatusCode::CONFLICT, "父目录不存在")
-                        }
-                        crate::core::fs::FsError::Conflict(_) => {
-                            dav_error(StatusCode::METHOD_NOT_ALLOWED, "名称非法")
-                        }
-                        other => dav_error(StatusCode::BAD_REQUEST, &other.message()),
-                    };
-                }
-            };
-            if path_guard::symlink_exists(&target) {
-                return dav_error(StatusCode::METHOD_NOT_ALLOWED, "目标已存在");
-            }
-            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
-                return response;
-            }
-            match tokio::fs::create_dir(&target).await {
-                Ok(_) => StatusCode::CREATED.into_response(),
-                Err(err) => dav_error(StatusCode::CONFLICT, &format!("创建目录失败：{err}")),
-            }
-        }
-
-        "DELETE" => {
-            if let Err(response) = ensure_writable(readonly, mount) {
-                return response;
-            }
-            let target = match resolve(mount, &rest) {
-                Ok(path) => path,
-                Err(response) => return response,
-            };
-            if let Err(response) = reject_mount_root(&target, &root) {
-                return response;
-            }
-            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
-                return response;
-            }
-            let state = state.clone();
-            let delete_target = target.clone();
-            match tokio::task::spawn_blocking(move || {
-                let _guard = state.path_locks.acquire(std::slice::from_ref(&delete_target));
-                fs_ops::remove_path(&delete_target)
-            })
+    let guard_mount = mount_owned.clone();
+    let guard_rest = rest.clone();
+    if let Err(response) =
+        tokio::task::spawn_blocking(move || guard_path(&guard_mount, &guard_rest, writing))
             .await
-            {
-                Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-                Ok(Err(err)) => dav_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("删除失败：{}", err.message())),
-                Err(err) => dav_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("task failed: {err}")),
-            }
-        }
-
-        "MOVE" | "COPY" => {
-            let is_move = method.as_str() == "MOVE";
-            if let Err(response) = ensure_writable(readonly, mount) {
-                return response;
-            }
-            let Some(destination) = headers
-                .get("destination")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-            else {
-                return dav_error(StatusCode::BAD_REQUEST, "缺少 Destination 头");
-            };
-            let (dest_mount_id, dest_rest) = match parse_destination(&destination) {
-                Ok(pair) => pair,
-                Err(response) => return response,
-            };
-            // 禁止跨挂载点操作（设计文档 3.10）
-            if dest_mount_id.as_deref() != Some(mount_id.as_str()) {
-                return dav_error(StatusCode::FORBIDDEN, "禁止跨挂载点操作");
-            }
-            let overwrite = headers
-                .get("overwrite")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("t"))
-                .unwrap_or(true);
-
-            let source = match resolve(mount, &rest) {
-                Ok(path) => path,
-                Err(response) => return response,
-            };
-            if is_move && let Err(response) = reject_mount_root(&source, &root) {
-                return response;
-            }
-            if std::fs::symlink_metadata(&source).is_err() {
-                return dav_error(StatusCode::NOT_FOUND, "源路径不存在");
-            }
-            // 源被别的客户端锁着（正在编辑）就不能搬走；目标被锁同样拒绝
-            if let Err(response) = ensure_not_locked(&state, &display_path, &headers) {
-                return response;
-            }
-            if let Err(response) =
-                ensure_not_locked(&state, &dav_key(&mount_id, &dest_rest), &headers)
-            {
-                return response;
-            }
-
-            // 目标语义：dest 存在且为目录 → 拷/移进该目录；dest 不存在 → 父目录必须存在；
-            // dest 是文件 → 仅 overwrite=T 时替换
-            let dest = match resolve(mount, &dest_rest) {
-                Ok(path) => path,
-                Err(_) if dest_rest.is_empty() => return dav_error(StatusCode::NOT_FOUND, "目标不存在"),
-                // 目标尚未创建是常态：退一步解析「最近一段已存在的父目录」
-                Err(_) => {
-                    let (parent_text, name) = match dest_rest.rsplit_once('/') {
-                        Some((parent, name)) if !name.is_empty() => {
-                            (parent.to_string(), name.to_string())
-                        }
-                        _ => (String::new(), dest_rest.clone()),
-                    };
-                    let parent = match resolve(mount, &parent_text) {
-                        Ok(path) => path,
-                        Err(response) => return response,
-                    };
-                    if !parent.is_dir() {
-                        return dav_error(StatusCode::CONFLICT, "目标父目录不存在");
-                    }
-                    parent.join(&name)
-                }
-            };
-            let final_target = match std::fs::symlink_metadata(&dest).ok().as_ref() {
-                Some(meta) if meta.is_dir() => {
-                    let Some(name) = source.file_name() else {
-                        return dav_error(StatusCode::FORBIDDEN, "挂载点根不可作为源");
-                    };
-                    dest.join(name)
-                }
-                Some(_) if !overwrite => {
-                    return dav_error(StatusCode::PRECONDITION_FAILED, "目标已存在");
-                }
-                _ => dest,
-            };
-            if final_target == source {
-                return dav_error(StatusCode::FORBIDDEN, "源与目标相同");
-            }
-            if let Err(response) = reject_mount_root(&final_target, &root) {
-                return response;
-            }
-
-            let state = state.clone();
-            let src = source.clone();
-            let dst = final_target.clone();
-            // 覆盖判定看最终目标（dest 可能是「拷进这个目录」的目录本身）
-            let remove_existing = path_guard::symlink_exists(&final_target);
-            let result = tokio::task::spawn_blocking(move || {
-                let _guard = state.path_locks.acquire(&[src.clone(), dst.clone()]);
-                if is_move {
-                    if remove_existing {
-                        // 覆盖：先删目标再挪（目标可能是目录树）
-                        fs_ops::remove_path(&dst).map_err(|e| e.message())?;
-                        std::fs::rename(&src, &dst).map_err(|e| e.to_string())
-                    } else {
-                        path_guard::rename_no_replace(&src, &dst)
-                            .map_err(|e| match e {
-                                crate::core::fs::FsError::Conflict(_) => {
-                                    "409:目标已存在".to_string()
-                                }
-                                other => other.message(),
-                            })
-                    }
-                } else {
-                    if remove_existing {
-                        fs_ops::remove_path(&dst).map_err(|e| e.message())?;
-                    }
-                    copy_recursive(&src, &dst)
-                }
+            .unwrap_or_else(|err| {
+                Err(dav_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("task failed: {err}"),
+                ))
             })
-            .await;
-
-            match result {
-                Ok(Ok(())) => StatusCode::CREATED.into_response(),
-                Ok(Err(message)) => {
-                    if let Some(status) = message
-                        .strip_prefix("409:")
-                        .map(|_| StatusCode::PRECONDITION_FAILED)
-                    {
-                        return dav_error(status, "目标已存在");
-                    }
-                    dav_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("操作失败：{message}"))
-                }
-                Err(err) => dav_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("task failed: {err}")),
-            }
-        }
-
-        "LOCK" => {
-            // 真锁（内存表 + 30 分钟过期）：两个客户端同时编辑同一文件时，
-            // 后者拿到 423，而不是静默覆盖前者的保存。
-            let token = match state.dav_locks.lock(&display_path, if_header(&headers)) {
-                Ok(token) => token,
-                Err(_) => {
-                    return dav_error(StatusCode::LOCKED, "资源已被其它客户端锁定");
-                }
-            };
-            let xml = format!(
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
-<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>\
-<D:locktype><D:write/></D:locktype>\
-<D:lockscope><D:exclusive/></D:lockscope>\
-<D:depth>0</D:depth>\
-<D:timeout>Second-{ttl}</D:timeout>\
-<D:locktoken><D:href>{token}</D:href></D:locktoken>\
-</D:activelock></D:lockdiscovery></D:prop>",
-                ttl = crate::core::dav_locks::LOCK_TTL.as_secs()
-            );
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/xml; charset=utf-8".to_string()),
-                    (
-                        HeaderName::from_static("lock-token"),
-                        format!("<{token}>"),
-                    ),
-                ],
-                xml,
-            )
-                .into_response()
-        }
-
-        "UNLOCK" => {
-            let token = headers
-                .get("lock-token")
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().trim_start_matches('<').trim_end_matches('>'))
-                .unwrap_or_default();
-            match state.dav_locks.unlock(&display_path, token) {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(_) => dav_error(
-                    StatusCode::CONFLICT,
-                    "Lock-Token 与当前锁不匹配（或锁已过期）",
-                ),
-            }
-        }
-
-        _ => dav_error(StatusCode::METHOD_NOT_ALLOWED, "不支持的方法"),
+    {
+        return response;
     }
+    if matches!(method.as_str(), "MOVE" | "COPY")
+        && let Err(response) =
+            guard_destination(&mount_owned, &mount_id, &prefix, req.headers()).await
+    {
+        return response;
+    }
+
+    // ---- 转交 dav-server ----
+    // `strip_prefix` 与请求 URI 必须同时带上部署前缀，否则多挂载点与子路径部署
+    // 两头都会错位（href 少一层，Destination 对不上）。
+    let scope_prefix = format!("{}/dav/{}", prefix.as_str().trim_end_matches('/'), mount_id);
+    let cache_key = format!("{scope_prefix}|{}|{readonly}", root.display());
+    let handler = state
+        .dav
+        .get_or_build(cache_key, &root, &scope_prefix, readonly)
+        .await;
+
+    // nest 会把 `/dav` 剥掉（handler 看到的是 `/m0/...`），这里用原始路径重建，
+    // 让 dav-server 的 strip_prefix 能对上。
+    // MKCOL 带尾斜杠（cadaver / 部分 Java 客户端会这么发）时 dav-server 直接判 400，
+    // RFC 4918 允许这种写法，去掉尾斜杠再交给它。
+    let mut target_path = dav_path.as_str();
+    if method.as_str() == "MKCOL" && target_path.ends_with('/') {
+        target_path = target_path.trim_end_matches('/');
+        if target_path.is_empty() || target_path == PREFIX {
+            return dav_error(StatusCode::FORBIDDEN, "挂载点根目录已存在");
+        }
+    }
+    match rebuild_uri(target_path, prefix.as_str(), req.uri()) {
+        Some(uri) => *req.uri_mut() = uri,
+        None => return dav_error(StatusCode::BAD_REQUEST, "路径无法重建"),
+    }
+
+    let response = handler.handle(req).await;
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, Body::new(body))
+}
+
+/// 把剥过部署前缀的路径重新拼上前缀（dav-server 的 strip_prefix 用的是完整路径）。
+fn rebuild_uri(original: &str, prefix: &str, current: &Uri) -> Option<Uri> {
+    let path = if prefix.is_empty() {
+        original.to_string()
+    } else {
+        format!("{prefix}{original}")
+    };
+    let text = match current.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    text.parse::<Uri>().ok()
 }
 
 #[cfg(test)]
@@ -968,15 +641,22 @@ mod tests {
 
     #[test]
     fn split_route_decodes_per_segment() {
-        // 普通中文路径
         let (mid, rest) = split_route("/dav/m0/%E7%9B%B8%E5%86%8C/a%20b.txt").unwrap();
         assert_eq!(mid.as_deref(), Some("m0"));
         assert_eq!(rest, "相册/a b.txt");
-        // %2F 解码成分隔符属于路径内容，不会再切路由 —— 但这里它落在剩余段里，
-        // 会作为普通字符传给 path_guard，最终被名称校验或 canonicalize 拦住
         let (mid2, rest2) = split_route("/dav/m0/a%2Fb.txt").unwrap();
         assert_eq!(mid2.as_deref(), Some("m0"));
         assert_eq!(rest2, "a/b.txt");
+    }
+
+    #[test]
+    fn split_route_handles_root_forms() {
+        assert_eq!(split_route("/dav").unwrap().0, None);
+        assert_eq!(split_route("/dav/").unwrap().0, None);
+        assert_eq!(
+            split_route("/dav/m0/").unwrap(),
+            (Some("m0".into()), String::new())
+        );
     }
 
     #[test]
@@ -986,34 +666,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_range_variants() {
-        assert_eq!(parse_range(None, 100).unwrap(), None);
-        assert_eq!(parse_range(Some("bytes=0-"), 100).unwrap(), Some((0, 99)));
-        assert_eq!(
-            parse_range(Some("bytes=10-19"), 100).unwrap(),
-            Some((10, 19))
-        );
-        // 越界 end 截断
-        assert_eq!(
-            parse_range(Some("bytes=90-999"), 100).unwrap(),
-            Some((90, 99))
-        );
-        // 后缀式
-        assert_eq!(parse_range(Some("bytes=-5"), 100).unwrap(), Some((95, 99)));
-        // 无法满足
-        assert!(parse_range(Some("bytes=100-"), 100).is_err());
-        assert!(parse_range(Some("bytes=-0"), 100).is_err());
-        // 多段不支持
-        assert!(parse_range(Some("bytes=0-1,5-9"), 100).is_err());
+    fn rebuild_uri_keeps_prefix_and_query() {
+        let current: Uri = "/m0/docs?x=1".parse().unwrap();
+        let uri = rebuild_uri("/dav/m0/docs", "/asmoday", &current).unwrap();
+        assert_eq!(uri.path(), "/asmoday/dav/m0/docs");
+        assert_eq!(uri.query(), Some("x=1"));
+        // 根路径部署时原样返回
+        let uri = rebuild_uri("/dav/m0/", "", &"/m0/".parse().unwrap()).unwrap();
+        assert_eq!(uri.path(), "/dav/m0/");
     }
 
     #[test]
-    fn parse_destination_accepts_url_and_path() {
-        let (mid, rest) = parse_destination("http://host:5100/dav/m0/sub/x.txt").unwrap();
-        assert_eq!(mid.as_deref(), Some("m0"));
-        assert_eq!(rest, "sub/x.txt");
-        let (mid2, rest2) = parse_destination("/dav/m1").unwrap();
-        assert_eq!(mid2.as_deref(), Some("m1"));
-        assert_eq!(rest2, "");
+    fn collection_xml_escapes_names() {
+        let xml = collection_xml("/dav/m0/", "A & B <c>", 0);
+        assert!(xml.contains("A &amp; B &lt;c&gt;"));
+        assert!(xml.contains("<D:collection/>"));
     }
 }

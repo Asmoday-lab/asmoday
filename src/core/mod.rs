@@ -3,7 +3,6 @@
 pub mod audio_tags;
 pub mod auth;
 pub mod config;
-pub mod dav_locks;
 pub mod ffmpeg;
 pub mod fs;
 pub mod fs_ops;

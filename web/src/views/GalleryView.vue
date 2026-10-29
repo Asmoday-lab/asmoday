@@ -5,6 +5,7 @@
  * 视频播放器由 defineAsyncComponent 按需加载（可在「原生播放器」降级开关切换）；
  * 照片网格用虚拟列表渲染；音乐走全局悬浮播放条（跨页面不中断）。
  */
+import { useEventListener } from '@vueuse/core'
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
@@ -544,12 +545,10 @@ async function loadLibraryState() {
 onMounted(() => {
   void load()
   void loadLibraryState()
-  window.addEventListener('keydown', onKey)
 })
 
-onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onKey)
-})
+// 快捷键：挂载/卸载由 useEventListener 成对处理
+useEventListener(window, 'keydown', onKey)
 </script>
 
 <template>

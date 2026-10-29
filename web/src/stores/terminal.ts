@@ -1,3 +1,5 @@
+import { useStorage } from '@vueuse/core'
+import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 export type TerminalStatus = 'connecting' | 'ready' | 'closed' | 'error'
@@ -15,28 +17,24 @@ export interface TerminalTab {
   platform: string
 }
 
-let seq = 0
-
-const tabs = ref<TerminalTab[]>([])
-const activeId = ref('')
-
 /** 纯净模式的默认值跨会话记住：用户一旦为了救急打开，下次还按这个来 */
 const SAFE_MODE_KEY = 'asmoday.terminal.noProfile'
 
-function loadSafeMode(): boolean {
-  try {
-    return window.localStorage.getItem(SAFE_MODE_KEY) === '1'
-  } catch {
-    return false
-  }
-}
+/**
+ * 纯净模式默认值。
+ *
+ * 历史值是字符串 `'1'` / `'0'`（早期直接读写 localStorage），
+ * 这里用自定义 serializer 保持兼容——改成布尔序列化会把老用户的设置读丢。
+ */
+const safeModeDefault = useStorage(SAFE_MODE_KEY, false, undefined, {
+  serializer: {
+    read: (raw: string) => raw === '1',
+    write: (value: boolean) => (value ? '1' : '0'),
+  },
+})
 
 export function saveSafeModeDefault(value: boolean) {
-  try {
-    window.localStorage.setItem(SAFE_MODE_KEY, value ? '1' : '0')
-  } catch {
-    /* 隐私模式下写不进去，忽略 */
-  }
+  safeModeDefault.value = value
 }
 
 function basename(path: string): string {
@@ -45,7 +43,11 @@ function basename(path: string): string {
   return parts[parts.length - 1] ?? path
 }
 
-export function useTerminalStore() {
+export const useTerminalStore = defineStore('terminal', () => {
+  const tabs = ref<TerminalTab[]>([])
+  const activeId = ref('')
+  let seq = 0
+
   const active = computed(() => tabs.value.find((tab) => tab.id === activeId.value) ?? null)
 
   function openTab(cwd: string, title?: string) {
@@ -56,7 +58,7 @@ export function useTerminalStore() {
       cwd,
       sessionId: null,
       status: 'connecting',
-      noProfile: loadSafeMode(),
+      noProfile: safeModeDefault.value,
       platform: '',
     })
     activeId.value = id
@@ -83,4 +85,4 @@ export function useTerminalStore() {
   }
 
   return { tabs, activeId, active, openTab, closeTab, setActive, updateTab }
-}
+})

@@ -6,6 +6,7 @@
  * 后端在 3 分钟内保留 PTY，因此现场不会丢。
  */
 import { computed, onMounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -13,7 +14,11 @@ import TerminalPane from '../components/TerminalPane.vue'
 import { listTerminalSessions, killTerminalSession, type TerminalSession } from '../api/terminal'
 import { useTerminalStore, saveSafeModeDefault, type TerminalStatus } from '../stores/terminal'
 
-const { tabs, activeId, active, openTab, closeTab, setActive, updateTab } = useTerminalStore()
+// Pinia store 直接解构会丢响应性：状态用 storeToRefs 转回 ref（保持 .value 用法），
+// 方法本身已绑定 store，可以正常解构。
+const terminal = useTerminalStore()
+const { tabs, activeId, active } = storeToRefs(terminal)
+const { openTab, closeTab, setActive, updateTab } = terminal
 const { t } = useI18n()
 const route = useRoute()
 

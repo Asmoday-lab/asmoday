@@ -5,13 +5,14 @@
  * `<html data-theme>` + `color-scheme`，绕开框架渲染延迟；状态在模块级共享，
  * 任意组件调用 useTheme() 都拿到同一份。
  *
- * - 偏好存 localStorage 的 `asmoday.theme`（存三态原值，不存解析后的色）；
- * - `system` 时用 `matchMedia('(prefers-color-scheme: dark)')` 的 `change` 事件
- *   实时跟随，无需刷新（8.2「监听系统变化」）；
+ * - 偏好存 localStorage 的 `asmoday.theme`（存三态原值，不存解析后的色）
+ *   —— 用 `useStorage` 双向绑定，写入自动落盘；
+ * - `system` 时用 `useMediaQuery` 跟随系统深浅色变化，无需刷新（8.2）；
  * - 首屏防白屏由 index.html 里的内联脚本负责，这里只处理运行期。
  */
 
-import { computed, ref } from 'vue'
+import { useMediaQuery, useStorage } from '@vueuse/core'
+import { computed, watch } from 'vue'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 /** 实际生效的两态 */
@@ -19,23 +20,13 @@ export type ResolvedTheme = 'light' | 'dark'
 
 const STORAGE_KEY = 'asmoday.theme'
 
-const mediaQuery =
-  typeof window !== 'undefined' && typeof window.matchMedia === 'function'
-    ? window.matchMedia('(prefers-color-scheme: dark)')
-    : null
-
-function isMode(value: unknown): value is ThemeMode {
-  return value === 'light' || value === 'dark' || value === 'system'
-}
-
-function readMode(): ThemeMode {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (isMode(stored)) return stored
-  } catch {
-    /* 隐私模式：读不到就按 system */
-  }
-  // 没有偏好时看首屏脚本已经写上的 data-theme，避免状态与画面打架
+/**
+ * 存储里还没有偏好时的初值。
+ *
+ * 首屏内联脚本已经按「localStorage → 系统偏好」画过一遍，并把结果写到
+ * `<html data-theme>`；这里读它，避免「状态说 system、画面已经是 dark」的闪动。
+ */
+function initialMode(): ThemeMode {
   if (typeof document !== 'undefined') {
     const attr = document.documentElement.getAttribute('data-theme')
     if (attr === 'light' || attr === 'dark') return attr
@@ -43,13 +34,12 @@ function readMode(): ThemeMode {
   return 'system'
 }
 
-const mode = ref<ThemeMode>(readMode())
-const systemDark = ref<boolean>(mediaQuery?.matches ?? true)
+const mode = useStorage<ThemeMode>(STORAGE_KEY, initialMode())
+const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
 
-function resolve(target: ThemeMode): ResolvedTheme {
-  if (target === 'system') return systemDark.value ? 'dark' : 'light'
-  return target
-}
+const resolved = computed<ResolvedTheme>(() =>
+  mode.value === 'system' ? (systemDark.value ? 'dark' : 'light') : mode.value,
+)
 
 function paint(next: ResolvedTheme) {
   const root = document.documentElement
@@ -58,45 +48,25 @@ function paint(next: ResolvedTheme) {
   root.style.colorScheme = next
 }
 
-const resolved = ref<ResolvedTheme>(resolve(mode.value))
-
-function apply(next: ThemeMode) {
-  mode.value = next
-  resolved.value = resolve(next)
-  paint(resolved.value)
-  try {
-    localStorage.setItem(STORAGE_KEY, next)
-  } catch {
-    /* 隐私模式下忽略 */
-  }
-}
-
-// 系统深浅色变化：只有偏好是 system 时才跟着变（8.2）
-mediaQuery?.addEventListener('change', (event) => {
-  systemDark.value = event.matches
-  if (mode.value === 'system') {
-    resolved.value = resolve('system')
-    paint(resolved.value)
-  }
-})
-
-/** 与首屏脚本对齐一次（幂等） */
-if (typeof document !== 'undefined') paint(resolved.value)
+// 任何来源的变化（用户点击 / 系统切换）都只走这一处副作用
+watch(resolved, paint, { immediate: true })
 
 /** 循环顺序：light → dark → system → light（8.2 侧边栏按钮） */
 const CYCLE: ThemeMode[] = ['light', 'dark', 'system']
 
 export function useTheme() {
   const toggle = () => {
-    apply(resolved.value === 'dark' ? 'light' : 'dark')
+    mode.value = resolved.value === 'dark' ? 'light' : 'dark'
   }
 
   const cycle = () => {
     const index = CYCLE.indexOf(mode.value)
-    apply(CYCLE[(index + 1) % CYCLE.length])
+    mode.value = CYCLE[(index + 1) % CYCLE.length]
   }
 
-  const setTheme = (next: ThemeMode) => apply(next)
+  const setTheme = (next: ThemeMode) => {
+    mode.value = next
+  }
 
   return {
     mode,

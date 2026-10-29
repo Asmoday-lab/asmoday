@@ -8,6 +8,14 @@
 // 就是整 crate allow，把精力留给真正的 lint。
 #![allow(clippy::result_large_err)]
 
+// 全局分配器（设计文档 9.1：单二进制 + 低尾延迟）。
+//
+// 只换分配器、不改任何调用点：`mimalloc` 实现的就是 `GlobalAlloc`，所以 `Vec` /
+// `String` / `Box` 全部照旧。musl 目标（静态链接）用系统分配器，原因见 Cargo.toml。
+#[cfg(not(target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod api;
 mod core;
 
@@ -57,8 +65,8 @@ pub struct AppState {
     pub dav_guard: Arc<core::auth::LoginGuard>,
     /// per-path 并发锁（设计文档 3.2.8）
     pub path_locks: Arc<core::locks::PathLocks>,
-    /// WebDAV 写锁表（LOCK/UNLOCK + If 头校验，防两端同时编辑互相覆盖）
-    pub dav_locks: Arc<core::dav_locks::DavLockTable>,
+    /// WebDAV 协议处理器（每个挂载点一套 LocalFs + MemLs，按配置指纹缓存）
+    pub dav: Arc<api::webdav::DavCache>,
     /// 批量删除的一次性令牌
     pub delete_tickets: Arc<api::files_mutate::DeleteTickets>,
     /// 哈希并发槽位（上限 2，设计文档 6.2）
@@ -281,7 +289,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         share_guard: Arc::new(core::auth::LoginGuard::new()),
         dav_guard: Arc::new(core::auth::LoginGuard::new()),
         path_locks: Arc::new(core::locks::PathLocks::new()),
-        dav_locks: Arc::new(core::dav_locks::DavLockTable::new()),
+        dav: Arc::new(api::webdav::DavCache::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         started,
@@ -561,11 +569,16 @@ fn protected_routes() -> Router<AppState> {
         )
 }
 
-/// WebDAV：独立入口，用 App Token 做 Basic 认证，不走 Cookie 中间件
+/// WebDAV：独立入口，用 App Token 做 Basic 认证，不走 Cookie 中间件。
+///
+/// 用 `nest` 而不是 `route("/dav") + route("/dav/{*rest}")`：后者在 matchit 里
+/// 匹配不到 `/dav` 与 `/dav/`（catch-all 段不能为空），而客户端添加服务器时
+/// 第一个请求恰恰就是打到这两个地址的 `OPTIONS` / `PROPFIND`——404 就是
+/// 「在客户端里加不上」的直接原因。`nest` 保证 `/dav`、`/dav/`、`/dav/x` 全进处理器。
 fn dav_routes() -> Router<AppState> {
     Router::new()
-        .route("/dav", any(api::webdav::handle))
-        .route("/dav/{*rest}", any(api::webdav::handle))
+        .route("/dav/", any(api::webdav::handle))
+        .nest("/dav", Router::new().fallback(any(api::webdav::handle)))
 }
 
 fn build_router(state: AppState) -> Router {

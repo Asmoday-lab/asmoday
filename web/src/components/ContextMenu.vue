@@ -9,7 +9,8 @@
  * - 首次渲染后按实际尺寸把菜单夹回视口内（8px 安全边距）；
  * - Esc / 点击遮罩 / 滚动 都关闭；置灰项带 `hint` 当 Tooltip（只读挂载点场景）。
  */
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { useEventListener } from '@vueuse/core'
+import { computed, nextTick, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
 
@@ -77,19 +78,12 @@ function pick(item: ContextMenuItem) {
 }
 
 function onKey(event: KeyboardEvent) {
+  // 监听常驻，只有菜单真的打开时才响应 Esc
+  if (!props.open) return
   if (event.key === 'Escape') close()
 }
 
-watch(
-  () => props.open,
-  (open) => {
-    if (open) window.addEventListener('keydown', onKey)
-    else window.removeEventListener('keydown', onKey)
-  },
-  { immediate: true },
-)
-
-onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
+useEventListener(window, 'keydown', onKey)
 
 const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px` }))
 </script>
