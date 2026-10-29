@@ -15,6 +15,8 @@ import { authApi } from '../api/auth'
 import { cacheApi, type CacheStats } from '../api/media'
 import { systemApi, type FfmpegInfo, type FfmpegSource } from '../api/system'
 import { ApiError, readApiError } from '../lib/errors'
+import { filesApi, type MountPoint } from '../api/files'
+import { APP_BASE } from '../lib/base'
 import { formatSize } from '../lib/format'
 import { useTheme, type ThemeMode } from '../composables/useTheme'
 import { applyLocale, detectLocale, SUPPORTED_LOCALES, type Locale } from '../lib/i18n'
@@ -229,7 +231,34 @@ const tokenDays = ref(0)
 const newToken = ref('')
 const tokenError = ref('')
 
-const davUrl = `${window.location.origin}/dav`
+// ---------------- WebDAV 地址（动态拼接：origin + base_url + /dav/<挂载点>/） ----------------
+const davMounts = ref<MountPoint[]>([])
+const davMountsLoaded = ref(false)
+const selectedMountId = ref('')
+
+async function loadDavMounts() {
+  try {
+    const res = await filesApi.mounts()
+    davMounts.value = res.mounts
+    // 唯一挂载点自动选中（下拉菜单隐藏）；多选时默认第一个在线的
+    const first = res.mounts.find((m) => m.online) ?? res.mounts[0]
+    if (first && !res.mounts.some((m) => m.id === selectedMountId.value)) {
+      selectedMountId.value = first.id
+    }
+  } catch {
+    // 拉取失败保持空态提示，不阻塞设置页其它区块
+  } finally {
+    davMountsLoaded.value = true
+  }
+}
+
+/** 完整 WebDAV 地址。尾斜杠强制：WebDAV 的目录 URL 规范形式，
+ * 少了它部分客户端（RaiDrive 等）会把它当文件挂载报错 */
+const davUrl = computed(() => {
+  if (!selectedMountId.value) return ''
+  const base = APP_BASE ? `${window.location.origin}${APP_BASE}` : window.location.origin
+  return `${base}/dav/${selectedMountId.value}/`
+})
 
 function showToast(message: string) {
   toast.value = message
@@ -530,8 +559,9 @@ const davCopied = ref(false)
 let davCopyTimer: number | null = null
 
 async function copyDavUrl() {
+  if (!davUrl.value) return
   try {
-    await navigator.clipboard.writeText(davUrl)
+    await navigator.clipboard.writeText(davUrl.value)
     davCopied.value = true
     if (davCopyTimer !== null) window.clearTimeout(davCopyTimer)
     davCopyTimer = window.setTimeout(() => {
@@ -547,6 +577,7 @@ onMounted(() => {
   void loadCache()
   void loadFfmpeg()
   void loadSafety()
+  void loadDavMounts()
 })
 </script>
 
@@ -942,18 +973,38 @@ onMounted(() => {
         <p class="mb-1 text-xs font-semibold tracking-wider text-muted uppercase">
           {{ t('settings.security.davUrl') }}
         </p>
+        <!-- 挂载点选择：仅一个时自动选中并隐藏下拉（设计文档 6.6 设置页联动） -->
+        <select
+          v-if="davMounts.length > 1"
+          v-model="selectedMountId"
+          data-testid="dav-mount-select"
+          class="mb-2 w-full rounded-md border border-line bg-elevated px-3 py-2 text-xs text-ink"
+        >
+          <option v-for="m in davMounts" :key="m.id" :value="m.id">
+            {{ m.name }}{{ m.readonly ? `（${t('settings.security.davReadonly')}）` : '' }}
+          </option>
+        </select>
         <div class="mb-2 flex items-center gap-2">
-          <code
-            class="min-w-0 flex-1 truncate rounded-md bg-elevated px-3 py-2 font-mono text-xs text-ink"
+          <input
+            type="text"
+            readonly
+            :value="davUrl"
+            :disabled="!davUrl"
+            :placeholder="
+              davMountsLoaded && !davMounts.length ? t('settings.security.davNoMounts') : ''
+            "
             :title="davUrl"
-          >{{ davUrl }}</code>
+            data-testid="dav-url-input"
+            class="min-w-0 flex-1 cursor-text truncate rounded-md bg-elevated px-3 py-2 font-mono text-xs text-ink disabled:cursor-not-allowed disabled:text-muted"
+          />
           <button
-            class="grid h-10 w-10 shrink-0 place-items-center rounded-md border transition-colors"
+            class="grid h-10 w-10 shrink-0 place-items-center rounded-md border transition-colors disabled:cursor-not-allowed disabled:opacity-50"
             :class="
               davCopied
                 ? 'border-emerald-500/40 fg-ok'
                 : 'border-line text-muted hover:text-ink'
             "
+            :disabled="!davUrl"
             :title="davCopied ? t('settings.security.davCopied') : t('settings.security.copyDav')"
             data-testid="copy-dav-url"
             @click="copyDavUrl"

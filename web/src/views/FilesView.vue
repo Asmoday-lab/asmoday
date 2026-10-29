@@ -1585,7 +1585,14 @@ async function activate(entry: EntryInfo) {
     toggleSelect(entry)
     return
   }
-  if (entry.is_dir) {
+  // 断链先拦：目标不存在或逃出挂载点，点击给明确提示而不是让后端报 4xx
+  if (linkBroken(entry)) {
+    showToast(t('files.symlink.brokenToast'))
+    return
+  }
+  // 目录（含指向挂载点内目录的软链接）直接进入；
+  // 后端解析 canonicalize 后归属校验照常生效，越权仍会被拒
+  if (entry.is_dir || linkToDir(entry)) {
     await open(entry.path)
     return
   }
@@ -1740,7 +1747,23 @@ function closeEditor() {
   editorLoading.value = false
 }
 
+/** 断链：后端无法跟随解析（目标不存在或逃出挂载点），target_is_dir 缺省/null */
+function linkBroken(entry: EntryInfo): boolean {
+  return Boolean(entry.is_symlink) && entry.target_is_dir == null
+}
+
+/** 软链接指向目录：按目录渲染（可进入），图标叠快捷方式箭头 */
+function linkToDir(entry: EntryInfo): boolean {
+  return Boolean(entry.is_symlink) && entry.target_is_dir === true
+}
+
 function iconFor(entry: EntryInfo) {
+  // 软链接三态：断链 → link 图标（置灰）；指向目录 → 文件夹（叠箭头角标）；
+  // 指向文件 → 按目标类型渲染，同样叠箭头角标
+  if (entry.is_symlink) {
+    if (entry.target_is_dir == null) return 'link'
+    if (entry.target_is_dir) return 'folder'
+  }
   if (entry.is_dir) return 'folder'
   switch (entry.kind) {
     case 'image':
@@ -1759,7 +1782,8 @@ function iconFor(entry: EntryInfo) {
 }
 
 function toneFor(entry: EntryInfo) {
-  if (entry.is_dir) return 'fg-warn'
+  if (linkBroken(entry)) return 'text-muted'
+  if (entry.is_dir || linkToDir(entry)) return 'fg-warn'
   switch (entry.kind) {
     case 'image':
       return 'fg-info'
@@ -1774,6 +1798,15 @@ function toneFor(entry: EntryInfo) {
     default:
       return 'text-muted'
   }
+}
+
+/** 悬停标题：软链接展示目标路径与断链状态（设计文档 3.2.7） */
+function entryTitle(entry: EntryInfo): string {
+  if (!entry.is_symlink) return entry.name
+  const target = entry.symlink_target || '?'
+  if (entry.target_is_dir == null) return `${entry.name} → ${target}（${t('files.symlink.broken')}）`
+  const kind = entry.target_is_dir ? t('files.symlink.dirTarget') : t('files.symlink.fileTarget')
+  return `${entry.name} → ${target}（${kind}）`
 }
 
 // 分享 / 编辑器 / 预览 / 各类变更弹窗都是模态层，打开时锁住列表滚动
@@ -2343,8 +2376,9 @@ onBeforeUnmount(() => {
               :class="[
                 selected === entry.path ? 'border-accent/50 bg-panel' : '',
                 selectMode && isSelected(entry.path) ? 'border-accent bg-accent-soft' : '',
+                linkBroken(entry) ? 'opacity-50' : '',
               ]"
-              :title="entry.name"
+              :title="entryTitle(entry)"
               :data-entry="entry.name"
               :data-kind="entry.kind"
               :data-selected="isSelected(entry.path) ? '1' : undefined"
@@ -2387,6 +2421,13 @@ onBeforeUnmount(() => {
                   @error="markThumbFailed(entry.path)"
                 />
                 <AppIcon v-else :name="iconFor(entry)" :size="34" />
+                <!-- 软链接角标：文件夹/文件图标叠快捷方式箭头（设计文档 3.2.7） -->
+                <span
+                  v-if="entry.is_symlink && entry.target_is_dir != null"
+                  class="pointer-events-none absolute right-1 top-1 grid size-4 place-items-center rounded-full bg-panel/90 text-ink shadow-sm"
+                >
+                  <AppIcon name="arrowUpRight" :size="9" />
+                </span>
                 <!-- 视频封面之上叠播放角标，一眼区分「能看」和「只是文件」 -->
                 <span
                   v-if="entry.kind === 'video' && !thumbFailed.has(entry.path)"
@@ -2420,7 +2461,9 @@ onBeforeUnmount(() => {
               :class="[
                 selected === entry.path ? 'bg-accent-soft' : '',
                 selectMode && isSelected(entry.path) ? 'bg-accent-soft' : '',
+                linkBroken(entry) ? 'opacity-50' : '',
               ]"
+              :title="entryTitle(entry)"
               :data-entry="entry.name"
               :data-kind="entry.kind"
               :data-selected="isSelected(entry.path) ? '1' : undefined"
@@ -2448,8 +2491,17 @@ onBeforeUnmount(() => {
               >
                 <AppIcon name="check" :size="10" />
               </span>
-              <span :class="toneFor(entry)"><AppIcon :name="iconFor(entry)" :size="15" /></span>
-              <span class="min-w-0 flex-1 truncate text-ink">{{ entry.name }}</span>
+              <span class="relative" :class="toneFor(entry)">
+                <AppIcon :name="iconFor(entry)" :size="15" />
+                <!-- 软链接角标：列表视图同样叠快捷方式箭头 -->
+                <span
+                  v-if="entry.is_symlink && entry.target_is_dir != null"
+                  class="absolute -right-1.5 -top-1 grid size-2.5 place-items-center rounded-full bg-panel text-ink"
+                >
+                  <AppIcon name="arrowUpRight" :size="7" />
+                </span>
+              </span>
+              <span class="min-w-0 flex-1 truncate text-ink" :title="entryTitle(entry)">{{ entry.name }}</span>
               <span class="w-24 shrink-0 text-right text-muted whitespace-nowrap">
                 {{ entry.is_dir ? '—' : formatSize(entry.size) }}
               </span>

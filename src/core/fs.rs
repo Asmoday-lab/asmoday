@@ -223,6 +223,14 @@ pub struct EntryInfo {
     /// 单项 stat 失败：不让整页 500，标记后由前端显示占位（设计文档 3.2.4）
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stat_error: bool,
+    /// 软链接目标的原始写法（`read_link` 原样返回，相对 / 绝对都可能是）。
+    /// 仅软链接条目携带；前端悬停展示。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+    /// 跟随链接后目标是否为目录。
+    /// `None` = 断链、无法解析或目标逃出挂载点（前端标记为断链并置灰）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_is_dir: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,6 +407,9 @@ pub async fn list_dir(
     sort: ListSort,
     order: ListOrder,
     cursor: Option<&str>,
+    // 当前挂载点的 canonical_root：软链接目标越出它即标记为断链（E_SYMLINK_ESCAPE 语义）。
+    // 分享页等无挂载点上下文的调用传 `None`（只解析目标，不做越界判定）。
+    mount_root: Option<&Path>,
 ) -> Result<Listing, FsError> {
     let page = page.max(1);
 
@@ -512,6 +523,26 @@ pub async fn list_dir(
             let ext = extension_of_name(name);
             let (kind, editable) = classify_name(name, ext.as_str(), *is_dir);
 
+            // 软链接：跟随解析目标（设计文档 3.2.7）。
+            // - 目标信息只对当前页的软链接条目 stat，数量少，不拖累整页性能；
+            // - canonicalize 成功且未越出挂载点 → target_is_dir 给真实判定；
+            // - 断链（ENOENT）或逃出挂载点 → None，前端标记断链置灰。
+            let (symlink_target, target_is_dir) = if is_symlink {
+                let raw = tokio::fs::read_link(&full)
+                    .await
+                    .ok()
+                    .map(|target| target.to_string_lossy().into_owned());
+                let resolved = std::fs::canonicalize(&full)
+                    .map(|canon| {
+                        let inside = mount_root.is_none_or(|root| canon.starts_with(root));
+                        inside.then(|| canon.is_dir())
+                    })
+                    .unwrap_or(None);
+                (raw, resolved)
+            } else {
+                (None, None)
+            };
+
             entries.push(EntryInfo {
                 name: name.clone(),
                 path: normalize_display(&full),
@@ -523,6 +554,8 @@ pub async fn list_dir(
                 ext,
                 editable,
                 stat_error,
+                symlink_target,
+                target_is_dir,
             });
         }
     }

@@ -93,7 +93,7 @@
     "forgotBody2": "to get a one-time password, then change it after signing in.",
     "tokens": "WebDAV tokens",
     "davUrl": "Mount URL",
-    "davHint": "Connect with any WebDAV client (RaiDrive, Windows network drive, PhotoSync): any username, and one of the asm_-prefixed tokens below as the password. Read-only tokens can only browse and download.",
+    "davHint": "Copy the full URL above and connect with any WebDAV client. Use the token name below as the username and the matching asm_-prefixed token as the password. Read-only tokens can only browse and download.",
     "createToken": "Create token",
     "tokenName": "Name, e.g. PhotoSync",
     "readonly": "Read-only",
@@ -118,7 +118,9 @@
     "recoveryCopy": "Copy all",
     "recoveryDone": "I've saved them",
     "recoveryCopied": "Recovery codes copied",
-    "totpDisableCodePlaceholder": "TOTP or recovery code"
+    "totpDisableCodePlaceholder": "TOTP or recovery code",
+    "davNoMounts": "No mounts yet, create one first",
+    "davReadonly": "read-only"
   },
   "advanced": {
     "form": "Form",

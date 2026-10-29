@@ -710,7 +710,17 @@ pub fn remove_path(path: &Path) -> Result<(), FsError> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{}", normalize_display(path))))?;
 
-    let result = if meta.is_dir() {
+    let result = if meta.file_type().is_symlink() {
+        // 只删链接本身，绝不跟随（调用方必须传 nofollow 解析出来的链接路径）。
+        // Windows 的目录链接要 remove_dir 才能摘掉 reparse point，remove_file 会 ACCESS_DENIED
+        std::fs::remove_file(path).or_else(|err| {
+            if cfg!(windows) {
+                std::fs::remove_dir(path).map_err(|_| err)
+            } else {
+                Err(err)
+            }
+        })
+    } else if meta.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)

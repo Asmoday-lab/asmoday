@@ -332,6 +332,21 @@ pub async fn handle(
     };
     let root = root.clone();
 
+    // 路由容错：GET/HEAD `/dav/<mount_id>`（无尾斜杠）且挂载点存在 → 301 到带斜杠形式。
+    // 浏览器地址栏和部分客户端把目录 URL 当规范入口，重定向后相对路径的子资源
+    // 解析才不会丢一层；`/dav/<mount_id>/`（带斜杠）维持原行为（GET 目录 → 405 请用 PROPFIND）。
+    if matches!(method.as_str(), "GET" | "HEAD")
+        && rest.is_empty()
+        && !uri.path().ends_with('/')
+    {
+        let location = format!("{}/{}/", PREFIX, percent_encode_segment(&mount_id));
+        return (
+            StatusCode::MOVED_PERMANENTLY,
+            [(header::LOCATION, location)],
+        )
+            .into_response();
+    }
+
     let display_path = format!(
         "{}/{}/{}",
         PREFIX,

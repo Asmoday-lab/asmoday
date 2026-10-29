@@ -93,7 +93,7 @@
     "forgotBody2": "获取一次性新密码，登录后再改。",
     "tokens": "WebDAV 令牌",
     "davUrl": "挂载地址",
-    "davHint": "用任意 WebDAV 客户端（RaiDrive、Windows 映射网络驱动器、PhotoSync）连接：用户名随意，密码填下面生成的 asm_ 开头的令牌。只读令牌只能浏览与下载。",
+    "davHint": "请复制上方完整地址，使用任意 WebDAV 客户端连接。账号填入下方令牌的名称，密码填入对应的 asm_ 开头令牌。只读令牌只能浏览与下载。",
     "createToken": "创建令牌",
     "tokenName": "名称，如 PhotoSync",
     "readonly": "只读",
@@ -118,7 +118,9 @@
     "recoveryCopy": "复制全部",
     "recoveryDone": "我已保存",
     "recoveryCopied": "恢复码已复制",
-    "totpDisableCodePlaceholder": "TOTP 或恢复码"
+    "totpDisableCodePlaceholder": "TOTP 或恢复码",
+    "davNoMounts": "暂无挂载点，请先创建",
+    "davReadonly": "只读"
   },
   "advanced": {
     "form": "可视化表单",

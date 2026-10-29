@@ -244,5 +244,11 @@
     "share": "Share",
     "directLink": "Copy direct link",
     "properties": "Properties"
+  },
+  "symlink": {
+    "broken": "Broken link",
+    "brokenToast": "This symlink is broken or points outside the mount",
+    "dirTarget": "points to a directory",
+    "fileTarget": "points to a file"
   }
 }

@@ -15,6 +15,8 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+use std::path::Path;
+
 use crate::core::config::Config;
 use crate::core::fs::{self, FsError, RootSet};
 use crate::core::path_guard;
@@ -152,6 +154,8 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         fs::ListSort::parse(query.sort.as_deref()),
         fs::ListOrder::parse(query.order.as_deref()),
         query.cursor.as_deref().filter(|value| !value.is_empty()),
+        // 软链接目标的越界判定基准：挂载点 canonical_root（设计文档 3.2.7）
+        mount.canon_root().ok().map(|root| root.as_path()),
     )
     .await
     {
@@ -698,9 +702,23 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
 /// DELETE /api/files/raw?path=…：删除文件或目录（目录递归）
 pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let set = roots_for(&state).await;
-    let target = match fs::resolve_existing(&query.path, &set.allowed) {
-        Ok(path) => path,
-        Err(err) => return fs_error(err),
+    // 最后一段**不跟随**：软链接本身才是删除目标。若对整条路径 canonicalize，
+    // 指向目录的链接会被解析成目标实体，下面 remove_dir_all 就把目标整个删掉了
+    // （设计文档 3.2.7 红线：删链接严禁递归删目标）。
+    let raw = Path::new(query.path.trim());
+    let target = match raw.parent().zip(raw.file_name()) {
+        Some((parent, name)) if !parent.as_os_str().is_empty() => {
+            let parent_text = parent.to_string_lossy();
+            match fs::resolve_existing(&parent_text, &set.allowed) {
+                Ok(parent_canon) => parent_canon.join(name),
+                Err(err) => return fs_error(err),
+            }
+        }
+        // 没有父段（删挂载点根这类）维持原语义，下面的根目录检查会拒绝
+        _ => match fs::resolve_existing(&query.path, &set.allowed) {
+            Ok(path) => path,
+            Err(err) => return fs_error(err),
+        },
     };
 
     // 挂载点根目录本身不允许删（避免一次误操作把整个库清掉）
@@ -716,7 +734,16 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
         Err(e) => return fs_error(FsError::Io(format!("读取目标信息失败：{e}"))),
     };
 
-    let result = if meta.is_dir() {
+    let result = if meta.file_type().is_symlink() {
+        // 只删链接本身：Windows 的目录链接要用 remove_dir 才能摘掉 reparse point
+        std::fs::remove_file(&target).or_else(|err| {
+            if cfg!(windows) {
+                std::fs::remove_dir(&target).map_err(|_| err)
+            } else {
+                Err(err)
+            }
+        })
+    } else if meta.is_dir() {
         tokio::fs::remove_dir_all(&target).await
     } else {
         tokio::fs::remove_file(&target).await

@@ -39,6 +39,10 @@ export interface EntryInfo {
   path: string
   is_dir: boolean
   is_symlink?: boolean
+  /** 软链接目标的原始写法（悬停展示）；仅软链接条目返回 */
+  symlink_target?: string
+  /** 跟随后目标是否目录；缺省/null = 断链或逃出挂载点（前端标记断链） */
+  target_is_dir?: boolean | null
   size: number
   modified: number | null
   kind: FileKind

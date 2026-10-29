@@ -531,6 +531,9 @@ pub async fn list_entries(
         fs::ListSort::Name,
         fs::ListOrder::Asc,
         None,
+        // 分享视图没有挂载点上下文：只解析软链接目标，不做越界标记
+        // （真正的读取出口仍走 raw/download 的归属校验）
+        None,
     )
     .await
     {

@@ -244,5 +244,11 @@
     "share": "分享",
     "directLink": "复制直链",
     "properties": "属性"
+  },
+  "symlink": {
+    "broken": "断链",
+    "brokenToast": "该软链接已失效或指向挂载点外",
+    "dirTarget": "指向目录",
+    "fileTarget": "指向文件"
   }
 }

@@ -209,7 +209,9 @@ async fn rename_inner(state: &AppState, body: RenameBody) -> Result<Value, FsErr
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
-    let source = path_guard::resolve_existing(mount, &body.path)?;
+    // 最后一段不跟随：重命名软链接改的是链接的名字，不是目标实体的名字
+    // （canonicalize 会把链接解析成目标，改名后链接原地失效，目标被搬走）
+    let source = path_guard::resolve_existing_nofollow(mount, &body.path)?;
     let roots: Vec<PathBuf> = set.mounts.iter().filter_map(|m| m.root.clone()).collect();
     ensure_not_mount_root(&source, &roots)?;
 
@@ -302,7 +304,11 @@ async fn transfer_inner(
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
         mount.ensure_writable()?;
         let root = mount.canon_root()?.clone();
-        let path = match path_guard::resolve_existing(mount, raw) {
+        // 最后一段不跟随：移动/复制软链接操作的是链接本身（fs_ops 的
+        // move_entry/copy_entry 都按 lstat 分派），canonicalize 会把链接
+        // 解析成目标实体，导致「移链接」变成「搬目标目录」。
+        // 逃出挂载点的链接由下方 check_symlink_target（复制）逐项拦截。
+        let path = match path_guard::resolve_existing_nofollow(mount, raw) {
             Ok(path) => path,
             Err(err @ FsError::SymlinkEscape(_)) => {
                 pre_results.push(ItemResult::failed(Path::new(raw.trim()), &err));
@@ -489,7 +495,9 @@ pub async fn delete_token(
         let Some(mount) = pick_mount(&set, body.mount_id.as_deref(), raw).ok() else {
             return fail(FsError::NotFound(format!("挂载点不存在：{raw}")));
         };
-        if let Err(err) = path_guard::resolve_existing(mount, raw) {
+        // 与 delete 同口径用 nofollow：逃出挂载点的链接也允许删（校验仅确认
+        // 「链接本身在挂载点内」，不跟随目标）
+        if let Err(err) = path_guard::resolve_existing_nofollow(mount, raw) {
             return fail(err);
         }
         if mount_id.is_empty() {
@@ -548,15 +556,24 @@ async fn delete_inner(state: &AppState, body: DeleteBody) -> Result<Value, FsErr
     for raw in &body.paths {
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
         mount.ensure_writable()?;
-        let path = path_guard::resolve_existing(mount, raw)?;
+        // 最后一段不跟随：删软链接只删链接本身，一旦 canonicalize 就会把
+        // 目标实体解析出来，remove_dir_all 直接清掉目标目录（设计文档 3.2.7 红线）。
+        // 逃出挂载点的链接也允许删——它只是个链接，删掉反而消除隐患。
+        let path = path_guard::resolve_existing_nofollow(mount, raw)?;
         let roots: Vec<PathBuf> = set.mounts.iter().filter_map(|m| m.root.clone()).collect();
         ensure_not_mount_root(&path, &roots)?;
         targets.push(path);
     }
 
     // ---- 确认环节 ----
+    // 目录判定用 lstat：软链接不跟随，指向目录的链接按链接处理，
+    // 不触发「输入目录名确认」流程（前端同样按链接渲染删除确认）
     let batch = targets.len() > 1;
-    let has_dir = targets.iter().any(|path| path.is_dir());
+    let has_dir = targets.iter().any(|path| {
+        std::fs::symlink_metadata(path)
+            .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            .unwrap_or(false)
+    });
     if batch || has_dir {
         let token_ok = body
             .confirm_token
