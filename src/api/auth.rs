@@ -1003,16 +1003,19 @@ pub async fn verify_recent(
     Json(json!({ "status": "ok" })).into_response()
 }
 
-/// GET /api/auth/totp/setup（受保护）：生成密钥与 otpauth 链接
+/// GET /api/auth/totp/setup（受保护）：生成密钥、otpauth 链接与二维码
 pub async fn totp_setup(State(state): State<AppState>, auth_user: AuthUser) -> Response {
     let secret = totp::generate_secret();
     if let Err(err) = state.auth.set_totp(auth_user.id, &secret, false) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
 
+    let uri = totp::otpauth_url("Asmoday", &auth_user.username, &secret);
+    // 二维码跟着 setup 一起下发：前端零依赖、离线可扫，不需要再发一次请求
     Json(json!({
         "secret": secret,
-        "uri": totp::otpauth_url("Asmoday", &auth_user.username, &secret),
+        "uri": uri,
+        "qr_svg": totp::qr_svg(&uri),
     }))
     .into_response()
 }

@@ -82,10 +82,15 @@ export const authApi = {
   async changePassword(current: string, next: string) {
     await post('/api/auth/password', { current, next })
   },
-  async totpSetup(): Promise<{ secret: string; uri: string }> {
+  /**
+   * 生成 TOTP 密钥。
+   * `qr_svg` 是服务端渲染好的二维码（otpauth 链接的 SVG），直接 v-html 塞进页面，
+   * 前端不引 QR 库；服务端异常时会缺这个字段，此时退回只显示明文密钥。
+   */
+  async totpSetup(): Promise<{ secret: string; uri: string; qr_svg?: string | null }> {
     const res = await fetch('/api/auth/totp/setup')
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
-    return (await res.json()) as { secret: string; uri: string }
+    return (await res.json()) as { secret: string; uri: string; qr_svg?: string | null }
   },
   /** 开启 2FA：返回一次性恢复码（只在这里出现一次，设计文档 3.1.4） */
   async totpEnable(code: string): Promise<string[]> {

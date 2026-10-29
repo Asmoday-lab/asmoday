@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn no_transform_appends_to_existing_cache_control() {
-        let mut resp = Response::builder()
+        let resp = Response::builder()
             .header(header::CACHE_CONTROL, "no-cache")
             .body(Body::empty())
             .unwrap();

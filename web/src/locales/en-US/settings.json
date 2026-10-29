@@ -78,6 +78,7 @@
     "totpOn": "Enabled",
     "totpOff": "Disabled",
     "totpHint": "Scan the generated secret with any authenticator (1Password, Aegis, Google Authenticator), then enter a 6-digit code to finish enabling.",
+    "totpScanHint": "Scan the QR code above with your authenticator, or type the secret below if you cannot scan.",
     "totpGenerate": "Generate TOTP secret",
     "totpCode": "6-digit code",
     "totpEnable": "Enable",

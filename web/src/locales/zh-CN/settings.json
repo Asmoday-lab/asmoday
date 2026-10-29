@@ -78,6 +78,7 @@
     "totpOn": "已开启",
     "totpOff": "未开启",
     "totpHint": "生成密钥后用任意验证器（1Password、Aegis、Google Authenticator）扫码，再输入 6 位动态码完成开启。",
+    "totpScanHint": "用验证器扫描上面的二维码；扫不了就手动输入下面的密钥。",
     "totpGenerate": "生成 TOTP 密钥",
     "totpCode": "6 位动态码",
     "totpEnable": "确认开启",

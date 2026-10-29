@@ -61,7 +61,7 @@ pub fn verify(secret: &str, code: u32, unix_secs: u64) -> bool {
     false
 }
 
-/// 生成 otpauth:// 链接，前端可直接渲染成二维码（离线生成，不依赖外部服务）
+/// 生成 otpauth:// 链接（`qr_svg` 拿它出二维码；离线生成，不依赖外部服务）
 pub fn otpauth_url(issuer: &str, account: &str, secret: &str) -> String {
     let label = format!("{issuer}:{account}");
     format!(
@@ -69,6 +69,26 @@ pub fn otpauth_url(issuer: &str, account: &str, secret: &str) -> String {
         urlencode(&label),
         secret,
         urlencode(issuer)
+    )
+}
+
+/// 把 otpauth:// 链接渲染成二维码 SVG（服务端出图，前端只管放）。
+///
+/// 为什么要服务端渲染：设置页原本只给了明文密钥和 otpauth 串，文案却说「扫码」——
+/// 用户装好验证器后无码可扫，只能手抄 32 位 Base32，实际体验等于不可用。
+///
+/// 选 SVG 而不是 PNG：不需要图像编码依赖（按默认特性会拖进整套 `image`），
+/// 任意缩放不糊，体积也更小。颜色固定深底浅底（扫描器要够对比度），
+/// 前端负责套白底容器，深色主题下同样能扫。
+pub fn qr_svg(uri: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(uri.as_bytes()).ok()?;
+    Some(
+        code.render::<qrcode::render::svg::Color>()
+            // 4 模块静区由渲染器自带；最小 200px 保证在高 DPI 屏上够清晰
+            .min_dimensions(200, 200)
+            .dark_color(qrcode::render::svg::Color("#111111"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .build(),
     )
 }
 
@@ -116,5 +136,44 @@ mod tests {
         assert!(decode_secret(&secret).is_some());
         let url = otpauth_url("Asmoday", "admin", &secret);
         assert!(url.starts_with("otpauth://totp/Asmoday%3Aadmin?secret="));
+    }
+
+    /// 二维码必须真的能扫出来，且解出来的就是那条 otpauth 链接。
+    ///
+    /// 这一段用 `rqrr` 把矩阵当图片解码（4 倍放大 + 4 模块静区），
+    /// 覆盖「版本选择 / 纠错等级 / 掩码」整套编码路径——只断言 SVG 里有
+    /// `<path>` 是不够的，编码错了照样有 path。
+    #[test]
+    fn qr_svg_decodes_back_to_otpauth_url() {
+        let secret = generate_secret();
+        let url = otpauth_url("Asmoday", "admin", &secret);
+        let svg = qr_svg(&url).expect("二维码生成失败");
+        assert!(svg.contains("<svg"), "输出不是 SVG：{svg}");
+
+        // 同一份矩阵拿去解码；静区按规范留 4 模块，放大 4 倍便于解码器定位
+        let code = qrcode::QrCode::new(url.as_bytes()).unwrap();
+        let w = code.width();
+        let h = w;
+        let colors = code.to_colors();
+        let quiet = 4usize;
+        let scale = 4usize;
+        let side = (w + quiet * 2) * scale;
+        let mut image = rqrr::PreparedImage::prepare_from_greyscale(side, side, |x, y| {
+            let mx = x / scale;
+            let my = y / scale;
+            if mx < quiet || my < quiet || mx >= w + quiet || my >= h + quiet {
+                return 255;
+            }
+            let idx = (my - quiet) * w + (mx - quiet);
+            match colors[idx] {
+                qrcode::Color::Dark => 0,
+                qrcode::Color::Light => 255,
+            }
+        });
+
+        let grids = image.detect_grids();
+        assert_eq!(grids.len(), 1, "应恰好识别出一个二维码");
+        let (_, content) = grids[0].decode().expect("二维码解码失败");
+        assert_eq!(content, url, "二维码内容与 otpauth 链接不一致");
     }
 }

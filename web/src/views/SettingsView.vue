@@ -209,6 +209,8 @@ const securityError = ref('')
 const securityBusy = ref(false)
 const totpSecret = ref('')
 const totpUri = ref('')
+/** 服务端渲染好的二维码 SVG（otpauth 链接）；生成失败时为空，退回只显示密钥 */
+const totpQr = ref('')
 const totpCode = ref('')
 const totpEnabled = computed(() => authApi.status.value.totp_enabled)
 const disablePassword = ref('')
@@ -506,6 +508,7 @@ async function startTotp() {
     const data = await authApi.totpSetup()
     totpSecret.value = data.secret
     totpUri.value = data.uri
+    totpQr.value = data.qr_svg ?? ''
   } catch (err) {
     securityError.value = err instanceof Error ? err.message : t('settings.security.totpGenerateFailed')
   }
@@ -518,6 +521,8 @@ async function enableTotp() {
     recoveryCodes.value = codes
     totpCode.value = ''
     totpSecret.value = ''
+    totpUri.value = ''
+    totpQr.value = ''
     showToast(t('settings.security.totpEnabled'))
   } catch (err) {
     securityError.value = err instanceof Error ? err.message : t('settings.security.totpVerifyFailed')
@@ -935,7 +940,15 @@ onMounted(() => {
           <button class="rounded-md border border-line px-3 py-1.5 text-xs text-ink" @click="startTotp">
             {{ t('settings.security.totpGenerate') }}
           </button>
-          <div v-if="totpSecret" class="mt-3 space-y-2">
+          <div v-if="totpSecret" class="mt-3 space-y-3">
+            <!-- 二维码恒为白底：深色主题下也能扫，别跟着主题反色 -->
+            <div
+              v-if="totpQr"
+              data-testid="totp-qr"
+              class="w-fit rounded-lg bg-white p-3 shadow-sm [&>svg]:block [&>svg]:h-[200px] [&>svg]:w-[200px]"
+              v-html="totpQr"
+            ></div>
+            <p v-if="totpQr" class="text-[12px] text-muted">{{ t('settings.security.totpScanHint') }}</p>
             <p class="font-mono text-xs break-all text-ink">{{ totpSecret }}</p>
             <p class="font-mono text-[11px] break-all text-muted">{{ totpUri }}</p>
             <div class="flex gap-2">

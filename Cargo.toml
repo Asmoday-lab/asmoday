@@ -45,6 +45,10 @@ hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
 rand = "0.9"
+# otpauth:// 二维码：服务端直接出 SVG，前端 v-html 塞进页面即可。
+# 不引前端 QR 库（省一次 npm 依赖 + ~20KB 包体），也不让「扫码」依赖第三方服务。
+# 关掉默认的 image 特性只要 svg，避免为了张二维码把整套图像编解码拖进二进制。
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # 跨平台真实伪终端（ConPTY / openpty）
 portable-pty = "0.8"
 # 跨平台主目录解析（设计文档 6.3：path 为空时必须落 dirs::home_dir()，
@@ -88,6 +92,11 @@ lofty = "0.25.5"
 dav-server = { version = "0.11", default-features = false, features = ["localfs"] }
 # dav-server 的 `DavFile::write_buf` 签名里要写 `Box<dyn bytes::Buf>`（本来就在依赖树里）
 bytes = "1"
+
+# 测试专用：把生成的二维码矩阵再解回来，证明「扫出来的就是那条 otpauth 链接」。
+# 只解码不编码（编码仍用上面的 qrcode），且仅在测试构建里链接，不进发布产物。
+[dev-dependencies]
+rqrr = "0.9"
 
 # TLS 平台分流（注释见上方 reqwest）。必须放在 [dependencies] 全部键之后。
 [target.'cfg(not(target_os = "linux"))'.dependencies]
