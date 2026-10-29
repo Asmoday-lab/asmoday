@@ -26,6 +26,7 @@ import {
   defaultHighlightStyle,
   indentOnInput,
   syntaxHighlighting,
+  type StreamParser,
 } from '@codemirror/language'
 import { oneDark } from '@codemirror/theme-one-dark'
 import type { LanguageKey } from '../api/languages'
@@ -48,22 +49,111 @@ let syncing = false
 const languageSlot = new Compartment()
 const themeSlot = new Compartment()
 
-/** 各语言的动态加载器：只有真正切到该语言时才会下载对应 chunk */
-const languageLoaders: Record<string, () => Promise<Extension>> = {
-  js: async () => (await import('@codemirror/lang-javascript')).javascript(),
-  jsx: async () => (await import('@codemirror/lang-javascript')).javascript({ jsx: true }),
-  ts: async () => (await import('@codemirror/lang-javascript')).javascript({ typescript: true }),
-  tsx: async () =>
-    (await import('@codemirror/lang-javascript')).javascript({ typescript: true, jsx: true }),
-  rust: async () => (await import('@codemirror/lang-rust')).rust(),
-  python: async () => (await import('@codemirror/lang-python')).python(),
+/**
+ * CSV / TSV 没有官方语法包：给一个极简 tokenizer 就够用（引号串 + 单元格）。
+ * 同样走 `StreamLanguage` 通道，切换语言时才创建，不占首屏。
+ */
+const csvMode: StreamParser<null> = {
+  name: 'csv',
+  token(stream) {
+    if (stream.match(/^"(?:[^"]|"")*"/)) return 'string'
+    if (stream.match(/^[^,\t\r\n]+/)) return 'atom'
+    stream.next()
+    return null
+  },
+}
+
+/** Makefile 同样没有官方包：只标目标、注释与变量，够读就行 */
+const makefileMode: StreamParser<null> = {
+  name: 'makefile',
+  token(stream) {
+    if (stream.sol() && stream.match(/^[^\s#:][^:=]*:(?!=)/)) return 'variableName'
+    if (stream.match(/^#[^\n]*/)) return 'comment'
+    if (stream.match(/^\$[({][^)}]+[)}]/)) return 'variableName.special'
+    stream.next()
+    return null
+  },
+}
+
+/**
+ * 各语言的动态加载器（设计文档 3.2.2.2）：只有真正切到该语言时才会下载对应 chunk。
+ *
+ * 用 `Record<LanguageKey, …>` 而不是 `Record<string, …>` 是刻意的：新增语言键却
+ * 忘了写加载器，TypeScript 当场报错，不会等用户点开才发现「没高亮」。
+ */
+const languageLoaders: Record<LanguageKey, () => Promise<Extension>> = {
+  plain: async () => [],
+  json: async () => (await import('@codemirror/lang-json')).json(),
+  yaml: async () => (await import('@codemirror/lang-yaml')).yaml(),
+  xml: async () => (await import('@codemirror/lang-xml')).xml(),
   toml: async () => {
     const mode = await import('@codemirror/legacy-modes/mode/toml')
     return StreamLanguage.define(mode.toml)
   },
+  csv: async () => StreamLanguage.define(csvMode),
+  properties: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/properties')
+    return StreamLanguage.define(mode.properties)
+  },
+  html: async () => (await import('@codemirror/lang-html')).html(),
+  css: async () => (await import('@codemirror/lang-css')).css(),
+  scss: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/sass')
+    return StreamLanguage.define(mode.sass)
+  },
+  javascript: async () => (await import('@codemirror/lang-javascript')).javascript(),
+  typescript: async () =>
+    (await import('@codemirror/lang-javascript')).javascript({ typescript: true }),
+  jsx: async () => (await import('@codemirror/lang-javascript')).javascript({ jsx: true }),
+  tsx: async () =>
+    (await import('@codemirror/lang-javascript')).javascript({ typescript: true, jsx: true }),
+  vue: async () => (await import('@codemirror/lang-vue')).vue(),
+  // Svelte 没有官方语法包：单文件组件本质是 HTML + 表达式，用 HTML 模式兜底
+  svelte: async () => (await import('@codemirror/lang-html')).html(),
+  rust: async () => (await import('@codemirror/lang-rust')).rust(),
+  python: async () => (await import('@codemirror/lang-python')).python(),
+  go: async () => (await import('@codemirror/lang-go')).go(),
+  java: async () => (await import('@codemirror/lang-java')).java(),
+  cpp: async () => (await import('@codemirror/lang-cpp')).cpp(),
+  csharp: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/clike')
+    return StreamLanguage.define(mode.csharp)
+  },
+  php: async () => (await import('@codemirror/lang-php')).php(),
+  ruby: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/ruby')
+    return StreamLanguage.define(mode.ruby)
+  },
+  lua: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/lua')
+    return StreamLanguage.define(mode.lua)
+  },
+  shell: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/shell')
+    return StreamLanguage.define(mode.shell)
+  },
+  powershell: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/powershell')
+    return StreamLanguage.define(mode.powerShell)
+  },
   nginx: async () => {
     const mode = await import('@codemirror/legacy-modes/mode/nginx')
     return StreamLanguage.define(mode.nginx)
+  },
+  dockerfile: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/dockerfile')
+    return StreamLanguage.define(mode.dockerFile)
+  },
+  makefile: async () => StreamLanguage.define(makefileMode),
+  sql: async () => (await import('@codemirror/lang-sql')).sql(),
+  markdown: async () => (await import('@codemirror/lang-markdown')).markdown(),
+  assembly: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/gas')
+    return StreamLanguage.define(mode.gas)
+  },
+  protobuf: async () => {
+    const mode = await import('@codemirror/legacy-modes/mode/protobuf')
+    return StreamLanguage.define(mode.protobuf)
   },
 }
 

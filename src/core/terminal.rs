@@ -178,6 +178,64 @@ pub struct TerminalManager {
     counter: Arc<AtomicUsize>,
 }
 
+/// 一条会话的对外快照（设计文档 3.3.6：前端「活动会话」面板据此展示与强制关闭）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub cwd: String,
+    pub shell: String,
+    pub no_profile: bool,
+    pub cols: u16,
+    pub rows: u16,
+    /// 当前挂着的 WebSocket 数：0 表示已断线正在保活，是最该被清理的
+    pub clients: usize,
+    /// 已存活秒数
+    pub age_secs: u64,
+}
+
+impl TerminalManager {
+    /// 当前所有会话的快照，按存活时间升序（最新的在前）。
+    pub fn snapshot(&self) -> Vec<SessionInfo> {
+        let Ok(map) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut list: Vec<SessionInfo> = map
+            .values()
+            .map(|session| {
+                let (cols, rows) = session
+                    .size
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or((MIN_COLS, MIN_ROWS));
+                SessionInfo {
+                    id: session.id.clone(),
+                    cwd: session.cwd.clone(),
+                    shell: session.shell.clone(),
+                    no_profile: session.no_profile,
+                    cols,
+                    rows,
+                    clients: session.clients.load(Ordering::SeqCst),
+                    age_secs: session.created.elapsed().as_secs(),
+                }
+            })
+            .collect();
+        list.sort_by_key(|info| info.age_secs);
+        list
+    }
+
+    /// 强制关闭指定会话（设计文档 3.3.6）。返回该会话是否存在。
+    pub fn force_close(&self, id: &str) -> bool {
+        let removed = self.inner.lock().ok().and_then(|mut map| map.remove(id));
+        match removed {
+            Some(session) => {
+                session.kill();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// 默认 Shell（设计文档 3.3 / 3.3.5）。
 ///
 /// - Windows：**优先 PowerShell 7（pwsh.exe）**。Conda、fnm 这类工具的初始化
@@ -689,5 +747,15 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
         assert!(pure_args.contains(&"-NoProfile".to_string()));
+    }
+
+    #[test]
+    fn empty_manager_lists_nothing_and_rejects_unknown_kill() {
+        // 会话面板的边界：没有会话时返回空列表而不是 panic；
+        // 关一个不存在的 id 必须返回 false（接口据此回 404），不能静默成功
+        let manager = TerminalManager::new();
+        assert!(manager.snapshot().is_empty());
+        assert_eq!(manager.len(), 0);
+        assert!(!manager.force_close("not-a-session"));
     }
 }

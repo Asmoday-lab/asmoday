@@ -5,7 +5,7 @@
 **Personal Media & Device Control Hub · Ultra-lightweight Single Binary Panel**
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v3.5.9-blue?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v3.15.0-blue?style=flat-square)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#)
 

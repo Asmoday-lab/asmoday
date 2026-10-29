@@ -102,19 +102,15 @@ pub async fn update_config_raw(State(state): State<AppState>, body: String) -> R
     }
 
     // 原样落盘（保留用户注释），而不是重新序列化
-    let tmp = state.config_path.with_extension("toml.tmp");
-    if let Err(err) = tokio::fs::write(&tmp, body.as_bytes()).await {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("写入临时配置失败：{err}"),
-        );
-    }
-    if let Err(err) = tokio::fs::rename(&tmp, &state.config_path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("替换配置文件失败：{err}"),
-        );
+    // 内容没变就不写盘：既避免无意义 IO，也避免自己触发一次热重载（设计文档 3.5）
+    match crate::core::config::write_if_changed(&state.config_path, &body).await {
+        Ok(_) => {}
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("写入配置文件失败：{err}"),
+            );
+        }
     }
 
     {

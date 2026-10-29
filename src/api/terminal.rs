@@ -226,7 +226,13 @@ async fn handle_socket(
             Ok(session) => session,
             Err(message) => {
                 let mut socket = socket;
-                let payload = json!({ "type": "error", "message": message });
+                // 带上错误码：并发打满时前端要能精准打开「活动会话」面板，
+                // 只给一句中文提示，用户还是不知道该关哪个
+                let payload = json!({
+                    "type": "error",
+                    "code": "E_TOO_MANY",
+                    "message": message,
+                });
                 let _ = socket.send(Message::Text(payload.to_string().into())).await;
                 return;
             }
@@ -323,10 +329,35 @@ async fn handle_socket(
     manager.schedule_reap(session.id.clone());
 }
 
-/// GET /api/terminal/sessions：调试/前端恢复标签页时用
+/// GET /api/terminal/sessions：活动会话列表（设计文档 3.3.6）
+///
+/// 返回明细而不只是数量：并发打满时前端要能列出「谁在占着」并让用户踢掉，
+/// 否则用户只会看到「已达上限」却无从下手。
 pub async fn list_sessions(State(state): State<AppState>) -> Response {
     let manager = state.terminals.clone();
-    axum::Json(json!({ "count": manager.len() })).into_response()
+    let sessions = manager.snapshot();
+    axum::Json(json!({
+        "count": sessions.len(),
+        "limit": crate::core::terminal::MAX_SESSIONS,
+        "sessions": sessions,
+    }))
+    .into_response()
+}
+
+/// DELETE /api/terminal/sessions/{id}：强制关闭一条遗留 PTY（设计文档 3.3.6）
+pub async fn kill_session(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if state.terminals.force_close(&id) {
+        axum::Json(json!({ "status": "ok" })).into_response()
+    } else {
+        crate::api::error::api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "E_NOT_FOUND",
+            "会话不存在或已结束",
+        )
+    }
 }
 
 #[cfg(test)]

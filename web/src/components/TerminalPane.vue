@@ -28,6 +28,8 @@ const emit = defineEmits<{
   (e: 'status', payload: { id: string; status: TerminalStatus }): void
   (e: 'consumed'): void
   (e: 'error', message: string): void
+  /** 服务端以 E_TOO_MANY 拒绝建会话：父组件据此打开「活动会话」面板 */
+  (e: 'limit'): void
 }>()
 
 const { t } = useI18n()
@@ -189,6 +191,7 @@ function connect() {
           warning?: string | null
           no_profile?: boolean
           platform?: string
+          code?: string
         }
         if (control.type === 'ready' && control.session_id) {
           attempts = 0
@@ -205,6 +208,7 @@ function connect() {
         } else if (control.type === 'error') {
           // 服务端明确拒绝（PTY 建不起来、会话超限等），重连只会空转
           fatal = true
+          if (control.code === 'E_TOO_MANY') emit('limit')
           emit('error', control.message ?? t('terminal.reconnect.generic'))
           emit('status', { id: props.tab.id, status: 'error' })
         }

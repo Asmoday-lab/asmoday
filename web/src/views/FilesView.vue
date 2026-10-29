@@ -492,7 +492,7 @@ async function submitTransfer() {
     const summary = summarizeResults(response)
     transferDialog.value = null
     exitSelect()
-    showTransferResult(dialog.mode, summary, displayPath(dest))
+    showTransferResult(dialog.mode, summary, displayPath(dest), dest, conflictChoice.value)
     await open(currentPath.value)
   } catch (err) {
     dialog.error = describe(err).message
@@ -501,22 +501,116 @@ async function submitTransfer() {
   }
 }
 
+interface TransferFailure {
+  path: string
+  source?: string
+  error_code?: string
+  message?: string
+}
+
 interface TransferSummary {
   ok: number
   failed: number
   skipped: number
-  failures: { path: string; source?: string; error_code?: string; message?: string }[]
+  failures: TransferFailure[]
 }
 
-const resultDialog = ref<({ mode: TransferMode; dest?: string } & TransferSummary) | null>(null)
+const resultDialog = ref<
+  ({ mode: TransferMode; dest?: string; destAbs?: string; conflict: OnConflict } & TransferSummary) | null
+>(null)
 
-function showTransferResult(mode: TransferMode, summary: TransferSummary, dest?: string) {
+function showTransferResult(
+  mode: TransferMode,
+  summary: TransferSummary,
+  dest: string | undefined,
+  destAbs: string | undefined,
+  conflict: OnConflict,
+) {
   if (summary.failed === 0) {
     showToast(t('files.transfer.done'))
     return
   }
-  // 失败时带上目标目录：权限类错误（如目录拒绝写入）需要一眼定位是哪个目录
-  resultDialog.value = { mode, ...summary, dest }
+  // 失败时带上目标目录：权限类错误（如目录拒绝写入）需要一眼定位是哪个目录；
+  // conflict 也要带上——重试必须沿用同一套冲突策略，否则「跳过」会变成「覆盖」
+  resultDialog.value = { mode, ...summary, dest, destAbs, conflict }
+}
+
+/**
+ * 这些错误码来自**外部状态**，立刻重试必然再次失败（设计文档 8.5 第 7 条）。
+ * `E_SOURCE_DELETE_FAILED` 更特殊：数据其实已经写到目标了，重试等于复制第二份。
+ */
+const RETRY_BLOCKED_CODES = new Set([
+  'E_BUSY',
+  'E_CONFLICT',
+  'E_DIR_CONFLICT',
+  'E_SOURCE_DELETE_FAILED',
+  'E_READONLY',
+  'E_FORBIDDEN',
+])
+
+function canRetry(item: TransferFailure): boolean {
+  return !RETRY_BLOCKED_CODES.has(item.error_code ?? '')
+}
+
+/** 阻塞项不是给个「重试」就完事，必须告诉用户到底要动哪里 */
+function blockedHint(item: TransferFailure): string {
+  switch (item.error_code) {
+    case 'E_BUSY':
+      return t('files.result.hintBusy')
+    case 'E_CONFLICT':
+    case 'E_DIR_CONFLICT':
+      return t('files.result.hintConflict')
+    case 'E_SOURCE_DELETE_FAILED':
+      return t('files.result.hintSourceLeft')
+    case 'E_READONLY':
+    case 'E_FORBIDDEN':
+      return t('files.result.hintReadonly')
+    default:
+      return ''
+  }
+}
+
+const retrying = ref(false)
+
+/** 只重试「可能自己好起来」的失败项（网络抖动、单点权限等） */
+async function retryFailures() {
+  const dialog = resultDialog.value
+  if (!dialog || retrying.value) return
+  const targets = dialog.failures.filter(canRetry)
+  if (!targets.length || !dialog.destAbs) return
+  retrying.value = true
+  try {
+    const call = dialog.mode === 'copy' ? filesApi.copy : filesApi.move
+    const response = await call(
+      targets.map((item) => item.path),
+      dialog.destAbs,
+      dialog.conflict,
+    )
+    const summary = summarizeResults(response)
+    // 阻塞项没参与重试，必须原样留在列表里，否则用户会以为它们成功了
+    const blocked = dialog.failures.filter((item) => !canRetry(item))
+    const merged: TransferSummary = {
+      ok: summary.ok,
+      failed: summary.failed + blocked.length,
+      skipped: summary.skipped,
+      failures: [...summary.failures, ...blocked],
+    }
+    resultDialog.value = merged.failed
+      ? {
+          mode: dialog.mode,
+          dest: dialog.dest,
+          destAbs: dialog.destAbs,
+          conflict: dialog.conflict,
+          ...merged,
+        }
+      : null
+    if (!merged.failed) showToast(t('files.transfer.done'))
+    await open(currentPath.value)
+  } catch (err) {
+    showToast(describe(err).message)
+  } finally {
+    retrying.value = false
+  }
 }
 
 function failureText(item: { error_code?: string; message?: string }) {
@@ -1230,8 +1324,18 @@ async function boot() {
       }
       return
     }
-    // 配置被改过，URL 里的挂载点已经没了 → 卡片页才是正确落点
-    if (requestedId) void router.replace({ name: 'files' })
+    // 配置被改过：URL 里的挂载点已经没了 / 掉线了 → 卡片页才是正确落点，
+    // 但必须说清楚原因，静默替换会让用户以为点错了（设计文档 3.2.8）
+    if (requestedId) {
+      showToast(
+        t(
+          requested
+            ? 'files.roots.offlineToast'
+            : 'files.roots.removedToast',
+        ),
+      )
+      void router.replace({ name: 'files' })
+    }
 
     const online = data.mounts.filter((mount) => mount.online)
     if (!data.mounts.length) {
@@ -1306,8 +1410,20 @@ async function open(
   error.value = null
   selected.value = null
   preview.value = null
+  // 中断上一次仍在飞的列表请求：挂载点被移除时，旧响应绝不能覆盖新状态
+  inflight?.abort()
+  const controller = new AbortController()
+  inflight = controller
   try {
-    const data = await filesApi.list(path, pageNo, showHidden.value, sortKey.value, sortDir.value)
+    const data = await filesApi.list(
+      path,
+      pageNo,
+      showHidden.value,
+      sortKey.value,
+      sortDir.value,
+      null,
+      controller.signal,
+    )
     listing.value = data
     currentPath.value = data.path
     page.value = data.page
@@ -1315,11 +1431,69 @@ async function open(
     if (options.sync !== false) syncUrl(data.path, options.push ? 'push' : 'replace')
     return true
   } catch (err) {
+    // 被后一次导航取消：静默退出，不要把 AbortError 当错误展示
+    if (controller.signal.aborted) return false
+    // 读不到目录时先确认挂载点还在（设计文档 3.2.8）：配置热重载删掉/掉线了，
+    // 必须回卡片页并说明，不能把用户留在「目标不存在」的报错页
+    if (!(await ensureMountAlive())) return false
     error.value = describe(err)
     return false
   } finally {
-    loading.value = false
+    if (inflight === controller) {
+      inflight = null
+      loading.value = false
+    }
   }
+}
+
+/** 当前在飞的目录请求（挂载点守卫与重新导航都要能立刻掐断它） */
+let inflight: AbortController | null = null
+
+/**
+ * 挂载点存活性守卫（设计文档 3.2.8）。
+ *
+ * 返回 false 表示当前挂载点已经不可用、页面已被踢回卡片页。
+ */
+async function ensureMountAlive(): Promise<boolean> {
+  const mount = activeMount.value
+  if (!mount) return true
+  let data: { mounts: MountPoint[]; implicit: boolean }
+  try {
+    data = await filesApi.mounts()
+  } catch {
+    // 网络抖动不当作挂载点消失，否则会把正在正常浏览的用户踢出去
+    return true
+  }
+  roots.value = data.mounts
+  rootsImplicit.value = data.implicit
+  const fresh = data.mounts.find((item) => item.id === mount.id)
+  if (!fresh) {
+    leaveMount('removed')
+    return false
+  }
+  if (!fresh.online) {
+    leaveMount('offline')
+    return false
+  }
+  activeMount.value = fresh
+  return true
+}
+
+/** 中断在途请求、清空目录态并回卡片页，同时说明原因 */
+function leaveMount(reason: 'removed' | 'offline') {
+  inflight?.abort()
+  inflight = null
+  listing.value = null
+  currentPath.value = ''
+  selected.value = null
+  preview.value = null
+  error.value = null
+  loading.value = false
+  activeMount.value = null
+  showToast(
+    t(reason === 'removed' ? 'files.roots.removedToast' : 'files.roots.offlineToast'),
+  )
+  void router.replace({ name: 'files' })
 }
 
 async function loadMore() {
@@ -1645,6 +1819,32 @@ watch(
 )
 
 onMounted(boot)
+
+// ---------------- 挂载点存活性巡检（设计文档 3.2.8） ----------------
+//
+// 配置热重载没有推送通道，只能靠「回到页面立即查 + 每 30 秒巡检」发现当前挂载点
+// 被移除或掉线；一旦发现就中断在途请求、清空目录态并回卡片页。
+const MOUNT_PROBE_MS = 30_000
+let probeTimer: number | null = null
+
+function probeMounts() {
+  if (document.visibilityState !== 'visible') return
+  if (!activeMount.value) return
+  void ensureMountAlive()
+}
+
+onMounted(() => {
+  probeTimer = window.setInterval(probeMounts, MOUNT_PROBE_MS)
+  document.addEventListener('visibilitychange', probeMounts)
+})
+
+onBeforeUnmount(() => {
+  if (probeTimer !== null) window.clearInterval(probeTimer)
+  probeTimer = null
+  document.removeEventListener('visibilitychange', probeMounts)
+  inflight?.abort()
+  inflight = null
+})
 </script>
 
 <template>
@@ -2749,10 +2949,30 @@ onMounted(boot)
             >
               <p class="break-all text-[12px] text-ink">{{ displayPath(item.source ?? item.path) }}</p>
               <p class="mt-0.5 text-[11px] fg-danger">{{ failureText(item) }}</p>
+              <!-- 阻塞项只给指引，不给「重试」：立刻重试必然再失败（设计文档 8.5 第 7 条） -->
+              <p v-if="blockedHint(item)" class="mt-0.5 text-[11px] text-muted">
+                {{ blockedHint(item) }}
+              </p>
             </li>
           </ul>
         </template>
-        <div class="mt-5 flex justify-end">
+        <div class="mt-5 flex justify-end gap-2">
+          <!-- 只有全部是阻塞项时才给「忽略并继续」，否则用户会连能重试的一起丢掉 -->
+          <button
+            v-if="!resultDialog.failures.some(canRetry)"
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+            @click="resultDialog = null"
+          >
+            {{ t('files.result.ignore') }}
+          </button>
+          <button
+            v-else
+            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+            :disabled="retrying"
+            @click="retryFailures"
+          >
+            {{ retrying ? t('common.action.loading') : t('files.result.retry') }}
+          </button>
           <button
             class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
             @click="resultDialog = null"

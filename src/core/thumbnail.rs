@@ -28,6 +28,31 @@ pub const MAX_CONCURRENT: usize = 2;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 每隔多少次生成跑一次淘汰
 const CLEANUP_EVERY: usize = 25;
+/// 「下载中」判定窗口（设计文档 3.4.1 的下载目录特调）
+const FRESH_WINDOW: Duration = Duration::from_secs(60);
+/// 只有体积够大的新鲜文件才算「正在下载」
+///
+/// 刚上传的照片写盘是毫秒级，如果按 mtime 一刀切，用户上传完会先看到一堆占位图，
+/// 以为缩略图坏了。真正会反复重绘的是几百兆的影视文件，所以用体积当第二道判据。
+const FRESH_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 文件是否可能仍在写盘（mtime 极新且体积可观）。
+fn is_fresh_write(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() < FRESH_SIZE_BYTES {
+        return false;
+    }
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    // 时钟回拨（mtime 在未来）时不当作新鲜：宁可生成一次，也不要永远回占位图
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age < FRESH_WINDOW)
+        .unwrap_or(false)
+}
 
 /// 占位图（内联 SVG，1 个请求 0 依赖）
 pub const PLACEHOLDER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240">
@@ -175,6 +200,13 @@ impl Thumbnailer {
             }
         }
 
+        // 下载中的大文件先不生成（设计文档 3.4.1）：写盘还没结束，
+        // 这一秒生成的图下一秒就因 mtime 变化失效，纯属白烧 CPU。
+        // 缓存命中已在上方返回，所以「已下完的文件」不受影响。
+        if is_fresh_write(path) {
+            return (ThumbOutcome::Placeholder, None);
+        }
+
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
             Ok(Ok(permit)) => permit,
             // 队列被打满：立刻回占位图，由前端稍后重试
@@ -249,6 +281,12 @@ impl Thumbnailer {
                     mime: format.mime(),
                 });
             }
+        }
+
+        // 正在下载的影视文件：截帧要拉起 FFmpeg 进程，比解图更贵，
+        // 更要等写盘结束（设计文档 3.4.1）。缓存命中已在上面返回。
+        if is_fresh_write(path) {
+            return ThumbOutcome::Placeholder;
         }
 
         // 共享同一个信号量：截帧比解 JPEG 更吃 CPU，绝不允许并发打满
@@ -630,5 +668,38 @@ mod tests {
         let _ = fs::remove_dir_all(&missing);
         assert_eq!(cleanup_cache(&missing, 1024, 3600).unwrap(), 0);
         assert_eq!(clear_cache(&missing).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn fresh_big_file_is_treated_as_downloading() {
+        let dir = scratch_dir("thumb-fresh");
+        let big = dir.join("movie.mp4");
+        fs::write(&big, vec![0u8; (FRESH_SIZE_BYTES + 1) as usize]).unwrap();
+        // 刚写完的大文件：正是「下载中」的形态，必须先回占位图
+        assert!(is_fresh_write(&big));
+
+        // 小文件不受影响：刚上传的照片要能立刻出缩略图
+        let small = dir.join("photo.jpg");
+        fs::write(&small, vec![0u8; 1024]).unwrap();
+        assert!(!is_fresh_write(&small));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_file_is_never_deferred() {
+        let dir = scratch_dir("thumb-old");
+        let file = dir.join("archive.mkv");
+        fs::write(&file, vec![0u8; (FRESH_SIZE_BYTES + 1) as usize]).unwrap();
+        // 把 mtime 往前拨 10 分钟：写盘早已结束，必须正常生成
+        let old = SystemTime::now() - Duration::from_secs(600);
+        let handle = fs::File::options().write(true).open(&file).unwrap();
+        handle.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        assert!(!is_fresh_write(&file));
+
+        // 不存在 / 没权限时必须返回 false（不能让缩略图整体 500）
+        assert!(!is_fresh_write(&dir.join("nope.mp4")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

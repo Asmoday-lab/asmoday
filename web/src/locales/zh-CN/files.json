@@ -12,6 +12,8 @@
     "empty": "还没有可浏览的挂载点",
     "emptyHint": "到「系统设置 → 高级」里添加 [[system.mounts]]，或直接编辑 config.toml",
     "missingToast": "该挂载点路径不可用，请检查 config.toml",
+    "removedToast": "当前挂载点已从配置中移除，已返回挂载点列表",
+    "offlineToast": "挂载点离线，无法访问内层目录",
     "opening": "正在打开挂载点…"
   },
   "toolbar": {
@@ -186,7 +188,13 @@
     "title": "操作结果",
     "summary": "成功 {ok} · 失败 {failed} · 跳过 {skipped}",
     "targetDir": "目标目录",
-    "failures": "失败项"
+    "failures": "失败项",
+    "retry": "重试失败项",
+    "ignore": "忽略并继续",
+    "hintBusy": "文件正被其他程序占用，请关闭下载器/播放器后再重试",
+    "hintConflict": "目标已存在，请改用重命名策略或换一个目录",
+    "hintSourceLeft": "数据已写入目标目录，原文件需要你手动删除",
+    "hintReadonly": "该挂载点不可写，请换一个目标目录"
   },
   "stat": {
     "title": "属性",

@@ -38,5 +38,20 @@
   "charset": {
     "title": "向当前终端发送 chcp 65001 修复中文乱码",
     "sent": "已发送 chcp 65001"
+  },
+  "sessions": {
+    "label": "会话",
+    "title": "活动终端会话",
+    "summary": "正在使用 {count} / {limit} 个会话",
+    "empty": "当前没有活动的终端会话",
+    "refresh": "刷新会话列表",
+    "close": "强制关闭",
+    "closeTitle": "强制结束这条 PTY（其中的进程会被杀掉）",
+    "closed": "已强制关闭该会话",
+    "current": "当前标签",
+    "clients": "{n} 个连接",
+    "ageSeconds": "{n} 秒",
+    "ageMinutes": "{n} 分钟",
+    "ageHours": "{n} 小时"
   }
 }

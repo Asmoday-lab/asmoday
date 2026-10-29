@@ -38,5 +38,20 @@
   "charset": {
     "title": "Send chcp 65001 to fix garbled text",
     "sent": "chcp 65001 sent"
+  },
+  "sessions": {
+    "label": "Sessions",
+    "title": "Active terminal sessions",
+    "summary": "{count} / {limit} sessions in use",
+    "empty": "No active terminal sessions",
+    "refresh": "Refresh session list",
+    "close": "Kill",
+    "closeTitle": "Force-close this PTY (running processes will be terminated)",
+    "closed": "Session closed",
+    "current": "this tab",
+    "clients": "{n} connections",
+    "ageSeconds": "{n}s",
+    "ageMinutes": "{n}m",
+    "ageHours": "{n}h"
   }
 }

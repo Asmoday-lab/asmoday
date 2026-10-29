@@ -402,6 +402,9 @@ pub async fn load_or_create(path: &Path) -> Result<(Config, bool), String> {
 
 impl Config {
     /// 序列化为 TOML 并原子写入（先写临时文件再 rename）。
+    ///
+    /// 内容与现有文件一致时**不写盘**（设计文档 3.5）：既省一次 IO，
+    /// 也避免自己触发一次无意义的热重载。
     pub async fn save_to(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
 
@@ -415,13 +418,9 @@ impl Config {
             }
         }
 
-        let tmp = path.with_extension("toml.tmp");
-        tokio::fs::write(&tmp, body.as_bytes())
+        write_if_changed(path, &body)
             .await
-            .map_err(|e| format!("写入临时配置 {} 失败: {e}", tmp.display()))?;
-        tokio::fs::rename(&tmp, path)
-            .await
-            .map_err(|e| format!("替换配置 {} 失败: {e}", path.display()))?;
+            .map_err(|e| format!("写入配置 {} 失败: {e}", path.display()))?;
 
         Ok(())
     }
@@ -639,10 +638,85 @@ impl Config {
 // 热重载（设计文档 3.5：保存配置后无需重启进程）
 // ---------------------------------------------------------------------------
 
+/// 防抖窗口（设计文档 3.5：500ms）。编辑器一次保存常连发多个事件，
+/// 等它彻底写完再读，否则会读到半个文件。
+const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+/// 相同热重载日志的最小间隔（设计文档 3.5：防刷屏卡死）
+const RELOAD_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 自写盘抑制计数：>0 时监听器忽略一切事件。
+///
+/// 防的是「写盘 → 触发监听 → 重载 → 再写盘」的死循环。用计数而不是 bool，
+/// 因为它可能被并发持有（可视化表单与源码模式同时保存）。
+static SUSPEND_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 持有期间挂起配置监听器；`Drop` 自动恢复——异常返回也不会把监听器永久挂死。
+pub struct WatchSuspend;
+
+impl Drop for WatchSuspend {
+    fn drop(&mut self) {
+        SUSPEND_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 挂起配置监听器，防止自己的写盘动作被当成外部修改。
+pub fn suspend_watch() -> WatchSuspend {
+    SUSPEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    WatchSuspend
+}
+
+fn watch_suspended() -> bool {
+    SUSPEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// 最近一次由本进程写入的配置原文。
+///
+/// 挂起计数器只能盖住「写盘那一刻」，文件事件往往在 rename 之后几十毫秒才送达，
+/// 那时挂起已经解除；这份内容比对就是第二道闸：内容与自己刚写的一致 → 纯回声，直接丢弃。
+static SELF_WRITE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 只在内容真的变化时写盘（设计文档 3.5「内容没变坚决不写盘」）。
+///
+/// 返回 `true` 表示确实写了。调用方不用再自己挂起监听器——这里已经处理。
+pub async fn write_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = tokio::fs::read_to_string(path).await {
+        if existing == body {
+            return Ok(false);
+        }
+    }
+    let _guard = suspend_watch();
+    let tmp = path.with_extension("toml.tmp");
+    tokio::fs::write(&tmp, body.as_bytes()).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    if let Ok(mut slot) = SELF_WRITE.lock() {
+        *slot = Some(body.to_string());
+    }
+    Ok(true)
+}
+
+/// 事件是否代表「配置内容真的变了」。
+///
+/// 只认 `Create` 与 `Modify`（`Metadata` / `Other` 除外）：
+/// - `Access`（文件被读取）在文件管理器里浏览一眼就会触发，放进来会让热重载被无意义地反复触发；
+/// - `ModifyKind::Metadata`（改权限、改时间戳）同样不算内容变更；
+/// - **`ModifyKind::Any` 必须放行**：Windows 的 notify 后端只报 `Modify(Any)`，
+///   按文档字面只收 `Modify(Data)` 会让 Windows 上的热重载彻底失效。
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    use notify::event::{EventKind, ModifyKind};
+    match kind {
+        EventKind::Create(_) => true,
+        EventKind::Modify(inner) => !matches!(inner, ModifyKind::Metadata(_) | ModifyKind::Other),
+        // 后端无法归类时的兜底：宁可多重载一次，也不要让 Windows 用户改了配置没反应
+        EventKind::Any => true,
+        _ => false,
+    }
+}
+
 /// 后台线程监听 config.toml 变更并热重载内存配置。
 ///
 /// - 监听父目录（编辑器常用「临时文件 + rename」整体替换，监听文件本身会丢事件）；
-/// - 300ms 防抖，等编辑器写完再读；
+/// - 500ms 防抖；
+/// - 事件种类过滤 + 内容比对 + 自写盘挂起，三重防死循环；
 /// - 解析/校验失败时保留旧配置并在日志里说明；
 /// - 端口变更仍需重启进程（listener 不会 rebind）。
 pub fn spawn_watcher(state: crate::AppState) {
@@ -673,22 +747,70 @@ pub fn spawn_watcher(state: crate::AppState) {
             }
             crate::log_info!("watching config file for changes: {}", target.display());
 
+            let mut last_applied: Option<String> = None;
+            let mut last_log: Option<std::time::Instant> = None;
+
             loop {
                 let event = match rx.recv() {
                     Ok(event) => event,
                     Err(_) => return,
                 };
                 let Ok(event) = event else { continue };
+                // 自己写盘引发的回声：直接丢掉，绝不重载
+                if watch_suspended() {
+                    continue;
+                }
                 if !event.paths.iter().any(|p| p.file_name() == Some(file_name.as_os_str())) {
                     continue;
                 }
+                // 排障用：不同平台的 notify 后端给出的事件种类并不一致
+                //（Windows 常给 `Modify(Any)`，Linux 给 `Modify(Data(Any))`），
+                // 打一条 DEBUG 就能看出为什么没触发重载
+                crate::log_debug!("config watcher event: {:?}", event.kind);
+                if !is_content_change(&event.kind) {
+                    continue;
+                }
                 // 防抖：吞掉防抖窗口内连发的后续事件
-                while let Ok(more) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                while let Ok(more) = rx.recv_timeout(RELOAD_DEBOUNCE) {
                     if more.is_err() {
                         return;
                     }
                 }
-                reload_into(&state, &target);
+                let raw = match std::fs::read_to_string(&target) {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        crate::log_warn!(
+                            "config hot reload skipped (read failed: {err}), keeping previous config"
+                        );
+                        continue;
+                    }
+                };
+                // 内容没变（自己刚写过、或编辑器只 touch 了 mtime）就不重载
+                if last_applied.as_deref() == Some(raw.as_str()) {
+                    continue;
+                }
+                // 自己刚写的内容：事件迟到了而已，记下来别重载
+                let echo = SELF_WRITE
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .map(|written| written == raw)
+                    .unwrap_or(false);
+                if echo {
+                    last_applied = Some(raw);
+                    continue;
+                }
+                if apply_text(&state, &raw) {
+                    last_applied = Some(raw);
+                    // 日志节流：1 秒内最多一条，避免事件风暴刷屏
+                    let due = last_log
+                        .map(|t| t.elapsed() >= RELOAD_LOG_INTERVAL)
+                        .unwrap_or(true);
+                    if due {
+                        crate::log_info!("config hot-reloaded from {}", target.display());
+                        last_log = Some(std::time::Instant::now());
+                    }
+                }
             }
         });
 
@@ -697,32 +819,29 @@ pub fn spawn_watcher(state: crate::AppState) {
     }
 }
 
-fn reload_into(state: &crate::AppState, path: &Path) {
-    let parsed = std::fs::read_to_string(path)
-        .map_err(|e| format!("读取失败：{e}"))
-        .and_then(|raw| toml::from_str::<Config>(&raw).map_err(|e| format!("解析失败：{e}")));
-
-    match parsed {
-        Ok(config) => match config.validate() {
-            Ok(()) => {
-                // 缩略图策略随配置一起生效
-                state
-                    .thumbnails
-                    .apply_limits(config.media.limit_bytes(), config.media.max_age_secs());
-                // 日志分级同样随配置热更新（设计文档 3.7：排障时改配置即生效，无需重启）
-                crate::core::logging::apply(&config.log);
-                let mut config = config;
-                // 热重载同样要过一遍危险配置自检，不许绕过启动时的拦截
-                let _ = config.apply_safety();
-                *state.config.blocking_write() = config;
-                crate::log_info!("config hot-reloaded from {}", path.display());
-            }
-            Err(err) => {
-                crate::log_warn!("config validation failed, keeping previous config: {err}")
-            }
-        },
+/// 解析并应用一份配置文本。返回 `true` 表示已生效。
+fn apply_text(state: &crate::AppState, raw: &str) -> bool {
+    let config = match toml::from_str::<Config>(raw) {
+        Ok(config) => config,
         Err(err) => {
-            crate::log_warn!("config hot reload skipped ({err}), keeping previous config")
+            crate::log_warn!("config hot reload skipped (parse failed: {err}), keeping previous config");
+            return false;
         }
+    };
+    if let Err(err) = config.validate() {
+        crate::log_warn!("config validation failed, keeping previous config: {err}");
+        return false;
     }
+
+    // 缩略图策略随配置一起生效
+    state
+        .thumbnails
+        .apply_limits(config.media.limit_bytes(), config.media.max_age_secs());
+    // 日志分级同样随配置热更新（设计文档 3.7：排障时改配置即生效，无需重启）
+    crate::core::logging::apply(&config.log);
+    let mut config = config;
+    // 热重载同样要过一遍危险配置自检，不许绕过启动时的拦截
+    let _ = config.apply_safety();
+    *state.config.blocking_write() = config;
+    true
 }

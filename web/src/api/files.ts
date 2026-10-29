@@ -140,7 +140,11 @@ export interface SaveTextResult {
   has_bom: boolean
 }
 
-async function getJson<T>(url: string): Promise<T> {  const res = await fetch(url, { headers: { Accept: 'application/json' } })
+async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    ...init,
+    headers: { Accept: 'application/json', ...(init?.headers ?? {}) },
+  })
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as T
 }
@@ -177,6 +181,7 @@ export const filesApi = {
     sort = 'name',
     order = 'asc',
     cursor?: string | null,
+    signal?: AbortSignal,
   ) => {
     const params = new URLSearchParams({
       path,
@@ -186,7 +191,7 @@ export const filesApi = {
     })
     if (cursor) params.set('cursor', cursor)
     else params.set('page', String(page))
-    return getJson<Listing>(`/api/files/list?${params.toString()}`)
+    return getJson<Listing>(`/api/files/list?${params.toString()}`, { signal })
   },
 
   /** 直接给 <img>/<video> 用；同样走挂载点校验 */

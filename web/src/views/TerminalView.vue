@@ -10,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import TerminalPane from '../components/TerminalPane.vue'
+import { listTerminalSessions, killTerminalSession, type TerminalSession } from '../api/terminal'
 import { useTerminalStore, saveSafeModeDefault, type TerminalStatus } from '../stores/terminal'
 
 const { tabs, activeId, active, openTab, closeTab, setActive, updateTab } = useTerminalStore()
@@ -45,9 +46,74 @@ function showToast(message: string) {
 function newTab(cwd = '') {
   if (tabs.value.length >= MAX_TABS) {
     showToast(t('terminal.reconnect.limit', { max: MAX_TABS }))
+    // 光提示没用：直接把「活动会话」面板顶上来，让用户挑一个踢掉（设计文档 3.3.6）
+    void openSessions()
     return
   }
   openTab(cwd)
+}
+
+// ---------------- 活动会话（设计文档 3.3.6） ----------------
+//
+// 并发上限 10 个，断线后 PTY 还会保活 3 分钟。没有这个面板，用户遇到
+// 「已达上限」只能干等或重启进程——这是文档明确要求补的逃生口。
+
+const showSessions = ref(false)
+const sessions = ref<TerminalSession[]>([])
+const sessionLimit = ref(MAX_TABS)
+const sessionsBusy = ref(false)
+const sessionsError = ref('')
+
+async function refreshSessions() {
+  sessionsBusy.value = true
+  sessionsError.value = ''
+  try {
+    const data = await listTerminalSessions()
+    sessions.value = data.sessions
+    if (data.limit > 0) sessionLimit.value = data.limit
+  } catch (err) {
+    sessionsError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    sessionsBusy.value = false
+  }
+}
+
+function openSessions() {
+  showSessions.value = true
+  return refreshSessions()
+}
+
+/** 强制关闭一条会话：若它正被某个标签复用，顺手清掉 sessionId 让该标签按需重开 */
+async function closeSession(session: TerminalSession) {
+  try {
+    await killTerminalSession(session.id)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : String(err))
+    return
+  }
+  const owner = tabs.value.find((tab) => tab.sessionId === session.id)
+  if (owner) updateTab(owner.id, { sessionId: null, status: 'closed' })
+  showToast(t('terminal.sessions.closed'))
+  await refreshSessions()
+}
+
+function isTabSession(session: TerminalSession) {
+  return active.value?.sessionId === session.id
+}
+
+/** 存活时长：列表里只给「多久了」，精确到秒没有意义 */
+function ageText(secs: number) {
+  if (secs < 60) return t('terminal.sessions.ageSeconds', { n: secs })
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return t('terminal.sessions.ageMinutes', { n: mins })
+  return t('terminal.sessions.ageHours', { n: Math.floor(mins / 60) })
+}
+
+/** 目录只留最后两段，避免长路径把列表撑破 */
+function shortPath(path: string) {
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  if (parts.length <= 2) return path
+  return `…/${parts.slice(-2).join('/')}`
 }
 
 function openFromRoute() {
@@ -237,6 +303,17 @@ const statusTone: Record<TerminalStatus, string> = {
         <span class="hidden sm:inline">UTF-8</span>
       </button>
 
+      <!-- 活动会话：并发打满 / 有断线残留时的逃生口（设计文档 3.3.6） -->
+      <button
+        type="button"
+        class="flex h-7 shrink-0 items-center gap-1 rounded px-1.5 text-[11px] text-muted transition-colors hover:bg-elevated hover:text-ink"
+        :title="t('terminal.sessions.title')"
+        @click="openSessions"
+      >
+        <AppIcon name="list" :size="13" />
+        <span class="hidden sm:inline">{{ t('terminal.sessions.label') }}</span>
+      </button>
+
       <button
         type="button"
         class="grid size-7 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink md:hidden"
@@ -283,6 +360,7 @@ const statusTone: Record<TerminalStatus, string> = {
             @session="onSession"
             @consumed="ctrl = false; alt = false"
             @error="onError"
+            @limit="openSessions"
           />
         </div>
       </div>
@@ -346,6 +424,96 @@ const statusTone: Record<TerminalStatus, string> = {
         </button>
       </span>
     </footer>
+
+    <!-- 活动会话面板（设计文档 3.3.6）：并发打满或断线残留时踢掉占用者 -->
+    <div
+      v-if="showSessions"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      @click.self="showSessions = false"
+    >
+      <div
+        class="flex max-h-[70vh] w-full max-w-md flex-col rounded-2xl border border-line bg-panel p-5 shadow-xl"
+      >
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <p class="text-sm font-medium text-ink">{{ t('terminal.sessions.title') }}</p>
+            <p class="mt-1 text-[11px] text-muted">
+              {{
+                t('terminal.sessions.summary', {
+                  count: sessions.length,
+                  limit: sessionLimit,
+                })
+              }}
+            </p>
+          </div>
+          <button
+            type="button"
+            class="grid size-7 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink"
+            :title="t('terminal.sessions.refresh')"
+            @click="refreshSessions"
+          >
+            <AppIcon name="refresh" :size="14" />
+          </button>
+        </div>
+
+        <p
+          v-if="sessionsError"
+          class="mt-3 rounded-lg border border-line bg-elevated px-2.5 py-2 text-[11px] fg-danger"
+        >
+          {{ sessionsError }}
+        </p>
+        <p v-else-if="sessionsBusy && sessions.length === 0" class="mt-3 text-[11px] text-muted">
+          {{ t('common.action.loading') }}
+        </p>
+        <p v-else-if="sessions.length === 0" class="mt-3 text-[11px] text-muted">
+          {{ t('terminal.sessions.empty') }}
+        </p>
+
+        <ul v-else class="mt-3 min-h-0 flex-1 space-y-1.5 overflow-y-auto">
+          <li
+            v-for="session in sessions"
+            :key="session.id"
+            class="rounded-lg border border-line bg-elevated px-2.5 py-2"
+          >
+            <div class="flex items-center gap-2">
+              <span class="min-w-0 flex-1 truncate text-[12px] text-ink" :title="session.cwd">
+                {{ shortPath(session.cwd) }}
+              </span>
+              <span
+                v-if="isTabSession(session)"
+                class="shrink-0 rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent"
+              >
+                {{ t('terminal.sessions.current') }}
+              </span>
+              <button
+                type="button"
+                class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-panel hover:text-ink"
+                :title="t('terminal.sessions.closeTitle')"
+                @click="closeSession(session)"
+              >
+                {{ t('terminal.sessions.close') }}
+              </button>
+            </div>
+            <p class="mt-1 truncate text-[10px] text-muted">
+              <template v-if="session.no_profile">{{ t('terminal.safeMode.label') }} · </template>
+              {{ session.cols }}×{{ session.rows }} ·
+              {{ t('terminal.sessions.clients', { n: session.clients }) }} ·
+              {{ ageText(session.age_secs) }}
+            </p>
+          </li>
+        </ul>
+
+        <div class="mt-4 flex justify-end">
+          <button
+            type="button"
+            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+            @click="showSessions = false"
+          >
+            {{ t('common.action.close') }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <Transition name="fade">
       <div

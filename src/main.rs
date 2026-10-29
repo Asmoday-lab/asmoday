@@ -437,6 +437,10 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/shares/{token}", axum::routing::delete(api::shares::delete))
         .route("/api/terminal/ws", get(api::terminal::ws_handler))
         .route("/api/terminal/sessions", get(api::terminal::list_sessions))
+        .route(
+            "/api/terminal/sessions/{id}",
+            axum::routing::delete(api::terminal::kill_session),
+        )
         .route("/proxy/{service_id}", any(api::proxy::handle_root))
         .route("/proxy/{service_id}/", any(api::proxy::handle_root))
         .route("/proxy/{service_id}/{*rest}", any(api::proxy::handle_rest))

@@ -12,6 +12,8 @@
     "empty": "No mount available yet",
     "emptyHint": "Add [[system.mounts]] under Settings → Advanced, or edit config.toml directly",
     "missingToast": "This mount path is unavailable, please check config.toml",
+    "removedToast": "This mount was removed from the config — back to the mount list",
+    "offlineToast": "This mount is offline — its sub-folders are unreachable",
     "opening": "Opening mount…"
   },
   "toolbar": {
@@ -186,7 +188,13 @@
     "title": "Result",
     "summary": "{ok} succeeded · {failed} failed · {skipped} skipped",
     "targetDir": "Destination",
-    "failures": "Failed items"
+    "failures": "Failed items",
+    "retry": "Retry failed",
+    "ignore": "Ignore and continue",
+    "hintBusy": "The file is in use — close the downloader/player and try again",
+    "hintConflict": "The target already exists — use the rename policy or another folder",
+    "hintSourceLeft": "Data is in the destination; remove the source file manually",
+    "hintReadonly": "This mount is read-only — pick another destination"
   },
   "stat": {
     "title": "Properties",
