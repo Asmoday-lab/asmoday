@@ -16,6 +16,9 @@ toml = "0.8"
 # 保留用户注释的原地改写：可视化表单保存时只改“值”，不重写整篇文档
 # （toml 0.8 的 to_string_pretty 会丢掉全部注释 —— 红线 10 不允许）
 toml_edit = "0.22"
+# 双栈监听：host = "::" 时显式关掉 IPV6_V6ONLY，Windows 默认只收 v6
+# （tokio 自身已在依赖树里带 socket2，这里只是声明出来直接用）
+socket2 = "0.6"
 # 按扩展名推断 Content-Type（本地查表，不联网）
 mime_guess = "2"
 # 单二进制：把前端产物内嵌进可执行文件

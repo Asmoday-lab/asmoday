@@ -22,6 +22,8 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Asmoday 配置文件 — TOML 格式
 [server]
 # 监听地址。默认为 "0.0.0.0"（方便局域网访问及 Docker 映射）。
 # 若仅本机使用或已前置 Nginx/Caddy 反代，建议改为 "127.0.0.1"。
+# IPv6：写 "::" 即双栈监听（同一端口同时收 IPv4 + IPv6 连接），
+# 只收 v6 写 "::1"（本机）或具体地址；IPv6 字面量不需要方括号。
 # 命令行 -H / 环境变量 ASMODAY_HOST 优先级更高。
 host = "0.0.0.0"
 # 监听端口（1-65535）。命令行 -p / 环境变量 ASMODAY_PORT 优先级更高。
@@ -792,7 +794,14 @@ impl Config {
                 code: "PROXY_TRUST_SKIP_2FA",
             });
         }
-        if self.server.host == "0.0.0.0" && !self.server.ssl.enabled {
+        // 全接口监听（0.0.0.0 / ::，解析失败已被上面的 validate 拦截）
+        let host_unspecified = self
+            .server
+            .host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_unspecified())
+            .unwrap_or(false);
+        if host_unspecified && !self.server.ssl.enabled {
             issues.push(SafetyIssue {
                 level: "warn",
                 code: "HOST_ALL_INTERFACES_NO_SSL",
@@ -846,7 +855,7 @@ impl Config {
                     "server.ssl.enabled=false but base_url looks like an https URL"
                 }
                 "HOST_ALL_INTERFACES_NO_SSL" => {
-                    "listening on 0.0.0.0 without SSL. If you plan to expose this to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS."
+                    "listening on all interfaces (0.0.0.0/::) without SSL. If you plan to expose this to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS."
                 }
                 "RESET_PASSWORD_ENV_PRESENT" => {
                     "ASMODAY_RESET_PASSWORD is set: it takes effect on every start, remove it after resetting"

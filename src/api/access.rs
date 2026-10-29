@@ -141,7 +141,7 @@ pub async fn track(
         let client_ip = crate::api::auth::pick_client_ip(
             trust_proxy,
             &trusted,
-            &peer.ip().to_string(),
+            &crate::api::auth::peer_ip(peer),
             &headers,
         );
         // 有查询串时拼成 `path?query`（已脱敏），否则保持纯路径

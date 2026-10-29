@@ -287,20 +287,19 @@ async fn run(cli: Cli) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("invalid server.host {}: {e}", listen.0))?;
     let addr = SocketAddr::new(host_ip, port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    let listener = bind_listener(addr).await?;
 
     crate::log_info!("config file: {}", config_path.display());
     crate::log_info!("data directory: {}", data_dir.display());
     if addr.ip().is_unspecified() {
+        let stack = if addr.is_ipv6() { " (dual stack: IPv4 + IPv6)" } else { "" };
         crate::log_info!(
-            "listening on {addr} (all interfaces; put a reverse proxy in front for public access)"
+            "listening on {addr}{stack} (all interfaces; put a reverse proxy in front for public access)"
         );
-        // 设计文档 v2.7.0 6.x：0.0.0.0 且未启用 SSL 必须输出规范 WARN
+        // 设计文档 v2.7.0 6.x：全接口监听（0.0.0.0 / ::）且未启用 SSL 必须输出规范 WARN
         if !listen.1 {
             crate::log_warn!(
-                "listening on 0.0.0.0 without SSL. If you plan to expose this to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS."
+                "listening on all interfaces without SSL. If you plan to expose this to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS."
             );
         }
     } else {
@@ -334,6 +333,35 @@ async fn run(cli: Cli) -> Result<(), String> {
     crate::log_info!("shutdown complete");
     core::logging::flush();
     Ok(())
+}
+
+/// 绑定监听 socket。
+///
+/// IPv6 地址必须显式关掉 `IPV6_V6ONLY`：Windows 默认值是 on，直接
+/// `TcpListener::bind("[::]:p")` 只收 IPv6，IPv4 客户端全部拒连；
+/// Linux 默认 off 但属于系统行为，不该赌。统一走 socket2 设置后，
+/// `host = "::"` 即双栈（v4 连接的 peer 是 `::ffff:a.b.c.d`，由
+/// `auth::peer_ip` 归一回 IPv4 字面量）。IPv4 路径行为与
+/// `TcpListener::bind` 完全一致。
+async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .and_then(|socket| {
+        if addr.is_ipv6() {
+            socket.set_only_v6(false)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        Ok(socket)
+    })
+    .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("failed to register listener for {addr}: {e}"))
 }
 
 /// 公开路由（无需登录）

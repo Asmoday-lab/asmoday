@@ -298,7 +298,7 @@ pub async fn handle(
     let Some(creds) = basic_credentials(&headers) else {
         return unauthorized();
     };
-    let guard_key = format!("{}|{}", peer.ip(), creds.username);
+    let guard_key = format!("{}|{}", crate::api::auth::peer_ip(peer), creds.username);
     if let Err(remaining) = state.dav_guard.check(&guard_key) {
         return dav_error(
             StatusCode::TOO_MANY_REQUESTS,

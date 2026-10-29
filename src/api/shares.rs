@@ -367,7 +367,7 @@ async fn guard(
     if hotlink_denied(state, headers).await {
         return Err(error(StatusCode::FORBIDDEN, "直链来源不在防盗链白名单内"));
     }
-    let ip = peer.0.ip();
+    let ip = crate::api::auth::peer_ip(peer.0);
     check_password(state, &format!("{ip}|{token}"), password_hash, query)
 }
 

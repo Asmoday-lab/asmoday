@@ -102,7 +102,7 @@ async fn cookie_scope(
         .map(|addr| {
             trusted
                 .iter()
-                .any(|rule| ip_matches(&addr.ip().to_string(), rule))
+                .any(|rule| ip_matches(&peer_ip(addr), rule))
         })
         .unwrap_or(false);
     let forwarded_https = headers
@@ -173,6 +173,24 @@ fn is_password_change_path(path: &str) -> bool {
     )
 }
 
+/// 统一的「客户端 IP 字符串」入口：`normalize_ip` 折叠 v4-mapped。
+/// 所有需要拿 peer IP 做匹配/键值/日志的地方都走它，保证写法一致。
+pub(crate) fn peer_ip(peer: SocketAddr) -> String {
+    normalize_ip(peer.ip()).to_string()
+}
+
+/// XFF / X-Real-IP 单个条目的归一：剥 bracket、折叠 v4-mapped。
+/// 有些反代把 IPv6 写成 `[2001:db8::1]` 甚至 `[2001:db8::1]:443`，
+/// 不归一的话限流/封禁键会分裂。
+fn forwarded_ip_candidate(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let value = match trimmed.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map(|(host, _)| host).unwrap_or(rest),
+        None => trimmed,
+    };
+    normalize_ip_str(value)
+}
+
 /// WebSocket 握手的同源校验。
 ///
 /// 握手是 GET，`origin_matches_host` 对 GET 一律放行（导航请求不能带自定义头），
@@ -192,15 +210,72 @@ pub(crate) fn ws_origin_allowed(headers: &HeaderMap) -> bool {
     normalize_authority(authority_of(origin)) == normalize_authority(host)
 }
 
-/// 主机名归一：小写 + 去掉默认端口
-fn normalize_authority(value: &str) -> String {
-    let lowered = value.trim().to_ascii_lowercase();
-    for suffix in [":80", ":443"] {
-        if let Some(stripped) = lowered.strip_suffix(suffix) {
-            return stripped.to_string();
+/// authority 拆成 `(host, port)`。IPv6 字面量按 bracket 解析，
+/// 避免 `rsplit_once(':')` 把 `[::1]:8080` 的地址本体拆碎。
+fn split_authority(value: &str) -> (&str, Option<u16>) {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = &rest[..end];
+            let port = rest[end + 1..]
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok());
+            return (host, port);
         }
     }
-    lowered
+    match value.rsplit_once(':') {
+        // 冒号后全是数字才算端口；`example.com:` 之类残缺串按无端口处理
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            (host, port.parse().ok())
+        }
+        _ => (value, None),
+    }
+}
+
+/// 主机名归一：小写 + 去掉默认端口 + IPv6 规范化。
+///
+/// IPv6 在 Host/Origin 里必然带 bracket，剥掉后交给 `Ipv6Addr::parse`：
+/// - 规范写法归一（`[0:0:0:0:0:0:0:1]` 与 `[::1]` 相等）；
+/// - v4-mapped 折叠成 IPv4（`[::ffff:127.0.0.1]` 与 `127.0.0.1` 相等，
+///   与下方 `normalize_ip` 对 peer 的口径一致）；
+/// - 解析失败按普通主机名处理，行为与旧实现兼容。
+fn normalize_authority(value: &str) -> String {
+    let (host, port) = split_authority(value);
+    let host = match host.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(), // Display 即小写规范形
+        },
+        Err(_) => host.to_ascii_lowercase(),
+    };
+    match port {
+        Some(80) | Some(443) => host,
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    }
+}
+
+/// socket 层的 v4-mapped IPv6 还原成 IPv4 字面量。
+///
+/// 双栈监听（`host = "::"` + `IPV6_V6ONLY=false`）下，IPv4 连接的 peer 是
+/// `::ffff:a.b.c.d`。不还原的话 `trusted_ips` 里写的 `127.0.0.1` 匹配不上、
+/// 限流/口令防爆破的键与日志分裂成两种写法（v4 直连一条、经 v6 栈又一条）。
+pub(crate) fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// `normalize_ip` 的字符串入口：解析失败原样返回（调用方多在日志/键场景）。
+pub(crate) fn normalize_ip_str(ip: &str) -> String {
+    ip.parse::<std::net::IpAddr>()
+        .map(normalize_ip)
+        .map(|parsed| parsed.to_string())
+        .unwrap_or_else(|_| ip.to_string())
 }
 
 fn cleared_cookie(path: &str, secure: bool) -> String {
@@ -233,7 +308,7 @@ async fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAdd
     };
 
     let peer_ip = match peer {
-        Some(addr) => addr.ip().to_string(),
+        Some(addr) => crate::api::auth::peer_ip(addr),
         None => return "unknown".to_string(),
     };
     pick_client_ip(trust, &trusted, &peer_ip, headers)
@@ -255,15 +330,15 @@ pub(crate) fn pick_client_ip(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
     {
-        let forwarded = forwarded.trim();
+        let forwarded = forwarded_ip_candidate(forwarded);
         if !forwarded.is_empty() {
-            return forwarded.to_string();
+            return forwarded;
         }
     }
     if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let real = real.trim();
+        let real = forwarded_ip_candidate(real);
         if !real.is_empty() {
-            return real.to_string();
+            return real;
         }
     }
 
@@ -274,11 +349,15 @@ pub(crate) fn pick_client_ip(
 // 中间件
 // ---------------------------------------------------------------------------
 
-/// 判断 IP 是否命中 trusted_ips（支持精确匹配与 IPv4 CIDR）。
+/// 判断 IP 是否命中 trusted_ips（支持精确匹配与 IPv4/IPv6 CIDR）。
 ///
-/// IPv6 只支持精确字符串匹配（CIDR 写法留给反代场景，命中不了就当不可信，宁可严一点）。
+/// 输入先过 `normalize_ip_str`：双栈下 IPv4 连接的 peer 是 `::ffff:a.b.c.d`，
+/// 归一后才能命中用户按 IPv4 写的规则。两个家族各自比较，不跨族匹配
+/// （v4-mapped 已折叠，剩下的纯 v6 与 v4 没有可比性）。
 pub(crate) fn ip_matches(ip: &str, rule: &str) -> bool {
-    if ip == rule {
+    let ip = normalize_ip_str(ip);
+    let rule = rule.trim();
+    if ip.eq_ignore_ascii_case(rule) {
         return true;
     }
     let Some((network, bits)) = rule.split_once('/') else {
@@ -287,10 +366,8 @@ pub(crate) fn ip_matches(ip: &str, rule: &str) -> bool {
     let Ok(bits) = bits.parse::<u32>() else {
         return false;
     };
-    if bits > 32 {
-        return false;
-    }
-    let parse = |value: &str| -> Option<u32> {
+
+    fn parse_v4(value: &str) -> Option<u128> {
         let parts: Vec<u8> = value
             .split('.')
             .map(|part| part.parse::<u8>().ok())
@@ -298,13 +375,37 @@ pub(crate) fn ip_matches(ip: &str, rule: &str) -> bool {
         if parts.len() != 4 {
             return None;
         }
-        Some(((parts[0] as u32) << 24) | ((parts[1] as u32) << 16) | ((parts[2] as u32) << 8) | parts[3] as u32)
+        Some(
+            ((parts[0] as u128) << 24)
+                | ((parts[1] as u128) << 16)
+                | ((parts[2] as u128) << 8)
+                | parts[3] as u128,
+        )
+    }
+    let (addr, network, max_bits): (u128, u128, u32) = if ip.contains(':') {
+        // IPv6：`ip` 已归一（v4-mapped 折叠），这里仍按解析结果走，双保险
+        match (
+            ip.parse::<std::net::Ipv6Addr>(),
+            network.parse::<std::net::Ipv6Addr>(),
+        ) {
+            (Ok(addr), Ok(net)) => (addr.to_bits(), net.to_bits(), 128),
+            _ => return false,
+        }
+    } else {
+        match (parse_v4(&ip), parse_v4(network)) {
+            (Some(addr), Some(net)) => (addr, net, 32),
+            _ => return false,
+        }
     };
-    let (Some(a), Some(b)) = (parse(ip), parse(network)) else {
+    if bits > max_bits {
         return false;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u128::MAX << (max_bits - bits)
     };
-    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-    (a & mask) == (b & mask)
+    (addr & mask) == (network & mask)
 }
 
 /// “座上宾”模式：信任反向代理传入的用户名 Header（设计文档 3.1.8）。
@@ -330,7 +431,7 @@ async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr
         return None;
     }
 
-    let peer_ip = peer.map(|addr| addr.ip().to_string())?;
+    let peer_ip = peer.map(crate::api::auth::peer_ip)?;
     if trusted.iter().all(|rule| rule.trim().is_empty())
         || !trusted.iter().any(|rule| ip_matches(&peer_ip, rule))
     {
@@ -967,5 +1068,91 @@ mod tests {
         let cleared = super::cleared_cookie("/nas", true);
         assert!(cleared.contains("Path=/nas;"));
         assert!(cleared.contains("Max-Age=0"));
+    }
+
+    // ---- IPv6 支持（双栈监听 / trusted_ips / 同源判定）----
+
+    use super::{forwarded_ip_candidate, ip_matches, normalize_ip_str, peer_ip};
+    use std::net::{IpAddr, SocketAddr};
+
+    #[test]
+    fn trusted_ips_match_ipv6_cidr_and_exact() {
+        // 精确匹配（含大写/压缩写法归一）
+        assert!(ip_matches("2001:db8::1", "2001:db8::1"));
+        assert!(ip_matches("2001:DB8:0:0:0:0:0:1", "2001:db8::1"));
+        assert!(!ip_matches("2001:db8::2", "2001:db8::1"));
+        // CIDR
+        assert!(ip_matches("2001:db8:abcd::1", "2001:db8::/32"));
+        assert!(ip_matches("fe80::a", "fe80::/10"));
+        assert!(!ip_matches("2001:db9::1", "2001:db8::/32"));
+        assert!(ip_matches("2001:db8::1", "2001:db8::1/128"));
+        // 位宽越界一律不命中
+        assert!(!ip_matches("2001:db8::1", "2001:db8::/129"));
+        // 家族隔离：v4 规则吃不下 v6，反之亦然
+        assert!(!ip_matches("2001:db8::1", "127.0.0.1"));
+        assert!(!ip_matches("2001:db8::1", "0.0.0.0/0"));
+        assert!(!ip_matches("127.0.0.1", "::/0"));
+        // v4 原有语义保持
+        assert!(ip_matches("172.16.5.9", "172.16.0.0/12"));
+        assert!(!ip_matches("172.32.0.1", "172.16.0.0/12"));
+        // 非法输入不命中、不 panic
+        assert!(!ip_matches("not-an-ip", "127.0.0.1"));
+        assert!(!ip_matches("127.0.0.1", "300.1.1.1/8"));
+    }
+
+    #[test]
+    fn v4_mapped_peer_folds_back_to_ipv4() {
+        // 双栈监听下 IPv4 连接的 peer 是 ::ffff:a.b.c.d，必须还原
+        let mapped = "::ffff:203.0.113.5".parse::<IpAddr>().unwrap();
+        assert_eq!(normalize_ip_str("::ffff:203.0.113.5"), "203.0.113.5");
+        assert_eq!(peer_ip(SocketAddr::new(mapped, 8443)), "203.0.113.5");
+        // 归一后能命中 IPv4 规则（旧实现对 ::ffff: 写法全部失配）
+        assert!(ip_matches("::ffff:172.16.5.9", "172.16.0.0/12"));
+        // 纯 v6 保持 v6
+        assert_eq!(normalize_ip_str("2001:DB8::1"), "2001:db8::1");
+        // 非法字符串原样返回（日志/键场景不能丢信息）
+        assert_eq!(normalize_ip_str("proxy.example"), "proxy.example");
+    }
+
+    #[test]
+    fn authority_normalization_understands_ipv6() {
+        // bracket + 端口
+        assert_eq!(normalize_authority("[::1]:8080"), "::1:8080");
+        assert_eq!(normalize_authority("[::1]"), "::1");
+        // 默认端口剥掉
+        assert_eq!(normalize_authority("[::1]:80"), "::1");
+        assert_eq!(normalize_authority("[::1]:443"), "::1");
+        // 全零组展开写法归一到压缩形
+        assert_eq!(normalize_authority("[0:0:0:0:0:0:0:1]:8080"), "::1:8080");
+        // v4-mapped 折叠，与 v4 直连写法等价
+        assert_eq!(normalize_authority("[::ffff:127.0.0.1]:8080"), "127.0.0.1:8080");
+        assert_eq!(normalize_authority("[::ffff:7f00:1]"), "127.0.0.1");
+        // bracket 内以 :80 结尾的地址不会被误剥端口
+        assert_eq!(normalize_authority("[::80]"), "::80");
+        // 主机名行为保持
+        assert_eq!(normalize_authority("NAS.Local:8080"), "nas.local:8080");
+        assert_eq!(normalize_authority("nas.local"), "nas.local");
+    }
+
+    #[test]
+    fn csrf_and_ws_origin_accept_ipv6_hosts() {
+        // Host/Origin 均为 IPv6 字面量，压缩写法不同也要相等
+        let map = headers(&[("host", "[2001:db8::1]:4242"), ("origin", "http://[2001:db8:0::1]:4242")]);
+        assert!(origin_matches_host(&map, &Method::POST));
+        // v4-mapped Origin 与 v4 Host 等价
+        let map = headers(&[("host", "127.0.0.1:4242"), ("origin", "http://[::ffff:127.0.0.1]:4242")]);
+        assert!(origin_matches_host(&map, &Method::POST));
+        // 不同地址必须拒绝
+        let map = headers(&[("host", "[::1]:4242"), ("origin", "http://[::2]:4242")]);
+        assert!(!origin_matches_host(&map, &Method::POST));
+    }
+
+    #[test]
+    fn forwarded_value_strips_ipv6_brackets() {
+        assert_eq!(forwarded_ip_candidate("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(forwarded_ip_candidate("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(forwarded_ip_candidate(" 198.51.100.7 "), "198.51.100.7");
+        // 无法解析的值原样保留
+        assert_eq!(forwarded_ip_candidate("proxy.local"), "proxy.local");
     }
 }
