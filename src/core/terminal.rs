@@ -46,10 +46,14 @@ pub fn clamp_size(cols: u64, rows: u64) -> (u16, u16) {
 }
 
 /// 拉起 shell 的方式（设计文档 3.3.7）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellOptions {
     /// 纯净模式：跳过 profile / rc，专用于配置文件死循环或严重报错时的救急
     pub no_profile: bool,
+    /// 配置覆盖的 shell（`[terminal].shell`；空 = 自动探测）
+    pub shell: String,
+    /// 配置覆盖的启动参数（`[terminal].args`；非空 = 完全替换内置参数）
+    pub args: Vec<String>,
 }
 
 /// 展开成绝对路径并去掉 canonicalize 留下的 `\\?\` 前缀。
@@ -282,7 +286,9 @@ fn default_shell() -> String {
     if fallback.is_file() {
         return fallback.to_string_lossy().to_string();
     }
-    "powershell.exe".to_string()
+    // 理论上到不了：System32 的 5.1 在任何 Windows 都在；真被裁剪掉就交 cmd.exe
+    // （设计文档 3.3.1：pwsh → powershell 5.1 → cmd）
+    "cmd.exe".to_string()
 }
 
 /// bash 的真实落点（设计文档 3.3.1）。
@@ -303,21 +309,51 @@ fn bash_path() -> Option<String> {
     candidates.into_iter().find(|p| Path::new(p).is_file())
 }
 
+/// zsh 的真实落点（设计文档 3.3.5）。
+///
+/// `$SHELL` 缺失或无效时的第一顺位回退：Termux 用户普遍装 zsh 当默认 shell，
+/// 但 systemd / docker 拉起的服务进程拿不到 `$SHELL`，只探测 bash 会让
+/// 「终端里的环境和 SSH 里不一样」。顺序：`$PREFIX/bin/zsh` → `/bin/zsh` → `/usr/bin/zsh`。
+#[cfg(not(windows))]
+fn zsh_path() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        let prefix = prefix.trim().trim_end_matches('/');
+        if !prefix.is_empty() {
+            candidates.push(format!("{prefix}/bin/zsh"));
+        }
+    }
+    candidates.push("/bin/zsh".to_string());
+    candidates.push("/usr/bin/zsh".to_string());
+    candidates.into_iter().find(|p| Path::new(p).is_file())
+}
+
 #[cfg(not(windows))]
 fn default_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .map(|shell| shell.trim().to_string())
         .filter(|shell| !shell.is_empty() && Path::new(shell).is_file())
-        // `$SHELL` 缺失（systemd 拉起、docker exec 无 env）时按 bash_path 探测；
-        // 连 bash 都没有（Alpine 等）退回 POSIX 的 /bin/sh，绝不给一个不存在的路径
+        // `$SHELL` 缺失（systemd 拉起、docker exec 无 env）时依次探测 zsh → bash；
+        // 最后的 sh 兜底先试 Termux 的 $PREFIX/bin/sh（设计文档 3.3.1），
+        // 再退 POSIX 的 /bin/sh——绝不给一个不存在的路径
+        .or_else(zsh_path)
         .or_else(bash_path)
-        .unwrap_or_else(|| "/bin/sh".to_string())
+        .unwrap_or_else(|| {
+            std::env::var("PREFIX")
+                .ok()
+                .map(|prefix| format!("{}/bin/sh", prefix.trim().trim_end_matches('/')))
+                .filter(|path| Path::new(path).is_file())
+                .unwrap_or_else(|| "/bin/sh".to_string())
+        })
 }
 
 /// 按模式挑 shell（设计文档 3.3.7）。
+///
+/// 配置覆盖优先级：`[terminal].shell` 非空时优先；纯净模式（救急通道）忽略一切配置，
+/// 固定走自动探测——配置文件把 shell 卡死后，用户还得靠它进得来修配置。
 #[cfg(windows)]
-fn shell_for(_options: ShellOptions) -> String {
+fn shell_for(_options: &ShellOptions) -> String {
     // Windows 的纯净模式是同一个 shell exe 加 `-NoProfile`，二进制不变
     default_shell()
 }
@@ -327,13 +363,30 @@ fn shell_for(_options: ShellOptions) -> String {
 /// `--noprofile --norc` 是 bash 专有参数，用户 `$SHELL` 是 zsh/fish 时直接传过去
 /// 会启动失败；所以只在确实有 bash 时切过去，没有就退回原 shell（不加参数）。
 #[cfg(not(windows))]
-fn shell_for(options: ShellOptions) -> String {
+fn shell_for(options: &ShellOptions) -> String {
     if options.no_profile {
         if let Some(bash) = bash_path() {
             return bash;
         }
     }
     default_shell()
+}
+
+/// 配置覆盖的 shell 是否生效（设计文档 3.3.5）。
+///
+/// 返回 `Some` 用配置值；`None` 走自动探测。纯净模式恒为 `None`。
+fn configured_shell(options: &ShellOptions) -> Option<String> {
+    if options.no_profile {
+        return None;
+    }
+    let trimmed = options.shell.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// 配置覆盖的启动参数是否生效：非空则**完全替换**内置参数（`-l` / `-NoExit` 等）。
+/// 纯净模式恒为 `None`——救急通道的 `--noprofile --norc` 不能被配置顶掉。
+fn configured_args(options: &ShellOptions) -> Option<&[String]> {
+    (!options.no_profile && !options.args.is_empty()).then_some(options.args.as_slice())
 }
 
 /// 组装 Windows `-Command` 的载荷（设计文档 3.3.5）。
@@ -363,7 +416,7 @@ fn windows_command_payload(history_path: Option<&str>) -> String {
 fn apply_shell_args(
     command: &mut CommandBuilder,
     _shell: &str,
-    options: ShellOptions,
+    options: &ShellOptions,
     history_path: Option<&str>,
 ) {
     command.arg("-NoLogo");
@@ -380,18 +433,11 @@ fn apply_shell_args(
 /// `bash -l` / `zsh -l` 会读 `/etc/profile` 与用户的 profile 脚本，Conda、nvm、fnm
 /// 这些工具的初始化都藏在里面；不登录启动的 shell 会让用户觉得「终端里的环境和 SSH 里不一样」。
 /// 纯净模式（救急）则反过来：跳过 profile 与 rc，并固定用 bash 以保证 `--noprofile --norc` 有效。
+///
+/// 历史重定向（`HISTFILE`）不在这里注入——它挪到了 `create()`，
+/// 因为 `[terminal].args` 自定义参数会整段替换这里的参数，而历史隔离必须永远生效。
 #[cfg(not(windows))]
-fn apply_shell_args(
-    command: &mut CommandBuilder,
-    shell: &str,
-    options: ShellOptions,
-    history_path: Option<&str>,
-) {
-    // 历史重定向靠 HISTFILE 环境变量（bash/zsh 都认），放在参数处理之前
-    if let Some(path) = history_path {
-        command.env("HISTFILE", path);
-    }
-
+fn apply_shell_args(command: &mut CommandBuilder, shell: &str, options: &ShellOptions) {
     let name = Path::new(shell)
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -491,7 +537,9 @@ impl TerminalManager {
             })
             .map_err(|e| format!("创建 PTY 失败：{e}"))?;
 
-        let shell = shell_for(options);
+        // 配置覆盖优先级（设计文档 3.3.5）：[terminal].shell > 自动探测。
+        // 纯净模式是配置写坏后的救急通道，必须忽略一切自定义，固定走探测结果。
+        let shell = configured_shell(&options).unwrap_or_else(|| shell_for(&options));
         let mut command = CommandBuilder::new(&shell);
         // 统一成原生路径再交给 PTY：前端传来的 `C:/Users/me` 在这里变成
         // `C:\Users\me`，避免个别 shell/带空格目录下的启动失败
@@ -505,7 +553,22 @@ impl TerminalManager {
         // 只覆盖「终端能力」相关变量
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        apply_shell_args(&mut command, &shell, options, env.history_path.as_deref());
+        // 历史隔离（设计文档 3.3.5）永远生效：放在参数替换逻辑之外，
+        // `[terminal].args` 自定义参数也拦不住它（bash/zsh 都认 HISTFILE）
+        #[cfg(not(windows))]
+        if let Some(path) = env.history_path.as_deref() {
+            command.env("HISTFILE", path);
+        }
+        // `[terminal].args` 非空 → 完全替换内置参数（-l / -NoExit / -Command 载荷
+        // 都不再追加）。Windows 下 chcp 与 PSReadLine 历史重定向随 -Command 一起
+        // 失效，由使用者自己的配置负责（模板注释已说明）。
+        if let Some(args) = configured_args(&options) {
+            for arg in args {
+                command.arg(arg);
+            }
+        } else {
+            apply_shell_args(&mut command, &shell, &options, env.history_path.as_deref());
+        }
 
         let child = pair
             .slave
@@ -724,7 +787,7 @@ mod tests {
     #[test]
     fn windows_args_keep_noexit_and_profile() {
         let mut command = CommandBuilder::new("powershell.exe");
-        apply_shell_args(&mut command, "powershell.exe", ShellOptions::default(), Some("C:/h.txt"));
+        apply_shell_args(&mut command, "powershell.exe", &ShellOptions::default(), Some("C:/h.txt"));
         let args: Vec<String> = command
             .get_argv()
             .iter()
@@ -736,12 +799,15 @@ mod tests {
 
         // 纯净模式逃生舱
         let mut pure = CommandBuilder::new("powershell.exe");
-        apply_shell_args(
-            &mut pure,
-            "powershell.exe",
-            ShellOptions { no_profile: true },
-            None,
-        );
+                   apply_shell_args(
+                    &mut pure,
+                    "powershell.exe",
+                    &ShellOptions {
+                        no_profile: true,
+                        ..Default::default()
+                    },
+                    None,
+                );
         let pure_args: Vec<String> = pure
             .get_argv()
             .iter()
@@ -758,5 +824,48 @@ mod tests {
         assert!(manager.snapshot().is_empty());
         assert_eq!(manager.len(), 0);
         assert!(!manager.force_close("not-a-session"));
+    }
+
+    #[test]
+    fn config_shell_override_priority() {
+        use super::{configured_args, configured_shell};
+        // 配置 shell 非空 → 生效
+        let options = ShellOptions {
+            shell: "  /usr/bin/zsh  ".to_string(),
+            args: vec!["-c".to_string(), "tmux new -A -s asmoday".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(configured_shell(&options).as_deref(), Some("/usr/bin/zsh"));
+        assert_eq!(configured_args(&options), Some(options.args.as_slice()));
+
+        // 配置为空/纯空白 → 走自动探测
+        let empty = ShellOptions::default();
+        assert_eq!(configured_shell(&empty), None);
+        assert_eq!(configured_args(&empty), None);
+
+        // 纯净模式是救急通道：配置再怎么写都被忽略
+        let pure = ShellOptions {
+            no_profile: true,
+            shell: "/usr/bin/fish".to_string(),
+            args: vec!["-x".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(configured_shell(&pure), None);
+        assert_eq!(configured_args(&pure), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn zsh_detected_before_bash_when_shell_env_missing() {
+        use super::{bash_path, zsh_path};
+        // 探测函数只回真实存在的路径；两条都在与本测试同机时 zsh 优先级更高
+        // 由 default_shell 的 or_else 顺序保证（$SHELL → zsh → bash → sh），
+        // 这里验证「有 zsh 时探测得到、且不因 bash 存在而误报」。
+        if let Some(zsh) = zsh_path() {
+            assert!(zsh.ends_with("zsh"), "zsh 探测结果必须是 zsh：{zsh}");
+        }
+        if let Some(bash) = bash_path() {
+            assert!(bash.ends_with("bash"), "bash 探测结果必须是 bash：{bash}");
+        }
     }
 }

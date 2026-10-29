@@ -135,6 +135,43 @@ body,
   height: 100%;
 }
 
+/* ============================================================
+   JetBrainsMono Nerd Font（终端专用，随应用打包）
+   Nerd Font 图标区（U+E000-U+F8FF、U+F0000+）只有这份字体里有，
+   starship / oh-my-zsh 的 powerline 图标、文件夹/Git 分支符号都靠它；
+   不内嵌的话这些字形全部渲染成豆腐块。
+   用相对路径经 Vite 打包（hashed asset），子路径部署下也能正确解析；
+   放 public/ 绝对路径在 base_url 子路径部署时会 404。
+   ============================================================ */
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font';
+  src: url('./assets/fonts/JetBrainsMonoNerdFont-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font';
+  src: url('./assets/fonts/JetBrainsMonoNerdFont-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font';
+  src: url('./assets/fonts/JetBrainsMonoNerdFont-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font';
+  src: url('./assets/fonts/JetBrainsMonoNerdFont-BoldItalic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
 body {
   margin: 0;
   background-color: var(--bg-base);

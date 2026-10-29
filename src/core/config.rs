@@ -72,6 +72,17 @@ ffmpeg_path = ""
 # 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束。
 upload_max_size_mb = 0
 
+# 终端 PTY 拉起覆盖（设计文档 3.3.5）。两项都留空/缺省时走自动探测：
+# Windows pwsh → powershell；类 Unix $SHELL → zsh → bash → sh。
+# [terminal]
+# 自定义 shell（绝对路径或 PATH 内可执行名，如 "/usr/bin/zsh"、"pwsh"）
+# shell = ""
+# 自定义启动参数。**设置后完全替换**内置参数（-l / -NoExit 等都不再加），
+# 例如接入 tmux：args = ["-c", "tmux new -A -s asmoday"]。
+# 注意：历史记录隔离依赖 shell 自身的 HISTFILE / PSReadLine 配置，
+# 走自定义参数时这部分由你自己的配置负责。
+# args = []
+
 # 日志策略（设计文档 3.7）：默认生产级克制，排障时分级开启，结构化可选。
 [log]
 # 控制台最低级别：debug | info | warn | error | off。默认 info——终端里只出现关键信息。
@@ -122,6 +133,8 @@ pub struct Config {
     pub media: MediaConfig,
     /// 日志分级与多输出（设计文档 3.7）
     pub log: LogConfig,
+    /// 终端 PTY 拉起覆盖（设计文档 3.3.5）
+    pub terminal: TerminalConfig,
 }
 
 impl Default for Config {
@@ -134,8 +147,23 @@ impl Default for Config {
             shares: SharesConfig::default(),
             media: MediaConfig::default(),
             log: LogConfig::default(),
+            terminal: TerminalConfig::default(),
         }
     }
+}
+
+/// `[terminal]`：PTY 拉起覆盖（设计文档 3.3.5）。
+///
+/// 两项都缺省时走自动探测；`shell` 非空则优先于 `$SHELL` 与平台探测；
+/// `args` 非空则**完全替换**内置启动参数（`-l` / `-NoExit` 等一律不再追加），
+/// 供 `["-c", "tmux new -A -s asmoday"]` 这类自定义接入。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalConfig {
+    /// 覆盖自动探测的 shell（绝对路径或 PATH 内可执行名；空 = 自动探测）
+    pub shell: String,
+    /// 覆盖默认启动参数（空 = 用内置参数）
+    pub args: Vec<String>,
 }
 
 /// 危险配置自检结果（设置页警告条 / 启动日志共用）

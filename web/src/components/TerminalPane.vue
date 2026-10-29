@@ -5,7 +5,7 @@
  * 客户端 → 服务端：键盘输入走 Binary，控制帧（resize）走 Text JSON；
  * 服务端 → 客户端：控制帧（ready/error）走 Text，PTY 输出走 Binary。
  */
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -64,30 +64,38 @@ const encoder = new TextEncoder()
 
 // 终端渲染区恒为深色：ANSI 高亮（ls 目录、vim 语法色）只在深底上可读，
 // 不跟随全局浅色主题（设计文档 v2.7.0 3.3.5）。
-// 蓝紫均取亮色变体，避免深底上过暗看不清。
+// 色板用 VS Code Dark+（标准 16 色 ANSI 映射）：对比度高、 saturated 足，
+// neofetch 色块 / ls --color / vim 主题都按这套色相设计，观感与本地终端一致。
 const darkTheme = {
-  background: '#101216',
-  foreground: '#e2e8f0',
-  cursor: '#6366f1',
-  cursorAccent: '#101216',
-  selectionBackground: 'rgba(99,102,241,0.35)',
-  black: '#1f2330',
-  red: '#f87171',
-  green: '#34d399',
-  yellow: '#fbbf24',
-  blue: '#60a5fa',
-  magenta: '#c084fc',
-  cyan: '#22d3ee',
-  white: '#e2e8f0',
-  brightBlack: '#9aa3b2',
-  brightRed: '#fca5a5',
-  brightGreen: '#6ee7b7',
-  brightYellow: '#fde68a',
-  brightBlue: '#93c5fd',
-  brightMagenta: '#d8b4fe',
-  brightCyan: '#67e8f9',
-  brightWhite: '#f8fafc',
+  background: '#1e1e1e',
+  foreground: '#cccccc',
+  cursor: '#ffffff',
+  cursorAccent: '#1e1e1e',
+  selectionBackground: '#264f78',
+  // 标准 ANSI（VS Code Dark+）
+  black: '#000000',
+  red: '#cd3131',
+  green: '#0dbc79',
+  yellow: '#e5e510',
+  blue: '#2472c8',
+  magenta: '#bc3fbc',
+  cyan: '#11a8cd',
+  white: '#e5e5e5',
+  // bright ANSI
+  brightBlack: '#666666',
+  brightRed: '#f14c4c',
+  brightGreen: '#23d18b',
+  brightYellow: '#f5f543',
+  brightBlue: '#3b8eea',
+  brightMagenta: '#d670d6',
+  brightCyan: '#29b8db',
+  brightWhite: '#e5e5e5',
 }
+
+/** xterm 等宽字体链：Nerd Font 随应用打包（src/style.css @font-face），
+ *  专治 starship / oh-my-zsh 的 powerline 图标与 Git 分支符号变豆腐块 */
+const TERMINAL_FONT_FAMILY =
+  '"JetBrainsMono Nerd Font", "Cascadia Code", Consolas, "Courier New", monospace'
 
 /** 前端绝不自作聪明传 `~` / `%USERPROFILE%`：未指定目录时后端用 dirs::home_dir() 兜底 */
 const PLACEHOLDER_PATH = /^(~|\$HOME|\$\{HOME\}|%USERPROFILE%)([\\/]|$)/i
@@ -276,7 +284,7 @@ onMounted(() => {
   term = new Terminal({
     cursorBlink: true,
     fontSize: 13,
-    fontFamily: "'Cascadia Code', Consolas, 'Courier New', monospace",
+    fontFamily: TERMINAL_FONT_FAMILY,
     lineHeight: 1.35,
     scrollback: 5000,
     theme: darkTheme,
@@ -287,9 +295,30 @@ onMounted(() => {
   term.loadAddon(fit)
   term.open(host.value)
 
-  requestAnimationFrame(() => {
-    fit?.fit()
-    term?.focus()
+  // Tab 键必须进 PTY：浏览器默认行为是移动焦点（自动补全直接失效）。
+  // xterm 收到 return false 会走自己的键盘处理流程把 \t 发给 onData。
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type === 'keydown' && event.key === 'Tab') {
+      event.preventDefault()
+      event.stopPropagation()
+      sendRaw('\t')
+      return false
+    }
+    return true
+  })
+
+  // nextTick 确保 host 已完成布局再 fit：挂载瞬间容器尺寸可能是 0，
+  // 提前 fit 会算出错误的 cols/rows，PTY 与画布列数错位（色块换行错乱）。
+  void nextTick(() => {
+    requestAnimationFrame(() => {
+      try {
+        fit?.fit()
+      } catch {
+        /* 容器尚未布局 */
+      }
+      sendResize()
+      term?.focus()
+    })
   })
 
   term.onData((data) => {
@@ -356,5 +385,14 @@ defineExpose({ sendRaw, reconnect, focus: () => term?.focus() })
 </script>
 
 <template>
-  <div ref="host" class="h-full w-full overflow-hidden px-3 py-2" />
+  <!-- 渲染区强制深色（设计文档 3.3.4 / 8.4.4）：xterm 初始化与字体加载前也不能白闪；
+       外壳（标签栏/底边）由 TerminalView 跟随全局主题，这里只管画布本身 -->
+  <div ref="host" class="terminal-canvas h-full w-full overflow-hidden px-3 py-2" />
 </template>
+
+<style scoped>
+.terminal-canvas {
+  background: #1e1e1e;
+  border-radius: 6px;
+}
+</style>

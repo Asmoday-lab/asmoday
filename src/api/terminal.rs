@@ -24,6 +24,9 @@ use crate::AppState;
 #[derive(Debug, Deserialize)]
 pub struct TerminalQuery {
     pub path: Option<String>,
+    /// 挂载点 id（设计文档 3.2.2）。传了则 CWD = 挂载点根 + `path` 相对部分，
+    /// 经 `path_guard` 归属校验后才交给 PTY；未传时 `path` 按绝对路径解析。
+    pub mount_id: Option<String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub session_id: Option<String>,
@@ -77,6 +80,16 @@ pub async fn ws_handler(
         fs::load_roots(&config, &state.cwd)
     };
 
+    // 挂载点集合与终端拉起覆盖（设计文档 3.3.5）：同一次读锁拿全
+    let (mounts, shell_override, args_override) = {
+        let config = state.config.read().await;
+        (
+            crate::core::path_guard::load(&config, &state.cwd),
+            config.terminal.shell.trim().to_string(),
+            config.terminal.args.clone(),
+        )
+    };
+
     // 主目录：dirs 是跨平台唯一可靠来源（Windows 走 Known Folder API，
     // Linux/macOS 依次看 $HOME、passwd、NSHomeDirectory，自己读环境变量会漏）
     let home: Option<PathBuf> = dirs::home_dir().filter(|path| path.is_dir());
@@ -98,49 +111,91 @@ pub async fn ws_handler(
     // 而不是把 WS 握手直接拒掉——浏览器读不到握手失败的响应体，用户只会看到"连不上"。
     let mut warning: Option<String> = None;
 
-    // 占位符兜底：万一前端（或旧缓存里的 JS）传了 `~`、`$HOME`、`%USERPROFILE%`，
-    // 这里展开成真实主目录，避免 Shell 因为字面量路径不存在而拉不起来。
-    let requested = query
-        .path
+    let fallback_cwd = || default_cwd(&roots, home.as_deref());
+
+    // CWD 解析（设计文档 3.2.2 / 6.3）：mount_id 优先（挂载根 + 相对 path），
+    // 其次绝对 path，最后默认目录。归属校验统一走 path_guard，越权一律拒绝。
+    let mut cwd: PathBuf = if let Some(id) = query
+        .mount_id
         .as_deref()
         .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|raw| match expand_home(raw, home.as_deref()) {
-            Some(expanded) => {
-                crate::log_warn!(
-                    "terminal path received a home placeholder '{raw}'; resolved to the system home directory"
-                );
-                warning =
-                    Some("path 不要传 ~ 或 %USERPROFILE%，已按系统主目录解析".to_string());
-                expanded.to_string_lossy().into_owned()
-            }
-            None => raw.to_string(),
-        });
-
-    // 目标目录：优先用 path（可以是目录，也可以是文件所在目录），否则用默认根
-    let mut cwd: PathBuf = match requested.as_deref() {
-        Some(raw) => match fs::resolve_existing(raw, &allowed) {
-            Ok(path) => {
-                if path.is_dir() {
-                    path
-                } else {
-                    path.parent().map(Path::to_path_buf).unwrap_or(path)
+        .filter(|s| !s.is_empty())
+    {
+        match mounts.find(id) {
+            Some(mount) if mount.root.is_some() => {
+                let raw = query.path.as_deref().unwrap_or("");
+                match crate::core::path_guard::resolve_existing(mount, raw) {
+                    Ok(path) => {
+                        if path.is_dir() {
+                            path
+                        } else {
+                            // 文件也可以作为起点：取其所在目录（与文件管理「在此打开终端」一致）
+                            path.parent().map(Path::to_path_buf).unwrap_or(path)
+                        }
+                    }
+                    Err(FsError::NotFound(_)) => {
+                        warning = Some(format!("目录已不存在（挂载点 {id}），已切换到默认目录"));
+                        match fallback_cwd() {
+                            Some(path) => path,
+                            None => return reject(FsError::NotFound("没有可用的挂载点".to_string())),
+                        }
+                    }
+                    Err(err) => return reject(err),
                 }
             }
-            Err(FsError::NotFound(_)) => {
-                warning = Some(format!("目录已不存在（{raw}），已切换到默认目录"));
-                match default_cwd(&roots, home.as_deref()) {
+            _ => {
+                warning = Some("挂载点不存在或已离线，已切换到默认目录".to_string());
+                match fallback_cwd() {
                     Some(path) => path,
                     None => return reject(FsError::NotFound("没有可用的挂载点".to_string())),
                 }
             }
-            // 越权一律拒绝，不能因为"路径不存在"以外的原因退回默认目录
-            Err(err) => return reject(err),
-        },
-        None => match default_cwd(&roots, home.as_deref()) {
-            Some(path) => path,
-            None => return reject(FsError::NotFound("没有可用的挂载点".to_string())),
-        },
+        }
+    } else {
+        // 占位符兜底：万一前端（或旧缓存里的 JS）传了 `~`、`$HOME`、`%USERPROFILE%`，
+        // 这里展开成真实主目录，避免 Shell 因为字面量路径不存在而拉不起来。
+        let requested = query
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|raw| match expand_home(raw, home.as_deref()) {
+                Some(expanded) => {
+                    crate::log_warn!(
+                        "terminal path received a home placeholder '{raw}'; resolved to the system home directory"
+                    );
+                    warning =
+                        Some("path 不要传 ~ 或 %USERPROFILE%，已按系统主目录解析".to_string());
+                    expanded.to_string_lossy().into_owned()
+                }
+                None => raw.to_string(),
+            });
+
+        // 目标目录：优先用 path（可以是目录，也可以是文件所在目录），否则用默认根
+        match requested.as_deref() {
+            Some(raw) => match fs::resolve_existing(raw, &allowed) {
+                Ok(path) => {
+                    if path.is_dir() {
+                        path
+                    } else {
+                        path.parent().map(Path::to_path_buf).unwrap_or(path)
+                    }
+                }
+                Err(FsError::NotFound(_)) => {
+                    warning = Some(format!("目录已不存在（{raw}），已切换到默认目录"));
+                    match fallback_cwd() {
+                        Some(path) => path,
+                        None => return reject(FsError::NotFound("没有可用的挂载点".to_string())),
+                    }
+                }
+                // 越权一律拒绝，不能因为"路径不存在"以外的原因退回默认目录
+                Err(err) => return reject(err),
+            },
+            None => match fallback_cwd() {
+                Some(path) => path,
+                None => return reject(FsError::NotFound("没有可用的挂载点".to_string())),
+            },
+        }
     };
 
     // 兜底：目录已不存在时退回工作目录
@@ -155,6 +210,9 @@ pub async fn ws_handler(
     let session_id = query.session_id.filter(|s| !s.trim().is_empty());
     let options = crate::core::terminal::ShellOptions {
         no_profile: query.no_profile.unwrap_or(false),
+        // 配置覆盖（设计文档 3.3.5）：[terminal].shell > 自动探测；args 非空完全替换
+        shell: shell_override,
+        args: args_override,
     };
 
     // 历史记录强制隔离（设计文档 3.3.5）：不做探测、不做条件分支，
