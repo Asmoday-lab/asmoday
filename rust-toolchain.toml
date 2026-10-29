@@ -1,8 +1,8 @@
 # 固定工具链通道与组件：本地 `cargo fmt` / `cargo clippy` 能直接跑，
-# 不用每个人自己 `rustup component add`；CI 与 release 用的也是 stable。
+# 不用每个人自己 `rustup component add`；发版流水线用的也是 stable。
 #
 # 不钉具体小版本（如 1.99.1）：本项目不是库，没有下游 MSRV 约束，
-# 钉死反而要每次升级都改一遍三处（这里 / ci.yml / release.yml）。
+# 钉死反而要每次升级都改一遍两处（这里 / release.yml）。
 # 真正的下限写在 Cargo.toml 的 rust-version 里。
 [toolchain]
 channel = "stable"
