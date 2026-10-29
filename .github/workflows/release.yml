@@ -37,7 +37,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
-          # 【关键修复】你的 Vite 输出在项目根目录的 dist，而不是 web/dist
+          # 你的 Vite 输出在项目根目录的 dist
           path: dist
 
   # ==========================================
@@ -57,14 +57,10 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+          # 使用 macos-13 避免 GitHub 排队缺货问题
           - os: macos-13
             target: aarch64-apple-darwin
-            experimental: true # 允许失败
           - os: macos-13
-            target: x86_64-apple-darwin
-            experimental: true # 允许失败latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
             target: x86_64-apple-darwin
 
     steps:
@@ -74,7 +70,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: frontend-dist
-          # 【关键修复】下载到项目根目录的 dist，供 rust-embed 吸收
+          # 下载到项目根目录的 dist，供 rust-embed 吸收
           path: dist
 
       - uses: dtolnay/rust-toolchain@stable
@@ -141,7 +137,7 @@ jobs:
     needs: build
     # 如果前面构建有任何一个因为排队失败，这步直接跳过（不算报错）
     if: ${{ needs.build.result == 'success' }}
-    runs-on: macos-13 # 使用不缺货的机器
+    runs-on: macos-13
     steps:
       - name: Download Mac Artifacts
         uses: actions/download-artifact@v4
@@ -174,12 +170,12 @@ jobs:
           name: macos-universal
           path: asmoday-macos-universal.tar.gz
 
-# ==========================================
+  # ==========================================
   # Job 4: 过滤产物并发布
   # ==========================================
   release:
     needs: [build, macos_universal]
-    # 即使 Mac 没合并成功，也强行发版
+    # 即使 Mac 合并失败，只要 build 核心任务成功，就强行发版
     if: ${{ always() && needs.build.result == 'success' }} 
     runs-on: ubuntu-latest
     steps:
@@ -189,7 +185,7 @@ jobs:
         with:
           path: dist
 
-      # 2. 精准提取（加容错逻辑，没Mac包就跳过）
+      # 2. 精准提取（加容错逻辑，没Mac包也不影响）
       - name: Select release assets
         run: |
           mkdir -p final_release
