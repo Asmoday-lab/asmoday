@@ -8,19 +8,19 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header, HeaderMap};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+use crate::AppState;
 use crate::core::auth::{hash_password, now_secs, random_token, verify_password};
 use crate::core::fs;
-use crate::AppState;
 
 /// 细节型错误（4xx 参数类）
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -84,7 +84,12 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>
         );
     }
 
-    let password_hash = match body.password.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    let password_hash = match body
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(password) => match hash_password(password) {
             Ok(hash) => Some(hash),
             Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -128,7 +133,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>
             "expires_at": expires_at,
         }))
         .into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("创建分享失败：{err}")),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建分享失败：{err}"),
+        ),
     }
 }
 
@@ -160,8 +168,12 @@ pub async fn list(State(state): State<AppState>) -> Response {
     });
 
     match rows {
-        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("读取失败：{err}")),
+        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() }))
+            .into_response(),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取失败：{err}"),
+        ),
     }
 }
 
@@ -174,7 +186,10 @@ pub async fn delete(State(state): State<AppState>, Path(token): Path<String>) ->
     match conn.execute("DELETE FROM shares WHERE token = ?1", [&token]) {
         Ok(0) => error_code(StatusCode::NOT_FOUND, "SHARE_NOT_FOUND", "Share not found"),
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败：{err}")),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("删除失败：{err}"),
+        ),
     }
 }
 
@@ -227,10 +242,14 @@ fn load_share(state: &AppState, token: &str) -> Result<ShareRow, Response> {
 }
 
 fn check_expiry(expires_at: Option<i64>) -> Result<(), Response> {
-    if let Some(expires) = expires_at {
-        if expires <= now_secs() {
-            return Err(error_code(StatusCode::GONE, "SHARE_EXPIRED", "Share link expired"));
-        }
+    if let Some(expires) = expires_at
+        && expires <= now_secs()
+    {
+        return Err(error_code(
+            StatusCode::GONE,
+            "SHARE_EXPIRED",
+            "Share link expired",
+        ));
     }
     Ok(())
 }
@@ -379,15 +398,30 @@ pub async fn info(
     headers: HeaderMap,
     peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) = match load_share(&state, &token) {
-        Ok(share) => share,
-        Err(response) => return response,
-    };
-    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
+    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) =
+        match load_share(&state, &token) {
+            Ok(share) => share,
+            Err(response) => return response,
+        };
+    if let Err(response) = guard(
+        &state,
+        &headers,
+        &token,
+        peer,
+        expires_at,
+        &password_hash,
+        &query,
+    )
+    .await
+    {
         return response;
     }
 
-    let name = path.split('/').filter(|s| !s.is_empty()).next_back().unwrap_or(&path).to_string();
+    let name = path
+        .split('/')
+        .rfind(|s| !s.is_empty())
+        .unwrap_or(&path)
+        .to_string();
 
     // **安全边界（设计文档 3.2.5）**：公开接口严禁返回物理路径 `path`——
     // 访客在 devtools 里就能看到宿主机目录结构。子路径导航全部用 token+sub，
@@ -411,19 +445,38 @@ pub async fn raw(
     headers: HeaderMap,
     peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) = match load_share(&state, &token) {
-        Ok(share) => share,
-        Err(response) => return response,
-    };
-    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
+    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) =
+        match load_share(&state, &token) {
+            Ok(share) => share,
+            Err(response) => return response,
+        };
+    if let Err(response) = guard(
+        &state,
+        &headers,
+        &token,
+        peer,
+        expires_at,
+        &password_hash,
+        &query,
+    )
+    .await
+    {
         return response;
     }
     if is_folder {
-        return error_code(StatusCode::BAD_REQUEST, "SHARE_NO_RAW", "Directory share has no direct link");
+        return error_code(
+            StatusCode::BAD_REQUEST,
+            "SHARE_NO_RAW",
+            "Directory share has no direct link",
+        );
     }
     // 设计文档 3.9：allow_download=false 时，任何带 ?download=1 的 raw 请求一律 403
     if !allow_download && query.download.unwrap_or(0) == 1 {
-        return error_code(StatusCode::FORBIDDEN, "E_FORBIDDEN", "Download is disabled for this share");
+        return error_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Download is disabled for this share",
+        );
     }
 
     let roots = {
@@ -446,15 +499,30 @@ pub async fn download(
     headers: HeaderMap,
     peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) = match load_share(&state, &token) {
-        Ok(share) => share,
-        Err(response) => return response,
-    };
-    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
+    let (path, is_folder, password_hash, allow_download, expires_at, _deleted) =
+        match load_share(&state, &token) {
+            Ok(share) => share,
+            Err(response) => return response,
+        };
+    if let Err(response) = guard(
+        &state,
+        &headers,
+        &token,
+        peer,
+        expires_at,
+        &password_hash,
+        &query,
+    )
+    .await
+    {
         return response;
     }
     if !allow_download {
-        return error_code(StatusCode::FORBIDDEN, "SHARE_DOWNLOAD_DISABLED", "Download disabled for this share");
+        return error_code(
+            StatusCode::FORBIDDEN,
+            "SHARE_DOWNLOAD_DISABLED",
+            "Download disabled for this share",
+        );
     }
 
     let roots = {
@@ -488,15 +556,30 @@ pub async fn list_entries(
     headers: HeaderMap,
     peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    let (path, is_folder, password_hash, _, expires_at, _deleted) = match load_share(&state, &token) {
+    let (path, is_folder, password_hash, _, expires_at, _deleted) = match load_share(&state, &token)
+    {
         Ok(share) => share,
         Err(response) => return response,
     };
-    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
+    if let Err(response) = guard(
+        &state,
+        &headers,
+        &token,
+        peer,
+        expires_at,
+        &password_hash,
+        &query,
+    )
+    .await
+    {
         return response;
     }
     if !is_folder {
-        return error_code(StatusCode::BAD_REQUEST, "SHARE_NOT_DIR", "Share is not a directory");
+        return error_code(
+            StatusCode::BAD_REQUEST,
+            "SHARE_NOT_DIR",
+            "Share is not a directory",
+        );
     }
 
     let roots = {
@@ -589,7 +672,11 @@ async fn stream_file(target: PathBuf, headers: &HeaderMap, as_attachment: bool) 
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
-    let disposition = if as_attachment { "attachment" } else { "inline" };
+    let disposition = if as_attachment {
+        "attachment"
+    } else {
+        "inline"
+    };
 
     let mut headers_out: Vec<(&'static str, String)> = vec![
         ("content-type", mime),
@@ -625,13 +712,24 @@ async fn stream_file(target: PathBuf, headers: &HeaderMap, as_attachment: bool) 
                 Ok(file) => file,
                 Err(_) => return error(StatusCode::NOT_FOUND, "文件已不存在"),
             };
-            if file.seek(std::io::SeekFrom::Start(range.start)).await.is_err() {
+            if file
+                .seek(std::io::SeekFrom::Start(range.start))
+                .await
+                .is_err()
+            {
                 return error(StatusCode::INTERNAL_SERVER_ERROR, "定位文件失败");
             }
             let limited = file.take(range.len());
-            headers_out.push(("content-range", format!("bytes {}-{}/{}", range.start, range.end, total)));
+            headers_out.push((
+                "content-range",
+                format!("bytes {}-{}/{}", range.start, range.end, total),
+            ));
             headers_out.push(("content-length", range.len().to_string()));
-            (StatusCode::PARTIAL_CONTENT, Body::from_stream(ReaderStream::new(limited))).into_response()
+            (
+                StatusCode::PARTIAL_CONTENT,
+                Body::from_stream(ReaderStream::new(limited)),
+            )
+                .into_response()
         }
         None => {
             let file = match tokio::fs::File::open(&target).await {
@@ -676,7 +774,17 @@ pub async fn verify(
         sub: None,
         download: None,
     };
-    if let Err(response) = guard(&state, &headers, &token, peer, expires_at, &password_hash, &query).await {
+    if let Err(response) = guard(
+        &state,
+        &headers,
+        &token,
+        peer,
+        expires_at,
+        &password_hash,
+        &query,
+    )
+    .await
+    {
         return response;
     }
     ok_json(json!({ "ok": true }))

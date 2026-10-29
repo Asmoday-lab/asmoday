@@ -200,12 +200,14 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedText, CodecError> {
 fn decode_utf16(body: &[u8], encoding: TextEncoding) -> Result<String, CodecError> {
     // 手写而非 encoding_rs：后者对 UTF-16 的编码方向支持不完整（输出会退化成
     // 单字节），解码方向也因此统一自己实现，避免两个方向行为不一致。
-    if body.len() % 2 != 0 {
+    if !body.len().is_multiple_of(2) {
         return Err(CodecError::UnknownEncoding);
     }
     let little = encoding == TextEncoding::Utf16Le;
     let units: Vec<u16> = body
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             if little {
                 u16::from_le_bytes([pair[0], pair[1]])
@@ -383,14 +385,26 @@ mod tests {
         assert!(decoded.has_bom);
         assert_eq!(decoded.text, "{\"a\":1}\n");
         // 原样加回
-        let bytes = encode(&decoded.text, decoded.encoding, decoded.eol, decoded.has_bom).unwrap();
+        let bytes = encode(
+            &decoded.text,
+            decoded.encoding,
+            decoded.eol,
+            decoded.has_bom,
+        )
+        .unwrap();
         assert_eq!(bytes, b"\xEF\xBB\xBF{\"a\":1}\n");
     }
 
     #[test]
     fn bom_is_never_added_when_absent() {
         let decoded = decode(b"{\"a\":1}\n").expect("no bom");
-        let bytes = encode(&decoded.text, decoded.encoding, decoded.eol, decoded.has_bom).unwrap();
+        let bytes = encode(
+            &decoded.text,
+            decoded.encoding,
+            decoded.eol,
+            decoded.has_bom,
+        )
+        .unwrap();
         assert_eq!(bytes, b"{\"a\":1}\n");
     }
 
@@ -408,7 +422,13 @@ mod tests {
     fn gbk_roundtrip_keeps_original_bytes() {
         let raw = [GBK_ZHONGWEN, b"\r\n"].concat();
         let decoded = decode(&raw).expect("gbk");
-        let bytes = encode(&decoded.text, decoded.encoding, decoded.eol, decoded.has_bom).unwrap();
+        let bytes = encode(
+            &decoded.text,
+            decoded.encoding,
+            decoded.eol,
+            decoded.has_bom,
+        )
+        .unwrap();
         assert_eq!(bytes, raw);
     }
 
@@ -421,18 +441,34 @@ mod tests {
 
     #[test]
     fn utf16_bom_roundtrip() {
-        let raw: Vec<u8> = [&[0xFF, 0xFE][..], &"hi\nthere\n".encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>()].concat();
+        let raw: Vec<u8> = [
+            &[0xFF, 0xFE][..],
+            &"hi\nthere\n"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        ]
+        .concat();
         let decoded = decode(&raw).expect("utf16le");
         assert_eq!(decoded.encoding, TextEncoding::Utf16Le);
         assert!(decoded.has_bom);
         assert_eq!(decoded.text, "hi\nthere\n");
-        let bytes = encode(&decoded.text, decoded.encoding, decoded.eol, decoded.has_bom).unwrap();
+        let bytes = encode(
+            &decoded.text,
+            decoded.encoding,
+            decoded.eol,
+            decoded.has_bom,
+        )
+        .unwrap();
         assert_eq!(bytes, raw);
     }
 
     #[test]
     fn binary_content_is_rejected() {
-        assert_eq!(decode(b"\x00\x01\x02binary").unwrap_err(), CodecError::Binary);
+        assert_eq!(
+            decode(b"\x00\x01\x02binary").unwrap_err(),
+            CodecError::Binary
+        );
     }
 
     #[test]
@@ -445,7 +481,13 @@ mod tests {
     #[test]
     fn file_without_trailing_newline_is_untouched() {
         let decoded = decode(b"no newline").expect("utf8");
-        let bytes = encode(&decoded.text, decoded.encoding, decoded.eol, decoded.has_bom).unwrap();
+        let bytes = encode(
+            &decoded.text,
+            decoded.encoding,
+            decoded.eol,
+            decoded.has_bom,
+        )
+        .unwrap();
         assert_eq!(bytes, b"no newline");
     }
 

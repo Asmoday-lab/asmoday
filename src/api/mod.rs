@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod compress;
 pub mod config;
 pub mod error;
 pub mod files;

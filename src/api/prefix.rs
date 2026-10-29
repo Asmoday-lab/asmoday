@@ -71,13 +71,13 @@ pub async fn apply(State(state): State<AppState>, mut request: Request, next: Ne
     if !prefix.is_empty() {
         let stripped = prefix.strip(request.uri().path()).to_string();
         // `strip` 不匹配时原样返回；只有真的变了才重建 URI（避免无谓分配）
-        if stripped != request.uri().path() {
-            if let Some(pq) = path_and_query(&stripped, request.uri().query()) {
-                let mut parts = request.uri().clone().into_parts();
-                parts.path_and_query = Some(pq);
-                if let Ok(uri) = axum::http::Uri::from_parts(parts) {
-                    *request.uri_mut() = uri;
-                }
+        if stripped != request.uri().path()
+            && let Some(pq) = path_and_query(&stripped, request.uri().query())
+        {
+            let mut parts = request.uri().clone().into_parts();
+            parts.path_and_query = Some(pq);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *request.uri_mut() = uri;
             }
         }
     }

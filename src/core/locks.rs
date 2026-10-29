@@ -42,10 +42,7 @@ impl PathLocks {
         for key in &keys {
             held.insert(key.clone());
         }
-        Ok(PathGuard {
-            locks: self,
-            keys,
-        })
+        Ok(PathGuard { locks: self, keys })
     }
 
     fn release(&self, keys: &[String]) {
@@ -84,8 +81,10 @@ mod tests {
     fn second_acquire_fails_fast() {
         let locks = PathLocks::new();
         let path = PathBuf::from("/tmp/asmoday-lock-test/a.txt");
-        let guard = locks.acquire(&[path.clone()]).expect("首次加锁应成功");
-        let err = match locks.acquire(&[path.clone()]) {
+        let guard = locks
+            .acquire(std::slice::from_ref(&path))
+            .expect("首次加锁应成功");
+        let err = match locks.acquire(std::slice::from_ref(&path)) {
             Ok(_) => panic!("second acquire should fail"),
             Err(err) => err,
         };
@@ -99,7 +98,7 @@ mod tests {
         let locks = PathLocks::new();
         let a = PathBuf::from("/tmp/asmoday-lock-test/a");
         let b = PathBuf::from("/tmp/asmoday-lock-test/b");
-        let _guard = locks.acquire(&[a.clone()]).unwrap();
+        let _guard = locks.acquire(std::slice::from_ref(&a)).unwrap();
         assert!(locks.acquire(&[a, b.clone()]).is_err());
         // 失败的批量加锁不能留下 b 的残留占用
         assert!(locks.acquire(&[b]).is_ok());
@@ -111,8 +110,10 @@ mod tests {
         let _guard = locks
             .acquire(&[PathBuf::from("/tmp/AsModay/Lock")])
             .unwrap();
-        assert!(locks
-            .acquire(&[PathBuf::from("/tmp/asmoday/lock")])
-            .is_err());
+        assert!(
+            locks
+                .acquire(&[PathBuf::from("/tmp/asmoday/lock")])
+                .is_err()
+        );
     }
 }

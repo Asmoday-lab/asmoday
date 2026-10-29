@@ -183,8 +183,8 @@ pub fn init(data_dir: &Path) {
 fn enable_windows_vt() {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
+        STD_OUTPUT_HANDLE, SetConsoleMode,
     };
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -229,10 +229,10 @@ fn write_to(sink_lock: &OnceLock<Mutex<Option<Sink>>>, line: &str) {
     if sink.written + line.len() as u64 > MAX_BYTES {
         rotate(sink);
     }
-    if let Some(file) = sink.file.as_mut() {
-        if file.write_all(line.as_bytes()).is_ok() {
-            sink.written += line.len() as u64;
-        }
+    if let Some(file) = sink.file.as_mut()
+        && file.write_all(line.as_bytes()).is_ok()
+    {
+        sink.written += line.len() as u64;
     }
 }
 
@@ -279,7 +279,10 @@ fn render_file_text(
     pid: u32,
 ) -> String {
     let suffix = source.map(|s| format!(" ({s})")).unwrap_or_default();
-    format!("{ts} [{}] [{pid}] {module}: {message}{suffix}\n", level.as_str())
+    format!(
+        "{ts} [{}] [{pid}] {module}: {message}{suffix}\n",
+        level.as_str()
+    )
 }
 
 /// JSON 行（结构化输出；ts 由调用方决定本地 / UTC 口径）
@@ -365,13 +368,14 @@ pub fn access(module: &str, message: &str) {
 /// 停机前强制 flush（优雅停机时调用，避免最后几行留在缓冲区）
 pub fn flush() {
     for sink_lock in [&MAIN_SINK, &ERROR_SINK] {
-        let Some(lock) = sink_lock.get() else { continue };
-        if let Ok(mut guard) = lock.lock() {
-            if let Some(sink) = guard.as_mut() {
-                if let Some(file) = sink.file.as_mut() {
-                    let _ = file.flush();
-                }
-            }
+        let Some(lock) = sink_lock.get() else {
+            continue;
+        };
+        if let Ok(mut guard) = lock.lock()
+            && let Some(sink) = guard.as_mut()
+            && let Some(file) = sink.file.as_mut()
+        {
+            let _ = file.flush();
         }
     }
 }
@@ -656,11 +660,16 @@ mod tests {
             42,
             false,
         );
-        assert_eq!(plain, "2026-10-28 23:00:00.000 [INFO] [42] core::fs_ops: copy done\n");
+        assert_eq!(
+            plain,
+            "2026-10-28 23:00:00.000 [INFO] [42] core::fs_ops: copy done\n"
+        );
 
-        let colored =
-            render_console_text(Level::Error, "a::b", "boom", None, "t", 1, true);
-        assert!(colored.contains("\x1b[31mERROR\x1b[0m"), "ERROR 应为红色：{colored:?}");
+        let colored = render_console_text(Level::Error, "a::b", "boom", None, "t", 1, true);
+        assert!(
+            colored.contains("\x1b[31mERROR\x1b[0m"),
+            "ERROR 应为红色：{colored:?}"
+        );
 
         let with_source = render_console_text(
             Level::Debug,

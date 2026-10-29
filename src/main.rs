@@ -2,6 +2,12 @@
 //!
 //! CLI 参数 > 环境变量 > config.toml（设计文档第 5 章）。
 
+// axum 的处理器普遍返回 `Result<_, Response>`：`Response` 自带 HeaderMap + Body，
+// 体积不小，于是每条 `Err` 分支都会触发 clippy::result_large_err。要消掉只能给
+// 每个处理器包一层 `Box`，那是给**错误路径**多加一次堆分配，纯亏；社区常见做法
+// 就是整 crate allow，把精力留给真正的 lint。
+#![allow(clippy::result_large_err)]
+
 mod api;
 mod core;
 
@@ -66,8 +72,7 @@ pub struct AppState {
 impl AppState {
     /// 打开一次 SQLite 连接（令牌表等轻量查询用）
     pub fn auth_connection(&self) -> Result<rusqlite::Connection, String> {
-        rusqlite::Connection::open(self.auth.db_path())
-            .map_err(|e| format!("打开数据库失败：{e}"))
+        rusqlite::Connection::open(self.auth.db_path()).map_err(|e| format!("打开数据库失败：{e}"))
     }
 }
 
@@ -131,7 +136,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         .unwrap_or_else(core::config::resolve_path);
     let (mut config, created) = core::config::load_or_create(&config_path).await?;
     if created {
-        println!("[asmoday] default config created: {}", config_path.display());
+        println!(
+            "[asmoday] default config created: {}",
+            config_path.display()
+        );
     }
     if let Ok(host) = std::env::var("ASMODAY_HOST") {
         let host = host.trim().to_string();
@@ -145,10 +153,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             config.server.host = host;
         }
     }
-    if let Ok(port) = std::env::var("ASMODAY_PORT") {
-        if let Ok(port) = port.trim().parse::<u16>() {
-            config.server.port = port;
-        }
+    if let Ok(port) = std::env::var("ASMODAY_PORT")
+        && let Ok(port) = port.trim().parse::<u16>()
+    {
+        config.server.port = port;
     }
     if let Some(port) = cli.port {
         config.server.port = port;
@@ -215,7 +223,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| format!("backup task failed: {e}"))??;
         println!(
             "[asmoday] database backed up to {} ({bytes} bytes)",
-            cli.backup.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            cli.backup
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         );
         return Ok(());
     }
@@ -339,7 +350,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     crate::log_info!("config file: {}", config_path.display());
     crate::log_info!("data directory: {}", data_dir.display());
     if addr.ip().is_unspecified() {
-        let stack = if addr.is_ipv6() { " (dual stack: IPv4 + IPv6)" } else { "" };
+        let stack = if addr.is_ipv6() {
+            " (dual stack: IPv4 + IPv6)"
+        } else {
+            ""
+        };
         crate::log_info!(
             "listening on {addr}{stack} (all interfaces; put a reverse proxy in front for public access)"
         );
@@ -422,9 +437,18 @@ fn public_routes() -> Router<AppState> {
         // 公开分享（令牌/口令/有效期/防盗链由处理器自行校验）
         .route("/api/public/share/{token}", get(api::shares::info))
         .route("/api/public/share/{token}/raw", get(api::shares::raw))
-        .route("/api/public/share/{token}/download", get(api::shares::download))
-        .route("/api/public/share/{token}/list", get(api::shares::list_entries))
-        .route("/api/public/share/{token}/verify", post(api::shares::verify))
+        .route(
+            "/api/public/share/{token}/download",
+            get(api::shares::download),
+        )
+        .route(
+            "/api/public/share/{token}/list",
+            get(api::shares::list_entries),
+        )
+        .route(
+            "/api/public/share/{token}/verify",
+            post(api::shares::verify),
+        )
 }
 
 /// 受保护路由（/api/* 与 /proxy/* 全量拦截）
@@ -498,10 +522,7 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/files/text", get(api::files::read_text))
         .route("/api/files/thumb", get(api::media::thumb))
-        .route(
-            "/api/files/upload",
-            axum::routing::put(api::files::upload),
-        )
+        .route("/api/files/upload", axum::routing::put(api::files::upload))
         .route("/api/files/search", get(api::files::search))
         .route("/api/files/subtitle", get(api::files::subtitle))
         .route("/api/media/browse", get(api::media::browse))
@@ -513,8 +534,14 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/media/favorites", get(api::media::favorites))
         .route("/api/media/cache", get(api::media::cache_stats))
         .route("/api/media/cache/clear", post(api::media::clear_cache))
-        .route("/api/shares", get(api::shares::list).post(api::shares::create))
-        .route("/api/shares/{token}", axum::routing::delete(api::shares::delete))
+        .route(
+            "/api/shares",
+            get(api::shares::list).post(api::shares::create),
+        )
+        .route(
+            "/api/shares/{token}",
+            axum::routing::delete(api::shares::delete),
+        )
         .route("/api/terminal/ws", get(api::terminal::ws_handler))
         .route("/api/terminal/sessions", get(api::terminal::list_sessions))
         .route(
@@ -524,8 +551,14 @@ fn protected_routes() -> Router<AppState> {
         .route("/proxy/{service_id}", any(api::proxy::handle_root))
         .route("/proxy/{service_id}/", any(api::proxy::handle_root))
         .route("/proxy/{service_id}/{*rest}", any(api::proxy::handle_rest))
-        .route("/api/tokens", get(api::tokens::list).post(api::tokens::create))
-        .route("/api/tokens/{id}", axum::routing::delete(api::tokens::delete))
+        .route(
+            "/api/tokens",
+            get(api::tokens::list).post(api::tokens::create),
+        )
+        .route(
+            "/api/tokens/{id}",
+            axum::routing::delete(api::tokens::delete),
+        )
 }
 
 /// WebDAV：独立入口，用 App Token 做 Basic 认证，不走 Cookie 中间件
@@ -536,11 +569,10 @@ fn dav_routes() -> Router<AppState> {
 }
 
 fn build_router(state: AppState) -> Router {
-    let protected = protected_routes()
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            api::auth::require_auth,
-        ));
+    let protected = protected_routes().route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        api::auth::require_auth,
+    ));
 
     public_routes()
         .merge(protected)
@@ -559,6 +591,9 @@ fn build_router(state: AppState) -> Router {
             state.clone(),
             api::security::security_headers,
         ))
+        // 传输层压缩（设计文档 2.4）：最外层，前端产物 / JSON / SVG 都压。
+        // 必须包在路由之后、安全头之外，才能把 index.html 回落也覆盖到。
+        .layer(api::compress::layer())
         .with_state(state)
 }
 
@@ -595,7 +630,9 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path) -> Result<(), String
     match auth.user_count() {
         Ok(0) => {}
         Ok(_) => {
-            crate::log_info!("administrator already exists; --init does not overwrite the password");
+            crate::log_info!(
+                "administrator already exists; --init does not overwrite the password"
+            );
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -753,8 +790,8 @@ mod tests {
 
     #[test]
     fn default_config_parses_and_validates() {
-        let config: Config = toml::from_str(core::config::DEFAULT_CONFIG_TOML)
-            .expect("默认配置必须能被自己解析");
+        let config: Config =
+            toml::from_str(core::config::DEFAULT_CONFIG_TOML).expect("默认配置必须能被自己解析");
         config.validate().expect("默认配置必须通过校验");
         assert_eq!(config.server.port, 4242);
         assert!(config.system.mounts.is_empty());

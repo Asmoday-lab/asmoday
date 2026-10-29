@@ -6,18 +6,18 @@
 
 use std::net::SocketAddr;
 
+use axum::Json;
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::AppState;
 use crate::core::auth::{now_secs, verify_password};
 use crate::core::totp;
-use crate::AppState;
 
 /// 会话 Cookie 名
 pub const SESSION_COOKIE: &str = "asmoday_session";
@@ -40,11 +40,9 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<AuthUser>()
-            .cloned()
-            .ok_or_else(|| json_error_code(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", "Unauthorized"))
+        parts.extensions.get::<AuthUser>().cloned().ok_or_else(|| {
+            json_error_code(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", "Unauthorized")
+        })
     }
 }
 
@@ -69,7 +67,9 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 /// 组装会话 Cookie（设计文档 3.1.3）：`Path` 跟 `base_url`、`Secure` 只在 HTTPS 下加。
 fn session_cookie(token: &str, max_age: i64, path: &str, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}={token}; Path={path}; HttpOnly; SameSite=Lax{secure}; Max-Age={max_age}")
+    format!(
+        "{SESSION_COOKIE}={token}; Path={path}; HttpOnly; SameSite=Lax{secure}; Max-Age={max_age}"
+    )
 }
 
 /// 当前请求下的 Cookie 作用域：`(Path, Secure)`。
@@ -101,11 +101,7 @@ async fn cookie_scope(
     };
 
     let via_trusted_proxy = peer
-        .map(|addr| {
-            trusted
-                .iter()
-                .any(|rule| ip_matches(&peer_ip(addr), rule))
-        })
+        .map(|addr| trusted.iter().any(|rule| ip_matches(&peer_ip(addr), rule)))
         .unwrap_or(false);
     let forwarded_https = headers
         .get("x-forwarded-proto")
@@ -194,7 +190,8 @@ fn requires_recent_verify(method: &Method, path: &str) -> bool {
     if !write {
         return false;
     }
-    matches!(path, "/api/tokens" | "/api/config" | "/api/config/raw") || path.starts_with("/api/tokens/")
+    matches!(path, "/api/tokens" | "/api/config" | "/api/config/raw")
+        || path.starts_with("/api/tokens/")
 }
 
 /// 统一的「客户端 IP 字符串」入口：`normalize_ip` 折叠 v4-mapped。
@@ -222,13 +219,19 @@ fn forwarded_ip_candidate(raw: &str) -> String {
 /// 这就是 CSWSH。这里按 Origin 严格比对；浏览器一定会带 Origin，
 /// 不带的是 curl / 脚本这类非浏览器客户端，本身没有 CSRF 面。
 pub(crate) fn ws_origin_allowed(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
         return true;
     };
     if origin.eq_ignore_ascii_case("null") {
         return false;
     }
-    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) else {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
         return false;
     };
     normalize_authority(authority_of(origin)) == normalize_authority(host)
@@ -238,14 +241,14 @@ pub(crate) fn ws_origin_allowed(headers: &HeaderMap) -> bool {
 /// 避免 `rsplit_once(':')` 把 `[::1]:8080` 的地址本体拆碎。
 fn split_authority(value: &str) -> (&str, Option<u16>) {
     let value = value.trim();
-    if let Some(rest) = value.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let host = &rest[..end];
-            let port = rest[end + 1..]
-                .strip_prefix(':')
-                .and_then(|p| p.parse().ok());
-            return (host, port);
-        }
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let host = &rest[..end];
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok());
+        return (host, port);
     }
     match value.rsplit_once(':') {
         // 冒号后全是数字才算端口；`example.com:` 之类残缺串按无端口处理
@@ -441,7 +444,11 @@ pub(crate) fn ip_matches(ip: &str, rule: &str) -> bool {
 ///
 /// 2FA 默认不跳过：用户开了 TOTP 且没有显式 `skip_2fa=true` 时返回 None，
 /// 让请求回落到本地登录把 OTP 走完（Header 直通不能成为绕过第二因子的后门）。
-async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<AuthUser> {
+async fn sso_user(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Option<AuthUser> {
     let (enabled, header_name, trusted, skip_2fa) = {
         let config = state.config.read().await;
         (
@@ -462,7 +469,12 @@ async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr
         return None;
     }
 
-    let username = headers.get(header_name.as_str())?.to_str().ok()?.trim().to_string();
+    let username = headers
+        .get(header_name.as_str())?
+        .to_str()
+        .ok()?
+        .trim()
+        .to_string();
     if username.is_empty() {
         return None;
     }
@@ -485,7 +497,11 @@ async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr
 }
 
 /// 拦截未登录请求：`/api/*` 与 `/proxy/*` 均需有效会话（或可信代理身份）。
-pub async fn require_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     // 初始化完成前，除初始化/登录接口外一律 503（设计文档 3.1.1）：
     // 否则未初始化的实例会以「匿名可读」的姿态把挂载点暴露出去。
     if state.auth.user_count().unwrap_or(0) == 0 {
@@ -518,7 +534,13 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
                     });
                     via_cookie = true;
                 }
-                _ => return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_USER_MISSING", "User not found"),
+                _ => {
+                    return json_error_code(
+                        StatusCode::UNAUTHORIZED,
+                        "AUTH_USER_MISSING",
+                        "User not found",
+                    );
+                }
             },
             Ok(None) => {
                 // 会话过期：继续尝试代理信任，失败再报错
@@ -589,12 +611,11 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
     request.extensions_mut().insert(user);
     let mut response = next.run(request).await;
     // 处理器自己发过 Set-Cookie（登录/改密/登出）就不要再叠一条，否则两条 Cookie 打架
-    if let Some(cookie) = refreshed_cookie {
-        if !response.headers().contains_key(header::SET_COOKIE) {
-            if let Ok(value) = header::HeaderValue::from_str(&cookie) {
-                response.headers_mut().insert(header::SET_COOKIE, value);
-            }
-        }
+    if let Some(cookie) = refreshed_cookie
+        && !response.headers().contains_key(header::SET_COOKIE)
+        && let Ok(value) = header::HeaderValue::from_str(&cookie)
+    {
+        response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
 }
@@ -647,14 +668,13 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut totp_enabled = false;
     let mut must_change_password = false;
 
-    if let Some(token) = cookie_token(&headers) {
-        if let Ok(Some(user_id)) = state.auth.session_user(&token) {
-            if let Ok(Some(user)) = state.auth.user_by_id(user_id) {
-                totp_enabled = user.totp_enabled;
-                must_change_password = user.must_change_password;
-                username = Some(user.username);
-            }
-        }
+    if let Some(token) = cookie_token(&headers)
+        && let Ok(Some(user_id)) = state.auth.session_user(&token)
+        && let Ok(Some(user)) = state.auth.user_by_id(user_id)
+    {
+        totp_enabled = user.totp_enabled;
+        must_change_password = user.must_change_password;
+        username = Some(user.username);
     }
 
     Json(json!({
@@ -677,7 +697,13 @@ pub async fn setup(
 ) -> Response {
     match state.auth.user_count() {
         Ok(0) => {}
-        Ok(_) => return json_error_code(StatusCode::CONFLICT, "AUTH_ALREADY_INITIALIZED", "Already initialized"),
+        Ok(_) => {
+            return json_error_code(
+                StatusCode::CONFLICT,
+                "AUTH_ALREADY_INITIALIZED",
+                "Already initialized",
+            );
+        }
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 
@@ -754,22 +780,38 @@ pub async fn login(
 
     let Some((user, hash, secret)) = found else {
         record_login_failure(&state.login_guard, &keys);
-        return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_INVALID", "Invalid username or password");
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_INVALID",
+            "Invalid username or password",
+        );
     };
 
     if !verify_password(&hash, &body.password) {
         record_login_failure(&state.login_guard, &keys);
-        return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_INVALID", "Invalid username or password");
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_INVALID",
+            "Invalid username or password",
+        );
     }
 
     // 可选双因素（设计文档 3.1.4）：6 位数字走 TOTP，其余当一次性恢复码
     if user.totp_enabled {
         let Some(secret) = secret else {
-            return json_error_code(StatusCode::INTERNAL_SERVER_ERROR, "TOTP_CONFIG_MISSING", "TOTP secret missing");
+            return json_error_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TOTP_CONFIG_MISSING",
+                "TOTP secret missing",
+            );
         };
         let code = body.totp.as_deref().unwrap_or("").trim();
         if code.is_empty() {
-            return json_error_code(StatusCode::UNAUTHORIZED, "TOTP_REQUIRED", "TOTP code required");
+            return json_error_code(
+                StatusCode::UNAUTHORIZED,
+                "TOTP_REQUIRED",
+                "TOTP code required",
+            );
         }
         let normalized = crate::core::auth::normalize_recovery_code(code);
         let is_totp = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit());
@@ -779,11 +821,18 @@ pub async fn login(
                 .ok()
                 .is_some_and(|number| totp::verify(&secret, number, now_secs() as u64))
         } else {
-            state.auth.consume_recovery_code(user.id, code).unwrap_or(false)
+            state
+                .auth
+                .consume_recovery_code(user.id, code)
+                .unwrap_or(false)
         };
         if !valid {
             record_login_failure(&state.login_guard, &keys);
-            return json_error_code(StatusCode::UNAUTHORIZED, "TOTP_INVALID", "Invalid TOTP code");
+            return json_error_code(
+                StatusCode::UNAUTHORIZED,
+                "TOTP_INVALID",
+                "Invalid TOTP code",
+            );
         }
     }
 
@@ -854,11 +903,19 @@ pub async fn change_password(
     };
 
     let Some((user, hash, _)) = found else {
-        return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_USER_MISSING", "User not found");
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_USER_MISSING",
+            "User not found",
+        );
     };
 
     if !verify_password(&hash, &body.current) {
-        return json_error_code(StatusCode::BAD_REQUEST, "PASSWORD_WRONG", "Current password is incorrect");
+        return json_error_code(
+            StatusCode::BAD_REQUEST,
+            "PASSWORD_WRONG",
+            "Current password is incorrect",
+        );
     }
 
     if let Err(err) = state.auth.update_password(user.id, &body.next) {
@@ -921,7 +978,11 @@ pub async fn verify_recent(
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
     let Some((_user, hash, _)) = found else {
-        return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_USER_MISSING", "User not found");
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_USER_MISSING",
+            "User not found",
+        );
     };
     if !verify_password(&hash, &body.password) {
         state.login_guard.record_failure(&guard_key);
@@ -964,12 +1025,22 @@ pub async fn totp_enable(
 ) -> Response {
     let secret = match state.auth.totp_secret(auth_user.id) {
         Ok(Some(secret)) => secret,
-        Ok(None) => return json_error_code(StatusCode::BAD_REQUEST, "TOTP_NOT_SETUP", "Generate a TOTP secret first"),
+        Ok(None) => {
+            return json_error_code(
+                StatusCode::BAD_REQUEST,
+                "TOTP_NOT_SETUP",
+                "Generate a TOTP secret first",
+            );
+        }
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
     let Ok(code) = body.code.trim().parse::<u32>() else {
-        return json_error_code(StatusCode::BAD_REQUEST, "TOTP_FORMAT", "TOTP code must be 6 digits");
+        return json_error_code(
+            StatusCode::BAD_REQUEST,
+            "TOTP_FORMAT",
+            "TOTP code must be 6 digits",
+        );
     };
 
     if !totp::verify(&secret, code, now_secs() as u64) {
@@ -1006,17 +1077,29 @@ pub async fn totp_disable(
     };
 
     let Some((user, hash, _)) = found else {
-        return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_USER_MISSING", "User not found");
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_USER_MISSING",
+            "User not found",
+        );
     };
 
     if !verify_password(&hash, &body.password) {
-        return json_error_code(StatusCode::BAD_REQUEST, "PASSWORD_WRONG", "Password is incorrect");
+        return json_error_code(
+            StatusCode::BAD_REQUEST,
+            "PASSWORD_WRONG",
+            "Password is incorrect",
+        );
     }
 
     // 关闭 2FA 必须给出「有效 TOTP 或恢复码」，只凭密码不给关（设计文档 3.1.4）
     let code = body.code.trim();
     if code.is_empty() {
-        return json_error_code(StatusCode::BAD_REQUEST, "TOTP_REQUIRED", "TOTP code or recovery code required");
+        return json_error_code(
+            StatusCode::BAD_REQUEST,
+            "TOTP_REQUIRED",
+            "TOTP code or recovery code required",
+        );
     }
     let normalized = crate::core::auth::normalize_recovery_code(code);
     let is_totp = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit());
@@ -1029,7 +1112,10 @@ pub async fn totp_disable(
             _ => false,
         }
     } else {
-        state.auth.consume_recovery_code(user.id, code).unwrap_or(false)
+        state
+            .auth
+            .consume_recovery_code(user.id, code)
+            .unwrap_or(false)
     };
     if !valid {
         return json_error_code(StatusCode::BAD_REQUEST, "TOTP_INVALID", "Invalid TOTP code");
@@ -1048,7 +1134,7 @@ pub async fn totp_disable(
 
 #[cfg(test)]
 mod tests {
-    use super::{origin_matches_host, normalize_authority};
+    use super::{normalize_authority, origin_matches_host};
     use axum::http::{HeaderMap, Method, header};
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -1072,20 +1158,29 @@ mod tests {
 
     #[test]
     fn csrf_allows_safe_methods() {
-        let map = headers(&[("host", "nas.local:4242"), ("origin", "http://evil.example")]);
+        let map = headers(&[
+            ("host", "nas.local:4242"),
+            ("origin", "http://evil.example"),
+        ]);
         assert!(origin_matches_host(&map, &Method::GET));
         assert!(origin_matches_host(&map, &Method::HEAD));
     }
 
     #[test]
     fn csrf_accepts_same_origin() {
-        let map = headers(&[("host", "nas.local:4242"), ("origin", "http://nas.local:4242")]);
+        let map = headers(&[
+            ("host", "nas.local:4242"),
+            ("origin", "http://nas.local:4242"),
+        ]);
         assert!(origin_matches_host(&map, &Method::POST));
     }
 
     #[test]
     fn csrf_rejects_cross_site_origin() {
-        let map = headers(&[("host", "nas.local:4242"), ("origin", "https://evil.example")]);
+        let map = headers(&[
+            ("host", "nas.local:4242"),
+            ("origin", "https://evil.example"),
+        ]);
         assert!(!origin_matches_host(&map, &Method::DELETE));
     }
 
@@ -1097,7 +1192,10 @@ mod tests {
 
     #[test]
     fn csrf_uses_referer_when_origin_missing() {
-        let map = headers(&[("host", "nas.local:4242"), ("referer", "http://nas.local:4242/files/m0/a")]);
+        let map = headers(&[
+            ("host", "nas.local:4242"),
+            ("referer", "http://nas.local:4242/files/m0/a"),
+        ]);
         assert!(origin_matches_host(&map, &Method::POST));
     }
 
@@ -1125,7 +1223,10 @@ mod tests {
         let mut map = HeaderMap::new();
         for (name, value) in pairs {
             let value: axum::http::HeaderValue = value.parse().unwrap();
-            map.insert(axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(), value);
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value,
+            );
         }
         map
     }
@@ -1222,7 +1323,10 @@ mod tests {
         // 全零组展开写法归一到压缩形
         assert_eq!(normalize_authority("[0:0:0:0:0:0:0:1]:8080"), "::1:8080");
         // v4-mapped 折叠，与 v4 直连写法等价
-        assert_eq!(normalize_authority("[::ffff:127.0.0.1]:8080"), "127.0.0.1:8080");
+        assert_eq!(
+            normalize_authority("[::ffff:127.0.0.1]:8080"),
+            "127.0.0.1:8080"
+        );
         assert_eq!(normalize_authority("[::ffff:7f00:1]"), "127.0.0.1");
         // bracket 内以 :80 结尾的地址不会被误剥端口
         assert_eq!(normalize_authority("[::80]"), "::80");
@@ -1234,10 +1338,16 @@ mod tests {
     #[test]
     fn csrf_and_ws_origin_accept_ipv6_hosts() {
         // Host/Origin 均为 IPv6 字面量，压缩写法不同也要相等
-        let map = headers(&[("host", "[2001:db8::1]:4242"), ("origin", "http://[2001:db8:0::1]:4242")]);
+        let map = headers(&[
+            ("host", "[2001:db8::1]:4242"),
+            ("origin", "http://[2001:db8:0::1]:4242"),
+        ]);
         assert!(origin_matches_host(&map, &Method::POST));
         // v4-mapped Origin 与 v4 Host 等价
-        let map = headers(&[("host", "127.0.0.1:4242"), ("origin", "http://[::ffff:127.0.0.1]:4242")]);
+        let map = headers(&[
+            ("host", "127.0.0.1:4242"),
+            ("origin", "http://[::ffff:127.0.0.1]:4242"),
+        ]);
         assert!(origin_matches_host(&map, &Method::POST));
         // 不同地址必须拒绝
         let map = headers(&[("host", "[::1]:4242"), ("origin", "http://[::2]:4242")]);

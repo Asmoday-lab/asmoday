@@ -16,7 +16,11 @@ pub const ENV_FFMPEG_PATH: &str = "ASMODAY_FFMPEG_PATH";
 
 /// 可执行文件名：Windows 需要补 `.exe`，其余平台同名
 pub fn binary_name() -> &'static str {
-    if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }
+    if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
 }
 
 /// 路径来源，用于设置页「来源：…」文案。
@@ -295,10 +299,10 @@ pub fn encode_webp_rgba(
 ) -> bool {
     use std::io::Write;
 
-    if let Some(parent) = output.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return false;
-        }
+    if let Some(parent) = output.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return false;
     }
 
     let child = command(bin)
@@ -329,16 +333,19 @@ pub fn encode_webp_rgba(
     let Ok(mut child) = child else {
         return false;
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(rgba).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(output);
-            return false;
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(rgba).is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(output);
+        return false;
     }
     let ok = matches!(child.wait(), Ok(status) if status.success());
-    let written = ok && std::fs::metadata(output).map(|m| m.len() > 0).unwrap_or(false);
+    let written = ok
+        && std::fs::metadata(output)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
     if !written {
         let _ = std::fs::remove_file(output);
     }
@@ -356,10 +363,10 @@ pub fn extract_poster(
     width: u32,
     format: PosterFormat,
 ) -> bool {
-    if let Some(parent) = output.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return false;
-        }
+    if let Some(parent) = output.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return false;
     }
 
     let scale = format!("scale={width}:-2");
@@ -396,9 +403,9 @@ pub fn extract_poster(
     let status = cmd.arg(output).status().ok();
 
     match status {
-        Some(status) if status.success() => {
-            std::fs::metadata(output).map(|m| m.len() > 0).unwrap_or(false)
-        }
+        Some(status) if status.success() => std::fs::metadata(output)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
         _ => {
             let _ = std::fs::remove_file(output);
             false
@@ -435,7 +442,10 @@ mod tests {
         // 只验证优先级与来源标记，不依赖机器上是否真的装了 ffmpeg
         let resolved = resolve("D:/tools/ffmpeg.exe");
         assert_eq!(resolved.source, FfmpegSource::Config);
-        assert_eq!(resolved.path.as_deref(), Some(Path::new("D:/tools/ffmpeg.exe")));
+        assert_eq!(
+            resolved.path.as_deref(),
+            Some(Path::new("D:/tools/ffmpeg.exe"))
+        );
     }
 
     #[test]
@@ -443,7 +453,11 @@ mod tests {
         let dir = std::env::temp_dir().join("asmoday-ffmpeg-dir-test");
         let _ = std::fs::create_dir_all(&dir);
         let resolved = executable(dir.to_string_lossy().as_ref());
-        assert!(resolved.ends_with(binary_name()), "got {}", resolved.display());
+        assert!(
+            resolved.ends_with(binary_name()),
+            "got {}",
+            resolved.display()
+        );
         let _ = std::fs::remove_dir(&dir);
     }
 

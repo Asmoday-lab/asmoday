@@ -12,13 +12,13 @@
 //! 3. 目录冲突永不合并：`overwrite` 对目录直接 `E_DIR_CONFLICT`。
 
 use std::collections::HashSet;
-use std::time::Duration;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::core::fs::{normalize_display, FsError};
+use crate::core::fs::{FsError, normalize_display};
 use crate::core::path_guard::{
     is_part_file, numbered_name, part_name, rename_no_replace, rename_replace, split_name,
     validate_name,
@@ -160,10 +160,7 @@ pub struct Summary {
 pub fn summarize(results: &[ItemResult]) -> Summary {
     Summary {
         ok: results.iter().filter(|r| r.ok).count(),
-        failed: results
-            .iter()
-            .filter(|r| !r.ok && !r.skipped)
-            .count(),
+        failed: results.iter().filter(|r| !r.ok && !r.skipped).count(),
         skipped: results.iter().filter(|r| r.skipped).count(),
     }
 }
@@ -209,16 +206,18 @@ fn measure_dir(
         .map_err(|e| FsError::Io(format!("读取目录失败 {}：{e}", normalize_display(dir))))?;
     for entry in reader {
         let Ok(entry) = entry else { continue };
-        let Ok(meta) = entry.file_type() else { continue };
+        let Ok(meta) = entry.file_type() else {
+            continue;
+        };
         *items += 1;
 
         if meta.is_dir() {
             measure_dir(&entry.path(), items, bytes, limits)?;
-        } else if meta.is_file() {
-            if let Ok(meta) = entry.metadata() {
-                *bytes = bytes.saturating_add(meta.len());
-                limits.check_bytes(*bytes)?;
-            }
+        } else if meta.is_file()
+            && let Ok(meta) = entry.metadata()
+        {
+            *bytes = bytes.saturating_add(meta.len());
+            limits.check_bytes(*bytes)?;
         }
     }
     Ok(())
@@ -311,9 +310,9 @@ pub fn mkdir(parent: &Path, name: &str) -> Result<PathBuf, FsError> {
     let target = parent.join(name);
     match std::fs::create_dir(&target) {
         Ok(()) => Ok(target),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(FsError::Conflict(
-            format!("同名项已存在：{name}"),
-        )),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(FsError::Conflict(format!("同名项已存在：{name}")))
+        }
         Err(err) => Err(FsError::Io(format!("创建目录失败：{err}"))),
     }
 }
@@ -328,9 +327,9 @@ pub fn touch(parent: &Path, name: &str) -> Result<PathBuf, FsError> {
         .open(&target)
     {
         Ok(_) => Ok(target),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(FsError::Conflict(
-            format!("同名项已存在：{name}"),
-        )),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(FsError::Conflict(format!("同名项已存在：{name}")))
+        }
         Err(err) => Err(FsError::Io(format!("创建文件失败：{err}"))),
     }
 }
@@ -494,8 +493,7 @@ pub fn copy_entry(
 
     if is_dir {
         let target = dest_dir.join(&first_name);
-        std::fs::create_dir(&target)
-            .map_err(|e| FsError::Io(format!("创建目标目录失败：{e}")))?;
+        std::fs::create_dir(&target).map_err(|e| FsError::Io(format!("创建目标目录失败：{e}")))?;
         copy_dir_contents(src, &target)?;
         return Ok(Some(target));
     }
@@ -523,8 +521,8 @@ fn copy_file_with_retry(
     conflict: OnConflict,
     book: &mut NameBook,
 ) -> Result<Option<PathBuf>, FsError> {
-    let before = std::fs::metadata(src)
-        .map_err(|e| FsError::Io(format!("读取源文件信息失败：{e}")))?;
+    let before =
+        std::fs::metadata(src).map_err(|e| FsError::Io(format!("读取源文件信息失败：{e}")))?;
 
     let part = dest_dir.join(part_name(original_name));
     // DEBUG 通道：复制落点与临时文件全路径，排障「创建临时文件失败」类问题时的关键线索
@@ -544,12 +542,12 @@ fn copy_file_with_retry(
         )));
     }
     // 源文件在复制过程中被改写 → 结果不可信，保留 .part 供排查
-    if let (Ok(after), Ok(before_mtime)) = (std::fs::metadata(src), before.modified()) {
-        if after.len() != before.len() || after.modified().ok() != Some(before_mtime) {
-            return Err(FsError::Io(
-                "复制过程中源文件发生变化，已保留 .asmoday-part 临时文件".to_string(),
-            ));
-        }
+    if let (Ok(after), Ok(before_mtime)) = (std::fs::metadata(src), before.modified())
+        && (after.len() != before.len() || after.modified().ok() != Some(before_mtime))
+    {
+        return Err(FsError::Io(
+            "复制过程中源文件发生变化，已保留 .asmoday-part 临时文件".to_string(),
+        ));
     }
 
     let mut candidate = first_name.to_string();
@@ -561,7 +559,9 @@ fn copy_file_with_retry(
         }
         match rename_no_replace(&part, &target) {
             Ok(()) => return Ok(Some(target)),
-            Err(FsError::Conflict(_)) if conflict == OnConflict::Rename && attempt < PLACE_RETRY => {
+            Err(FsError::Conflict(_))
+                if conflict == OnConflict::Rename && attempt < PLACE_RETRY =>
+            {
                 let Placement::Use(next, _) =
                     resolve_placement(book, original_name, false, conflict)?
                 else {
@@ -579,11 +579,10 @@ fn copy_file_with_retry(
 
 /// 流式复制（禁止 `read()` 整个文件，设计文档 8.5 第 4 条）
 fn stream_copy(src: &Path, part: &Path) -> Result<u64, FsError> {
-    let input = std::fs::File::open(src)
-        .map_err(|e| map_io_error(e, "打开源文件失败", src))?;
+    let input = std::fs::File::open(src).map_err(|e| map_io_error(e, "打开源文件失败", src))?;
     let mut reader = BufReader::with_capacity(COPY_BUFFER, input);
-    let output = std::fs::File::create(part)
-        .map_err(|e| map_io_error(e, "创建临时文件失败", part))?;
+    let output =
+        std::fs::File::create(part).map_err(|e| map_io_error(e, "创建临时文件失败", part))?;
     let mut writer = BufWriter::with_capacity(COPY_BUFFER, output);
 
     let mut total = 0u64;
@@ -600,9 +599,7 @@ fn stream_copy(src: &Path, part: &Path) -> Result<u64, FsError> {
             .map_err(|e| map_write_error(e, part))?;
         total += read as u64;
     }
-    writer
-        .flush()
-        .map_err(|e| map_write_error(e, part))?;
+    writer.flush().map_err(|e| map_write_error(e, part))?;
     Ok(total)
 }
 
@@ -610,7 +607,10 @@ fn stream_copy(src: &Path, part: &Path) -> Result<u64, FsError> {
 fn map_write_error(err: std::io::Error, path: &Path) -> FsError {
     let kind = err.kind();
     if kind == std::io::ErrorKind::StorageFull
-        || matches!(err.raw_os_error(), Some(28) /* ENOSPC */ | Some(112) /* ERROR_DISK_FULL */)
+        || matches!(
+            err.raw_os_error(),
+            Some(28) /* ENOSPC */ | Some(112) /* ERROR_DISK_FULL */
+        )
     {
         return FsError::NoSpace(format!(
             "目标磁盘空间不足（写入失败：{}）",
@@ -626,7 +626,10 @@ fn map_write_error(err: std::io::Error, path: &Path) -> FsError {
 /// 报成 500「服务器内部错误」既吓人又没信息。典型场景：下载器还在写
 /// Downloads 里的文件，用户马上就复制它；或目标文件夹带着失效 SID。
 fn map_io_error(err: std::io::Error, action: &str, path: &Path) -> FsError {
-    if matches!(err.raw_os_error(), Some(32) /* ERROR_SHARING_VIOLATION */ | Some(33) /* ERROR_LOCK_VIOLATION */) {
+    if matches!(
+        err.raw_os_error(),
+        Some(32) /* ERROR_SHARING_VIOLATION */ | Some(33) /* ERROR_LOCK_VIOLATION */
+    ) {
         return FsError::Busy(format!(
             "{action}：文件正被其他程序占用（{}）",
             normalize_display(path)
@@ -636,7 +639,9 @@ fn map_io_error(err: std::io::Error, action: &str, path: &Path) -> FsError {
     // 典型成因是文件夹带着旧系统 / 其他机器拷贝来的失效 SID，或由管理员权限的
     // 下载器创建，普通权限的 asmoday 只能读不能写；也可能是杀毒 / 受控文件夹
     // 访问拦截了未签名的新构建 exe。这是用户可自救的状态，给足排查路径。
-    if err.raw_os_error() == Some(5) /* ERROR_ACCESS_DENIED */ {
+    if err.raw_os_error() == Some(5)
+    /* ERROR_ACCESS_DENIED */
+    {
         return FsError::Forbidden(format!(
             "{action}：目标位置拒绝写入（拒绝访问，os error 5）—— {path_display}。\
              常见原因：① 文件夹「安全」权限未授予当前用户写入（右键 → 属性 → 安全，\
@@ -650,8 +655,7 @@ fn map_io_error(err: std::io::Error, action: &str, path: &Path) -> FsError {
 }
 
 fn copy_dir_contents(src: &Path, dest: &Path) -> Result<(), FsError> {
-    let reader = std::fs::read_dir(src)
-        .map_err(|e| FsError::Io(format!("读取源目录失败：{e}")))?;
+    let reader = std::fs::read_dir(src).map_err(|e| FsError::Io(format!("读取源目录失败：{e}")))?;
     for entry in reader {
         let entry = entry.map_err(|e| FsError::Io(format!("遍历源目录失败：{e}")))?;
         let from = entry.path();
@@ -662,8 +666,7 @@ fn copy_dir_contents(src: &Path, dest: &Path) -> Result<(), FsError> {
         if meta.file_type().is_symlink() {
             copy_symlink(&from, &to)?;
         } else if meta.is_dir() {
-            std::fs::create_dir(&to)
-                .map_err(|e| FsError::Io(format!("创建目标目录失败：{e}")))?;
+            std::fs::create_dir(&to).map_err(|e| FsError::Io(format!("创建目标目录失败：{e}")))?;
             copy_dir_contents(&from, &to)?;
         } else {
             copy_file_plain(&from, &to)?;
@@ -695,8 +698,7 @@ fn copy_file_plain(src: &Path, target: &Path) -> Result<(), FsError> {
 
 /// 复制软链接本身（读 target 字符串重建链接）
 fn copy_symlink(src: &Path, target: &Path) -> Result<(), FsError> {
-    let link = std::fs::read_link(src)
-        .map_err(|e| FsError::Io(format!("读取软链接失败：{e}")))?;
+    let link = std::fs::read_link(src).map_err(|e| FsError::Io(format!("读取软链接失败：{e}")))?;
 
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(&link, target);
@@ -732,7 +734,8 @@ pub fn move_entry(
         .ok_or_else(|| FsError::BadRequest("源路径没有文件名".to_string()))?;
 
     if same_mount {
-        let Placement::Use(final_name, overwrite) = resolve_placement(book, &name, is_dir, conflict)?
+        let Placement::Use(final_name, overwrite) =
+            resolve_placement(book, &name, is_dir, conflict)?
         else {
             return Ok(None);
         };
@@ -789,10 +792,7 @@ pub fn remove_path(path: &Path) -> Result<(), FsError> {
     match result {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Err(FsError::Io(
-            format!(
-                "无权限或文件被占用，删除失败：{}",
-                normalize_display(path)
-            ),
+            format!("无权限或文件被占用，删除失败：{}", normalize_display(path)),
         )),
         Err(err) => Err(FsError::Io(format!(
             "删除失败 {}：{err}",
@@ -847,10 +847,10 @@ fn walk_parts(dir: &Path, cutoff: std::time::SystemTime, removed: &mut usize, fr
         }
         if is_part_file(&name) {
             // 太新的 .part 可能正在写入，跳过
-            if let Ok(meta) = entry.metadata() {
-                if meta.modified().map(|t| t > cutoff).unwrap_or(false) {
-                    continue;
-                }
+            if let Ok(meta) = entry.metadata()
+                && meta.modified().map(|t| t > cutoff).unwrap_or(false)
+            {
+                continue;
             }
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if std::fs::remove_file(&path).is_ok() {
@@ -900,7 +900,7 @@ pub fn available_space(dir: &Path) -> Option<u64> {
         if ok == 0 {
             return None;
         }
-        return Some(free_available);
+        Some(free_available)
     }
 
     #[cfg(not(windows))]
@@ -981,10 +981,7 @@ mod tests {
             "创建临时文件失败",
             Path::new("C:/mnt/lora/luwanq.txt.asmoday-part.ab12cd34"),
         );
-        assert!(
-            matches!(err, FsError::Forbidden(_)),
-            "实际：{err:?}"
-        );
+        assert!(matches!(err, FsError::Forbidden(_)), "实际：{err:?}");
         assert_eq!(
             crate::api::error::code_of(&err),
             "E_FORBIDDEN",
@@ -996,10 +993,7 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "asmoday-fsops-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("asmoday-fsops-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1043,13 +1037,18 @@ mod tests {
     #[test]
     fn copy_uses_part_then_final_name() {
         let dir = scratch("copy");
-        std::fs::create_dir(&dir.join("dest")).unwrap();
+        std::fs::create_dir(dir.join("dest")).unwrap();
         std::fs::write(dir.join("src.bin"), b"hello").unwrap();
 
         let mut book = NameBook::new(&dir.join("dest"));
-        let target = copy_entry(&dir.join("src.bin"), &dir.join("dest"), &mut book, OnConflict::Rename)
-            .unwrap()
-            .unwrap();
+        let target = copy_entry(
+            &dir.join("src.bin"),
+            &dir.join("dest"),
+            &mut book,
+            OnConflict::Rename,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"hello");
         // 没有残留 .part
         let leftovers: Vec<_> = std::fs::read_dir(dir.join("dest"))
@@ -1060,9 +1059,14 @@ mod tests {
         assert!(!leftovers.iter().any(|n| is_part_file(n)), "{leftovers:?}");
 
         // 再复制一次 → 自动改名
-        let second = copy_entry(&dir.join("src.bin"), &dir.join("dest"), &mut book, OnConflict::Rename)
-            .unwrap()
-            .unwrap();
+        let second = copy_entry(
+            &dir.join("src.bin"),
+            &dir.join("dest"),
+            &mut book,
+            OnConflict::Rename,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(second.file_name().unwrap(), "src (1).bin");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1074,8 +1078,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("dest/src")).unwrap();
 
         let mut book = NameBook::new(&dir.join("dest"));
-        let err = copy_entry(&dir.join("src"), &dir.join("dest"), &mut book, OnConflict::Overwrite)
-            .unwrap_err();
+        let err = copy_entry(
+            &dir.join("src"),
+            &dir.join("dest"),
+            &mut book,
+            OnConflict::Overwrite,
+        )
+        .unwrap_err();
         assert!(matches!(err, FsError::DirConflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1092,7 +1101,7 @@ mod tests {
             max_bytes: 1024,
         };
         assert!(matches!(
-            measure(&[dir.clone()], by_bytes).unwrap_err(),
+            measure(std::slice::from_ref(&dir), by_bytes).unwrap_err(),
             FsError::TooLarge(_)
         ));
 
@@ -1108,7 +1117,7 @@ mod tests {
             measure_shallow(&many, by_items).unwrap_err(),
             FsError::TooMany(_)
         ));
-        let (items, _) = measure(&[dir.clone()], by_items).unwrap();
+        let (items, _) = measure(std::slice::from_ref(&dir), by_items).unwrap();
         assert_eq!(items, 8, "8 个文件都该数到，且不因项数上限被拒");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1125,7 +1134,7 @@ mod tests {
             max_bytes: 0,
         };
         assert!(limits.unlimited());
-        let (items, _) = measure(&[dir.clone()], limits).unwrap();
+        let (items, _) = measure(std::slice::from_ref(&dir), limits).unwrap();
         assert_eq!(items, 150);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1182,8 +1191,14 @@ mod tests {
     fn cleanup_parts_removes_orphans_only() {
         let dir = scratch("parts");
         std::fs::write(dir.join("keep.txt"), b"x").unwrap();
-        std::fs::write(dir.join(format!("keep.txt{}aaaaaaaa", crate::core::path_guard::PART_MARK)), b"y")
-            .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "keep.txt{}aaaaaaaa",
+                crate::core::path_guard::PART_MARK
+            )),
+            b"y",
+        )
+        .unwrap();
 
         // 启动清理有 10 分钟宽限期：刚写的 .part 可能是另一个进程正在传的文件
         assert_eq!(cleanup_parts(&dir).0, 0);

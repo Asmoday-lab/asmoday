@@ -38,7 +38,9 @@ pub fn max_concurrent() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(MAX_CONCURRENT_FALLBACK + 1);
-    cores.saturating_sub(1).clamp(MAX_CONCURRENT_FALLBACK, MAX_CONCURRENT_CAP)
+    cores
+        .saturating_sub(1)
+        .clamp(MAX_CONCURRENT_FALLBACK, MAX_CONCURRENT_CAP)
 }
 
 /// 等待信号量的最长时间，超时回占位图
@@ -136,7 +138,8 @@ impl Thumbnailer {
 
     /// 应用 `[media]` 配置（启动时与配置热重载后调用）。
     pub fn apply_limits(&self, limit_bytes: u64, max_age_secs: u64) {
-        self.limit_bytes.store(limit_bytes.max(1), Ordering::Relaxed);
+        self.limit_bytes
+            .store(limit_bytes.max(1), Ordering::Relaxed);
         self.max_age_secs.store(max_age_secs, Ordering::Relaxed);
     }
 
@@ -209,10 +212,7 @@ impl Thumbnailer {
             let file = base.with_extension(ext);
             if let Ok(bytes) = tokio::fs::read(&file).await {
                 // 触碰 mtime，参与 LRU 排序
-                let _ = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&file)
-                    .await;
+                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
                 return (ThumbOutcome::Ready(Rendered { bytes, mime }), None);
             }
         }
@@ -257,10 +257,7 @@ impl Thumbnailer {
         match result {
             Ok(Some((bytes, mime, fresh))) => {
                 self.count_generated();
-                (
-                    ThumbOutcome::Ready(Rendered { bytes, mime }),
-                    Some(fresh),
-                )
+                (ThumbOutcome::Ready(Rendered { bytes, mime }), Some(fresh))
             }
             _ => (ThumbOutcome::Placeholder, None),
         }
@@ -269,7 +266,7 @@ impl Thumbnailer {
     /// 生成计数 + 每 N 次跑一次后台淘汰（避免每次生成都全目录扫一遍）
     fn count_generated(&self) {
         let count = self.generated.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % CLEANUP_EVERY != 0 {
+        if !count.is_multiple_of(CLEANUP_EVERY) {
             return;
         }
         let dir = self.cache_dir.clone();
@@ -329,21 +326,16 @@ impl Thumbnailer {
                 }
                 let destination = stem.with_extension(format.extension());
                 // 先试 1 秒（避开片头黑帧），极短视频截不到就退回第 0 帧
-                let ok = ffmpeg::extract_poster(
-                    &ffmpeg_bin,
-                    &source,
-                    &destination,
-                    1,
-                    width,
-                    format,
-                ) || ffmpeg::extract_poster(
-                    &ffmpeg_bin,
-                    &source,
-                    &destination,
-                    0,
-                    width,
-                    format,
-                );
+                let ok =
+                    ffmpeg::extract_poster(&ffmpeg_bin, &source, &destination, 1, width, format)
+                        || ffmpeg::extract_poster(
+                            &ffmpeg_bin,
+                            &source,
+                            &destination,
+                            0,
+                            width,
+                            format,
+                        );
                 if !ok {
                     continue;
                 }
@@ -386,7 +378,10 @@ impl Thumbnailer {
 ///
 /// 统一转 RGBA：WebP 保留透明通道，JPEG 分支再降到 RGB（JPEG 不支持 alpha）。
 fn render_thumbnail(path: &Path, width: u32) -> Option<(image::RgbaImage, Vec<u8>)> {
-    let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
     let image = reader.decode().ok()?;
 
     let small = image.thumbnail(32, 32).to_rgba8();
@@ -409,22 +404,22 @@ fn encode_thumbnail(
     caps: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>,
     base: &Path,
 ) -> Option<(Vec<u8>, &'static str)> {
-    if let Some(bin) = webp_bin {
-        if capabilities(caps, bin).webp {
-            let target = base.with_extension("webp");
-            if ffmpeg::encode_webp_rgba(
-                bin,
-                thumb.as_raw(),
-                thumb.width(),
-                thumb.height(),
-                82,
-                &target,
-            ) {
-                match std::fs::read(&target) {
-                    Ok(bytes) => return Some((bytes, "image/webp")),
-                    Err(_) => {
-                        let _ = std::fs::remove_file(&target);
-                    }
+    if let Some(bin) = webp_bin
+        && capabilities(caps, bin).webp
+    {
+        let target = base.with_extension("webp");
+        if ffmpeg::encode_webp_rgba(
+            bin,
+            thumb.as_raw(),
+            thumb.width(),
+            thumb.height(),
+            82,
+            &target,
+        ) {
+            match std::fs::read(&target) {
+                Ok(bytes) => return Some((bytes, "image/webp")),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&target);
                 }
             }
         }
@@ -444,10 +439,10 @@ fn encode_thumbnail(
 /// FFmpeg 能力探测结果缓存：同一路径只探测一次，换路径（改配置）才重探。
 fn capabilities(cache: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>, bin: &Path) -> Capabilities {
     let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
-    if let Some((cached, caps)) = guard.as_ref() {
-        if cached == bin {
-            return *caps;
-        }
+    if let Some((cached, caps)) = guard.as_ref()
+        && cached == bin
+    {
+        return *caps;
     }
     let caps = ffmpeg::probe_capabilities(bin);
     *guard = Some((bin.to_path_buf(), caps));
@@ -484,13 +479,13 @@ pub fn cleanup_cache(dir: &Path, limit: u64, max_age_secs: u64) -> std::io::Resu
         let modified = meta.modified().unwrap_or(UNIX_EPOCH);
 
         // 过期淘汰：长期没人看过的缩略图直接删（删失败则留待 LRU 再试一次）
-        if max_age_secs > 0 {
-            if let Ok(age) = now.duration_since(modified) {
-                if age >= Duration::from_secs(max_age_secs) && std::fs::remove_file(&path).is_ok() {
-                    removed += meta.len();
-                    continue;
-                }
-            }
+        if max_age_secs > 0
+            && let Ok(age) = now.duration_since(modified)
+            && age >= Duration::from_secs(max_age_secs)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed += meta.len();
+            continue;
         }
 
         total += meta.len();
@@ -531,11 +526,11 @@ pub fn clear_cache(dir: &Path) -> std::io::Result<(usize, u64)> {
         if !path.is_file() {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
-            if std::fs::remove_file(&path).is_ok() {
-                count += 1;
-                freed += meta.len();
-            }
+        if let Ok(meta) = entry.metadata()
+            && std::fs::remove_file(&path).is_ok()
+        {
+            count += 1;
+            freed += meta.len();
         }
     }
     Ok((count, freed))
@@ -578,7 +573,11 @@ mod tests {
         assert_eq!(a, Thumbnailer::cache_base(&file, 320));
         // 基名不带扩展名：WebP / JPEG 两种缓存靠 with_extension 派生
         assert!(!a.contains('.'), "基名不应含扩展名：{a}");
-        assert!(Path::new(&a).with_extension("webp").ends_with(format!("{a}.webp")));
+        assert!(
+            Path::new(&a)
+                .with_extension("webp")
+                .ends_with(format!("{a}.webp"))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -650,7 +649,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_drops_oldest_until_under_limit() {        let dir = scratch_dir("thumb-cleanup");
+    fn cleanup_drops_oldest_until_under_limit() {
+        let dir = scratch_dir("thumb-cleanup");
         for i in 0..10 {
             fs::write(dir.join(format!("f{i}.jpg")), vec![0u8; 1024]).unwrap();
         }
@@ -687,10 +687,8 @@ mod tests {
     #[test]
     fn cleanup_is_idempotent_on_missing_dir() {
         // 目录不存在时必须返回 0 而不是 Io 错误（设置页清理按钮要幂等）
-        let missing = std::env::temp_dir().join(format!(
-            "asmoday-thumb-missing-{}",
-            std::process::id()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("asmoday-thumb-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
         assert_eq!(cleanup_cache(&missing, 1024, 3600).unwrap(), 0);
         assert_eq!(clear_cache(&missing).unwrap(), (0, 0));
@@ -720,7 +718,9 @@ mod tests {
         // 把 mtime 往前拨 10 分钟：写盘早已结束，必须正常生成
         let old = SystemTime::now() - Duration::from_secs(600);
         let handle = fs::File::options().write(true).open(&file).unwrap();
-        handle.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        handle
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
         assert!(!is_fresh_write(&file));
 
         // 不存在 / 没权限时必须返回 false（不能让缩略图整体 500）

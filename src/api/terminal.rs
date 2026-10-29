@@ -18,8 +18,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::core::fs::{self, FsError};
 use crate::AppState;
+use crate::core::fs::{self, FsError};
 
 #[derive(Debug, Deserialize)]
 pub struct TerminalQuery {
@@ -99,12 +99,11 @@ pub async fn ws_handler(
     // 前端把返回的 cwd 作为 path 重连时就会被 403 拒绝（表现为"终端连不上"）。
     // 注意：这只影响终端，文件管理仍严格限定在挂载点内。
     let mut allowed = roots.allowed.clone();
-    if let Some(home) = &home {
-        if let Ok(canon) = std::fs::canonicalize(home) {
-            if !allowed.iter().any(|root| root == &canon) {
-                allowed.push(canon);
-            }
-        }
+    if let Some(home) = &home
+        && let Ok(canon) = std::fs::canonicalize(home)
+        && !allowed.iter().any(|root| root == &canon)
+    {
+        allowed.push(canon);
     }
 
     // 目录被删掉是常态（文件管理里刚删过），这时退回默认目录继续开终端，
@@ -137,7 +136,9 @@ pub async fn ws_handler(
                         warning = Some(format!("目录已不存在（挂载点 {id}），已切换到默认目录"));
                         match fallback_cwd() {
                             Some(path) => path,
-                            None => return reject(FsError::NotFound("没有可用的挂载点".to_string())),
+                            None => {
+                                return reject(FsError::NotFound("没有可用的挂载点".to_string()));
+                            }
                         }
                     }
                     Err(err) => return reject(err),
@@ -221,7 +222,9 @@ pub async fn ws_handler(
     let env = crate::core::terminal::prepare_env(&state.data_dir);
 
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, cwd, cols, rows, session_id, options, env, warning)
+        handle_socket(
+            socket, state, cwd, cols, rows, session_id, options, env, warning,
+        )
     })
 }
 
@@ -249,7 +252,10 @@ fn expand_home(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
         rest
     } else if upper.starts_with("${HOME}") {
         &text["${HOME}".len()..]
-    } else if let Some(rest) = text.strip_prefix("$HOME").or_else(|| text.strip_prefix("$home")) {
+    } else if let Some(rest) = text
+        .strip_prefix("$HOME")
+        .or_else(|| text.strip_prefix("$home"))
+    {
         rest
     } else if upper.starts_with("%USERPROFILE%") {
         &text["%USERPROFILE%".len()..]
@@ -269,6 +275,9 @@ fn reject(err: FsError) -> Response {
     crate::api::error::fs_error(&err)
 }
 
+// 一个 WS 处理函数要拿全「连接 + 状态 + 会话参数」，拆成结构体只是把参数
+// 挪个地方，反而看不出哪些是连接期的、哪些是创建期就固定下来的。
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -326,7 +335,11 @@ async fn handle_socket(
         // 目录被删 / 受限环境等非致命情况：连接照建，但要让用户知道
         "warning": warning,
     });
-    if sink.send(Message::Text(ready.to_string().into())).await.is_err() {
+    if sink
+        .send(Message::Text(ready.to_string().into()))
+        .await
+        .is_err()
+    {
         session.clients.fetch_sub(1, Ordering::SeqCst);
         return;
     }
@@ -447,7 +460,10 @@ mod tests {
             expand_home("%userprofile%/docs", Some(home)),
             Some(home.join("docs"))
         );
-        assert_eq!(expand_home("$HOME/docs", Some(home)), Some(home.join("docs")));
+        assert_eq!(
+            expand_home("$HOME/docs", Some(home)),
+            Some(home.join("docs"))
+        );
         assert_eq!(
             expand_home("${HOME}/docs", Some(home)),
             Some(home.join("docs"))

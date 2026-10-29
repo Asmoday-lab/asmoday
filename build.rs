@@ -15,7 +15,12 @@ fn main() {
         .unwrap_or_else(|| "dev".to_string());
 
     let date = Command::new("git")
-        .args(["log", "-1", "--format=%cd", "--date=format:%Y-%m-%dT%H:%M:%SZ"])
+        .args([
+            "log",
+            "-1",
+            "--format=%cd",
+            "--date=format:%Y-%m-%dT%H:%M:%SZ",
+        ])
         .output()
         .ok()
         .filter(|out| out.status.success())

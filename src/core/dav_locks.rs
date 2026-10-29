@@ -49,21 +49,21 @@ impl DavLockTable {
         let now = Instant::now();
         let tokens = lock_tokens(if_header);
 
-        if let Some(entry) = entries.get(key) {
-            if entry.expires > now {
-                if tokens.iter().any(|token| token == &entry.token) {
-                    let token = entry.token.clone();
-                    entries.insert(
-                        key.to_string(),
-                        Entry {
-                            token: token.clone(),
-                            expires: now + LOCK_TTL,
-                        },
-                    );
-                    return Ok(token);
-                }
-                return Err(LockError::Locked);
+        if let Some(entry) = entries.get(key)
+            && entry.expires > now
+        {
+            if tokens.iter().any(|token| token == &entry.token) {
+                let token = entry.token.clone();
+                entries.insert(
+                    key.to_string(),
+                    Entry {
+                        token: token.clone(),
+                        expires: now + LOCK_TTL,
+                    },
+                );
+                return Ok(token);
             }
+            return Err(LockError::Locked);
         }
 
         let token = format!("opaquelocktoken:{}", crate::core::auth::random_token());

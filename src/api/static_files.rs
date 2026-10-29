@@ -116,7 +116,10 @@ pub async fn serve(
     }
 
     // 前端路由（无扩展名）→ index.html；带扩展名视为真 404
-    let has_extension = path.rsplit('/').next().is_some_and(|name| name.contains('.'));
+    let has_extension = path
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.contains('.'));
     if !has_extension {
         return index(&base);
     }

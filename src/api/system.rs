@@ -12,15 +12,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::core::{ffmpeg, fs, fs_ops, path_guard, thumbnail};
 use crate::AppState;
+use crate::core::{ffmpeg, fs, fs_ops, path_guard, thumbnail};
 
 /// 批量重建缩略图的进度（进程内单份，重启即清零）
 #[derive(Debug, Clone, Default, Serialize)]
@@ -59,10 +59,11 @@ pub struct TestPayload {
 /// `POST /api/system/test-ffmpeg`
 ///
 /// 只测用户填的那一条（不回落），这样「该路径不可用」才是准确结论。
-pub async fn test_ffmpeg(State(_state): State<AppState>, body: Option<Json<TestPayload>>) -> Response {
-    let path = body
-        .map(|Json(payload)| payload.path)
-        .unwrap_or_default();
+pub async fn test_ffmpeg(
+    State(_state): State<AppState>,
+    body: Option<Json<TestPayload>>,
+) -> Response {
+    let path = body.map(|Json(payload)| payload.path).unwrap_or_default();
 
     if path.trim().is_empty() {
         // 空路径等价于「测当前生效的那个」，语义最不容易被误解
@@ -78,7 +79,10 @@ pub async fn test_ffmpeg(State(_state): State<AppState>, body: Option<Json<TestP
 /// 在阻塞线程里跑 `-version` / `-encoders`，把结果拼成前端约定的结构。
 ///
 /// `webp_support` 决定缩略图与视频封面能否输出 WebP（设计文档 3.4 / 3.5）。
-async fn probe(path: Option<std::path::PathBuf>, source: ffmpeg::FfmpegSource) -> serde_json::Value {
+async fn probe(
+    path: Option<std::path::PathBuf>,
+    source: ffmpeg::FfmpegSource,
+) -> serde_json::Value {
     let Some(bin) = path else {
         return json!({
             "status": "missing",
@@ -232,7 +236,10 @@ pub async fn backup(State(state): State<AppState>) -> Response {
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
@@ -359,10 +366,7 @@ async fn run_rebuild(state: AppState) {
     for (path, is_video) in candidates {
         let (outcome, fresh) = if is_video {
             match ffmpeg_bin.as_deref() {
-                Some(bin) => (
-                    state.thumbnails.video_poster(&path, bin, 320).await,
-                    None,
-                ),
+                Some(bin) => (state.thumbnails.video_poster(&path, bin, 320).await, None),
                 None => (thumbnail::ThumbOutcome::Placeholder, None),
             }
         } else {

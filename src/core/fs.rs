@@ -180,9 +180,7 @@ fn parse_candidate(raw: &str) -> Result<PathBuf, FsError> {
     // 第一道闸：显式拒绝任何 ../ 上跳
     for component in path.components() {
         if matches!(component, Component::ParentDir) {
-            return Err(FsError::Forbidden(
-                "禁止使用 ../ 进行路径穿越".to_string(),
-            ));
+            return Err(FsError::Forbidden("禁止使用 ../ 进行路径穿越".to_string()));
         }
     }
 
@@ -194,9 +192,7 @@ fn ensure_within(canon: &Path, allowed: &[PathBuf]) -> Result<(), FsError> {
     if allowed.iter().any(|root| canon.starts_with(root)) {
         Ok(())
     } else {
-        Err(FsError::Forbidden(
-            "该路径不在已授权的挂载点内".to_string(),
-        ))
+        Err(FsError::Forbidden("该路径不在已授权的挂载点内".to_string()))
     }
 }
 
@@ -444,11 +440,7 @@ pub async fn list_dir(
             break;
         }
         // file_type() 不跟随软链接，避免指向目录的链接被当作目录递归进去
-        let is_dir = entry
-            .file_type()
-            .await
-            .map(|t| t.is_dir())
-            .unwrap_or(false);
+        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
         items.push((name, is_dir, None));
     }
 
@@ -467,15 +459,23 @@ pub async fn list_dir(
         }
         let key_cmp = match sort {
             ListSort::Name => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-            ListSort::Size => a.2.as_ref().map(|m| m.len()).cmp(&b.2.as_ref().map(|m| m.len())),
-            ListSort::Mtime => a
-                .2
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .cmp(&b.2.as_ref().and_then(|m| m.modified().ok())),
+            ListSort::Size => {
+                a.2.as_ref()
+                    .map(|m| m.len())
+                    .cmp(&b.2.as_ref().map(|m| m.len()))
+            }
+            ListSort::Mtime => {
+                a.2.as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .cmp(&b.2.as_ref().and_then(|m| m.modified().ok()))
+            }
         };
         if key_cmp != std::cmp::Ordering::Equal {
-            return if order == ListOrder::Desc { key_cmp.reverse() } else { key_cmp };
+            return if order == ListOrder::Desc {
+                key_cmp.reverse()
+            } else {
+                key_cmp
+            };
         }
         a.0.to_lowercase().cmp(&b.0.to_lowercase())
     });
@@ -562,7 +562,7 @@ pub async fn list_dir(
 
     let parent = dir
         .parent()
-        .map(|p| normalize_display(p))
+        .map(normalize_display)
         .filter(|p| !p.is_empty() && p != &normalize_display(dir));
 
     Ok(Listing {
@@ -588,23 +588,76 @@ pub fn extension_of_name(name: &str) -> String {
 }
 
 const TEXT_EXTS: &[&str] = &[
-    "txt", "md", "markdown", "json", "json5", "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue",
-    "svelte", "rs", "py", "rb", "go", "java", "kt", "c", "h", "cpp", "hpp", "cs", "php", "swift",
-    "toml", "ini", "cfg", "conf", "env", "properties", "sh", "bash", "zsh", "fish", "ps1", "bat",
-    "cmd", "html", "htm", "css", "scss", "less", "xml", "svg", "yaml", "yml", "sql", "lua", "pl",
-    "log", "lock", "gitignore", "dockerfile", "makefile", "editorconfig",
+    "txt",
+    "md",
+    "markdown",
+    "json",
+    "json5",
+    "js",
+    "mjs",
+    "cjs",
+    "jsx",
+    "ts",
+    "tsx",
+    "vue",
+    "svelte",
+    "rs",
+    "py",
+    "rb",
+    "go",
+    "java",
+    "kt",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cs",
+    "php",
+    "swift",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "properties",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "bat",
+    "cmd",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "less",
+    "xml",
+    "svg",
+    "yaml",
+    "yml",
+    "sql",
+    "lua",
+    "pl",
+    "log",
+    "lock",
+    "gitignore",
+    "dockerfile",
+    "makefile",
+    "editorconfig",
 ];
 
 const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic", "heif", "ico", "tif",
-    "tiff",
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic", "heif", "ico", "tif", "tiff",
 ];
 
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "flv", "wmv", "mpg", "mpeg", "m2ts", "m3u8",
 ];
 
-const AUDIO_EXTS: &[&str] = &["mp3", "flac", "wav", "aac", "ogg", "m4a", "opus", "wma", "ape"];
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "flac", "wav", "aac", "ogg", "m4a", "opus", "wma", "ape",
+];
 
 const ARCHIVE_EXTS: &[&str] = &[
     "zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "zst", "iso",
@@ -728,7 +781,6 @@ mod tests {
         assert_eq!(ListOrder::parse(None), ListOrder::Asc);
     }
 
-
     #[test]
     fn rejects_parent_dir_traversal() {
         for raw in ["/tmp/../etc/passwd", "..\\windows\\system32", "../secret"] {
@@ -755,7 +807,7 @@ mod tests {
         let root = std::env::temp_dir();
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let inside = root.join("asmoday-inside-check.txt");
-        assert!(ensure_within(&inside, &[root.clone()]).is_ok());
+        assert!(ensure_within(&inside, std::slice::from_ref(&root)).is_ok());
         let outside = if cfg!(windows) {
             PathBuf::from(r"C:\Windows\System32")
         } else {
@@ -854,7 +906,11 @@ mod tests {
             Ordering::Greater
         );
         // 反向：游标是文件时，目录都在它前面
-        let file_cur = Cursor { is_dir: false, name: "b".into(), ..cur };
+        let file_cur = Cursor {
+            is_dir: false,
+            name: "b".into(),
+            ..cur
+        };
         assert_eq!(
             cursor_cmp(&plain("a", true), ListSort::Name, ListOrder::Asc, &file_cur),
             Ordering::Less
@@ -873,6 +929,9 @@ mod tests {
         };
         // 降序时更小的文件在游标之后
         let item = ("b".to_string(), false, None);
-        assert_eq!(cursor_cmp(&item, ListSort::Size, ListOrder::Desc, &cur), Ordering::Greater);
+        assert_eq!(
+            cursor_cmp(&item, ListSort::Size, ListOrder::Desc, &cur),
+            Ordering::Greater
+        );
     }
 }

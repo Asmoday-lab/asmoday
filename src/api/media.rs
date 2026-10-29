@@ -7,18 +7,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::AppState;
 use crate::core::ffmpeg;
 use crate::core::fs::{self, FsError};
 use crate::core::thumbnail::{PLACEHOLDER_SVG, ThumbOutcome};
-use crate::AppState;
 
 /// 单次扫描的条目上限，防超大目录拖垮后端
 const SCAN_LIMIT: usize = 4000;
@@ -239,7 +239,8 @@ pub async fn cover(State(state): State<AppState>, Query(query): Query<CoverQuery
         Err(err) => return fs_error(err),
     };
 
-    let read = tokio::task::spawn_blocking(move || crate::core::id3::read_cover(&path)).await;
+    let read =
+        tokio::task::spawn_blocking(move || crate::core::audio_tags::read_cover(&path)).await;
     match read {
         Ok(Some(cover)) => (
             StatusCode::OK,
@@ -324,10 +325,9 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
     };
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
-    let outcome = tokio::task::spawn_blocking(move || {
-        scan_albums(&scan_root, depth, &wanted, &auth_store)
-    })
-    .await;
+    let outcome =
+        tokio::task::spawn_blocking(move || scan_albums(&scan_root, depth, &wanted, &auth_store))
+            .await;
 
     match outcome {
         Ok((items, truncated)) => Json(json!({
@@ -367,7 +367,9 @@ fn find_subtitle(video: &Path) -> Option<String> {
 
 /// ThumbHash → 平均色（#rrggbb）。解码失败就当没有，前端回退纯色。
 fn average_color(hash_b64: &str) -> Option<String> {
-    let bytes = data_encoding::BASE64.decode(hash_b64.trim().as_bytes()).ok()?;
+    let bytes = data_encoding::BASE64
+        .decode(hash_b64.trim().as_bytes())
+        .ok()?;
     let (r, g, b, _) = thumbhash::thumb_hash_to_average_rgba(&bytes).ok()?;
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     Some(format!(
@@ -405,7 +407,9 @@ fn scan(
             }
 
             let path = entry.path();
-            let Ok(file_type) = entry.file_type() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().to_string();
 
             // 系统垃圾（Thumbs.db / .DS_Store / ._* / ~$*）一律不进媒体库，
@@ -415,7 +419,7 @@ fn scan(
             }
 
             if file_type.is_dir() {
-                if level + 1 <= depth
+                if level < depth
                     && !name.starts_with('.')
                     && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
                 {
@@ -439,7 +443,7 @@ fn scan(
 
             let meta = entry.metadata().ok();
             let tags = if kind == "audio" {
-                crate::core::id3::read_tags(&path)
+                crate::core::audio_tags::read_tags(&path)
             } else {
                 Default::default()
             };
@@ -499,18 +503,18 @@ fn scan(
                     }
                 }
             }
-            if let Some(hash) = value {
-                if let Some(item) = out.get_mut(*index) {
-                    item.hash = Some(hash.clone());
-                    item.color = average_color(&hash);
-                }
+            if let Some(hash) = value
+                && let Some(item) = out.get_mut(*index)
+            {
+                item.hash = Some(hash.clone());
+                item.color = average_color(&hash);
             }
         }
         auth.thumb_hashes_set_many(&migrated);
     }
 
     // 新的在前
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|item| std::cmp::Reverse(item.modified));
     (out, scanned, truncated)
 }
 
@@ -540,7 +544,9 @@ fn scan_albums(
     let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, true)];
 
     'walk: while let Some((dir, level, is_root)) = stack.pop() {
-        let Ok(reader) = std::fs::read_dir(&dir) else { continue };
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut count = 0usize;
         // (mtime, path)：相册封面取最新的一张图
         let mut newest: Option<(u64, PathBuf)> = None;
@@ -551,7 +557,9 @@ fn scan_albums(
                 truncated = true;
                 break 'walk;
             }
-            let Ok(file_type) = entry.file_type() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().to_string();
             // 系统垃圾（Thumbs.db / .DS_Store / ._*）一律不进媒体库（设计文档 3.3.7）
             if crate::core::junk::is_system_junk(&name) {
@@ -588,7 +596,11 @@ fn scan_albums(
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|delta| delta.as_secs())
                 .unwrap_or(0);
-            if newest.as_ref().map(|(best, _)| mtime > *best).unwrap_or(true) {
+            if newest
+                .as_ref()
+                .map(|(best, _)| mtime > *best)
+                .unwrap_or(true)
+            {
                 newest = Some((mtime, entry.path()));
             }
         }
@@ -611,7 +623,9 @@ fn scan_albums(
             path: fs::normalize_display(&dir),
             count,
             is_root,
-            cover: cover_source.as_ref().map(|path| fs::normalize_display(path)),
+            cover: cover_source
+                .as_ref()
+                .map(|path| fs::normalize_display(path)),
             cover_hash: None,
             cover_color: None,
             modified,
@@ -632,17 +646,21 @@ fn scan_albums(
             .collect();
         let hits = auth.thumb_hashes_get_many(&keys);
         for ((index, _), key) in lookup.iter().zip(keys.iter()) {
-            if let Some(hash) = hits.get(key) {
-                if let Some(album) = albums.get_mut(*index) {
-                    album.cover_hash = Some(hash.clone());
-                    album.cover_color = average_color(hash);
-                }
+            if let Some(hash) = hits.get(key)
+                && let Some(album) = albums.get_mut(*index)
+            {
+                album.cover_hash = Some(hash.clone());
+                album.cover_color = average_color(hash);
             }
         }
     }
 
     // 新的在前；没有 mtime 的沉底
-    albums.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+    albums.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     (albums, truncated)
 }
 
@@ -682,7 +700,12 @@ pub async fn progress(State(state): State<AppState>, Json(body): Json<ProgressBo
         "INSERT INTO play_history (mount_id, file_path, last_played_at, progress)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(mount_id, file_path) DO UPDATE SET last_played_at = ?3, progress = ?4",
-        rusqlite::params![mount_id, display, crate::core::auth::now_secs(), body.progress.max(0)],
+        rusqlite::params![
+            mount_id,
+            display,
+            crate::core::auth::now_secs(),
+            body.progress.max(0)
+        ],
     );
     match result {
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
@@ -712,7 +735,8 @@ pub async fn history(State(state): State<AppState>) -> Response {
         }))
     });
     match rows {
-        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() })).into_response(),
+        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() }))
+            .into_response(),
         Err(err) => fs_error(FsError::Io(format!("查询播放历史失败：{err}"))),
     }
 }
@@ -768,7 +792,8 @@ pub async fn favorites(State(state): State<AppState>) -> Response {
         }))
     });
     match rows {
-        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() })).into_response(),
+        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() }))
+            .into_response(),
         Err(err) => fs_error(FsError::Io(format!("查询收藏失败：{err}"))),
     }
 }
@@ -785,11 +810,11 @@ pub async fn cache_stats(State(state): State<AppState>) -> Response {
         let mut bytes = 0u64;
         if let Ok(reader) = std::fs::read_dir(&dir) {
             for entry in reader.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        files += 1;
-                        bytes += meta.len();
-                    }
+                if let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                {
+                    files += 1;
+                    bytes += meta.len();
                 }
             }
         }

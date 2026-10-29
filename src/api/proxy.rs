@@ -18,8 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::core::config::ServiceConfig;
 use crate::AppState;
+use crate::core::config::ServiceConfig;
 
 use crate::api::auth::SESSION_COOKIE;
 
@@ -90,7 +90,13 @@ async fn lookup(state: &AppState, id: &str) -> Result<ServiceConfig, Response> {
         .iter()
         .find(|service| service.id == id)
         .cloned()
-        .ok_or_else(|| error_code(StatusCode::NOT_FOUND, "SERVICE_NOT_FOUND", format!("Unknown service: {id}")))
+        .ok_or_else(|| {
+            error_code(
+                StatusCode::NOT_FOUND,
+                "SERVICE_NOT_FOUND",
+                format!("Unknown service: {id}"),
+            )
+        })
 }
 
 fn build_target(base: &str, rest: &str, query: Option<&str>) -> String {
@@ -101,11 +107,11 @@ fn build_target(base: &str, rest: &str, query: Option<&str>) -> String {
     } else {
         format!("{base}/{rest}")
     };
-    if let Some(query) = query {
-        if !query.is_empty() {
-            url.push('?');
-            url.push_str(query);
-        }
+    if let Some(query) = query
+        && !query.is_empty()
+    {
+        url.push('?');
+        url.push_str(query);
     }
     url
 }
@@ -121,7 +127,8 @@ fn to_ws_url(url: &str) -> String {
     }
 }
 
-fn is_websocket(headers: &HeaderMap) -> bool {    headers
+fn is_websocket(headers: &HeaderMap) -> bool {
+    headers
         .get(header::UPGRADE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.eq_ignore_ascii_case("websocket"))
@@ -174,7 +181,17 @@ pub async fn handle_root(
     ws: MaybeWs,
     body: Bytes,
 ) -> Response {
-    dispatch(state, service_id, String::new(), method, uri, headers, ws, body).await
+    dispatch(
+        state,
+        service_id,
+        String::new(),
+        method,
+        uri,
+        headers,
+        ws,
+        body,
+    )
+    .await
 }
 
 /// `/proxy/{service_id}/{*rest}`
@@ -315,16 +332,13 @@ async fn dispatch(
                     ),
                 }
             }
-            Err(err) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("读取上游响应失败：{err}"),
-            ),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, format!("读取上游响应失败：{err}")),
         };
     }
 
-    let stream = upstream.bytes_stream().map(|chunk| {
-        chunk.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
-    });
+    let stream = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
 
     match builder.body(Body::from_stream(stream)) {
         Ok(response) => response,
@@ -400,7 +414,8 @@ mod tests {
 
     #[test]
     fn session_cookie_never_reaches_upstream() {
-        let raw = HeaderValue::from_static("asmoday_session=secret123; grafana_user=admin; theme=dark");
+        let raw =
+            HeaderValue::from_static("asmoday_session=secret123; grafana_user=admin; theme=dark");
         let filtered = strip_session_cookie(&raw).expect("其余 cookie 应保留");
         let text = filtered.to_str().unwrap();
         assert!(!text.contains("secret123"), "会话 token 被下发了：{text}");
@@ -411,7 +426,10 @@ mod tests {
     #[test]
     fn cookie_header_is_dropped_when_only_session_left() {
         let raw = HeaderValue::from_static("asmoday_session=secret123");
-        assert!(strip_session_cookie(&raw).is_none(), "只剩本站会话时整个头都不该发");
+        assert!(
+            strip_session_cookie(&raw).is_none(),
+            "只剩本站会话时整个头都不该发"
+        );
     }
 
     #[test]

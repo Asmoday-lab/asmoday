@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -219,14 +219,13 @@ impl AuthStore {
         let Ok(conn) = self.connect() else {
             return map;
         };
-        let Ok(mut stmt) =
-            conn.prepare("SELECT hash FROM thumb_hashes WHERE key = ?1")
-        else {
+        let Ok(mut stmt) = conn.prepare("SELECT hash FROM thumb_hashes WHERE key = ?1") else {
             return map;
         };
         for key in keys {
-            if let Ok(Some(hash)) =
-                stmt.query_row(params![key], |row| row.get::<_, String>(0)).optional()
+            if let Ok(Some(hash)) = stmt
+                .query_row(params![key], |row| row.get::<_, String>(0))
+                .optional()
             {
                 map.insert(key.clone(), hash);
             }
@@ -256,7 +255,9 @@ impl AuthStore {
         for (key, hash) in entries {
             let _ = stmt.execute(params![key, hash, now]);
         }
-        let saves = self.hash_saves.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        let saves = self
+            .hash_saves
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
         // 取模判断而非等值判断：批量写入跨过 256 边界时也要触发一次
         if (saves % 256) + entries.len() as u64 >= 256 {
             let _ = conn.execute(
@@ -276,10 +277,10 @@ impl AuthStore {
     }
 
     fn connect(&self) -> Result<Connection, String> {
-        if let Some(parent) = self.db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+        if let Some(parent) = self.db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(&self.db_path)
             .map_err(|e| format!("打开数据库 {} 失败：{e}", self.db_path.display()))?;
@@ -438,7 +439,8 @@ impl AuthStore {
             .transaction()
             .map_err(|e| format!("开启事务失败：{e}"))?;
         for table in ["favorites", "play_history"] {
-            let sql = format!("DELETE FROM {table} WHERE file_path = ?1 OR file_path LIKE ?1 || '/%'");
+            let sql =
+                format!("DELETE FROM {table} WHERE file_path = ?1 OR file_path LIKE ?1 || '/%'");
             tx.execute(&sql, [path])
                 .map_err(|e| format!("清理 {table} 失败：{e}"))?;
         }
@@ -474,8 +476,7 @@ impl AuthStore {
         if let Some(parent) = target.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建备份目录失败：{e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建备份目录失败：{e}"))?;
         }
         // VACUUM INTO 遇到已存在的文件会直接报错，先给出更好懂的提示
         if target.exists() {
@@ -540,7 +541,10 @@ impl AuthStore {
         })
     }
 
-    pub fn find_user(&self, username: &str) -> Result<Option<(User, String, Option<String>)>, String> {
+    pub fn find_user(
+        &self,
+        username: &str,
+    ) -> Result<Option<(User, String, Option<String>)>, String> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password FROM users WHERE username = ?1",
@@ -668,7 +672,8 @@ impl AuthStore {
             return Ok(false);
         };
         hashes.remove(index);
-        let remaining = serde_json::to_string(&hashes).map_err(|e| format!("序列化恢复码失败：{e}"))?;
+        let remaining =
+            serde_json::to_string(&hashes).map_err(|e| format!("序列化恢复码失败：{e}"))?;
         tx.execute(
             "UPDATE users SET totp_recovery_codes = ?1 WHERE id = ?2",
             params![remaining, user_id],
@@ -792,8 +797,11 @@ impl AuthStore {
 
     pub fn purge_expired(&self) -> Result<usize, String> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now_secs()])
-            .map_err(|e| format!("清理过期会话失败：{e}"))
+        conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ?1",
+            params![now_secs()],
+        )
+        .map_err(|e| format!("清理过期会话失败：{e}"))
     }
 }
 
@@ -884,7 +892,10 @@ pub fn normalize_recovery_code(code: &str) -> String {
 }
 
 fn recovery_code_hash(code: &str) -> String {
-    fingerprint(&format!("asmoday-recovery:{}", normalize_recovery_code(code)))
+    fingerprint(&format!(
+        "asmoday-recovery:{}",
+        normalize_recovery_code(code)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -913,12 +924,12 @@ impl LoginGuard {
             Ok(map) => map,
             Err(_) => return Ok(()),
         };
-        if let Some(attempt) = map.get(key) {
-            if let Some(until) = attempt.blocked_until {
-                let now = Instant::now();
-                if until > now {
-                    return Err((until - now).as_secs().max(1));
-                }
+        if let Some(attempt) = map.get(key)
+            && let Some(until) = attempt.blocked_until
+        {
+            let now = Instant::now();
+            if until > now {
+                return Err((until - now).as_secs().max(1));
             }
         }
         map.retain(|_, attempt| {
@@ -986,11 +997,16 @@ mod tests {
 
         // 存量记录迁到空串挂载点（= 隐式根），路径与原值一字不差
         let (mount, path, created): (String, String, i64) = conn
-            .query_row("SELECT mount_id, file_path, created_at FROM favorites", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_row(
+                "SELECT mount_id, file_path, created_at FROM favorites",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
             .unwrap();
-        assert_eq!((mount.as_str(), path.as_str(), created), ("", "/m/a.mp4", 1));
+        assert_eq!(
+            (mount.as_str(), path.as_str(), created),
+            ("", "/m/a.mp4", 1)
+        );
         let progress: i64 = conn
             .query_row("SELECT progress FROM play_history", [], |row| row.get(0))
             .unwrap();
@@ -1192,6 +1208,9 @@ mod tests {
             )
             .unwrap();
         assert!(expires > now + 3600, "临近过期必须滑动续期");
-        assert!(expires <= created + SESSION_ABSOLUTE_TTL, "不得越过 30 天绝对上限");
+        assert!(
+            expires <= created + SESSION_ABSOLUTE_TTL,
+            "不得越过 30 天绝对上限"
+        );
     }
 }

@@ -5,11 +5,11 @@
 //! - `GET  /api/files/raw?path=`：流式读取，支持 HTTP Range（206 / 416）、ETag / Last-Modified（304）
 //! - `PUT  /api/files/raw?path=`：编辑器保存写回（仅文本类、原子替换）
 
+use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -17,10 +17,10 @@ use tokio_util::io::ReaderStream;
 
 use std::path::Path;
 
+use crate::AppState;
 use crate::core::config::Config;
 use crate::core::fs::{self, FsError, RootSet};
 use crate::core::path_guard;
-use crate::AppState;
 
 /// 编辑器单次保存上限（8 MiB）
 const MAX_EDIT_BYTES: usize = 8 * 1024 * 1024;
@@ -208,10 +208,10 @@ pub async fn raw(
         response
             .headers_mut()
             .insert(header::ETAG, etag.parse().expect("valid etag"));
-        if let Some(value) = &last_modified {
-            if let Ok(parsed) = value.parse() {
-                response.headers_mut().insert(header::LAST_MODIFIED, parsed);
-            }
+        if let Some(value) = &last_modified
+            && let Ok(parsed) = value.parse()
+        {
+            response.headers_mut().insert(header::LAST_MODIFIED, parsed);
         }
         return response;
     }
@@ -249,7 +249,8 @@ pub async fn raw(
             }
             let limited = file.take(range.len());
             let stream = ReaderStream::new(limited);
-            let mut response = (StatusCode::PARTIAL_CONTENT, Body::from_stream(stream)).into_response();
+            let mut response =
+                (StatusCode::PARTIAL_CONTENT, Body::from_stream(stream)).into_response();
             let mut headers_out = vec![
                 (header::CONTENT_TYPE, mime),
                 (header::ACCEPT_RANGES, "bytes".to_string()),
@@ -305,7 +306,10 @@ pub async fn raw(
 pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let set = mounts_for(&state).await;
     let Some(mount) = set.find_by_path_text(&query.path) else {
-        return fs_error(FsError::NotFound(format!("路径不在任何挂载点内：{}", query.path)));
+        return fs_error(FsError::NotFound(format!(
+            "路径不在任何挂载点内：{}",
+            query.path
+        )));
     };
     let path = match path_guard::resolve_existing(mount, &query.path) {
         Ok(path) => path,
@@ -321,13 +325,19 @@ pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQu
         Err(e) => return fs_error(FsError::Io(format!("读取文件信息失败：{e}"))),
     };
     if meta.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "The target is a directory, it cannot be opened in the editor");
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "The target is a directory, it cannot be opened in the editor",
+        );
     }
     if meta.len() as usize > MAX_EDIT_BYTES {
         return fail_code(
             StatusCode::PAYLOAD_TOO_LARGE,
             "E_TOO_LARGE",
-            format!("File exceeds the editor limit ({} MiB)", MAX_EDIT_BYTES / 1024 / 1024),
+            format!(
+                "File exceeds the editor limit ({} MiB)",
+                MAX_EDIT_BYTES / 1024 / 1024
+            ),
         );
     }
 
@@ -387,7 +397,10 @@ pub async fn write_text(
     if body.len() > MAX_EDIT_BYTES {
         return fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("File exceeds the editor limit ({} MiB)", MAX_EDIT_BYTES / 1024 / 1024),
+            format!(
+                "File exceeds the editor limit ({} MiB)",
+                MAX_EDIT_BYTES / 1024 / 1024
+            ),
         );
     }
 
@@ -411,7 +424,10 @@ pub async fn write_text(
         Err(e) => return fs_error(FsError::Io(format!("读取文件信息失败：{e}"))),
     };
     if meta.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "The target is a directory, it cannot be written");
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "The target is a directory, it cannot be written",
+        );
     }
 
     let name = path
@@ -432,7 +448,11 @@ pub async fn write_text(
     let text = match std::str::from_utf8(&body) {
         Ok(text) => text,
         Err(_) => {
-            return fail_code(StatusCode::BAD_REQUEST, "NOT_TEXT", "Content is not valid UTF-8 text");
+            return fail_code(
+                StatusCode::BAD_REQUEST,
+                "NOT_TEXT",
+                "Content is not valid UTF-8 text",
+            );
         }
     };
 
@@ -441,14 +461,24 @@ pub async fn write_text(
     let encoding = match query.encoding.as_deref() {
         Some(raw) => match crate::core::text_codec::TextEncoding::parse(raw) {
             Some(encoding) => encoding,
-            None => return fail(StatusCode::BAD_REQUEST, format!("Unsupported encoding: {raw}")),
+            None => {
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    format!("Unsupported encoding: {raw}"),
+                );
+            }
         },
         None => existing.0,
     };
     let eol = match query.eol.as_deref() {
         Some(raw) => match crate::core::text_codec::Eol::parse(raw) {
             Some(eol) => eol,
-            None => return fail(StatusCode::BAD_REQUEST, format!("Unsupported line ending: {raw}")),
+            None => {
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    format!("Unsupported line ending: {raw}"),
+                );
+            }
         },
         None => existing.1,
     };
@@ -456,7 +486,12 @@ pub async fn write_text(
         Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => true,
             "0" | "false" | "no" | "off" => false,
-            other => return fail(StatusCode::BAD_REQUEST, format!("Invalid bom parameter: {other}")),
+            other => {
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid bom parameter: {other}"),
+                );
+            }
         },
         None => existing.2,
     };
@@ -504,7 +539,11 @@ pub async fn write_text(
 /// 现有文件的（编码, 换行, BOM）；读不出来或解不出来时退回 UTF-8 / LF / 无 BOM。
 async fn read_style_snapshot(
     path: &std::path::Path,
-) -> (crate::core::text_codec::TextEncoding, crate::core::text_codec::Eol, bool) {
+) -> (
+    crate::core::text_codec::TextEncoding,
+    crate::core::text_codec::Eol,
+    bool,
+) {
     use crate::core::text_codec::{Eol, TextEncoding};
     match tokio::fs::read(path).await {
         Ok(bytes) => match crate::core::text_codec::decode(&bytes) {
@@ -580,7 +619,11 @@ pub async fn upload(
 
     let target = dir.join(name);
     if target.exists() && !query.overwrite {
-        return fail_code(StatusCode::CONFLICT, "E_CONFLICT", format!("File already exists: {name}"));
+        return fail_code(
+            StatusCode::CONFLICT,
+            "E_CONFLICT",
+            format!("File already exists: {name}"),
+        );
     }
 
     // 上传前检查目标挂载点剩余空间（设计文档 3.2.3）
@@ -589,10 +632,17 @@ pub async fn upload(
     }
 
     // 二次确认：拼接后的真实路径仍在授权根内
-    if let Ok(canonical_parent) = std::fs::canonicalize(&dir) {
-        if !roots.allowed.iter().any(|root| canonical_parent.starts_with(root)) {
-            return fail_code(StatusCode::FORBIDDEN, "E_FORBIDDEN", "Upload target is outside the allowed roots");
-        }
+    if let Ok(canonical_parent) = std::fs::canonicalize(&dir)
+        && !roots
+            .allowed
+            .iter()
+            .any(|root| canonical_parent.starts_with(root))
+    {
+        return fail_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Upload target is outside the allowed roots",
+        );
     }
 
     let tmp = dir.join(format!(".{name}.asmoday-upload.tmp"));
@@ -762,10 +812,7 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
 // ---------------------------------------------------------------------------
 
 /// GET /api/files/subtitle?path=…：统一输出 WebVTT（浏览器只认 vtt，srt 现场转）
-pub async fn subtitle(
-    State(state): State<AppState>,
-    Query(query): Query<PathQuery>,
-) -> Response {
+pub async fn subtitle(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let set = roots_for(&state).await;
     let path = match fs::resolve_existing(&query.path, &set.allowed) {
         Ok(path) => path,
@@ -784,7 +831,11 @@ pub async fn subtitle(
         Ok(bytes) => decode_subtitle_text(&bytes),
         Err(e) => return fs_error(FsError::Io(format!("读取字幕失败：{e}"))),
     };
-    let body = if ext == "srt" { srt_to_vtt(&raw) } else { ensure_vtt_header(&raw) };
+    let body = if ext == "srt" {
+        srt_to_vtt(&raw)
+    } else {
+        ensure_vtt_header(&raw)
+    };
 
     (
         StatusCode::OK,

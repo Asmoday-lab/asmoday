@@ -4,16 +4,16 @@
 //! - 令牌形如 `asm_<32 hex>`，数据库只存 SHA-1 摘要；
 //! - 可设置只读/读写与有效天数。
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 
-use crate::core::auth::now_secs;
 use crate::AppState;
+use crate::core::auth::now_secs;
 
 fn hash_token(token: &str) -> String {
     let mut hasher = Sha1::new();
@@ -87,8 +87,12 @@ pub async fn list(State(state): State<AppState>) -> Response {
     });
 
     match rows {
-        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("读取失败：{err}")),
+        Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() }))
+            .into_response(),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取失败：{err}"),
+        ),
     }
 }
 
@@ -96,7 +100,11 @@ pub async fn list(State(state): State<AppState>) -> Response {
 pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>) -> Response {
     let name = body.name.trim();
     if name.is_empty() {
-        return error_code(StatusCode::BAD_REQUEST, "TOKEN_NAME_EMPTY", "Token name is required");
+        return error_code(
+            StatusCode::BAD_REQUEST,
+            "TOKEN_NAME_EMPTY",
+            "Token name is required",
+        );
     }
 
     let token = format!("asm_{}", crate::core::auth::random_token());
@@ -158,7 +166,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>
             "mount_id": scope,
         }))
         .into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("创建失败：{err}")),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建失败：{err}"),
+        ),
     }
 }
 
@@ -172,7 +183,10 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     match conn.execute("DELETE FROM access_tokens WHERE id = ?1", [id]) {
         Ok(0) => error(StatusCode::NOT_FOUND, "令牌不存在"),
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败：{err}")),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("删除失败：{err}"),
+        ),
     }
 }
 
@@ -194,10 +208,10 @@ pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<Tok
     if token_name != username {
         return None;
     }
-    if let Some(expires) = expires_at {
-        if expires <= now_secs() {
-            return None;
-        }
+    if let Some(expires) = expires_at
+        && expires <= now_secs()
+    {
+        return None;
     }
     Some(TokenAccess {
         readonly: readonly != 0,

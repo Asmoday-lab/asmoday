@@ -77,18 +77,21 @@ pub async fn security_headers(
 
     // HTTPS 判定：自己终结 TLS，或来自可信反代的 X-Forwarded-Proto
     let via_trusted_proxy = peer
-        .map(|addr| trusted.iter().any(|rule| crate::api::auth::ip_matches(&crate::api::auth::peer_ip(addr), rule)))
+        .map(|addr| {
+            trusted
+                .iter()
+                .any(|rule| crate::api::auth::ip_matches(&crate::api::auth::peer_ip(addr), rule))
+        })
         .unwrap_or(false);
-    let https = ssl_enabled
-        || (via_trusted_proxy && forwarded_proto.as_deref() == Some("https"));
+    let https = ssl_enabled || (via_trusted_proxy && forwarded_proto.as_deref() == Some("https"));
 
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     let mut put = |name: header::HeaderName, value: &str| {
-        if !headers.contains_key(&name) {
-            if let Ok(value) = HeaderValue::from_str(value) {
-                headers.insert(name, value);
-            }
+        if !headers.contains_key(&name)
+            && let Ok(value) = HeaderValue::from_str(value)
+        {
+            headers.insert(name, value);
         }
     };
 

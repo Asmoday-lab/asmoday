@@ -9,9 +9,9 @@
 //! 强行套一个泛化 code 反而会把它盖掉。5xx 一律补 `E_INTERNAL`：服务端细节
 //! 既不该泄漏，也不需要前端逐条翻译。
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 use crate::core::fs::FsError;

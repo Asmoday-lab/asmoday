@@ -2,6 +2,9 @@
 name = "asmoday"
 version = "0.1.0"
 edition = "2024"
+# 下限来自 std 的文件锁（`File::try_lock`，1.89 稳定）：单实例锁靠它，
+# 再低就得引第三方 crate 或退回 SQLite 排他锁的老路。
+rust-version = "1.89"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -57,6 +60,18 @@ encoding_rs = "0.8"
 httpdate = "1"
 # 把中间件包在 Router 外面需要用到 tower::Layer（axum 内部本来就用它，这里只是显式声明）
 tower = "0.5"
+# 传输层压缩（br 优先、gzip 兜底）。tower-http 本来就在 axum 的依赖树里，
+# 这里只多开两个压缩特性，不引入第二份 tower-http。
+# 自写 Content-Encoding 要自己处理分块、Vary、ETag 弱化、Content-Length 移除，
+# 漏一个就是线上事故，交给社区实现更划算。
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
+# tower-http 的 Predicate::should_compress 签名里带 http_body::Body，
+# 实现自定义判定必须能写出这个 trait 路径（本来就在依赖树里）。
+# 注意 crate 名带连字符、lib 名是 http_body
+http-body = "1"
+# 音频标签（ID3v2 / FLAC / Ogg / MP4 / WAV / AIFF / APE / WavPack）。
+# 自己写 ID3v2 只能覆盖 MP3，FLAC 与 M4A 直接没标签（音乐库整页空白）。
+lofty = "0.25.5"
 
 # TLS 平台分流（注释见上方 reqwest）。必须放在 [dependencies] 全部键之后。
 [target.'cfg(not(target_os = "linux"))'.dependencies]

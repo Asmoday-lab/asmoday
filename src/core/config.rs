@@ -139,6 +139,7 @@ format = "text"
 /// 根配置结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub auth: AuthConfig,
@@ -152,21 +153,6 @@ pub struct Config {
     pub log: LogConfig,
     /// 终端 PTY 拉起覆盖（设计文档 3.3.5）
     pub terminal: TerminalConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            auth: AuthConfig::default(),
-            system: SystemConfig::default(),
-            services: Vec::new(),
-            shares: SharesConfig::default(),
-            media: MediaConfig::default(),
-            log: LogConfig::default(),
-            terminal: TerminalConfig::default(),
-        }
-    }
 }
 
 /// `[terminal]`：PTY 拉起覆盖（设计文档 3.3.5）。
@@ -463,12 +449,12 @@ pub async fn load_or_create(path: &Path) -> Result<(Config, bool), String> {
     let mut created = false;
 
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| format!("创建配置目录 {} 失败: {e}", parent.display()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("创建配置目录 {} 失败: {e}", parent.display()))?;
         }
         tokio::fs::write(path, DEFAULT_CONFIG_TOML)
             .await
@@ -480,8 +466,8 @@ pub async fn load_or_create(path: &Path) -> Result<(Config, bool), String> {
         .await
         .map_err(|e| format!("读取配置 {} 失败: {e}", path.display()))?;
 
-    let config: Config = toml::from_str(&raw)
-        .map_err(|e| format!("解析配置 {} 失败: {e}", path.display()))?;
+    let config: Config =
+        toml::from_str(&raw).map_err(|e| format!("解析配置 {} 失败: {e}", path.display()))?;
 
     config.validate()?;
     Ok((config, created))
@@ -504,7 +490,12 @@ pub async fn load_or_create(path: &Path) -> Result<(Config, bool), String> {
 /// 只有表数组与纯表能缺席（解析时 `#[serde(default)]` 会补成空），
 /// **标量数组不能**：`trusted_ips = []` 与「没有这个键」语义完全不同
 /// （后者回到默认白名单，前者是真空白名单）。
-const OMITTABLE_PATHS: &[&str] = &["system", "system.mounts", "services", "services.inject_headers"];
+const OMITTABLE_PATHS: &[&str] = &[
+    "system",
+    "system.mounts",
+    "services",
+    "services.inject_headers",
+];
 
 fn is_omittable(path: &str) -> bool {
     OMITTABLE_PATHS.contains(&path)
@@ -552,7 +543,9 @@ fn inline_array(array: &mut toml_edit::Array) {
     array.set_trailing_comma(false);
     array.set_trailing("");
     for (index, value) in array.iter_mut().enumerate() {
-        value.decor_mut().set_prefix(if index == 0 { "" } else { " " });
+        value
+            .decor_mut()
+            .set_prefix(if index == 0 { "" } else { " " });
         value.decor_mut().set_suffix("");
     }
 }
@@ -584,7 +577,7 @@ fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prefix:
         .iter()
         .filter(|(key, _)| {
             let path = join_path(prefix, key);
-            match source.get(*key) {
+            match source.get(key) {
                 None => true,
                 Some(item) => is_omittable_item(&path, item),
             }
@@ -606,10 +599,10 @@ fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prefix:
             // 整张表都是「可省略的空值」（如 `[system]` 下只有一个空 mounts）时
             // 不要写进文档：否则第一次保存留下 `[system]/mounts = []`，
             // 第二次保存又把它当空段删掉，两次结果不一致（不幂等）。
-            if let Some(table) = source_item.as_table() {
-                if table_fully_omittable(&path, table) {
-                    continue;
-                }
+            if let Some(table) = source_item.as_table()
+                && table_fully_omittable(&path, table)
+            {
+                continue;
             }
             target.insert(key, source_item.clone());
             continue;
@@ -653,11 +646,7 @@ fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prefix:
 /// 按索引对齐：已有条目原地改字段（条目上的注释、条目内注释都保留），
 /// 多出来的追加，少了的截断 —— 只有「条目数量变少」时才会丢掉被删条目的注释，
 /// 那是用户真的删了它，可以接受。
-fn merge_table_array(
-    item: &mut toml_edit::Item,
-    source: &toml_edit::ArrayOfTables,
-    path: &str,
-) {
+fn merge_table_array(item: &mut toml_edit::Item, source: &toml_edit::ArrayOfTables, path: &str) {
     use toml_edit::Item;
 
     if !matches!(item, Item::ArrayOfTables(_)) {
@@ -690,16 +679,14 @@ fn merge_table_array(
 fn render_preserving_comments(existing: Option<&str>, config: &Config) -> Result<String, String> {
     let plain = || toml::to_string_pretty(config).map_err(|e| format!("序列化配置失败: {e}"));
 
-    let fresh = match plain() {
-        Ok(text) => text,
-        // 序列化失败是真异常（Save 必须失败），不要静默写空文件
-        Err(err) => return Err(err),
-    };
+    let fresh = plain()?;
     let Ok(mut fresh_doc) = fresh.parse::<toml_edit::DocumentMut>() else {
         return plain();
     };
     inline_all(fresh_doc.as_table_mut());
-    let Ok(mut doc) = existing.unwrap_or(DEFAULT_CONFIG_TOML).parse::<toml_edit::DocumentMut>()
+    let Ok(mut doc) = existing
+        .unwrap_or(DEFAULT_CONFIG_TOML)
+        .parse::<toml_edit::DocumentMut>()
     else {
         // 现有文件被手改坏了（少括号之类）：退回全量重写，至少配置能保存成功
         return plain();
@@ -726,12 +713,12 @@ impl Config {
         let existing = tokio::fs::read_to_string(path).await.ok();
         let body = render_preserving_comments(existing.as_deref(), self)?;
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| format!("创建配置目录 {} 失败: {e}", parent.display()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("创建配置目录 {} 失败: {e}", parent.display()))?;
         }
 
         write_if_changed(path, &body)
@@ -767,13 +754,18 @@ impl Config {
 
         let base_url = self.server.proxy.base_url.trim();
         if !base_url.is_empty() && (!base_url.starts_with('/') || base_url.ends_with('/')) {
-            return Err("server.proxy.base_url 必须以 / 开头且不以 / 结尾，例如 \"/asmoday\"".to_string());
+            return Err(
+                "server.proxy.base_url 必须以 / 开头且不以 / 结尾，例如 \"/asmoday\"".to_string(),
+            );
         }
         if !base_url
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'))
         {
-            return Err("server.proxy.base_url 只能包含字母、数字、- 和 _（避免注入到 HTML 时出错）".to_string());
+            return Err(
+                "server.proxy.base_url 只能包含字母、数字、- 和 _（避免注入到 HTML 时出错）"
+                    .to_string(),
+            );
         }
 
         // 媒体缓存：0 会让淘汰逻辑「永远删到空」或「缓存永不过期」，都不合理
@@ -826,7 +818,10 @@ impl Config {
             if id.is_empty() {
                 return Err("services[].id 不能为空".to_string());
             }
-            if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            if !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
                 return Err(format!("services[{id}].id 只能包含字母、数字、- 和 _"));
             }
             if !ids.insert(id.to_string()) {
@@ -837,7 +832,9 @@ impl Config {
             }
             let target = service.target_url.trim();
             if !(target.starts_with("http://") || target.starts_with("https://")) {
-                return Err(format!("services[{id}].target_url 必须以 http:// 或 https:// 开头"));
+                return Err(format!(
+                    "services[{id}].target_url 必须以 http:// 或 https:// 开头"
+                ));
             }
             if service.kind != "external" {
                 return Err(format!("services[{id}].type 目前仅支持 \"external\""));
@@ -1002,10 +999,10 @@ static SELF_WRITE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 ///
 /// 返回 `true` 表示确实写了。调用方不用再自己挂起监听器——这里已经处理。
 pub async fn write_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
-    if let Ok(existing) = tokio::fs::read_to_string(path).await {
-        if existing == body {
-            return Ok(false);
-        }
+    if let Ok(existing) = tokio::fs::read_to_string(path).await
+        && existing == body
+    {
+        return Ok(false);
     }
     let _guard = suspend_watch();
     let tmp = path.with_extension("toml.tmp");
@@ -1147,7 +1144,9 @@ fn apply_text(state: &crate::AppState, raw: &str) -> bool {
     let config = match toml::from_str::<Config>(raw) {
         Ok(config) => config,
         Err(err) => {
-            crate::log_warn!("config hot reload skipped (parse failed: {err}), keeping previous config");
+            crate::log_warn!(
+                "config hot reload skipped (parse failed: {err}), keeping previous config"
+            );
             return false;
         }
     };
@@ -1178,7 +1177,9 @@ mod tests {
     use super::*;
 
     fn comment_lines(text: &str) -> usize {
-        text.lines().filter(|line| line.trim_start().starts_with('#')).count()
+        text.lines()
+            .filter(|line| line.trim_start().starts_with('#'))
+            .count()
     }
 
     /// 文档里是否真有这一行表头（注释掉的示例不算）
@@ -1273,7 +1274,10 @@ thumb_cache_max_size_mb = 512
         assert!(has_headers(&text, "[[system.mounts]]"), "{text}");
         assert!(has_headers(&text, "[[services]]"), "{text}");
         assert!(has_headers(&text, "[services.inject_headers]"), "{text}");
-        assert!(text.contains("# 以下为可选配置，默认注释"), "模板注释不能丢：\n{text}");
+        assert!(
+            text.contains("# 以下为可选配置，默认注释"),
+            "模板注释不能丢：\n{text}"
+        );
         assert_eq!(parsed(&text), config);
 
         // 删干净之后，文档里不该留下空段或空数组
@@ -1284,7 +1288,10 @@ thumb_cache_max_size_mb = 512
         assert!(!has_headers(&text, "[[system.mounts]]"), "{text}");
         assert!(!has_headers(&text, "[[services]]"), "{text}");
         assert!(!has_headers(&text, "[services.inject_headers]"), "{text}");
-        assert!(!has_headers(&text, "[system]"), "空的 [system] 段应当移除：\n{text}");
+        assert!(
+            !has_headers(&text, "[system]"),
+            "空的 [system] 段应当移除：\n{text}"
+        );
         assert_eq!(parsed(&text), emptied);
     }
 

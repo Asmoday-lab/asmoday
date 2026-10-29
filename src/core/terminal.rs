@@ -130,7 +130,10 @@ impl Session {
     }
 
     pub fn write_all(&self, data: &[u8]) -> Result<(), String> {
-        let mut writer = self.writer.lock().map_err(|_| "pty writer poisoned".to_string())?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| "pty writer poisoned".to_string())?;
         writer
             .write_all(data)
             .and_then(|_| writer.flush())
@@ -140,7 +143,10 @@ impl Session {
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         // 最后一道闸：即便调用方漏了钳制，也绝不把 0 / 超大值塞进 ConPTY
         let (cols, rows) = clamp_size(cols as u64, rows as u64);
-        let master = self.master.lock().map_err(|_| "pty master poisoned".to_string())?;
+        let master = self
+            .master
+            .lock()
+            .map_err(|_| "pty master poisoned".to_string())?;
         master
             .resize(PtySize {
                 rows,
@@ -468,7 +474,9 @@ fn apply_shell_args(command: &mut CommandBuilder, shell: &str, options: &ShellOp
     }
 
     // `-l` 只给认识的 POSIX 家族 shell；nushell / elvish 之类参数不同，绝不硬塞
-    const LOGIN_SHELLS: &[&str] = &["bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh"];
+    const LOGIN_SHELLS: &[&str] = &[
+        "bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh",
+    ];
     if LOGIN_SHELLS.contains(&name.as_str()) {
         command.arg("-l");
     }
@@ -686,15 +694,13 @@ impl TerminalManager {
                 Some(session) => session.clients.load(Ordering::SeqCst) == 0,
                 None => false,
             };
-            if should_kill {
-                if let Some(session) = manager.get(&id) {
-                    // 回收走优雅退出：给 shell 留保存历史、收尾子进程的机会
-                    let session_for_close = Arc::clone(&session);
-                    tokio::task::spawn_blocking(move || session_for_close.close_graceful())
-                        .await
-                        .ok();
-                    manager.kill(&id);
-                }
+            if should_kill && let Some(session) = manager.get(&id) {
+                // 回收走优雅退出：给 shell 留保存历史、收尾子进程的机会
+                let session_for_close = Arc::clone(&session);
+                tokio::task::spawn_blocking(move || session_for_close.close_graceful())
+                    .await
+                    .ok();
+                manager.kill(&id);
             }
         });
     }
@@ -711,7 +717,11 @@ impl TerminalManager {
         let sessions: Vec<(String, Arc<Session>)> = self
             .inner
             .lock()
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect())
+            .map(|map| {
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect()
+            })
             .unwrap_or_default();
         for (_, session) in sessions {
             session.kill();
@@ -741,7 +751,10 @@ mod tests {
         // [terminal] 的 max_sessions 直接决定并发闸门，0 也要兜成 1（否则一个都开不了）
         let manager = TerminalManager::with_limits(3, Duration::from_secs(42));
         assert_eq!(manager.max_sessions(), 3);
-        assert_eq!(TerminalManager::with_limits(0, Duration::ZERO).max_sessions(), 1);
+        assert_eq!(
+            TerminalManager::with_limits(0, Duration::ZERO).max_sessions(),
+            1
+        );
         // 缺省值必须与设计文档 3.3 一致（10 并发 / 180 秒保活）
         assert_eq!(TerminalManager::default().max_sessions(), MAX_SESSIONS);
     }
@@ -772,7 +785,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_command_chcp_first_then_history() {
-        let payload = windows_command_payload(Some("C:/data/terminal_history/ConsoleHost_history.txt"));
+        let payload =
+            windows_command_payload(Some("C:/data/terminal_history/ConsoleHost_history.txt"));
         // 设计文档 3.3.5：chcp 65001 优先发送
         assert!(payload.starts_with("chcp.com 65001 > $null; "));
         assert!(payload.contains(
@@ -794,7 +808,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp);
         let env = prepare_env(&temp);
         let path = env.history_path.unwrap();
-        assert!(path.replace('\\', "/").ends_with("terminal_history/.bash_history"));
+        assert!(
+            path.replace('\\', "/")
+                .ends_with("terminal_history/.bash_history")
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -807,7 +824,13 @@ mod tests {
         let pwsh_installed = ["ProgramFiles", "ProgramW6432"].iter().any(|key| {
             std::env::var(key)
                 .ok()
-                .map(|dir| Path::new(&dir).join("PowerShell").join("7").join("pwsh.exe").is_file())
+                .map(|dir| {
+                    Path::new(&dir)
+                        .join("PowerShell")
+                        .join("7")
+                        .join("pwsh.exe")
+                        .is_file()
+                })
                 .unwrap_or(false)
         });
         if pwsh_installed {
@@ -827,7 +850,12 @@ mod tests {
     #[test]
     fn windows_args_keep_noexit_and_profile() {
         let mut command = CommandBuilder::new("powershell.exe");
-        apply_shell_args(&mut command, "powershell.exe", &ShellOptions::default(), Some("C:/h.txt"));
+        apply_shell_args(
+            &mut command,
+            "powershell.exe",
+            &ShellOptions::default(),
+            Some("C:/h.txt"),
+        );
         let args: Vec<String> = command
             .get_argv()
             .iter()
@@ -839,15 +867,15 @@ mod tests {
 
         // 纯净模式逃生舱
         let mut pure = CommandBuilder::new("powershell.exe");
-                   apply_shell_args(
-                    &mut pure,
-                    "powershell.exe",
-                    &ShellOptions {
-                        no_profile: true,
-                        ..Default::default()
-                    },
-                    None,
-                );
+        apply_shell_args(
+            &mut pure,
+            "powershell.exe",
+            &ShellOptions {
+                no_profile: true,
+                ..Default::default()
+            },
+            None,
+        );
         let pure_args: Vec<String> = pure
             .get_argv()
             .iter()
@@ -888,7 +916,6 @@ mod tests {
             no_profile: true,
             shell: "/usr/bin/fish".to_string(),
             args: vec!["-x".to_string()],
-            ..Default::default()
         };
         assert_eq!(configured_shell(&pure), None);
         assert_eq!(configured_args(&pure), None);

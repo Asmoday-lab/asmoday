@@ -91,7 +91,14 @@ mod tests {
     #[test]
     fn ordinary_hidden_files_are_not_junk() {
         // 这些必须由 show_hidden 开关控制，不能被黑名单误杀
-        for name in [".env", ".git", ".gitignore", ".github", ".config", "readme.md"] {
+        for name in [
+            ".env",
+            ".git",
+            ".gitignore",
+            ".github",
+            ".config",
+            "readme.md",
+        ] {
             assert!(!is_system_junk(name), "{name} 不应被过滤");
         }
     }

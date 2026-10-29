@@ -50,9 +50,9 @@ pub struct MountEntry {
 
 impl MountEntry {
     pub fn canon_root(&self) -> Result<&PathBuf, FsError> {
-        self.root.as_ref().ok_or_else(|| {
-            FsError::NotFound(format!("挂载点 {} 当前不可用", self.info.name))
-        })
+        self.root
+            .as_ref()
+            .ok_or_else(|| FsError::NotFound(format!("挂载点 {} 当前不可用", self.info.name)))
     }
 
     /// 只读挂载点直接拒绝一切写操作（设计文档 3.2.6 通用前提）
@@ -86,7 +86,11 @@ impl MountSet {
         self.mounts
             .iter()
             .find(|m| m.info.id == needle)
-            .or_else(|| self.mounts.iter().find(|m| paths_equal(&m.info.path, needle)))
+            .or_else(|| {
+                self.mounts
+                    .iter()
+                    .find(|m| paths_equal(&m.info.path, needle))
+            })
             .or_else(|| self.find_by_path_text(needle))
     }
 
@@ -116,7 +120,11 @@ impl MountSet {
     pub fn mount_of(&self, canon_path: &Path) -> Option<&MountEntry> {
         self.mounts
             .iter()
-            .filter(|m| m.root.as_ref().is_some_and(|root| canon_path.starts_with(root)))
+            .filter(|m| {
+                m.root
+                    .as_ref()
+                    .is_some_and(|root| canon_path.starts_with(root))
+            })
             .max_by_key(|m| m.root.as_ref().map(|r| r.as_os_str().len()).unwrap_or(0))
     }
 
@@ -248,12 +256,12 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
     let parent_canon = std::fs::canonicalize(&parent_raw)
         .map_err(|_| FsError::NotFound(format!("目录不存在：{parent}")))?;
     if !parent_canon.starts_with(root) {
-        return Err(FsError::PathTraversal(
-            "目标目录不在挂载点内".to_string(),
-        ));
+        return Err(FsError::PathTraversal("目标目录不在挂载点内".to_string()));
     }
     if !parent_canon.is_dir() {
-        return Err(FsError::BadRequest("目标是文件，不能作为父目录".to_string()));
+        return Err(FsError::BadRequest(
+            "目标是文件，不能作为父目录".to_string(),
+        ));
     }
     Ok(parent_canon.join(name))
 }
@@ -292,7 +300,6 @@ fn absolute(mount: &MountEntry, raw: &str) -> Result<PathBuf, FsError> {
 
 /// 单段文件名校验。任何一条不满足都直接拒绝，不做「自动纠正」。
 pub fn validate_name(name: &str) -> Result<(), FsError> {
-    let name = name;
     if name.is_empty() {
         return Err(FsError::BadRequest("名称不能为空".to_string()));
     }
@@ -302,7 +309,10 @@ pub fn validate_name(name: &str) -> Result<(), FsError> {
     if name.contains('\0') || name.chars().any(|c| c.is_control()) {
         return Err(FsError::BadRequest("名称含控制字符".to_string()));
     }
-    if name.chars().any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')) {
+    if name
+        .chars()
+        .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
         return Err(FsError::BadRequest(
             "名称不能包含 / \\ : * ? \" < > |".to_string(),
         ));
@@ -346,7 +356,10 @@ pub fn is_part_file(name: &str) -> bool {
         return false;
     };
     let suffix = &name[index + PART_MARK.len()..];
-    suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    suffix.len() == 8
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// 整条路径的最后一段是否为临时文件。
@@ -460,7 +473,11 @@ fn platform_rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     let to_c = CString::new(to.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     let rc = unsafe {
         syscall(
             SYS_RENAMEAT2,
@@ -472,7 +489,11 @@ fn platform_rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         )
     };
     // 未知架构：直接走 ENOSYS 降级路径
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
     let rc: i64 = {
         let _ = (&from_c, &to_c);
         -1
@@ -493,7 +514,10 @@ fn platform_rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         std::io::Error::from_raw_os_error(38) // ENOSYS
     };
     // 老内核 / 不支持的 FS：退回「硬链接占位 + 删除源」，链接本身是原子的
-    if matches!(err.raw_os_error(), Some(38) /* ENOSYS */ | Some(22) /* EINVAL */) {
+    if matches!(
+        err.raw_os_error(),
+        Some(38) /* ENOSYS */ | Some(22) /* EINVAL */
+    ) {
         std::fs::hard_link(from, to)?;
         std::fs::remove_file(from)?;
         return Ok(());
@@ -562,8 +586,25 @@ mod tests {
     #[test]
     fn rejects_dangerous_names() {
         for name in [
-            "", ".", "..", "a/b", "a\\b", "C:x", "a*b", "a?b", "a|b", "a\"b", "a<b", "a>b",
-            "trail ", "trail.", "CON", "con.txt", "LPT1", "a\0b", "x.asmoday-part.abc12345",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "C:x",
+            "a*b",
+            "a?b",
+            "a|b",
+            "a\"b",
+            "a<b",
+            "a>b",
+            "trail ",
+            "trail.",
+            "CON",
+            "con.txt",
+            "LPT1",
+            "a\0b",
+            "x.asmoday-part.abc12345",
         ] {
             assert!(validate_name(name).is_err(), "{name} 应被拒绝");
         }
@@ -571,7 +612,15 @@ mod tests {
 
     #[test]
     fn accepts_normal_names() {
-        for name in ["a.txt", "照片 2024", ".env", "归档.tar.gz", "a..b", "COM10", "NULx"] {
+        for name in [
+            "a.txt",
+            "照片 2024",
+            ".env",
+            "归档.tar.gz",
+            "a..b",
+            "COM10",
+            "NULx",
+        ] {
             assert!(validate_name(name).is_ok(), "{name} 应被接受");
         }
     }
@@ -607,11 +656,15 @@ mod tests {
     #[test]
     fn part_path_checks_last_segment() {
         // 整条路径只看最后一段：临时文件不可预览/下载（设计文档 3.2.6.4，v3.4.0）
-        assert!(is_part_path(Path::new("/mnt/a/movie.mp4.asmoday-part.a1b2c3d4")));
+        assert!(is_part_path(Path::new(
+            "/mnt/a/movie.mp4.asmoday-part.a1b2c3d4"
+        )));
         assert!(is_part_path(Path::new("movie.mp4.asmoday-part.a1b2c3d4")));
         assert!(!is_part_path(Path::new("/mnt/a/movie.mp4")));
         // 临时文件所在目录本身不受影响
-        assert!(!is_part_path(Path::new("/mnt/x.asmoday-part.a1b2c3d4/movie.mp4")));
+        assert!(!is_part_path(Path::new(
+            "/mnt/x.asmoday-part.a1b2c3d4/movie.mp4"
+        )));
     }
 
     #[test]

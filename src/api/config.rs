@@ -3,15 +3,15 @@
 //! - `GET  /api/config`：返回解析后的 JSON 配置
 //! - `POST /api/config`：接收 JSON，校验后序列化为 TOML 落盘，并热更新内存中的配置
 
-use axum::extract::rejection::JsonRejection;
+use axum::Json;
 use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
-use crate::core::config::Config;
 use crate::AppState;
+use crate::core::config::Config;
 
 /// GET /api/config
 pub async fn get_config(State(state): State<AppState>) -> Json<Config> {
@@ -79,7 +79,10 @@ pub async fn get_config_raw(State(state): State<AppState>) -> Response {
     match tokio::fs::read_to_string(&state.config_path).await {
         Ok(text) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             text,
         )
             .into_response(),
@@ -94,7 +97,13 @@ pub async fn get_config_raw(State(state): State<AppState>) -> Response {
 pub async fn update_config_raw(State(state): State<AppState>, body: String) -> Response {
     let parsed: Config = match toml::from_str(&body) {
         Ok(config) => config,
-        Err(err) => return error_code(StatusCode::BAD_REQUEST, "CONFIG_PARSE", format!("TOML syntax error: {err}")),
+        Err(err) => {
+            return error_code(
+                StatusCode::BAD_REQUEST,
+                "CONFIG_PARSE",
+                format!("TOML syntax error: {err}"),
+            );
+        }
     };
 
     if let Err(message) = parsed.validate() {

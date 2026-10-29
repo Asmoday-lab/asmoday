@@ -51,7 +51,8 @@ impl RuntimePrefix {
             return path;
         }
         match path.strip_prefix(self.0.as_str()) {
-            Some(rest) if rest.is_empty() => "/",
+            // 正好等于前缀（`/app`）→ 视作站点根
+            Some("") => "/",
             Some(rest) if rest.starts_with('/') => rest,
             _ => path,
         }

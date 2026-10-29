@@ -20,9 +20,9 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, SeekFrom};
 use tokio_util::io::ReaderStream;
 
+use crate::AppState;
 use crate::core::fs;
 use crate::core::{fs_ops, path_guard};
-use crate::AppState;
 
 const PREFIX: &str = "/dav";
 /// PROPFIND 单层条目上限（防客户端一次拉爆 CPU/IO，设计文档 3.10）
@@ -163,7 +163,10 @@ fn parse_range(header_value: Option<&str>, len: u64) -> Result<Option<(u64, u64)
         return Ok(None);
     };
     if len == 0 {
-        return Err(dav_error(StatusCode::RANGE_NOT_SATISFIABLE, "空文件无法分段"));
+        return Err(dav_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "空文件无法分段",
+        ));
     }
     let spec = value
         .trim()
@@ -217,9 +220,7 @@ async fn mount_load(state: &AppState) -> path_guard::MountSet {
 /// 把请求里挂载点内的相对路径解析成存在的绝对路径（canonicalize，防逃逸）。
 fn resolve(mount: &path_guard::MountEntry, rest: &str) -> Result<PathBuf, Response> {
     path_guard::resolve_existing(mount, rest).map_err(|err| match err {
-        crate::core::fs::FsError::NotFound(_) => {
-            dav_error(StatusCode::NOT_FOUND, "路径不存在")
-        }
+        crate::core::fs::FsError::NotFound(_) => dav_error(StatusCode::NOT_FOUND, "路径不存在"),
         crate::core::fs::FsError::SymlinkEscape(_) => {
             dav_error(StatusCode::FORBIDDEN, "禁止经软链接逃逸")
         }
@@ -231,10 +232,7 @@ fn resolve(mount: &path_guard::MountEntry, rest: &str) -> Result<PathBuf, Respon
 }
 
 /// 写方法统一拦截：只读 Token 与只读挂载点双重 403
-fn ensure_writable(
-    readonly: bool,
-    mount: &path_guard::MountEntry,
-) -> Result<(), Response> {
+fn ensure_writable(readonly: bool, mount: &path_guard::MountEntry) -> Result<(), Response> {
     if readonly {
         return Err(dav_error(StatusCode::FORBIDDEN, "该令牌为只读"));
     }
@@ -252,11 +250,7 @@ fn if_header(headers: &HeaderMap) -> Option<&str> {
 ///
 /// 不校验会怎样：两个人同时用 Word 打开同一个文档，后保存的直接覆盖前一个，
 /// 且双方都不会收到任何提示——这是「伪锁」最实际的伤害。
-fn ensure_not_locked(
-    state: &AppState,
-    key: &str,
-    headers: &HeaderMap,
-) -> Result<(), Response> {
+fn ensure_not_locked(state: &AppState, key: &str, headers: &HeaderMap) -> Result<(), Response> {
     match state.dav_locks.check_write(key, if_header(headers)) {
         Ok(()) => Ok(()),
         Err(_) => Err(dav_error(
@@ -276,7 +270,8 @@ fn dav_key(mount_id: &str, rel: &str) -> String {
     )
 }
 
-fn reject_mount_root(target: &Path, root: &Path) -> Result<(), Response> {    if target == root {
+fn reject_mount_root(target: &Path, root: &Path) -> Result<(), Response> {
+    if target == root {
         return Err(dav_error(
             StatusCode::FORBIDDEN,
             "挂载点根目录不可执行该操作",
@@ -303,7 +298,9 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
         Ok(())
     } else {
-        std::fs::copy(src, dst).map(|_| ()).map_err(|e| e.to_string())
+        std::fs::copy(src, dst)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -377,10 +374,7 @@ pub async fn handle(
     // 路由容错：GET/HEAD `/dav/<mount_id>`（无尾斜杠）且挂载点存在 → 301 到带斜杠形式。
     // 浏览器地址栏和部分客户端把目录 URL 当规范入口，重定向后相对路径的子资源
     // 解析才不会丢一层；`/dav/<mount_id>/`（带斜杠）维持原行为（GET 目录 → 405 请用 PROPFIND）。
-    if matches!(method.as_str(), "GET" | "HEAD")
-        && rest.is_empty()
-        && !uri.path().ends_with('/')
-    {
+    if matches!(method.as_str(), "GET" | "HEAD") && rest.is_empty() && !uri.path().ends_with('/') {
         let location = format!("{}/{}/", PREFIX, percent_encode_segment(&mount_id));
         return (
             StatusCode::MOVED_PERMANENTLY,
@@ -771,7 +765,7 @@ pub async fn handle(
             let state = state.clone();
             let delete_target = target.clone();
             match tokio::task::spawn_blocking(move || {
-                let _guard = state.path_locks.acquire(&[delete_target.clone()]);
+                let _guard = state.path_locks.acquire(std::slice::from_ref(&delete_target));
                 fs_ops::remove_path(&delete_target)
             })
             .await
@@ -995,9 +989,15 @@ mod tests {
     fn parse_range_variants() {
         assert_eq!(parse_range(None, 100).unwrap(), None);
         assert_eq!(parse_range(Some("bytes=0-"), 100).unwrap(), Some((0, 99)));
-        assert_eq!(parse_range(Some("bytes=10-19"), 100).unwrap(), Some((10, 19)));
+        assert_eq!(
+            parse_range(Some("bytes=10-19"), 100).unwrap(),
+            Some((10, 19))
+        );
         // 越界 end 截断
-        assert_eq!(parse_range(Some("bytes=90-999"), 100).unwrap(), Some((90, 99)));
+        assert_eq!(
+            parse_range(Some("bytes=90-999"), 100).unwrap(),
+            Some((90, 99))
+        );
         // 后缀式
         assert_eq!(parse_range(Some("bytes=-5"), 100).unwrap(), Some((95, 99)));
         // 无法满足

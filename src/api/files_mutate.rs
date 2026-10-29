@@ -23,17 +23,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::core::auth::now_secs;
 use crate::core::fs::{self, FsError};
 use crate::core::fs_ops::{self, ItemResult, NameBook, OnConflict};
 use crate::core::path_guard::{self, MountEntry, MountSet};
-use crate::AppState;
 
 /// 删除确认令牌有效期（设计文档 3.2.6.5）
 pub const DELETE_TOKEN_TTL: Duration = Duration::from_secs(60);
@@ -128,9 +128,8 @@ fn check_symlink_target(path: &Path, root: &Path) -> Result<(), FsError> {
     if !meta.file_type().is_symlink() {
         return Ok(());
     }
-    let canon = std::fs::canonicalize(path).map_err(|_| {
-        FsError::SymlinkEscape("软链接目标不存在或无法解析，拒绝复制".to_string())
-    })?;
+    let canon = std::fs::canonicalize(path)
+        .map_err(|_| FsError::SymlinkEscape("软链接目标不存在或无法解析，拒绝复制".to_string()))?;
     if !canon.starts_with(root) {
         return Err(FsError::SymlinkEscape(format!(
             "软链接指向挂载点外：{}",
@@ -171,7 +170,7 @@ pub async fn touch(State(state): State<AppState>, Json(body): Json<CreateBody>) 
 }
 
 async fn create_inner(state: &AppState, body: CreateBody, is_dir: bool) -> Result<Value, FsError> {
-    let set = mounts_of(&state).await;
+    let set = mounts_of(state).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
@@ -182,7 +181,7 @@ async fn create_inner(state: &AppState, body: CreateBody, is_dir: bool) -> Resul
         .to_path_buf();
     let name = body.name.clone();
 
-    let _guard = state.path_locks.acquire(&[target.clone()])?;
+    let _guard = state.path_locks.acquire(std::slice::from_ref(&target))?;
     let created = blocking(move || {
         if is_dir {
             fs_ops::mkdir(&parent, &name)
@@ -216,7 +215,7 @@ pub async fn rename(State(state): State<AppState>, Json(body): Json<RenameBody>)
 }
 
 async fn rename_inner(state: &AppState, body: RenameBody) -> Result<Value, FsError> {
-    let set = mounts_of(&state).await;
+    let set = mounts_of(state).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
@@ -232,9 +231,7 @@ async fn rename_inner(state: &AppState, body: RenameBody) -> Result<Value, FsErr
         .ok_or_else(|| FsError::BadRequest("路径没有父目录".to_string()))?
         .join(&body.new_name);
 
-    let _guard = state
-        .path_locks
-        .acquire(&[source.clone(), guess.clone()])?;
+    let _guard = state.path_locks.acquire(&[source.clone(), guess.clone()])?;
 
     let old_display = fs::normalize_display(&source);
     let rename_to = body.new_name.clone();
@@ -243,10 +240,10 @@ async fn rename_inner(state: &AppState, body: RenameBody) -> Result<Value, FsErr
     let new_display = fs::normalize_display(&target);
 
     // 数据库联动：失败只记 ERROR，不回滚文件系统（设计文档 3.2.6.7）
-    if old_display != new_display {
-        if let Err(err) = state.auth.rewrite_meta_paths(&old_display, &new_display) {
-            crate::log_error!("failed to sync metadata after rename: {err}");
-        }
+    if old_display != new_display
+        && let Err(err) = state.auth.rewrite_meta_paths(&old_display, &new_display)
+    {
+        crate::log_error!("failed to sync metadata after rename: {err}");
     }
 
     Ok(json!({
@@ -273,7 +270,10 @@ pub struct TransferBody {
 }
 
 /// POST /api/files/move
-pub async fn move_entries(State(state): State<AppState>, Json(body): Json<TransferBody>) -> Response {
+pub async fn move_entries(
+    State(state): State<AppState>,
+    Json(body): Json<TransferBody>,
+) -> Response {
     match transfer_inner(&state, body, true).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
@@ -281,7 +281,10 @@ pub async fn move_entries(State(state): State<AppState>, Json(body): Json<Transf
 }
 
 /// POST /api/files/copy
-pub async fn copy_entries(State(state): State<AppState>, Json(body): Json<TransferBody>) -> Response {
+pub async fn copy_entries(
+    State(state): State<AppState>,
+    Json(body): Json<TransferBody>,
+) -> Response {
     match transfer_inner(&state, body, false).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
@@ -304,7 +307,7 @@ async fn transfer_inner(
         )));
     }
 
-    let set = mounts_of(&state).await;
+    let set = mounts_of(state).await;
 
     // ---- 源 ----
     let mut sources = Vec::with_capacity(body.paths.len());
@@ -365,9 +368,7 @@ async fn transfer_inner(
     //
     // 同挂载点移动走原子 rename：不搬数据、不占新空间，统计整棵树纯属浪费
     // （机械盘上搬一个十万文件的目录，光统计就要几十秒），因此直接跳过。
-    let cross_mount = sources
-        .iter()
-        .any(|source| !source.starts_with(&dest_root));
+    let cross_mount = sources.iter().any(|source| !source.starts_with(&dest_root));
     let needs_bytes = !is_move || cross_mount;
 
     // 先做浅层统计：选中 300 项时一秒内就能拒掉，不用等整棵树遍历完
@@ -382,7 +383,9 @@ async fn transfer_inner(
     // 哪条记录的 allow_download / 密码该胜出，因此直接拒绝本次移动。
     if is_move && body.on_conflict == OnConflict::Overwrite {
         for source in &sources {
-            let Some(name) = source.file_name() else { continue };
+            let Some(name) = source.file_name() else {
+                continue;
+            };
             let tentative = dest_dir.join(name);
             if !tentative.exists() {
                 continue;
@@ -418,9 +421,7 @@ async fn transfer_inner(
         let mut results: Vec<ItemResult> = Vec::with_capacity(work_sources.len());
         for (source, root) in work_sources.iter().zip(work_roots.iter()) {
             // 复制的软链接必须指向挂载点内：逃逸的链接拒绝复制该项，不中断整批
-            if !is_move
-                && let Err(err) = check_symlink_target(source, root)
-            {
+            if !is_move && let Err(err) = check_symlink_target(source, root) {
                 results.push(ItemResult::failed(source, &err));
                 continue;
             }
@@ -573,7 +574,7 @@ async fn delete_inner(state: &AppState, body: DeleteBody) -> Result<Value, FsErr
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
 
-    let set = mounts_of(&state).await;
+    let set = mounts_of(state).await;
     let mut targets = Vec::with_capacity(body.paths.len());
     for raw in &body.paths {
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
@@ -667,11 +668,7 @@ async fn delete_inner(state: &AppState, body: DeleteBody) -> Result<Value, FsErr
 }
 
 /// 校验并消费一次性令牌；返回是否有效
-fn consume_delete_token(
-    state: &AppState,
-    token: &str,
-    paths: &[String],
-) -> Result<bool, FsError> {
+fn consume_delete_token(state: &AppState, token: &str, paths: &[String]) -> Result<bool, FsError> {
     let Ok(mut tickets) = state.delete_tickets.lock() else {
         return Err(FsError::Io("ticket store poisoned".to_string()));
     };
@@ -734,10 +731,8 @@ async fn measure_inner(state: &AppState, body: MeasureBody) -> Result<Value, FsE
     }
 
     let work = targets;
-    let (items, bytes, truncated) = blocking(move || {
-        Ok::<_, FsError>(fs_ops::survey(&work, SURVEY_CAP))
-    })
-    .await?;
+    let (items, bytes, truncated) =
+        blocking(move || Ok::<_, FsError>(fs_ops::survey(&work, SURVEY_CAP))).await?;
     Ok(json!({
         "items": items,
         "bytes": bytes,
@@ -783,7 +778,9 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<StatQuery>)
     let mime = if link_meta.is_dir() {
         "inode/directory".to_string()
     } else {
-        mime_guess::from_path(&path).first_or_octet_stream().to_string()
+        mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string()
     };
 
     // 媒体分辨率（v2.9）：图片读文件头（不解码），视频交给外部 FFmpeg 探测；
@@ -796,7 +793,10 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<StatQuery>)
                 .ok()
                 .flatten()
         } else if mime.starts_with("video/") {
-            let configured = crate::api::files::config_snapshot(&state).await.media.ffmpeg_path;
+            let configured = crate::api::files::config_snapshot(&state)
+                .await
+                .media
+                .ffmpeg_path;
             let bin = crate::core::ffmpeg::resolve(&configured).path;
             match bin {
                 Some(bin) => {
@@ -897,12 +897,12 @@ pub async fn hash(State(state): State<AppState>, Json(body): Json<HashBody>) -> 
 }
 
 async fn hash_inner(state: &AppState, body: HashBody) -> Result<Value, FsError> {
-    let set = mounts_of(&state).await;
+    let set = mounts_of(state).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     let path = path_guard::resolve_existing(mount, &body.path)?;
 
-    let meta = std::fs::metadata(&path)
-        .map_err(|err| FsError::Io(format!("读取文件信息失败：{err}")))?;
+    let meta =
+        std::fs::metadata(&path).map_err(|err| FsError::Io(format!("读取文件信息失败：{err}")))?;
     if meta.is_dir() {
         return Err(FsError::BadRequest("目录不支持哈希".to_string()));
     }
@@ -932,8 +932,8 @@ fn hash_file(path: &Path) -> Result<String, FsError> {
     use sha1::{Digest, Sha1};
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|err| FsError::Io(format!("打开文件失败：{err}")))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|err| FsError::Io(format!("打开文件失败：{err}")))?;
     let mut hasher = Sha1::new();
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
