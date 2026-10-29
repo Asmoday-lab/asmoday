@@ -53,7 +53,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 portable-pty = "0.8"
 # 跨平台主目录解析（设计文档 6.3：path 为空时必须落 dirs::home_dir()，
 # 不要自己读 USERPROFILE/HOME —— macOS/Linux 的规则并不一致）
-dirs = "6"
+dirs = "7"
 # 缩略图解码/缩放（只处理静态图片；视频封面走外部可选 FFmpeg 截帧，不链接 libav*）
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 # 聚合服务反代。TLS 按目标平台分流（见文件末尾的两个 [target] 节）：
