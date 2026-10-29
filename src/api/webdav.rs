@@ -57,6 +57,30 @@ fn dav_error(status: StatusCode, message: &str) -> Response {
     (status, message.to_string()).into_response()
 }
 
+/// DAV 响应统一标 `Cache-Control: no-transform`（已有指令保留、追加）。
+///
+/// 为什么：最外层 `api::compress::layer()` 的白名单会压缩 text/html /
+/// application/xml，而 dav-server 的**流式 body** 被压缩层包住后会静默断流——
+/// 服务端日志记 200、handler 正常返回，客户端却只看到连接被关
+/// （Chromium `ERR_EMPTY_RESPONSE`，2026-10-29 实测复现；curl 不带
+/// `Accept-Encoding: gzip/br`，所以全量 curl 回归没暴露）。
+/// DAV 响应体普遍很小，压缩收益趋近零，直接整体跳过；顺带规避
+/// Content-Encoding 与 Range / If 头的语义相互干扰。
+fn mark_no_transform<B>(mut response: Response<B>) -> Response<B> {
+    let merged = match response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(existing) => format!("{existing}, no-transform"),
+        None => "no-transform".to_string(),
+    };
+    if let Ok(value) = merged.parse() {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
 struct Credentials {
     username: String,
     token: String,
@@ -524,7 +548,9 @@ pub async fn handle(
     };
     let set = mount_load(&state).await;
     let Some(mount_id) = mount_id else {
-        return virtual_root(&state, &access, &prefix, &method, req.headers()).await;
+        return mark_no_transform(
+            virtual_root(&state, &access, &prefix, &method, req.headers()).await,
+        );
     };
     // 令牌限定挂载点：泄漏的令牌只影响一个目录，而不是全库
     if let Some(scope) = access.mount_scope.as_deref()
@@ -618,7 +644,7 @@ pub async fn handle(
 
     let response = handler.handle(req).await;
     let (parts, body) = response.into_parts();
-    Response::from_parts(parts, Body::new(body))
+    mark_no_transform(Response::from_parts(parts, Body::new(body)))
 }
 
 /// 把剥过部署前缀的路径重新拼上前缀（dav-server 的 strip_prefix 用的是完整路径）。
@@ -638,6 +664,26 @@ fn rebuild_uri(original: &str, prefix: &str, current: &Uri) -> Option<Uri> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_transform_appends_to_existing_cache_control() {
+        let mut resp = Response::builder()
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::empty())
+            .unwrap();
+        let resp = mark_no_transform(resp);
+        assert_eq!(
+            resp.headers()[header::CACHE_CONTROL],
+            "no-cache, no-transform"
+        );
+    }
+
+    #[test]
+    fn no_transform_inserts_when_missing() {
+        let resp = Response::builder().body(Body::empty()).unwrap();
+        let resp = mark_no_transform(resp);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-transform");
+    }
 
     #[test]
     fn split_route_decodes_per_segment() {
