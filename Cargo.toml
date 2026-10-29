@@ -50,7 +50,7 @@ rand = "0.9"
 # 关掉默认的 image 特性只要 svg，避免为了张二维码把整套图像编解码拖进二进制。
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # 跨平台真实伪终端（ConPTY / openpty）
-portable-pty = "0.8"
+portable-pty = "0.9"
 # 跨平台主目录解析（设计文档 6.3：path 为空时必须落 dirs::home_dir()，
 # 不要自己读 USERPROFILE/HOME —— macOS/Linux 的规则并不一致）
 dirs = "6"
