@@ -143,7 +143,7 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 <details>
 <summary><b>点击展开查看历史更新日志</b></summary>
 
-- **v3.15.0 (文档对齐)**：PTY 尺寸强制钳制（0/超大值不再击穿 ConPTY）、访问日志查询串按需脱敏、跨挂载移动「删源失败」独立错误码 `E_SOURCE_DELETE_FAILED`、垃圾文件补 `.crdownload/.part/.!ut/.tmp`、Termux `$PREFIX/bin/bash` 兼容、终端活动会话面板与强制关闭、编辑器语言矩阵扩至 30+ 语言、挂载点动态移除/离线兜底、缩略图下载中跳过、配置热重载四重防死循环、批量失败项防呆重试。
+- **v3.15.0 (文档对齐)**：PTY 尺寸强制钳制（0/超大值不再击穿 ConPTY）、访问日志查询串按需脱敏、跨挂载移动「删源失败」独立错误码 `E_SOURCE_DELETE_FAILED`、垃圾文件补 `.crdownload/.part/.!ut/.tmp`、Termux `$PREFIX/bin/bash` 兼容、终端活动会话面板与强制关闭、编辑器语言矩阵扩至 30+ 语言、挂载点动态移除/离线兜底、缩略图下载中跳过、配置热重载四重防死循环、批量失败项防呆重试、配置表单保存改为 AST 级局部改写（`toml_edit`，用户手写的注释/空行/键序原样保留）。
 - **v3.5.9 (路径复制)**：右键菜单新增复制相对/绝对路径，修复分享页路径泄露漏洞。
 - **v3.5.8 (日志系统)**：引入分级日志与脱敏，独立 `errors.log`。
 - **v3.5.6 (错误码)**：Windows 权限拒绝(403)友好提示。

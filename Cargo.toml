@@ -13,6 +13,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 配置格式固定 TOML（红线：禁止 YAML）
 toml = "0.8"
+# 保留用户注释的原地改写：可视化表单保存时只改“值”，不重写整篇文档
+# （toml 0.8 的 to_string_pretty 会丢掉全部注释 —— 红线 10 不允许）
+toml_edit = "0.22"
 # 按扩展名推断 Content-Type（本地查表，不联网）
 mime_guess = "2"
 # 单二进制：把前端产物内嵌进可执行文件

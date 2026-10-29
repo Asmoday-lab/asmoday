@@ -400,15 +400,244 @@ pub async fn load_or_create(path: &Path) -> Result<(Config, bool), String> {
     Ok((config, created))
 }
 
+// ---------------------------------------------------------------------------
+// 保留注释的序列化（红线 10：配置文件是给人看的）
+//
+// 思路：先把新配置序列化成一份「纯净文档」，再按字段粒度合并进现有文档的
+// `toml_edit::DocumentMut` —— 只替换 `Item` 的值，`Key`/`Table` 上挂着的
+// 注释（decor）、空行、键序全部原样保留；新增的段追加在末尾。
+//
+// 中间层为什么也用 toml_edit 而不是 toml::Value：`toml::map::Map` 是
+// BTreeMap，过一道就会把 `[[services]]` 里的字段按字母序重排，
+// 用户看到的顺序就和自己写的不一样了。
+// ---------------------------------------------------------------------------
+
+/// 允许在文档里「整体消失」的路径。
+///
+/// 只有表数组与纯表能缺席（解析时 `#[serde(default)]` 会补成空），
+/// **标量数组不能**：`trusted_ips = []` 与「没有这个键」语义完全不同
+/// （后者回到默认白名单，前者是真空白名单）。
+const OMITTABLE_PATHS: &[&str] = &["system", "system.mounts", "services", "services.inject_headers"];
+
+fn is_omittable(path: &str) -> bool {
+    OMITTABLE_PATHS.contains(&path)
+}
+
+fn join_path(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// 值为空，且该路径允许缺席 → 文档里不该留下 `x = []` / `[x]` 这种噪声。
+fn is_omittable_item(path: &str, item: &toml_edit::Item) -> bool {
+    if !is_omittable(path) {
+        return false;
+    }
+    is_empty_item(item)
+}
+
+/// 这个 Item 在「写不写都一样」的意义上是不是空的。
+fn is_empty_item(item: &toml_edit::Item) -> bool {
+    match item {
+        toml_edit::Item::Value(toml_edit::Value::Array(array)) => array.is_empty(),
+        toml_edit::Item::ArrayOfTables(tables) => tables.is_empty(),
+        toml_edit::Item::Table(table) => table.is_empty(),
+        _ => false,
+    }
+}
+
+/// 表里每一项都「可省略且为空」→ 整张表不必出现在文档里。
+fn table_fully_omittable(path: &str, table: &toml_edit::Table) -> bool {
+    !table.is_empty()
+        && table
+            .iter()
+            .all(|(key, item)| is_omittable_item(&join_path(path, key), item))
+}
+
+/// 把数组摊成单行（`["a", "b"]`）。
+///
+/// 序列化产物里数组可能是 `[\n    "a",\n]` 的多行形式，直接 clone 会把用户
+/// 原本单行的 `trusted_ips = [...]` 撑成好几行——值没变，格式却被改动了。
+fn inline_array(array: &mut toml_edit::Array) {
+    array.set_trailing_comma(false);
+    array.set_trailing("");
+    for (index, value) in array.iter_mut().enumerate() {
+        value.decor_mut().set_prefix(if index == 0 { "" } else { " " });
+        value.decor_mut().set_suffix("");
+    }
+}
+
+/// 递归摊平整份文档里的数组（含表内、表数组内）。
+fn inline_all(table: &mut toml_edit::Table) {
+    use toml_edit::{Item, Value};
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Value(Value::Array(array)) => inline_array(array),
+            Item::Table(sub) => inline_all(sub),
+            Item::ArrayOfTables(tables) => {
+                for entry in tables.iter_mut() {
+                    inline_all(entry);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 把 `source` 合并进 `target`，返回「target 是否已变空」。
+fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prefix: &str) -> bool {
+    use toml_edit::Item;
+
+    // 1) 清掉「新配置里没有的键」与「应缺席的空键」。
+    //    Config 是 deny_unknown_fields，所以前者只可能是用户从源码模式删掉的段。
+    let drop_keys: Vec<String> = target
+        .iter()
+        .filter(|(key, _)| {
+            let path = join_path(prefix, key);
+            match source.get(*key) {
+                None => true,
+                Some(item) => is_omittable_item(&path, item),
+            }
+        })
+        .map(|(key, _)| key.to_string())
+        .collect();
+    for key in drop_keys {
+        target.remove(&key);
+    }
+
+    // 2) 逐字段写入：已有表递归下去（保住表内的注释），缺的键补上。
+    for (key, source_item) in source.iter() {
+        let path = join_path(prefix, key);
+        if is_omittable_item(&path, source_item) {
+            continue;
+        }
+
+        if !target.contains_key(key) {
+            // 整张表都是「可省略的空值」（如 `[system]` 下只有一个空 mounts）时
+            // 不要写进文档：否则第一次保存留下 `[system]/mounts = []`，
+            // 第二次保存又把它当空段删掉，两次结果不一致（不幂等）。
+            if let Some(table) = source_item.as_table() {
+                if table_fully_omittable(&path, table) {
+                    continue;
+                }
+            }
+            target.insert(key, source_item.clone());
+            continue;
+        }
+
+        // 注意：`get_mut` 的借用必须在下一次借用 `target` 前结束，
+        // 所以「写值」与「合并后删空表」分成两步，不要塞进同一个 match 元组。
+        match source_item {
+            Item::Table(source_sub) => {
+                let became_empty = match target.get_mut(key) {
+                    Some(Item::Table(sub)) => merge_table(sub, source_sub, &path),
+                    Some(slot) => {
+                        *slot = source_item.clone();
+                        false
+                    }
+                    None => false,
+                };
+                if became_empty {
+                    target.remove(key);
+                }
+            }
+            Item::ArrayOfTables(source_tables) => {
+                if let Some(item) = target.get_mut(key) {
+                    merge_table_array(item, source_tables, &path);
+                }
+            }
+            _ => {
+                if let Some(slot) = target.get_mut(key) {
+                    *slot = source_item.clone();
+                }
+            }
+        }
+    }
+
+    // 3) 递归合并后父表空了（例如只剩 `[system]` 而没挂载点），交给调用方删掉整段
+    target.is_empty()
+}
+
+/// 表数组（`[[system.mounts]]` / `[[services]]`）的就地合并。
+///
+/// 按索引对齐：已有条目原地改字段（条目上的注释、条目内注释都保留），
+/// 多出来的追加，少了的截断 —— 只有「条目数量变少」时才会丢掉被删条目的注释，
+/// 那是用户真的删了它，可以接受。
+fn merge_table_array(
+    item: &mut toml_edit::Item,
+    source: &toml_edit::ArrayOfTables,
+    path: &str,
+) {
+    use toml_edit::Item;
+
+    if !matches!(item, Item::ArrayOfTables(_)) {
+        // 目标不是表数组（用户手写成了 `services = []`）→ 直接按新值重建
+        *item = Item::ArrayOfTables(source.clone());
+        return;
+    }
+    let Some(tables) = item.as_array_of_tables_mut() else {
+        return;
+    };
+    for (index, entry) in source.iter().enumerate() {
+        if index < tables.len() {
+            if let Some(table) = tables.get_mut(index) {
+                merge_table(table, entry, path);
+            }
+        } else {
+            tables.push(entry.clone());
+        }
+    }
+    while tables.len() > source.len() {
+        let last = tables.len() - 1;
+        tables.remove(last);
+    }
+}
+
+/// 把配置渲染成文本，**保留 `existing` 里的注释**。
+///
+/// `existing` 为 `None`（首次保存）或解析失败时，退到带注释的默认模板 /
+/// `to_string_pretty`：保存这个动作本身不该失败。
+fn render_preserving_comments(existing: Option<&str>, config: &Config) -> Result<String, String> {
+    let plain = || toml::to_string_pretty(config).map_err(|e| format!("序列化配置失败: {e}"));
+
+    let fresh = match plain() {
+        Ok(text) => text,
+        // 序列化失败是真异常（Save 必须失败），不要静默写空文件
+        Err(err) => return Err(err),
+    };
+    let Ok(mut fresh_doc) = fresh.parse::<toml_edit::DocumentMut>() else {
+        return plain();
+    };
+    inline_all(fresh_doc.as_table_mut());
+    let Ok(mut doc) = existing.unwrap_or(DEFAULT_CONFIG_TOML).parse::<toml_edit::DocumentMut>()
+    else {
+        // 现有文件被手改坏了（少括号之类）：退回全量重写，至少配置能保存成功
+        return plain();
+    };
+
+    merge_table(doc.as_table_mut(), fresh_doc.as_table(), "");
+    Ok(doc.to_string())
+}
+
 impl Config {
-    /// 序列化为 TOML 并原子写入（先写临时文件再 rename）。
+    /// 原子写入配置文件（先写临时文件再 rename），**保留原有注释与键顺序**。
+    ///
+    /// 实现要点：不是 `toml::to_string_pretty` 全量重写（那会丢掉用户写的每一行注释，
+    /// 破坏红线 10「配置文件可手改、注释可读」），而是把现有文件解析成
+    /// `toml_edit::DocumentMut`，只在字段粒度上替换“值”，注释/空行/键序原地不动。
     ///
     /// 内容与现有文件一致时**不写盘**（设计文档 3.5）：既省一次 IO，
     /// 也避免自己触发一次无意义的热重载。
     pub async fn save_to(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
 
-        let body = toml::to_string_pretty(self).map_err(|e| format!("序列化配置失败: {e}"))?;
+        // 现有文件读不到（首次保存 / 权限问题）就用默认模板当骨架，
+        // 这样生成出来的文件同样是带注释的版本，而不是一堆裸键值。
+        let existing = tokio::fs::read_to_string(path).await.ok();
+        let body = render_preserving_comments(existing.as_deref(), self)?;
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -844,4 +1073,214 @@ fn apply_text(state: &crate::AppState, raw: &str) -> bool {
     let _ = config.apply_safety();
     *state.config.blocking_write() = config;
     true
+}
+
+// ---------------------------------------------------------------------------
+// 测试：注释保留（红线 10）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comment_lines(text: &str) -> usize {
+        text.lines().filter(|line| line.trim_start().starts_with('#')).count()
+    }
+
+    /// 文档里是否真有这一行表头（注释掉的示例不算）
+    fn has_headers(text: &str, header: &str) -> bool {
+        text.lines().any(|line| line.trim() == header)
+    }
+
+    fn parsed(text: &str) -> Config {
+        toml::from_str(text).expect("渲染结果必须能被自己解析")
+    }
+
+    fn rendered(cfg: &Config) -> String {
+        render_preserving_comments(Some(DEFAULT_CONFIG_TOML), cfg).unwrap()
+    }
+
+    #[test]
+    fn rendering_keeps_every_template_comment() {
+        let mut config = parsed(DEFAULT_CONFIG_TOML);
+        config.server.port = 5000;
+        config.server.host = "127.0.0.1".to_string();
+
+        let text = rendered(&config);
+        assert!(
+            comment_lines(&text) >= comment_lines(DEFAULT_CONFIG_TOML),
+            "注释行数不能减少：{} < {}",
+            comment_lines(&text),
+            comment_lines(DEFAULT_CONFIG_TOML)
+        );
+        // 关键注释文案必须还在（不能是“只剩几个 #”）
+        for needle in [
+            "# Asmoday 配置文件",
+            "# 监听地址",
+            "# 媒体缓存策略",
+            "# HTTP 访问日志独立级别",
+            "# 以下为可选配置，默认注释",
+        ] {
+            assert!(text.contains(needle), "注释丢失：{needle}\n---\n{text}");
+        }
+        assert!(text.contains("port = 5000"), "值没写进去：\n{text}");
+        // 数组要摊成单行：序列化产物是多行格式，直接搬会把用户原有的一行撑开
+        assert!(
+            text.contains(r#"trusted_ips = ["127.0.0.1", "172.16.0.0/12"]"#),
+            "数组被拆成多行了：\n{text}"
+        );
+        assert_eq!(parsed(&text), config);
+    }
+
+    #[test]
+    fn user_added_comments_and_keys_survive() {
+        let source = r#"# 我自己的备注：这台机器给客厅用
+[server]
+# 端口别用 4242，和 NAS 冲突
+port = 4242
+
+[media]
+thumb_cache_max_size_mb = 512
+"#;
+        let mut config = parsed(source);
+        config.server.port = 8080;
+        config.media.thumb_cache_max_size_mb = 2048;
+
+        let text = render_preserving_comments(Some(source), &config).unwrap();
+        assert!(text.contains("# 我自己的备注：这台机器给客厅用"), "{text}");
+        assert!(text.contains("# 端口别用 4242，和 NAS 冲突"), "{text}");
+        assert!(text.contains("port = 8080"), "{text}");
+        assert!(text.contains("thumb_cache_max_size_mb = 2048"), "{text}");
+        assert_eq!(parsed(&text), config);
+    }
+
+    #[test]
+    fn mounts_and_services_are_added_then_removed_cleanly() {
+        let mut config = parsed(DEFAULT_CONFIG_TOML);
+        config.system.mounts.push(MountConfig {
+            name: "Local Storage".to_string(),
+            path: "/mnt/nas".to_string(),
+            readonly: true,
+        });
+        config.services.push(ServiceConfig {
+            id: "grafana".to_string(),
+            name: "监控面板".to_string(),
+            icon: Some("chart".to_string()),
+            kind: "external".to_string(),
+            target_url: "http://192.168.1.50:3000".to_string(),
+            strip_prefix: true,
+            rewrite_html: false,
+            insecure_skip_verify: false,
+            inject_headers: BTreeMap::from([("X-WEBAUTH-USER".to_string(), "admin".to_string())]),
+        });
+
+        let text = rendered(&config);
+        // 只认真正的表头行：模板里的 `# [[system.mounts]]` 是注释示例，contains 会误判
+        assert!(has_headers(&text, "[[system.mounts]]"), "{text}");
+        assert!(has_headers(&text, "[[services]]"), "{text}");
+        assert!(has_headers(&text, "[services.inject_headers]"), "{text}");
+        assert!(text.contains("# 以下为可选配置，默认注释"), "模板注释不能丢：\n{text}");
+        assert_eq!(parsed(&text), config);
+
+        // 删干净之后，文档里不该留下空段或空数组
+        let mut emptied = config.clone();
+        emptied.system.mounts.clear();
+        emptied.services.clear();
+        let text = render_preserving_comments(Some(&text), &emptied).unwrap();
+        assert!(!has_headers(&text, "[[system.mounts]]"), "{text}");
+        assert!(!has_headers(&text, "[[services]]"), "{text}");
+        assert!(!has_headers(&text, "[services.inject_headers]"), "{text}");
+        assert!(!has_headers(&text, "[system]"), "空的 [system] 段应当移除：\n{text}");
+        assert_eq!(parsed(&text), emptied);
+    }
+
+    #[test]
+    fn empty_scalar_array_is_not_dropped() {
+        // trust_proxy_headers 为 true 但白名单清空 = 所有人都被当成代理，
+        // 这个「空」是用户的真实意图，绝不能因为“空就省略”而被默认值顶掉。
+        let mut config = parsed(DEFAULT_CONFIG_TOML);
+        config.server.proxy.trusted_ips.clear();
+        config.auth.proxy_trust.trusted_ips.clear();
+
+        let text = rendered(&config);
+        assert!(text.contains("trusted_ips = []"), "{text}");
+        assert_eq!(parsed(&text), config);
+    }
+
+    #[test]
+    fn rendering_is_idempotent() {
+        let mut config = parsed(DEFAULT_CONFIG_TOML);
+        config.log.format = "json".to_string();
+        config.shares.referer_allowlist = vec!["example.com".to_string()];
+
+        let first = rendered(&config);
+        let second = render_preserving_comments(Some(&first), &config).unwrap();
+        assert_eq!(first, second, "同样的配置渲染两次必须一字不差");
+    }
+
+    #[test]
+    fn broken_template_falls_back_to_plain_serialization() {
+        // 现有文件被手改坏了（例如少个方括号）：保存动作本身不能失败
+        let mut config = parsed(DEFAULT_CONFIG_TOML);
+        config.server.port = 9000;
+        let text = render_preserving_comments(Some("[server\nport = 1"), &config).unwrap();
+        assert_eq!(parsed(&text), config);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("asmoday-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn save_to_keeps_comments_on_disk() {
+        let dir = scratch("comments");
+        let path = dir.join(CONFIG_FILENAME);
+        std::fs::write(
+            &path,
+            "# 主机上的手写备注：别删这一行\n[server]\n# 端口备注\nport = 4242\n",
+        )
+        .unwrap();
+
+        let (mut config, created) = load_or_create(&path).await.unwrap();
+        assert!(!created);
+        config.server.port = 4321;
+        config.media.thumb_cache_max_size_mb = 256;
+        config.save_to(&path).await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 主机上的手写备注：别删这一行"), "{text}");
+        assert!(text.contains("# 端口备注"), "{text}");
+        assert!(text.contains("port = 4321"), "{text}");
+        assert_eq!(parsed(&text), config);
+
+        // 内容没变就不写盘（避免自触发一次热重载）
+        let stable = std::fs::read_to_string(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        config.save_to(&path).await.unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(stable, again, "第二次保存不应该改变内容");
+        assert_eq!(before, after, "内容未变化的保存不应落盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn save_to_creates_annotated_config_from_scratch() {
+        let dir = scratch("fresh");
+        let path = dir.join("nested").join(CONFIG_FILENAME);
+        let mut config = Config::default();
+        config.server.port = 4243;
+        config.save_to(&path).await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# Asmoday 配置文件 — TOML 格式"), "{text}");
+        assert!(text.contains("port = 4243"), "{text}");
+        assert_eq!(parsed(&text), config);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
