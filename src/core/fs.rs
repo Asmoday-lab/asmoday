@@ -53,6 +53,11 @@ pub enum FsError {
     TokenMismatch(String),
     /// 服务端 IO 失败
     Io(String),
+    /// 跨挂载点移动：复制已成功写入目标，但删除源文件失败（设计文档 3.2.6）。
+    ///
+    /// 必须与普通失败区分开：数据**已经在目标位置**，用户看到的不能是
+    /// 「移动失败」（否则会去目标目录再确认一遍、甚至重复复制）。
+    SourceDeleteFailed(String),
 }
 
 impl FsError {
@@ -76,6 +81,7 @@ impl FsError {
             | FsError::NameMismatch(m)
             | FsError::TokenExpired(m)
             | FsError::TokenMismatch(m)
+            | FsError::SourceDeleteFailed(m)
             | FsError::Io(m) => m.clone(),
         }
     }

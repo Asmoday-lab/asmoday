@@ -688,7 +688,16 @@ pub fn move_entry(
     let Some(target) = copy_entry(src, dest_dir, book, conflict)? else {
         return Ok(None);
     };
-    remove_path(src)?;
+    // 删源是最后一步，且失败必须独立上报（设计文档 3.2.6）：
+    // 此刻数据**已经**落到目标位置，如果这里抛通用错误，前端会提示「移动失败」，
+    // 用户要么以为文件没动、要么以为复制也失败了，事后还得自己找哪个版本是真的。
+    remove_path(src).map_err(|err| {
+        FsError::SourceDeleteFailed(format!(
+            "文件已成功写入目标位置，但原文件清理失败，请手动检查并删除原文件：{}（{}）",
+            normalize_display(src),
+            err.message()
+        ))
+    })?;
     Ok(Some(target))
 }
 

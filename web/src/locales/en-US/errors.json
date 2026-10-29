@@ -57,6 +57,7 @@
   "E_TOKEN_EXPIRED": "The delete confirmation expired, try again",
   "E_TOKEN_MISMATCH": "The delete confirmation does not match the selected files",
   "E_NAME_MISMATCH": "The folder name you typed does not match",
+  "E_SOURCE_DELETE_FAILED": "File was written to the target, but the source could not be removed; delete it manually",
   "E_VALIDATION": "Invalid request parameters",
   "E_UNSUPPORTED_PREVIEW": "This format cannot be previewed; allow download to share it",
   "E_INTERNAL": "Internal server error",

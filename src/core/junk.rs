@@ -34,6 +34,17 @@ const EXACT_NAMES: &[&str] = &[
 /// - `._`：macOS AppleDouble，给每个文件配一份资源叉（FAT/exFAT 挂载必现）
 const PREFIXES: &[&str] = &["~$", "._"];
 
+/// 后缀匹配：下载器 / 归档工具的半成品（设计文档 3.2.1）。
+///
+/// 这些文件写盘还没结束，出现在列表里会让人误以为「电影已经下好了」，
+/// 点开播放必然失败；进媒体库还会生成一堆半截图缩略图。
+///
+/// - `.crdownload`：Chrome / Edge
+/// - `.part`：Firefox 与多数下载工具
+/// - `.!ut`：uTorrent 未完成分片
+/// - `.tmp`：通用临时文件
+const SUFFIXES: &[&str] = &[".crdownload", ".part", ".!ut", ".tmp"];
+
 /// 是否是必须无条件过滤的系统垃圾项（文件或目录都适用）。
 pub fn is_system_junk(name: &str) -> bool {
     let trimmed = name.trim();
@@ -42,6 +53,9 @@ pub fn is_system_junk(name: &str) -> bool {
     }
     let lower = trimmed.to_lowercase();
     if EXACT_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    if SUFFIXES.iter().any(|suffix| lower.ends_with(suffix)) {
         return true;
     }
     PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
@@ -90,5 +104,34 @@ mod tests {
         assert!(!is_system_junk("~backup.txt"));
         assert!(!is_system_junk("a._b.txt"));
         assert!(!is_system_junk(""));
+    }
+
+    #[test]
+    fn half_downloaded_files_are_filtered() {
+        // 设计文档 3.2.1 第 3 条：下载中/临时文件不得进列表与媒体库
+        for name in [
+            "电影.mkv.crdownload",
+            "movie.mp4.CRDOWNLOAD",
+            "ubuntu.iso.part",
+            "file.bin.!ut",
+            "notes.tmp",
+            "Photo.JPG.TMP",
+        ] {
+            assert!(is_system_junk(name), "{name} 应被过滤");
+        }
+    }
+
+    #[test]
+    fn suffix_matching_does_not_eat_normal_names() {
+        // 只是「包含」这些字样的正常文件必须留着
+        for name in [
+            "depart.txt",
+            "partial-notes.md",
+            "tmp-backup.zip",
+            "part1.mp4",
+            "atut.txt",
+        ] {
+            assert!(!is_system_junk(name), "{name} 不应被过滤");
+        }
     }
 }

@@ -137,8 +137,10 @@ pub async fn ws_handler(
         cwd = state.cwd.clone();
     }
 
-    let cols = query.cols.unwrap_or(120).clamp(20, 500);
-    let rows = query.rows.unwrap_or(30).clamp(5, 200);
+    let (cols, rows) = crate::core::terminal::clamp_size(
+        query.cols.unwrap_or(120) as u64,
+        query.rows.unwrap_or(30) as u64,
+    );
     let session_id = query.session_id.filter(|s| !s.trim().is_empty());
     let options = crate::core::terminal::ShellOptions {
         no_profile: query.no_profile.unwrap_or(false),
@@ -290,7 +292,11 @@ async fn handle_socket(
                                 let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                                 let next_cols = value.get("cols").and_then(|v| v.as_u64()).unwrap_or(cols as u64);
                                 let next_rows = value.get("rows").and_then(|v| v.as_u64()).unwrap_or(rows as u64);
-                                let _ = session.resize(next_cols as u16, next_rows as u16);
+                                // 尺寸强制兜底（设计文档 3.3.2）：resize 帧与首连同一套钳制，
+                                // 0 / 超大值绝不透传给 ConPTY（否则整块终端崩溃）
+                                let (next_cols, next_rows) =
+                                    crate::core::terminal::clamp_size(next_cols, next_rows);
+                                let _ = session.resize(next_cols, next_rows);
                             }
                             _ => {
                                 // 非控制帧：当作用户输入
@@ -358,5 +364,19 @@ mod tests {
         assert_eq!(expand_home("", Some(home)), None);
         // 拿不到主目录时不做任何猜测
         assert_eq!(expand_home("~", None), None);
+    }
+
+    #[test]
+    fn clamps_pty_size_from_any_source() {
+        use crate::core::terminal::clamp_size;
+        // 0 / 负数（u64 下负数早就被 serde 拒了，这里覆盖 0）绝不能直通 PTY
+        assert_eq!(clamp_size(0, 0), (20, 5));
+        // 超大值（前端误报窗口宽度、外接屏切换瞬间）夹到上限，
+        // 而不是 `as u16` 截断成 4464 这种垃圾值
+        assert_eq!(clamp_size(70_000, 9_000), (500, 200));
+        // 合法值原样保留：高分屏 200 列 × 60 行必须不被改写
+        assert_eq!(clamp_size(200, 60), (200, 60));
+        // u64::MAX 也安全（serde 的 as_u64 可能给出任意大数）
+        assert_eq!(clamp_size(u64::MAX, u64::MAX), (500, 200));
     }
 }

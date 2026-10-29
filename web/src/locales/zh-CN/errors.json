@@ -57,6 +57,7 @@
   "E_TOKEN_EXPIRED": "删除确认令牌已过期，请重试",
   "E_TOKEN_MISMATCH": "删除确认令牌与所选文件不匹配",
   "E_NAME_MISMATCH": "输入的目录名不匹配",
+  "E_SOURCE_DELETE_FAILED": "文件已写入目标位置，但原文件清理失败，请手动检查并删除原文件",
   "E_VALIDATION": "请求参数不合法",
   "E_UNSUPPORTED_PREVIEW": "该格式无法在线预览，请允许下载后再分享",
   "E_INTERNAL": "服务器内部错误",

@@ -28,6 +28,23 @@ pub const MAX_SESSIONS: usize = 10;
 /// 环形缓冲区容量（设计文档 3.3.3：上限 1MB，超出丢最旧数据）
 const BUFFER_CAPACITY: usize = 1024 * 1024;
 
+/// PTY 尺寸合法区间（设计文档 3.3.2 尺寸强制兜底）。
+///
+/// 0 / 负数 / 超大值绝不能透传给底层 PTY：ConPTY 收到非法尺寸会在内部算出
+/// 负的填充宽度并崩溃（现象是整块终端全屏报错，如 `totalWidth -17`）。
+pub const MIN_COLS: u16 = 20;
+pub const MAX_COLS: u16 = 500;
+pub const MIN_ROWS: u16 = 5;
+pub const MAX_ROWS: u16 = 200;
+
+/// 把任意来源的尺寸夹进合法区间（首连查询串与后续 resize 控制帧共用一套规则）。
+pub fn clamp_size(cols: u64, rows: u64) -> (u16, u16) {
+    (
+        cols.clamp(MIN_COLS as u64, MAX_COLS as u64) as u16,
+        rows.clamp(MIN_ROWS as u64, MAX_ROWS as u64) as u16,
+    )
+}
+
 /// 拉起 shell 的方式（设计文档 3.3.7）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShellOptions {
@@ -117,17 +134,19 @@ impl Session {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        // 最后一道闸：即便调用方漏了钳制，也绝不把 0 / 超大值塞进 ConPTY
+        let (cols, rows) = clamp_size(cols as u64, rows as u64);
         let master = self.master.lock().map_err(|_| "pty master poisoned".to_string())?;
         master
             .resize(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| format!("调整终端尺寸失败：{e}"))?;
         if let Ok(mut size) = self.size.lock() {
-            *size = (cols.max(1), rows.max(1));
+            *size = (cols, rows);
         }
         Ok(())
     }
@@ -208,13 +227,34 @@ fn default_shell() -> String {
     "powershell.exe".to_string()
 }
 
+/// bash 的真实落点（设计文档 3.3.1）。
+///
+/// **严禁硬编码 `/bin/bash`**：Android / Termux 的根目录没有 `/bin/bash`，
+/// bash 装在 `$PREFIX/bin/bash`（通常是 `/data/data/com.termux/files/usr/bin/bash`）。
+/// 顺序固定为：`$PREFIX/bin/bash` → `/bin/bash`；都找不到时交给调用方降级。
+#[cfg(not(windows))]
+fn bash_path() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        let prefix = prefix.trim().trim_end_matches('/');
+        if !prefix.is_empty() {
+            candidates.push(format!("{prefix}/bin/bash"));
+        }
+    }
+    candidates.push("/bin/bash".to_string());
+    candidates.into_iter().find(|p| Path::new(p).is_file())
+}
+
 #[cfg(not(windows))]
 fn default_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .map(|shell| shell.trim().to_string())
         .filter(|shell| !shell.is_empty() && Path::new(shell).is_file())
-        .unwrap_or_else(|| "/bin/bash".to_string())
+        // `$SHELL` 缺失（systemd 拉起、docker exec 无 env）时按 bash_path 探测；
+        // 连 bash 都没有（Alpine 等）退回 POSIX 的 /bin/sh，绝不给一个不存在的路径
+        .or_else(bash_path)
+        .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
 /// 按模式挑 shell（设计文档 3.3.7）。
@@ -230,8 +270,10 @@ fn shell_for(_options: ShellOptions) -> String {
 /// 会启动失败；所以只在确实有 bash 时切过去，没有就退回原 shell（不加参数）。
 #[cfg(not(windows))]
 fn shell_for(options: ShellOptions) -> String {
-    if options.no_profile && Path::new("/bin/bash").is_file() {
-        return "/bin/bash".to_string();
+    if options.no_profile {
+        if let Some(bash) = bash_path() {
+            return bash;
+        }
     }
     default_shell()
 }
@@ -378,11 +420,13 @@ impl TerminalManager {
             }
         }
 
+        // 首连尺寸同样钳制（设计文档 3.3.2）：这里再夹一次，不信任上游
+        let (cols, rows) = clamp_size(cols as u64, rows as u64);
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -434,7 +478,7 @@ impl TerminalManager {
             buffer: Mutex::new(VecDeque::with_capacity(8 * 1024)),
             output: tx.clone(),
             clients: AtomicUsize::new(0),
-            size: Mutex::new((cols.max(1), rows.max(1))),
+            size: Mutex::new((cols, rows)),
         });
 
         // 后台泵：阻塞读 → 环缓冲 + 广播

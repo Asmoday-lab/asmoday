@@ -58,6 +58,8 @@ pub fn code_of(err: &FsError) -> &'static str {
         FsError::NameMismatch(_) => "E_NAME_MISMATCH",
         FsError::TokenExpired(_) => "E_TOKEN_EXPIRED",
         FsError::TokenMismatch(_) => "E_TOKEN_MISMATCH",
+        // 复制已成功、只有删源失败：必须给独立 code，前端才能提示「去目标目录确认」
+        FsError::SourceDeleteFailed(_) => "E_SOURCE_DELETE_FAILED",
         FsError::Io(_) => "E_INTERNAL",
     }
 }
@@ -78,6 +80,8 @@ pub fn status_of(err: &FsError) -> StatusCode {
         FsError::TooMany(_) | FsError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
         FsError::NoSpace(_) => StatusCode::INSUFFICIENT_STORAGE,
         FsError::TokenExpired(_) | FsError::TokenMismatch(_) => StatusCode::FORBIDDEN,
+        // 500：数据已写入目标，属于「部分成功」的服务端收尾失败
+        FsError::SourceDeleteFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         FsError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -121,6 +125,16 @@ mod tests {
             assert_eq!(status_of(&err), StatusCode::CONFLICT, "{code}");
             assert_eq!(code_of(&err), code);
         }
+    }
+
+    #[test]
+    fn source_delete_failure_has_its_own_code() {
+        // 设计文档 6.5：复制成功但删源失败必须独立成码，
+        // 不能再混进 E_INTERNAL —— 前端据此提示「去目标目录确认」
+        let err = FsError::SourceDeleteFailed("已写入目标，但源文件清理失败".to_string());
+        assert_eq!(code_of(&err), "E_SOURCE_DELETE_FAILED");
+        assert_eq!(status_of(&err), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message(), "已写入目标，但源文件清理失败");
     }
 
     #[test]
