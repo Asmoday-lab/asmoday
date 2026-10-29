@@ -67,7 +67,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>
         fs::load_roots(&config, &state.cwd)
     };
 
-    let target = match fs::resolve_existing(&body.path, &roots.allowed) {
+    let target = match fs::resolve_existing(&body.path, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return crate::api::error::fs_error(&err),
     };
@@ -483,7 +483,7 @@ pub async fn raw(
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)
     };
-    let target = match fs::resolve_existing(&path, &roots.allowed) {
+    let target = match fs::resolve_existing(&path, &roots.allowed, roots.follow_symlinks) {
         Ok(target) => target,
         Err(err) => return crate::api::error::fs_error(&err),
     };
@@ -529,7 +529,7 @@ pub async fn download(
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)
     };
-    let root = match fs::resolve_existing(&path, &roots.allowed) {
+    let root = match fs::resolve_existing(&path, &roots.allowed, roots.follow_symlinks) {
         Ok(target) => target,
         Err(err) => return crate::api::error::fs_error(&err),
     };
@@ -586,7 +586,7 @@ pub async fn list_entries(
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)
     };
-    let root = match fs::resolve_existing(&path, &roots.allowed) {
+    let root = match fs::resolve_existing(&path, &roots.allowed, roots.follow_symlinks) {
         Ok(target) => target,
         Err(err) => return crate::api::error::fs_error(&err),
     };
@@ -617,6 +617,7 @@ pub async fn list_entries(
         // 分享视图没有挂载点上下文：只解析软链接目标，不做越界标记
         // （真正的读取出口仍走 raw/download 的归属校验）
         None,
+        roots.follow_symlinks,
     )
     .await
     {

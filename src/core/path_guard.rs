@@ -39,6 +39,9 @@ pub struct MountPoint {
     pub implicit: bool,
     /// 目录当前是否存在（关机拔盘 / 路径写错时为 false，前端置灰）
     pub online: bool,
+    /// 软链接目标逃出挂载点时是否继续跟随（`[system].follow_symlinks`，
+    /// 设计文档 3.2.7）。false = 逃出即按断链/越界拒绝。
+    pub follow_symlinks: bool,
 }
 
 /// 挂载点 + 已 canonicalize 的根
@@ -142,6 +145,9 @@ impl MountSet {
 pub fn load(config: &Config, cwd: &Path) -> MountSet {
     let mut mounts = Vec::new();
     let mut online_any = false;
+    // 全局开关（`[system].follow_symlinks`），每个挂载点各存一份，
+    // 便于将来按挂载点覆盖时只改这一处取值。
+    let follow_symlinks = config.system.follow_symlinks;
 
     for (index, mount) in config.system.mounts.iter().enumerate() {
         let raw = PathBuf::from(&mount.path);
@@ -163,6 +169,7 @@ pub fn load(config: &Config, cwd: &Path) -> MountSet {
                 readonly: mount.readonly,
                 implicit: false,
                 online: canonical.is_some(),
+                follow_symlinks,
             },
             root: canonical,
         });
@@ -178,6 +185,7 @@ pub fn load(config: &Config, cwd: &Path) -> MountSet {
                 readonly: false,
                 implicit: true,
                 online: true,
+                follow_symlinks,
             },
             root: Some(canon),
         });
@@ -202,26 +210,109 @@ fn paths_equal(a: &str, b: &str) -> bool {
 // 路径解析
 // ---------------------------------------------------------------------------
 
+/// 允许「经由挂载点内软链接」逃逸时，是否应当放行这次解析。
+///
+/// 只认一种入口：**用户给的路径字面上就在挂载点内**，且沿途（挂载点根之下）
+/// 至少有一段是软链接。直接传挂载点外的绝对路径（`/etc/passwd`、
+/// `D:/其他盘/x`）永远不满足前半条，因此配置再宽也进不来 ——
+/// 配置放开的仅仅是「链接解析」，不是「任意路径」。
+pub fn escaped_via_symlink(candidate: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| escaped_via_symlink_in(candidate, root))
+}
+
+/// 单根版本（已持有 `canonical_root` 的调用点用这个，省一次切片构造）。
+pub fn escaped_via_symlink_in(candidate: &Path, root: &Path) -> bool {
+    lexical_inside(candidate, root) && has_symlink_component(candidate, root)
+}
+
+/// 把路径切成「归一化后的段」：统一分隔符、剥掉 Windows 的 `\\?\` 前缀、丢掉空段与 `.`。
+///
+/// 只做字面比较用，不碰磁盘；段内原始大小写保留，比较时按平台规则处理。
+fn path_segments(path: &Path) -> Vec<String> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
+    text.split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+/// 段的相等判定：Windows 大小写不敏感（`D:/Media` 与 `d:/media` 是同一条），
+/// 其它平台按字节比较。
+fn same_segment(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// 字面归属判定（不碰磁盘）：`candidate` 是否落在 `root` 之下。
+///
+/// 不能直接用 `Path::starts_with`：`std::fs::canonicalize` 在 Windows 上回
+/// `\\?\C:\...` 前缀形式，而用户/前端传来的是 `C:/...`，逐组件比较必然不匹配。
+fn lexical_inside(candidate: &Path, root: &Path) -> bool {
+    let cand = path_segments(candidate);
+    let base = path_segments(root);
+    !base.is_empty()
+        && cand.len() >= base.len()
+        && base
+            .iter()
+            .zip(cand.iter())
+            .all(|(a, b)| same_segment(a, b))
+}
+
+/// 从挂载点根开始逐段下探，任一段是链接即返回 true。
+///
+/// 用于区分「链接逃逸」与「路径穿越」：只有前者在 `follow_symlinks` 打开时放行。
+fn has_symlink_component(candidate: &Path, root: &Path) -> bool {
+    let cand = path_segments(candidate);
+    let base = path_segments(root);
+    if base.is_empty() || cand.len() <= base.len() {
+        return false;
+    }
+    let mut cursor = root.to_path_buf();
+    for segment in &cand[base.len()..] {
+        cursor.push(segment);
+        if std::fs::symlink_metadata(&cursor)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// 解析一个**已存在**的路径（绝对路径或相对挂载点根的相对路径），
 /// 返回 canonicalize 后的真实路径。
+///
+/// `[system].follow_symlinks = true` 时，经由挂载点内软链接逃出去的路径不再报错，
+/// 但**保留链接前缀**返回（不返回目标真实路径）—— 前端后续请求仍以链接路径寻址，
+/// 否则下一次请求会带着挂载点外的绝对路径回来，被第一道闸直接拒掉。
 pub fn resolve_existing(mount: &MountEntry, raw: &str) -> Result<PathBuf, FsError> {
     let root = mount.canon_root()?;
     let candidate = absolute(mount, raw)?;
     let canon = std::fs::canonicalize(&candidate)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
-    if !canon.starts_with(root) {
-        // 区分两种逃逸：本身是软链接（目标在挂载点外）单独报 E_SYMLINK_ESCAPE，
-        // 其余（含中间路径段是软链接）统一按 ../ 穿越处理（设计文档 3.2.7 / 6.6）。
-        let via_symlink = std::fs::symlink_metadata(&candidate)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false);
-        return Err(if via_symlink {
-            FsError::SymlinkEscape("软链接指向挂载点外".to_string())
-        } else {
-            FsError::PathTraversal("该路径不在挂载点内（可能经软链接逃逸）".to_string())
-        });
+    if canon.starts_with(root) {
+        return Ok(canon);
     }
-    Ok(canon)
+    if mount.info.follow_symlinks && escaped_via_symlink_in(&candidate, root) {
+        return Ok(candidate);
+    }
+    // 区分两种逃逸：本身是软链接（目标在挂载点外）单独报 E_SYMLINK_ESCAPE，
+    // 其余（含中间路径段是软链接）统一按 ../ 穿越处理（设计文档 3.2.7 / 6.6）。
+    let via_symlink = std::fs::symlink_metadata(&candidate)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    Err(if via_symlink {
+        FsError::SymlinkEscape("软链接指向挂载点外".to_string())
+    } else {
+        FsError::PathTraversal("该路径不在挂载点内（可能经软链接逃逸）".to_string())
+    })
 }
 
 /// 解析一个存在的路径，但**不跟随最后一段**（属性页 / 列表用 lstat，设计文档 3.2.7）。
@@ -237,6 +328,13 @@ pub fn resolve_existing_nofollow(mount: &MountEntry, raw: &str) -> Result<PathBu
     let parent_canon = std::fs::canonicalize(parent)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
     if !parent_canon.starts_with(root) {
+        // 父目录经软链接逃出挂载点：配置允许时继续按**链接前缀**寻址
+        // （最后一段仍不跟随，删除/重命名作用于链接路径本身指向的条目）。
+        if mount.info.follow_symlinks && escaped_via_symlink_in(parent, root) {
+            std::fs::symlink_metadata(&candidate)
+                .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
+            return Ok(candidate);
+        }
         return Err(FsError::PathTraversal("该路径不在挂载点内".to_string()));
     }
     let path = parent_canon.join(name);
@@ -256,6 +354,13 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
     let parent_canon = std::fs::canonicalize(&parent_raw)
         .map_err(|_| FsError::NotFound(format!("目录不存在：{parent}")))?;
     if !parent_canon.starts_with(root) {
+        if mount.info.follow_symlinks
+            && escaped_via_symlink_in(&parent_raw, root)
+            && parent_canon.is_dir()
+        {
+            // 目标目录经软链接逃出挂载点：仍以链接前缀拼出待创建路径
+            return Ok(parent_raw.join(name));
+        }
         return Err(FsError::PathTraversal("目标目录不在挂载点内".to_string()));
     }
     if !parent_canon.is_dir() {
@@ -673,5 +778,143 @@ mod tests {
         let b = part_name("x.bin");
         assert!(is_part_file(&a) && is_part_file(&b));
         assert_ne!(a, b);
+    }
+}
+
+/// 软链接逃逸放行（`[system].follow_symlinks`）的行为测试。
+///
+/// 需要真实的目录链接：Windows 上优先建符号链接（要特权），失败退回 junction
+/// （junction 在 Rust 里同样被识别为 reparse point / 链接）；两者都建不出来时
+/// 直接跳过，避免在没有权限的 CI 上假失败。
+#[cfg(test)]
+mod symlink_escape_tests {
+    use super::*;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("asmoday-pg-{tag}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建立测试目录");
+        std::fs::canonicalize(&dir).expect("canonicalize 测试目录")
+    }
+
+    /// 建目录链接；返回是否成功（失败视为环境不支持，测试跳过）
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            // 符号链接要 SeCreateSymbolicLink 特权；建不出来就退回 junction
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+                || std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg("mklink")
+                    .arg("/J")
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    fn mount_at(root: &Path, follow: bool) -> MountEntry {
+        MountEntry {
+            info: MountPoint {
+                id: "m0".to_string(),
+                name: "test".to_string(),
+                path: crate::core::fs::normalize_display(root),
+                readonly: false,
+                implicit: false,
+                online: true,
+                follow_symlinks: follow,
+            },
+            root: Some(root.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn direct_outside_path_is_always_rejected() {
+        let root = unique_dir("direct");
+        let mount = mount_at(&root, true);
+        let outside = if cfg!(windows) {
+            "C:/Windows/System32"
+        } else {
+            "/etc"
+        };
+        let err = resolve_existing(&mount, outside).unwrap_err();
+        assert!(
+            matches!(err, FsError::PathTraversal(_) | FsError::SymlinkEscape(_)),
+            "直接传挂载点外的绝对路径必须拒绝，实得 {err:?}"
+        );
+        // 放宽开关也不能靠「父目录 + 名字」的口子溜进去
+        let child = resolve_child(&mount, outside, "evil.txt");
+        assert!(child.is_err(), "外部绝对路径不能当父目录");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn escape_followed_only_when_enabled() {
+        let base = unique_dir("escape");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("note.txt"), b"hi").unwrap();
+        let link = root.join("link");
+        if !link_dir(&outside, &link) {
+            eprintln!("环境不支持创建目录链接，跳过");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let raw = format!(
+            "{}/link/note.txt",
+            crate::core::fs::normalize_display(&root)
+        );
+
+        // 放宽：保留链接前缀返回，后续请求才不会带着挂载点外的真实路径回来
+        let open = mount_at(&root, true);
+        let resolved = resolve_existing(&open, &raw).expect("follow_symlinks=true 应放行");
+        assert_eq!(
+            crate::core::fs::normalize_display(&resolved),
+            raw,
+            "必须保留链接前缀寻址（不能返回挂载点外的真实路径）"
+        );
+
+        // 严格：维持旧边界
+        let strict = mount_at(&root, false);
+        let err = resolve_existing(&strict, &raw).unwrap_err();
+        assert!(
+            matches!(err, FsError::PathTraversal(_) | FsError::SymlinkEscape(_)),
+            "follow_symlinks=false 必须拒绝，实得 {err:?}"
+        );
+
+        // 链接本身：两种模式都能 lstat（删除/重命名作用于链接）
+        let link_raw = format!("{}/link", crate::core::fs::normalize_display(&root));
+        assert_eq!(
+            crate::core::fs::normalize_display(
+                &resolve_existing_nofollow(&strict, &link_raw).unwrap()
+            ),
+            link_raw,
+            "链接本身按 lstat 解析：删除/重命名作用于链接"
+        );
+
+        // 逃逸目录内新建：放宽时给「链接前缀 + 名字」，严格时拒绝
+        let link_dir_raw = format!("{}/link", crate::core::fs::normalize_display(&root));
+        assert_eq!(
+            crate::core::fs::normalize_display(
+                &resolve_child(&open, &link_dir_raw, "new.txt").unwrap()
+            ),
+            format!("{link_dir_raw}/new.txt")
+        );
+        assert!(resolve_child(&strict, &link_dir_raw, "new.txt").is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

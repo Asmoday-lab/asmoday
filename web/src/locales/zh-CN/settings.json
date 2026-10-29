@@ -152,6 +152,8 @@
     "trustProxy": "信任反向代理转发的 X-Forwarded-* / X-Real-IP",
     "mounts": "挂载点",
     "mountsHint": "未配置挂载点时，只允许浏览进程工作目录。",
+    "followSymlinks": "跟随软链接（含 junction）",
+    "followSymlinksHint": "开启后，挂载点内指向其它位置的软链接/Junction 可以点进去浏览、预览、上传、改名；直接访问挂载点外的绝对路径仍会被拒绝。关闭则一律按断链处理（跨盘链接不可用）。",
     "protected": "挂载点与外部服务属于高级配置：面板重置不会覆盖它们，请在此处或源码模式修改。",
     "add": "添加",
     "mountName": "名称",

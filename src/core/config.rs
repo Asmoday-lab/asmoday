@@ -121,6 +121,13 @@ format = "text"
 # path = "D:/Media"
 # readonly = false
 
+# 软链接逃逸（默认 true，与 FileBrowser 行为一致）：挂载点内的符号链接 / junction
+# 可以点进去，目标在挂载点外也照常浏览、预览、上传、改名；寻址始终以「链接路径」
+# 为前缀，直接访问挂载点外的绝对路径依旧拒绝。改成 false 恢复严格边界——
+# 逃逸一律按断链处理（列表置灰、接口 403，跨盘链接不可用）。
+# [system]
+# follow_symlinks = true
+
 # 外部聚合服务（可多个），由内置反向代理网关透传
 # [[services]]
 # id = "grafana"
@@ -384,10 +391,26 @@ impl Default for ProxyTrustConfig {
 }
 
 /// `[system]`
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SystemConfig {
     pub mounts: Vec<MountConfig>,
+    /// 软链接目标逃出挂载点时是否继续跟随（FileBrowser 行为，设计文档 3.2.7）。
+    ///
+    /// `true`（默认）：挂载点内的软链接可以点进去浏览/读写，寻址始终以链接路径
+    /// 为前缀；直接传入挂载点外的绝对路径依旧拒绝，边界只对「链接解析」放行。
+    /// `false`：维持旧边界 —— 逃出即按断链处理（列表标灰、接口 403）。
+    #[serde(default = "default_true")]
+    pub follow_symlinks: bool,
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            mounts: Vec::new(),
+            follow_symlinks: true,
+        }
+    }
 }
 
 /// `[[system.mounts]]`
@@ -510,11 +533,44 @@ fn join_path(prefix: &str, key: &str) -> String {
 }
 
 /// 值为空，且该路径允许缺席 → 文档里不该留下 `x = []` / `[x]` 这种噪声。
+///
+/// 另外还有一类「与默认值相同的标量」：写与不写解析结果完全一样，
+/// 留在文档里只会让每次保存都多出一行（`follow_symlinks = true`），
+/// 所以同样按可省略处理。**不等于默认值时必须写**，否则用户改的设置会丢。
 fn is_omittable_item(path: &str, item: &toml_edit::Item) -> bool {
+    if is_default_scalar(path, item) {
+        return true;
+    }
     if !is_omittable(path) {
         return false;
     }
     is_empty_item(item)
+}
+
+/// 该路径的标量值是否正好等于默认值（只有这类才能整条省略）。
+fn is_default_scalar(path: &str, item: &toml_edit::Item) -> bool {
+    match path {
+        // `SystemConfig::default().follow_symlinks == true`
+        "system.follow_symlinks" => {
+            matches!(item, toml_edit::Item::Value(toml_edit::Value::Boolean(v)) if *v.value())
+        }
+        _ => false,
+    }
+}
+
+/// 插入新表前把「可省略的空键 / 默认值键」摘掉。
+///
+/// 不摘的话第一次保存会留下 `[system]/mounts = []`，第二次保存又把它当空段删掉，
+/// 两次结果不一致（不幂等）。
+fn prune_omittable(table: &mut toml_edit::Table, prefix: &str) {
+    let drop_keys: Vec<String> = table
+        .iter()
+        .filter(|(key, item)| is_omittable_item(&join_path(prefix, key), item))
+        .map(|(key, _)| key.to_string())
+        .collect();
+    for key in drop_keys {
+        table.remove(&key);
+    }
 }
 
 /// 这个 Item 在「写不写都一样」的意义上是不是空的。
@@ -599,9 +655,13 @@ fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prefix:
             // 整张表都是「可省略的空值」（如 `[system]` 下只有一个空 mounts）时
             // 不要写进文档：否则第一次保存留下 `[system]/mounts = []`，
             // 第二次保存又把它当空段删掉，两次结果不一致（不幂等）。
-            if let Some(table) = source_item.as_table()
-                && table_fully_omittable(&path, table)
-            {
+            if let Some(table) = source_item.as_table() {
+                if table_fully_omittable(&path, table) {
+                    continue;
+                }
+                let mut pruned = table.clone();
+                prune_omittable(&mut pruned, &path);
+                target.insert(key, toml_edit::Item::Table(pruned));
                 continue;
             }
             target.insert(key, source_item.clone());
@@ -1306,6 +1366,37 @@ thumb_cache_max_size_mb = 512
         let text = rendered(&config);
         assert!(text.contains("trusted_ips = []"), "{text}");
         assert_eq!(parsed(&text), config);
+    }
+
+    #[test]
+    fn follow_symlinks_only_written_when_not_default() {
+        // 只看「真正的键行」，不能拿 contains 判：模板里本来就有示例注释
+        fn key_lines(text: &str) -> Vec<&str> {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("follow_symlinks"))
+                .collect()
+        }
+
+        // 默认 true：不该在文档里留噪（否则每次保存都凭空多一行）
+        let config = parsed(DEFAULT_CONFIG_TOML);
+        assert!(config.system.follow_symlinks, "默认必须是 true");
+        let text = rendered(&config);
+        assert!(key_lines(&text).is_empty(), "{text}");
+
+        // 改成 false 必须落到文件里，且能读回来
+        let mut strict = parsed(DEFAULT_CONFIG_TOML);
+        strict.system.follow_symlinks = false;
+        let text = rendered(&strict);
+        assert_eq!(key_lines(&text), vec!["follow_symlinks = false"]);
+        assert_eq!(parsed(&text), strict);
+
+        // 再改回 true：这一行应当消失，且两次渲染逐字一致
+        strict.system.follow_symlinks = true;
+        let back = render_preserving_comments(Some(&text), &strict).unwrap();
+        assert!(key_lines(&back).is_empty(), "{back}");
+        let again = render_preserving_comments(Some(&back), &strict).unwrap();
+        assert_eq!(back, again, "保存必须幂等");
     }
 
     #[test]

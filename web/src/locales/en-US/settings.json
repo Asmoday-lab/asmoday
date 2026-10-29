@@ -152,6 +152,8 @@
     "trustProxy": "Trust X-Forwarded-* / X-Real-IP from the reverse proxy",
     "mounts": "Mounts",
     "mountsHint": "Without mounts only the process working directory is browsable.",
+    "followSymlinks": "Follow symlinks (incl. junctions)",
+    "followSymlinksHint": "When on, symlinks/junctions inside a mount can be browsed, previewed, uploaded into and renamed even if the target lives outside the mount. Absolute paths outside the mount are still rejected. When off, escaping links are treated as broken (cross-drive links stop working).",
     "protected": "Mounts and external services are advanced settings: panel resets never overwrite them. Edit them here or in source mode.",
     "add": "Add",
     "mountName": "Name",

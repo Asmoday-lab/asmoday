@@ -139,13 +139,13 @@ async fn mount_of(state: &AppState, display: &str) -> String {
 async fn resolve_default(state: &AppState, requested: Option<&str>) -> Result<PathBuf, FsError> {
     let roots = roots_for(state).await;
     match requested.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(raw) => fs::resolve_existing(raw, &roots.allowed),
+        Some(raw) => fs::resolve_existing(raw, &roots.allowed, roots.follow_symlinks),
         None => {
             let Some(root) = roots.default_root() else {
                 return Err(FsError::NotFound("没有可用的挂载点".to_string()));
             };
             let path = root.path.clone();
-            fs::resolve_existing(&path, &roots.allowed)
+            fs::resolve_existing(&path, &roots.allowed, roots.follow_symlinks)
         }
     }
 }
@@ -685,7 +685,7 @@ pub struct FavoriteBody {
 /// POST /api/media/progress：记录/刷新播放进度
 pub async fn progress(State(state): State<AppState>, Json(body): Json<ProgressBody>) -> Response {
     let roots = roots_for(&state).await;
-    let target = match fs::resolve_existing(&body.path, &roots.allowed) {
+    let target = match fs::resolve_existing(&body.path, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -744,7 +744,7 @@ pub async fn history(State(state): State<AppState>) -> Response {
 /// POST /api/media/favorite：收藏 / 取消收藏
 pub async fn favorite(State(state): State<AppState>, Json(body): Json<FavoriteBody>) -> Response {
     let roots = roots_for(&state).await;
-    let target = match fs::resolve_existing(&body.path, &roots.allowed) {
+    let target = match fs::resolve_existing(&body.path, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };

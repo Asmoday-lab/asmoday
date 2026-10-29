@@ -156,6 +156,7 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         query.cursor.as_deref().filter(|value| !value.is_empty()),
         // 软链接目标的越界判定基准：挂载点 canonical_root（设计文档 3.2.7）
         mount.canon_root().ok().map(|root| root.as_path()),
+        mount.info.follow_symlinks,
     )
     .await
     {
@@ -171,7 +172,7 @@ pub async fn raw(
     headers: HeaderMap,
 ) -> Response {
     let set = roots_for(&state).await;
-    let path = match fs::resolve_existing(&query.path, &set.allowed) {
+    let path = match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -609,7 +610,7 @@ pub async fn upload(
     }
 
     let roots = roots_for(&state).await;
-    let dir = match fs::resolve_existing(&query.dir, &roots.allowed) {
+    let dir = match fs::resolve_existing(&query.dir, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -631,12 +632,15 @@ pub async fn upload(
         return fs_error(err);
     }
 
-    // 二次确认：拼接后的真实路径仍在授权根内
+    // 二次确认：拼接后的真实路径仍在授权根内。
+    // 允许「经由挂载点内软链接」逃逸时（`[system].follow_symlinks`）不算越权——
+    // 与 `resolve_existing` 口径一致，否则链接目录里上传会被这一道单独拦掉。
     if let Ok(canonical_parent) = std::fs::canonicalize(&dir)
         && !roots
             .allowed
             .iter()
             .any(|root| canonical_parent.starts_with(root))
+        && !(roots.follow_symlinks && path_guard::escaped_via_symlink(&dir, &roots.allowed))
     {
         return fail_code(
             StatusCode::FORBIDDEN,
@@ -684,7 +688,7 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
         .filter(|p| !p.is_empty());
 
     let target = match requested {
-        Some(raw) => match fs::resolve_existing(raw, &roots.allowed) {
+        Some(raw) => match fs::resolve_existing(raw, &roots.allowed, roots.follow_symlinks) {
             Ok(path) => path,
             Err(err) => return fs_error(err),
         },
@@ -693,7 +697,7 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
                 return fs_error(FsError::NotFound("没有可用的挂载点".to_string()));
             };
             let root_path = root.path.clone();
-            match fs::resolve_existing(&root_path, &roots.allowed) {
+            match fs::resolve_existing(&root_path, &roots.allowed, roots.follow_symlinks) {
                 Ok(path) => path,
                 Err(err) => return fs_error(err),
             }
@@ -761,13 +765,13 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
     let target = match raw.parent().zip(raw.file_name()) {
         Some((parent, name)) if !parent.as_os_str().is_empty() => {
             let parent_text = parent.to_string_lossy();
-            match fs::resolve_existing(&parent_text, &set.allowed) {
+            match fs::resolve_existing(&parent_text, &set.allowed, set.follow_symlinks) {
                 Ok(parent_canon) => parent_canon.join(name),
                 Err(err) => return fs_error(err),
             }
         }
         // 没有父段（删挂载点根这类）维持原语义，下面的根目录检查会拒绝
-        _ => match fs::resolve_existing(&query.path, &set.allowed) {
+        _ => match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
             Ok(path) => path,
             Err(err) => return fs_error(err),
         },
@@ -814,7 +818,7 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
 /// GET /api/files/subtitle?path=…：统一输出 WebVTT（浏览器只认 vtt，srt 现场转）
 pub async fn subtitle(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let set = roots_for(&state).await;
-    let path = match fs::resolve_existing(&query.path, &set.allowed) {
+    let path = match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };

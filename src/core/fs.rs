@@ -110,6 +110,8 @@ pub struct RootSet {
     /// 已 canonicalize 的允许根，用于包含性校验
     pub allowed: Vec<PathBuf>,
     pub implicit: bool,
+    /// `[system].follow_symlinks`：是否允许经由挂载点内软链接访问挂载点外的目标
+    pub follow_symlinks: bool,
 }
 
 impl RootSet {
@@ -142,6 +144,7 @@ pub fn load_roots(config: &Config, cwd: &Path) -> RootSet {
         roots,
         allowed,
         implicit: set.implicit,
+        follow_symlinks: config.system.follow_symlinks,
     }
 }
 
@@ -156,13 +159,26 @@ pub fn normalize_display(path: &Path) -> String {
 // 路径解析与安全校验
 // ---------------------------------------------------------------------------
 
-/// 校验并解析用户传入的路径，返回 canonicalize 后的真实路径。
-pub fn resolve_existing(raw: &str, allowed: &[PathBuf]) -> Result<PathBuf, FsError> {
+/// 校验并解析用户传入的路径，返回可用的真实路径。
+///
+/// `follow_symlinks = true` 时，经由**挂载点内软链接**逃出允许根的目标不再拒绝，
+/// 但保留链接前缀返回（理由见 `path_guard::resolve_existing` 的注释）；
+/// 直接传挂载点外的绝对路径依旧 403。
+pub fn resolve_existing(
+    raw: &str,
+    allowed: &[PathBuf],
+    follow_symlinks: bool,
+) -> Result<PathBuf, FsError> {
     let candidate = parse_candidate(raw)?;
     let canon = std::fs::canonicalize(&candidate)
         .map_err(|_| FsError::NotFound(format!("路径不存在：{raw}")))?;
-    ensure_within(&canon, allowed)?;
-    Ok(canon)
+    if ensure_within(&canon, allowed).is_ok() {
+        return Ok(canon);
+    }
+    if follow_symlinks && crate::core::path_guard::escaped_via_symlink(&candidate, allowed) {
+        return Ok(candidate);
+    }
+    Err(FsError::Forbidden("该路径不在已授权的挂载点内".to_string()))
 }
 
 /// 只做字符串层面的合法性检查 + 拼接，不要求存在（写入前再校验父目录）。
@@ -406,6 +422,8 @@ pub async fn list_dir(
     // 当前挂载点的 canonical_root：软链接目标越出它即标记为断链（E_SYMLINK_ESCAPE 语义）。
     // 分享页等无挂载点上下文的调用传 `None`（只解析目标，不做越界判定）。
     mount_root: Option<&Path>,
+    // `[system].follow_symlinks`：为 true 时越界链接不再标断链，照常给出目标类型
+    follow_symlinks: bool,
 ) -> Result<Listing, FsError> {
     let page = page.max(1);
 
@@ -526,7 +544,9 @@ pub async fn list_dir(
             // 软链接：跟随解析目标（设计文档 3.2.7）。
             // - 目标信息只对当前页的软链接条目 stat，数量少，不拖累整页性能；
             // - canonicalize 成功且未越出挂载点 → target_is_dir 给真实判定；
-            // - 断链（ENOENT）或逃出挂载点 → None，前端标记断链置灰。
+            // - 越出挂载点时：`follow_symlinks = false` 记 None（前端标断链置灰），
+            //   为 true 则照常给目标类型，与后端放行口径保持一致；
+            // - 断链（ENOENT / 循环链接）恒为 None。
             let (symlink_target, target_is_dir) = if is_symlink {
                 let raw = tokio::fs::read_link(&full)
                     .await
@@ -534,7 +554,11 @@ pub async fn list_dir(
                     .map(|target| target.to_string_lossy().into_owned());
                 let resolved = std::fs::canonicalize(&full)
                     .map(|canon| {
-                        let inside = mount_root.is_none_or(|root| canon.starts_with(root));
+                        let inside = mount_root.is_none_or(|root| {
+                            canon.starts_with(root)
+                                || (follow_symlinks
+                                    && crate::core::path_guard::escaped_via_symlink_in(&full, root))
+                        });
                         inside.then(|| canon.is_dir())
                     })
                     .unwrap_or(None);

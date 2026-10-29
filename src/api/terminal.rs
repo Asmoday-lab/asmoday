@@ -174,7 +174,7 @@ pub async fn ws_handler(
 
         // 目标目录：优先用 path（可以是目录，也可以是文件所在目录），否则用默认根
         match requested.as_deref() {
-            Some(raw) => match fs::resolve_existing(raw, &allowed) {
+            Some(raw) => match fs::resolve_existing(raw, &allowed, roots.follow_symlinks) {
                 Ok(path) => {
                     if path.is_dir() {
                         path
@@ -234,7 +234,7 @@ fn default_cwd(roots: &fs::RootSet, home: Option<&Path>) -> Option<PathBuf> {
         return Some(home.to_path_buf());
     }
     let root = roots.default_root()?;
-    fs::resolve_existing(&root.path.clone(), &roots.allowed).ok()
+    fs::resolve_existing(&root.path.clone(), &roots.allowed, roots.follow_symlinks).ok()
 }
 
 /// 把 `~`、`~/x`、`$HOME/x`、`%USERPROFILE%\x` 展开成真实路径。

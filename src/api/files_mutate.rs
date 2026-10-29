@@ -120,8 +120,10 @@ fn ensure_not_mount_root(path: &Path, roots: &[PathBuf]) -> Result<(), FsError> 
 
 /// 复制软链接前校验目标没逃出挂载点（设计文档 3.2.7）。
 ///
-/// 直接复制链接本身会把这个「洞」搬到新位置，所以只允许指向挂载点内的链接。
-fn check_symlink_target(path: &Path, root: &Path) -> Result<(), FsError> {
+/// 直接复制链接本身会把这个「洞」搬到新位置，所以默认只允许指向挂载点内的链接。
+/// `follow_symlinks = true` 时这个「洞」本来就是被允许的访问方式
+/// （与浏览/读取口径一致），复制链接不再额外拦截，只拒绝解析不出的断链。
+fn check_symlink_target(path: &Path, root: &Path, follow_symlinks: bool) -> Result<(), FsError> {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Ok(());
     };
@@ -130,7 +132,7 @@ fn check_symlink_target(path: &Path, root: &Path) -> Result<(), FsError> {
     }
     let canon = std::fs::canonicalize(path)
         .map_err(|_| FsError::SymlinkEscape("软链接目标不存在或无法解析，拒绝复制".to_string()))?;
-    if !canon.starts_with(root) {
+    if !follow_symlinks && !canon.starts_with(root) {
         return Err(FsError::SymlinkEscape(format!(
             "软链接指向挂载点外：{}",
             fs::normalize_display(&canon)
@@ -313,6 +315,8 @@ async fn transfer_inner(
     let mut sources = Vec::with_capacity(body.paths.len());
     // 每个源所属挂载点的 canonical_root：软链接逃逸校验要用（设计文档 3.2.7）
     let mut src_roots: Vec<PathBuf> = Vec::with_capacity(body.paths.len());
+    // 每个源所属挂载点的 follow_symlinks（复制软链接时的放行口径）
+    let mut src_follow: Vec<bool> = Vec::with_capacity(body.paths.len());
     // 逃逸的软链接只失败该项，不中断整批（设计文档 3.2.7「记失败项」）
     let mut pre_results: Vec<ItemResult> = Vec::new();
     for raw in &body.paths {
@@ -335,6 +339,7 @@ async fn transfer_inner(
         ensure_not_mount_root(&path, &roots)?;
         sources.push(path);
         src_roots.push(root);
+        src_follow.push(mount.info.follow_symlinks);
     }
     if sources.is_empty() {
         let summary = fs_ops::summarize(&pre_results);
@@ -414,14 +419,19 @@ async fn transfer_inner(
     let conflict = body.on_conflict;
     let work_sources = sources.clone();
     let work_roots = src_roots.clone();
+    let work_follow = src_follow.clone();
     let work_dest = dest_dir.clone();
     let work_root = dest_root.clone();
     let results = blocking(move || {
         let mut book = NameBook::new(&work_dest);
         let mut results: Vec<ItemResult> = Vec::with_capacity(work_sources.len());
-        for (source, root) in work_sources.iter().zip(work_roots.iter()) {
-            // 复制的软链接必须指向挂载点内：逃逸的链接拒绝复制该项，不中断整批
-            if !is_move && let Err(err) = check_symlink_target(source, root) {
+        for ((source, root), follow) in work_sources
+            .iter()
+            .zip(work_roots.iter())
+            .zip(work_follow.iter())
+        {
+            // 复制的软链接默认必须指向挂载点内：逃逸的链接拒绝复制该项，不中断整批
+            if !is_move && let Err(err) = check_symlink_target(source, root, *follow) {
                 results.push(ItemResult::failed(source, &err));
                 continue;
             }

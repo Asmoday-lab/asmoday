@@ -61,7 +61,7 @@ interface AppConfig {
     local_enabled: boolean
     proxy_trust: { enabled: boolean; user_header: string }
   }
-  system: { mounts: Mount[] }
+  system: { mounts: Mount[]; follow_symlinks: boolean }
   services: Service[]
   media: MediaSettings
 }
@@ -370,6 +370,11 @@ async function loadConfig() {
     const res = await fetch('/api/config')
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
     const data = (await res.json()) as AppConfig
+    // 老后端 / 手写配置可能没这个键：缺省与后端一致（true），
+    // 否则表单保存会把用户显式写的 false 悄悄改回默认值。
+    if (data.system && typeof data.system.follow_symlinks !== 'boolean') {
+      data.system.follow_symlinks = true
+    }
     config.value = data
     draft.value = structuredClone(data)
   } catch (err) {
@@ -1299,6 +1304,15 @@ onMounted(() => {
           <p v-if="!draft.system.mounts.length" class="text-[12px] text-muted">
             {{ t('settings.advanced.mountsHint') }}
           </p>
+          <label class="mt-3 flex items-start gap-2 text-xs text-ink">
+            <input v-model="draft.system.follow_symlinks" type="checkbox" class="mt-0.5" />
+            <span>
+              {{ t('settings.advanced.followSymlinks') }}
+              <span class="mt-1 block text-[12px] text-muted">
+                {{ t('settings.advanced.followSymlinksHint') }}
+              </span>
+            </span>
+          </label>
           <div v-for="(mount, index) in draft.system.mounts" :key="index" class="mb-2 flex gap-2">
             <input
               v-model="mount.name"
