@@ -62,7 +62,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 #   openssl-sys，musl 环境没有 OpenSSL 可链，交叉编译直接失败。
 # 基础依赖只放双方共有的 stream，TLS 特性放 target 节，避免特性并集把两边都拉进来。
 reqwest = { version = "0.12", default-features = false, features = ["stream"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 # config.toml 热重载（设计文档 3.5：保存后无需重启进程）
 notify = "8"
 # 字幕编码探测：.srt 极大概率是 GBK，UTF-8 失败时用它兜底（设计文档 3.4.7 第 3 条）
