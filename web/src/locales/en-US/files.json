@@ -249,5 +249,12 @@
     "brokenToast": "This symlink is broken or points outside the mount",
     "dirTarget": "points to a directory",
     "fileTarget": "points to a file"
+  },
+  "keys": {
+    "copied": "Copied {count} item(s) — Ctrl+V to paste",
+    "cut": "Cut {count} item(s) — Ctrl+V to paste",
+    "copiedDone": "Copied {count} item(s)",
+    "movedDone": "Moved {count} item(s)",
+    "hint": "F2 rename · Delete remove · Ctrl+C/X/V copy, cut, paste · drag onto a folder to move"
   }
 }

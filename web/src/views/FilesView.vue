@@ -10,6 +10,7 @@
 import {
   computed,
   defineAsyncComponent,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   ref,
@@ -295,6 +296,7 @@ function openCreateDialog(kind: 'dir' | 'file') {
     return
   }
   createDialog.value = { kind, name: '', busy: false, error: '' }
+  void focusFieldLater('[data-testid="create-name"]')
 }
 
 async function submitCreate() {
@@ -327,11 +329,21 @@ const renameDialog = ref<{
   error: string
 } | null>(null)
 
-function openRenameDialog() {
-  const entry = menu.value?.entry
+/** 弹窗弹出后把焦点送进输入框并全选原名（F2 / 新建之后可以直接敲字） */
+async function focusFieldLater(selector: string) {
+  await nextTick()
+  const field = document.querySelector<HTMLInputElement>(selector)
+  field?.focus()
+  field?.select()
+}
+
+/** `entry` 省略时取右键菜单选中的那条（F2 走快捷键直传） */
+function openRenameDialog(entry?: EntryInfo) {
+  const target = entry ?? menu.value?.entry
   menu.value = null
-  if (!entry) return
-  renameDialog.value = { entry, name: entry.name, busy: false, error: '' }
+  if (!target) return
+  renameDialog.value = { entry: target, name: target.name, busy: false, error: '' }
+  void focusFieldLater('[data-testid="rename-name"]')
 }
 
 async function submitRename() {
@@ -376,7 +388,8 @@ const transferDialog = ref<{
 /** 冲突策略：默认「未选择」，强制用户明确表态（设计文档 3.2.6.2） */
 const conflictChoice = ref<OnConflict | 'ask'>('ask')
 
-function openTransferDialog(mode: TransferMode, targets?: EntryInfo[]) {
+/** `dest` 省略时默认当前目录（剪贴板粘贴 / 拖拽到文件夹都会显式传目标） */
+function openTransferDialog(mode: TransferMode, targets?: EntryInfo[], dest?: string) {
   const list = targets ?? (menu.value ? [menu.value.entry] : [])
   menu.value = null
   if (!list.length) return
@@ -385,7 +398,7 @@ function openTransferDialog(mode: TransferMode, targets?: EntryInfo[]) {
     mode,
     targets: list,
     // 默认目标 = 当前目录（用户改路径比从零输入快）
-    dest: currentPath.value,
+    dest: dest ?? currentPath.value,
     busy: false,
     error: '',
   }
@@ -1629,9 +1642,26 @@ function onEntryClick(entry: EntryInfo, event?: MouseEvent) {
     pressConsumed = false
     return
   }
+  // Shift + 点击 = 从锚点连选到这一条（桌面管理器 / FileBrowser 同款）
+  if (event && event.shiftKey) {
+    const list = displayEntries.value
+    const anchorPath = rangeAnchor.value ?? selected.value ?? entry.path
+    const from = list.findIndex((item) => item.path === anchorPath)
+    const to = list.findIndex((item) => item.path === entry.path)
+    if (from >= 0 && to >= 0) {
+      event.preventDefault()
+      selectMode.value = true
+      const [start, end] = from <= to ? [from, to] : [to, from]
+      const picked = new Set(selection.value)
+      for (let index = start; index <= end; index += 1) picked.add(list[index].path)
+      selection.value = [...picked]
+      return
+    }
+  }
   // Ctrl / ⌘ + 点击 = 进入或追加多选
   if (event && (event.ctrlKey || event.metaKey)) {
     if (!selectMode.value) selectMode.value = true
+    rangeAnchor.value = entry.path
     toggleSelect(entry)
     return
   }
@@ -1643,6 +1673,7 @@ function onEntryClick(entry: EntryInfo, event?: MouseEvent) {
     void activate(entry)
   } else {
     selected.value = entry.path
+    rangeAnchor.value = entry.path
   }
 }
 
@@ -1851,6 +1882,265 @@ watch(
   },
 )
 
+
+// ---------------- 键盘 / 内部剪贴板 / 拖拽移动（对齐 FileBrowser 的等效交互） ----------------
+//
+// FileBrowser 的文件管理用 F2 重命名、Delete 删除、Ctrl+C/X/V 内部剪贴板、
+// 把条目拖到文件夹即移动。这里沿用同一套键位与手势，但**不新增任何 UI**：
+// 全部复用已有的重命名弹窗 / 删除确认 / 移动复制链路（含冲突必须明确表态的红线）。
+// 移动端（coarsePointer）没有键盘，长按多选与底部操作栏保持原样。
+
+/** 内部剪贴板：只存条目，落地时才换成路径（跨目录、跨挂载点都由后端判定） */
+const clipboard = ref<{ mode: TransferMode; entries: EntryInfo[] } | null>(null)
+/** 正在被拖拽的条目；非空表示这是一次内部拖拽，用来挡住「拖文件上传」的遮罩 */
+const internalDrag = ref<EntryInfo[]>([])
+/** 拖拽悬停的目录（高亮 + 松手即移动到这里） */
+const dropTargetPath = ref<string | null>(null)
+/** Shift 范围选择的锚点 */
+const rangeAnchor = ref<string | null>(null)
+
+/** 键盘操作的作用对象：多选态用选中的一批，否则用当前高亮的一条 */
+function keyTargets(): EntryInfo[] {
+  if (selectMode.value && selection.value.length) return selectedEntries.value
+  if (!selected.value) return []
+  const hit = displayEntries.value.find((entry) => entry.path === selected.value)
+  return hit ? [hit] : []
+}
+
+/** 焦点在输入框里时绝不抢键（重命名输入框里按 Delete 是删字，不是删文件） */
+function typingInField(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  if (!el) return false
+  return (
+    el.tagName === 'INPUT' ||
+    el.tagName === 'TEXTAREA' ||
+    el.tagName === 'SELECT' ||
+    el.isContentEditable
+  )
+}
+
+/** 任一弹层打开时不接管全局键（Esc 除外，留给弹层自己的 @keydown.esc） */
+function anyOverlayOpen(): boolean {
+  return Boolean(
+    menu.value ||
+      renameDialog.value ||
+      createDialog.value ||
+      transferDialog.value ||
+      deleteTargets.value.length ||
+      resultDialog.value ||
+      statDialog.value ||
+      bulkDownloadConfirm.value ||
+      preview.value ||
+      editor.value,
+  )
+}
+
+/** Esc 的关闭顺序：先关最上面那层，再退多选，最后取消高亮 */
+function closeTopLayer(): boolean {
+  if (menu.value) {
+    menu.value = null
+    return true
+  }
+  if (deleteTargets.value.length) {
+    deleteTargets.value = []
+    return true
+  }
+  if (renameDialog.value) {
+    renameDialog.value = null
+    return true
+  }
+  if (createDialog.value) {
+    createDialog.value = null
+    return true
+  }
+  if (transferDialog.value) {
+    transferDialog.value = null
+    return true
+  }
+  if (resultDialog.value) {
+    resultDialog.value = null
+    return true
+  }
+  if (statDialog.value) {
+    statDialog.value = null
+    return true
+  }
+  if (bulkDownloadConfirm.value) {
+    bulkDownloadConfirm.value = null
+    return true
+  }
+  if (searchResults.value) {
+    clearSearch()
+    return true
+  }
+  if (selectMode.value) {
+    exitSelect()
+    return true
+  }
+  if (selected.value) {
+    selected.value = null
+    return true
+  }
+  return false
+}
+
+async function onKeydown(event: KeyboardEvent) {
+  const key = event.key
+  const meta = event.ctrlKey || event.metaKey
+
+  // Esc 先于输入框判定：焦点在弹窗输入框里时也要能关掉弹窗
+  if (key === 'Escape') {
+    if (closeTopLayer()) event.preventDefault()
+    return
+  }
+
+  if (typingInField(event.target)) return
+
+  if (anyOverlayOpen() || !currentPath.value) return
+  const targets = keyTargets()
+
+  if (key === 'F2') {
+    if (targets.length !== 1) return
+    event.preventDefault()
+    openRenameDialog(targets[0])
+    return
+  }
+
+  // Backspace 只在列表上有选中时才当删除，避免用户想「返回上级」却删了东西
+  if (key === 'Delete' || (key === 'Backspace' && targets.length)) {
+    if (!targets.length || readonly.value) return
+    event.preventDefault()
+    openDeleteDialog(targets)
+    return
+  }
+
+  if (!meta) return
+
+  if (key === 'a' || key === 'A') {
+    if (isSearching.value) return
+    event.preventDefault()
+    selectMode.value = true
+    selection.value = displayEntries.value.map((entry) => entry.path)
+    return
+  }
+
+  if (key === 'c' || key === 'C') {
+    if (!targets.length) return
+    clipboard.value = { mode: 'copy', entries: targets }
+    showToast(t('files.keys.copied', { count: targets.length }))
+    return
+  }
+
+  if (key === 'x' || key === 'X') {
+    if (!targets.length || readonly.value) return
+    clipboard.value = { mode: 'move', entries: targets }
+    showToast(t('files.keys.cut', { count: targets.length }))
+    return
+  }
+
+  if (key === 'v' || key === 'V') {
+    const clip = clipboard.value
+    if (!clip || (clip.mode === 'move' && readonly.value)) return
+    event.preventDefault()
+    await runTransfer(clip.mode, clip.entries, currentPath.value)
+  }
+}
+
+/**
+ * 直接落盘（冲突一律先按 skip 走）：没有同名项时一次点按就完成，命中冲突再回退到
+ * 移动/复制对话框让用户明确选择覆盖还是改名 —— 绝不替用户决定覆盖。
+ */
+async function runTransfer(mode: TransferMode, targets: EntryInfo[], dest: string) {
+  if (!targets.length || !dest) return
+  try {
+    const call = mode === 'copy' ? filesApi.copy : filesApi.move
+    const response = await call(targets.map((entry) => entry.path), dest, 'skip')
+    const summary = summarizeResults(response)
+    // `skip` 模式命中的同名项会进 `skipped` 而不是 `failures`：那也是「需要用户决定」
+    const conflict =
+      summary.skipped > 0 ||
+      summary.failures.some(
+        (item) => item.error_code === 'E_CONFLICT' || item.error_code === 'E_DIR_CONFLICT',
+      )
+    if (conflict) {
+      openTransferDialog(mode, targets, dest)
+      return
+    }
+    exitSelect()
+    if (summary.failed) {
+      showTransferResult(mode, summary, displayPath(dest), dest, 'skip')
+    } else {
+      showToast(t(mode === 'copy' ? 'files.keys.copiedDone' : 'files.keys.movedDone', { count: summary.ok }))
+    }
+    await open(currentPath.value)
+  } catch (err) {
+    showToast(describe(err).message)
+  }
+}
+
+// ---- 条目拖到文件夹 = 移动（按住 Alt 拖 = 复制，与桌面管理器一致） ----
+function movableEntries(entry: EntryInfo): EntryInfo[] {
+  if (selectMode.value && isSelected(entry.path)) return selectedEntries.value
+  return [entry]
+}
+
+function onEntryDragStart(event: DragEvent, entry: EntryInfo) {
+  if (readonly.value) return
+  const items = movableEntries(entry)
+  internalDrag.value = items
+  dropTargetPath.value = null
+  // 拖拽期间别让容器把这次拖动当成「拖文件上传」
+  dragging.value = false
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'copyMove'
+    // Firefox 必须带数据才会真正开始拖拽；内容不重要，内部拖拽只认 internalDrag
+    event.dataTransfer.setData('text/plain', items.map((item) => item.name).join(', '))
+  }
+}
+
+function onEntryDragOver(event: DragEvent, entry: EntryInfo) {
+  if (!internalDrag.value.length) return
+  if (!entry.is_dir && !linkToDir(entry)) return
+  if (internalDrag.value.some((item) => item.path === entry.path)) return
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = event.altKey ? 'copy' : 'move'
+  }
+  dropTargetPath.value = entry.path
+}
+
+function onEntryDragLeave(entry: EntryInfo) {
+  if (dropTargetPath.value === entry.path) dropTargetPath.value = null
+}
+
+async function onEntryDrop(event: DragEvent, entry: EntryInfo) {
+  const items = internalDrag.value
+  if (!items.length) return
+  if (!entry.is_dir && !linkToDir(entry)) return
+  event.preventDefault()
+  event.stopPropagation()
+  internalDrag.value = []
+  dropTargetPath.value = null
+  dragging.value = false
+  // 拖到自己身上 / 拖到自己所在目录：什么都不做
+  if (items.some((item) => item.path === entry.path)) return
+  const mode: TransferMode = event.altKey ? 'copy' : 'move'
+  await runTransfer(mode, items, entry.path)
+}
+
+function onEntryDragEnd() {
+  internalDrag.value = []
+  dropTargetPath.value = null
+  dragging.value = false
+}
+
+/** 容器级 dragover：内部拖拽不该弹出「拖到这里上传」的整屏遮罩 */
+function onRootDragOver() {
+  if (internalDrag.value.length) return
+  dragging.value = true
+}
+
 onMounted(boot)
 
 // ---------------- 挂载点存活性巡检（设计文档 3.2.8） ----------------
@@ -1869,12 +2159,14 @@ function probeMounts() {
 onMounted(() => {
   probeTimer = window.setInterval(probeMounts, MOUNT_PROBE_MS)
   document.addEventListener('visibilitychange', probeMounts)
+  window.addEventListener('keydown', onKeydown)
 })
 
 onBeforeUnmount(() => {
   if (probeTimer !== null) window.clearInterval(probeTimer)
   probeTimer = null
   document.removeEventListener('visibilitychange', probeMounts)
+  window.removeEventListener('keydown', onKeydown)
   inflight?.abort()
   inflight = null
 })
@@ -1883,7 +2175,7 @@ onBeforeUnmount(() => {
 <template>
   <section
     class="relative flex h-full min-h-0 overflow-hidden"
-    @dragover.prevent="dragging = true"
+    @dragover.prevent="onRootDragOver"
     @dragleave.prevent="dragging = false"
     @drop.prevent="onDrop"
   >
@@ -2368,15 +2660,22 @@ onBeforeUnmount(() => {
               :class="[
                 selected === entry.path ? 'border-accent/50 bg-panel' : '',
                 selectMode && isSelected(entry.path) ? 'border-accent bg-accent-soft' : '',
+                dropTargetPath === entry.path ? 'border-accent ring-2 ring-accent/40' : '',
                 linkBroken(entry) ? 'opacity-50' : '',
               ]"
               :title="entryTitle(entry)"
               :data-entry="entry.name"
               :data-kind="entry.kind"
               :data-selected="isSelected(entry.path) ? '1' : undefined"
+              :draggable="!readonly"
               @click="onEntryClick(entry, $event)"
               @dblclick="activate(entry)"
               @contextmenu.prevent="openMenu($event, entry)"
+              @dragstart="onEntryDragStart($event, entry)"
+              @dragend="onEntryDragEnd"
+              @dragover="onEntryDragOver($event, entry)"
+              @dragleave="onEntryDragLeave(entry)"
+              @drop="onEntryDrop($event, entry)"
               @touchstart.passive="onPressStart($event, entry)"
               @touchmove.passive="onPressMove($event)"
               @touchend="cancelPress"
@@ -2410,6 +2709,7 @@ onBeforeUnmount(() => {
                   class="size-full object-cover"
                   loading="lazy"
                   alt=""
+                  draggable="false"
                   @error="markThumbFailed(entry.path)"
                 />
                 <AppIcon v-else :name="iconFor(entry)" :size="34" />
@@ -2453,15 +2753,22 @@ onBeforeUnmount(() => {
               :class="[
                 selected === entry.path ? 'bg-accent-soft' : '',
                 selectMode && isSelected(entry.path) ? 'bg-accent-soft' : '',
+                dropTargetPath === entry.path ? 'bg-accent-soft ring-2 ring-inset ring-accent/40' : '',
                 linkBroken(entry) ? 'opacity-50' : '',
               ]"
               :title="entryTitle(entry)"
               :data-entry="entry.name"
               :data-kind="entry.kind"
               :data-selected="isSelected(entry.path) ? '1' : undefined"
+              :draggable="!readonly"
               @click="onEntryClick(entry, $event)"
               @dblclick="activate(entry)"
               @contextmenu.prevent="openMenu($event, entry)"
+              @dragstart="onEntryDragStart($event, entry)"
+              @dragend="onEntryDragEnd"
+              @dragover="onEntryDragOver($event, entry)"
+              @dragleave="onEntryDragLeave(entry)"
+              @drop="onEntryDrop($event, entry)"
               @touchstart.passive="onPressStart($event, entry)"
               @touchmove.passive="onPressMove($event)"
               @touchend="cancelPress"
@@ -2527,6 +2834,10 @@ onBeforeUnmount(() => {
           <span class="hidden sm:inline">
             · {{ t('files.list.shown', { shown: displayEntries.length }) }}
           </span>
+        </span>
+        <!-- 键位提示挂在底栏（不占新位置）：鼠标用户第一次也能发现 F2 / Delete / 拖拽 -->
+        <span v-if="!coarsePointer" class="hidden truncate pl-3 text-[11px] md:inline">
+          {{ t('files.keys.hint') }}
         </span>
       </footer>
 
@@ -2665,6 +2976,7 @@ onBeforeUnmount(() => {
             class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
             data-testid="delete-confirm-name"
             @keydown.enter="confirmDelete"
+            @keydown.esc="deleteTargets = []"
           />
           <span class="mt-1 block text-[11px] text-muted">{{ t('files.delete.confirmNameHint') }}</span>
         </label>
@@ -2740,7 +3052,9 @@ onBeforeUnmount(() => {
             :placeholder="t('files.create.placeholder')"
             class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
             data-testid="create-name"
+            autofocus
             @keydown.enter="submitCreate"
+            @keydown.esc="createDialog = null"
           />
         </label>
         <p v-if="createDialog.error" class="mt-3 text-xs fg-danger">{{ createDialog.error }}</p>
@@ -2778,7 +3092,9 @@ onBeforeUnmount(() => {
             type="text"
             class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
             data-testid="rename-name"
+            autofocus
             @keydown.enter="submitRename"
+            @keydown.esc="renameDialog = null"
           />
         </label>
         <p v-if="renameDialog.error" class="mt-3 text-xs fg-danger">{{ renameDialog.error }}</p>
@@ -2885,6 +3201,7 @@ onBeforeUnmount(() => {
               class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[12px] text-ink outline-none focus:border-accent"
               data-testid="transfer-dest"
               @keydown.enter="submitTransfer"
+              @keydown.esc="transferDialog = null"
             />
             <button
               v-if="transferPicker?.manual"

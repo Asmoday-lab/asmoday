@@ -249,5 +249,12 @@
     "brokenToast": "该软链接已失效或指向挂载点外",
     "dirTarget": "指向目录",
     "fileTarget": "指向文件"
+  },
+  "keys": {
+    "copied": "已复制 {count} 项，Ctrl+V 粘到目标目录",
+    "cut": "已剪切 {count} 项，Ctrl+V 粘到目标目录",
+    "copiedDone": "已复制 {count} 项",
+    "movedDone": "已移动 {count} 项",
+    "hint": "F2 重命名 · Delete 删除 · Ctrl+C/X/V 复制剪切粘贴 · 拖到文件夹移动"
   }
 }
