@@ -58,9 +58,20 @@ where
 /// Linux `/home/<name>`），不要传 `~` / `%USERPROFILE%` / `$HOME`。
 pub async fn ws_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     Query(query): Query<TerminalQuery>,
 ) -> Response {
+    // CSWSH 防线：握手是 GET，鉴权中间件的同源校验对 GET 不生效，
+    // 跨站页面一句 `new WebSocket("ws://host/api/terminal/ws")` 就能开一个 shell。
+    if !crate::api::auth::ws_origin_allowed(&headers) {
+        return crate::api::error::api_error(
+            axum::http::StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Cross-site WebSocket handshake rejected",
+        );
+    }
+
     let roots = {
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)

@@ -21,6 +21,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use crate::core::config::ServiceConfig;
 use crate::AppState;
 
+use crate::api::auth::SESSION_COOKIE;
+
 /// 需要从请求里剔除的逐跳头
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -134,6 +136,34 @@ fn is_html(headers: &reqwest::header::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// 从请求的 `Cookie` 头里摘掉本站会话，其余照原样保留。
+///
+/// 返回 `None` 表示摘完一条不剩——那这个头就整个不发，别给上游一个空串。
+fn strip_session_cookie(value: &HeaderValue) -> Option<HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let prefix = format!("{SESSION_COOKIE}=");
+    let kept: Vec<&str> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.starts_with(&prefix))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    HeaderValue::from_str(&kept.join("; ")).ok()
+}
+
+/// 这条 `Set-Cookie` 是不是本站会话（同名即丢弃）。
+fn is_session_cookie(value: &HeaderValue) -> bool {
+    let Ok(raw) = value.to_str() else {
+        return false;
+    };
+    let prefix = format!("{SESSION_COOKIE}=");
+    raw.trim_start()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+}
+
 /// `/proxy/{service_id}`
 pub async fn handle_root(
     State(state): State<AppState>,
@@ -217,6 +247,15 @@ async fn dispatch(
         if HOP_BY_HOP.contains(&lower.as_str()) {
             continue;
         }
+        // 本站会话 Cookie 绝不下发给上游：Cookie 是浏览器自动带上的，
+        // 上游哪怕只记一条访问日志，也等于把 asmoday 的 session token 交了出去。
+        // 上游自己的 Cookie 照常转发（只摘掉 `asmoday_session` 这一条）。
+        if lower == header::COOKIE.as_str() {
+            if let Some(filtered) = strip_session_cookie(value) {
+                request = request.header(name, filtered);
+            }
+            continue;
+        }
         request = request.header(name, value);
     }
     for (name, value) in &service.inject_headers {
@@ -244,6 +283,11 @@ async fn dispatch(
     for (name, value) in upstream_headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
         if DROP_RESPONSE.contains(&lower.as_str()) {
+            continue;
+        }
+        // 上游同名 Set-Cookie 会把浏览器的 asmoday 会话顶掉（等于被上游登出），
+        // 也不能让它反向覆盖本站 Cookie。
+        if lower == header::SET_COOKIE.as_str() && is_session_cookie(value) {
             continue;
         }
         if service.rewrite_html && lower == "content-length" {
@@ -347,5 +391,39 @@ async fn bridge_ws(socket: WebSocket, target: String, inject: Vec<(String, Strin
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_cookie_never_reaches_upstream() {
+        let raw = HeaderValue::from_static("asmoday_session=secret123; grafana_user=admin; theme=dark");
+        let filtered = strip_session_cookie(&raw).expect("其余 cookie 应保留");
+        let text = filtered.to_str().unwrap();
+        assert!(!text.contains("secret123"), "会话 token 被下发了：{text}");
+        assert!(text.contains("grafana_user=admin"), "{text}");
+        assert!(text.contains("theme=dark"), "{text}");
+    }
+
+    #[test]
+    fn cookie_header_is_dropped_when_only_session_left() {
+        let raw = HeaderValue::from_static("asmoday_session=secret123");
+        assert!(strip_session_cookie(&raw).is_none(), "只剩本站会话时整个头都不该发");
+    }
+
+    #[test]
+    fn upstream_set_cookie_cannot_hijack_session() {
+        assert!(is_session_cookie(&HeaderValue::from_static(
+            "asmoday_session=attacker; Path=/; HttpOnly"
+        )));
+        assert!(is_session_cookie(&HeaderValue::from_static(
+            "ASMODAY_SESSION=attacker"
+        )));
+        assert!(!is_session_cookie(&HeaderValue::from_static(
+            "grafana_session=ok; Path=/"
+        )));
     }
 }

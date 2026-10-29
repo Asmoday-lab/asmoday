@@ -201,7 +201,9 @@ async function logout() {
             : undefined
         "
       >
-        <RouterView v-slot="{ Component }">
+        <!-- 一次性密码会话：后端只放行改密接口，这里也别把主界面挂起来，
+             否则底层页面会连着发一堆 403 请求，弹一堆错误 toast -->
+        <RouterView v-if="!mustChangePassword" v-slot="{ Component }">
           <Transition name="route-fade" mode="out-in">
             <component :is="Component" />
           </Transition>

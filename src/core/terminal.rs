@@ -342,6 +342,7 @@ fn shell_for(options: ShellOptions) -> String {
 /// 1. `chcp 65001` **优先**：先切 UTF-8 代码页，之后所有输出（含 profile 报错）才不乱码；
 /// 2. `Set-PSReadLineOption -HistorySavePath` 把历史钉死在隔离目录，用户敲第一条
 ///    命令前就生效——绝不落到 `%APPDATA%`（受限令牌下必被拒，红字会一条接一条）。
+#[cfg(windows)]
 fn windows_command_payload(history_path: Option<&str>) -> String {
     let mut parts: Vec<String> = vec!["chcp.com 65001 > $null".to_string()];
     if let Some(path) = history_path {

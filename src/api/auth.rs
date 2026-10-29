@@ -27,6 +27,8 @@ pub const SESSION_COOKIE: &str = "asmoday_session";
 pub struct AuthUser {
     pub id: i64,
     pub username: String,
+    /// 是否还是一次性密码（`--init` / `--reset-password`）会话：改密前只放行改密自身
+    pub must_change_password: bool,
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -143,7 +145,12 @@ fn origin_matches_host(headers: &HeaderMap, method: &Method) -> bool {
     if candidate.eq_ignore_ascii_case("null") {
         return false;
     }
-    let authority = candidate
+    normalize_authority(authority_of(candidate)) == normalize_authority(host)
+}
+
+/// 从 `Origin` / `Referer` 里取出 authority（去掉 scheme、路径与 userinfo）。
+fn authority_of(candidate: &str) -> &str {
+    candidate
         .split("://")
         .nth(1)
         .unwrap_or(candidate)
@@ -153,8 +160,36 @@ fn origin_matches_host(headers: &HeaderMap, method: &Method) -> bool {
         // 去掉 userinfo（`user:pass@host`）
         .rsplit('@')
         .next()
-        .unwrap_or("");
-    normalize_authority(authority) == normalize_authority(host)
+        .unwrap_or("")
+}
+
+/// 一次性密码会话在改密前唯一能碰的几个接口。
+///
+/// `/api/auth/status` 是公开路由，不走中间件，所以这里不用列。
+fn is_password_change_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/auth/password" | "/api/auth/me" | "/api/auth/logout"
+    )
+}
+
+/// WebSocket 握手的同源校验。
+///
+/// 握手是 GET，`origin_matches_host` 对 GET 一律放行（导航请求不能带自定义头），
+/// 所以跨站页面 `new WebSocket("ws://victim/api/terminal/ws")` 能直接连上终端——
+/// 这就是 CSWSH。这里按 Origin 严格比对；浏览器一定会带 Origin，
+/// 不带的是 curl / 脚本这类非浏览器客户端，本身没有 CSRF 面。
+pub(crate) fn ws_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    if origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    normalize_authority(authority_of(origin)) == normalize_authority(host)
 }
 
 /// 主机名归一：小写 + 去掉默认端口
@@ -315,7 +350,11 @@ async fn sso_user(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr
         return None;
     }
 
-    Some(AuthUser { id: user.id, username: user.username })
+    Some(AuthUser {
+        id: user.id,
+        username: user.username,
+        must_change_password: user.must_change_password,
+    })
 }
 
 /// 拦截未登录请求：`/api/*` 与 `/proxy/*` 均需有效会话（或可信代理身份）。
@@ -344,7 +383,11 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
         match state.auth.session_user(&token) {
             Ok(Some(user_id)) => match state.auth.user_by_id(user_id) {
                 Ok(Some(user)) => {
-                    auth_user = Some(AuthUser { id: user.id, username: user.username });
+                    auth_user = Some(AuthUser {
+                        id: user.id,
+                        username: user.username,
+                        must_change_password: user.must_change_password,
+                    });
                     via_cookie = true;
                 }
                 _ => return json_error_code(StatusCode::UNAUTHORIZED, "AUTH_USER_MISSING", "User not found"),
@@ -391,6 +434,17 @@ pub async fn require_auth(State(state): State<AppState>, mut request: Request, n
     } else {
         None
     };
+
+    // 一次性密码（`--init` / `--reset-password`）会话必须先改密。
+    // 前端有遮罩，但遮罩只是 UI——直接 curl 带着 Cookie 照样能开终端、
+    // 能读全盘。这里只放行改密自身与状态查询，其余一律 403。
+    if user.must_change_password && !is_password_change_path(request.uri().path()) {
+        return json_error_code(
+            StatusCode::FORBIDDEN,
+            "E_PASSWORD_CHANGE_REQUIRED",
+            "Initial password must be changed before using the API",
+        );
+    }
 
     request.extensions_mut().insert(user);
     let mut response = next.run(request).await;
@@ -637,18 +691,11 @@ pub async fn logout(
 }
 
 /// GET /api/auth/me（受保护）
-pub async fn me(State(state): State<AppState>, auth_user: AuthUser) -> Response {
-    let must_change_password = state
-        .auth
-        .user_by_id(auth_user.id)
-        .ok()
-        .flatten()
-        .map(|user| user.must_change_password)
-        .unwrap_or(false);
+pub async fn me(auth_user: AuthUser) -> Response {
     Json(json!({
         "id": auth_user.id,
         "username": auth_user.username,
-        "must_change_password": must_change_password,
+        "must_change_password": auth_user.must_change_password,
     }))
     .into_response()
 }

@@ -26,4 +26,8 @@ fn main() {
     println!("cargo:rustc-env=ASMODAY_BUILD_ID={hash} ({date})");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
+    // 前端产物是被 rust-embed 在**编译期**内联进二进制的，cargo 并不知道
+    // `dist/` 与这个 crate 的关系。不声明这一行，`npm run build` 之后直接
+    // `cargo build --release` 会拿上一次的旧前端打包（表现为「发版了但页面没变」）。
+    println!("cargo:rerun-if-changed=dist");
 }
