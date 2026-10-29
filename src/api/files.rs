@@ -810,7 +810,11 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
     };
 
     match result {
-        Ok(()) => Json(json!({ "status": "ok" })).into_response(),
+        Ok(()) => {
+            // 与 /api/files/delete 同口径：缩略图缓存与色值一起清
+            crate::api::files_mutate::purge_thumb_cache(&state, &fs::normalize_display(&target));
+            Json(json!({ "status": "ok" })).into_response()
+        }
         Err(e) => fs_error(FsError::Io(format!("删除失败：{e}"))),
     }
 }

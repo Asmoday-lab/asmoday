@@ -498,7 +498,7 @@ async fn transfer_inner(
 ///
 /// 缓存键 = `normalize_display(path)` 的 sha1，所以传列表里的展示路径即可，
 /// 不需要先 canonicalize（删除后源文件已不存在，也 canonicalize 不了）。
-fn purge_thumb_cache(state: &AppState, display_path: &str) {
+pub(crate) fn purge_thumb_cache(state: &AppState, display_path: &str) {
     let path = Path::new(display_path);
     state.thumbnails.purge(path);
     let key = crate::core::thumbnail::Thumbnailer::hash_key(path);

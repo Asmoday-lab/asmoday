@@ -22,7 +22,11 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 /// 持锁的文件句柄必须活到进程退出：句柄一关，锁就没了。
-static HOLDER: OnceLock<Mutex<File>> = OnceLock::new();
+///
+/// 用 `Vec` 而不是单个槽位：同一进程里可能出现多个数据目录（测试尤其如此），
+/// 只留第一个的话，后拿到的句柄会在函数返回时被 drop —— 锁当场失效，
+/// 「第二个实例被拒」的语义也就不成立了。
+static HOLDERS: OnceLock<Mutex<Vec<File>>> = OnceLock::new();
 
 /// 获取数据目录的独占锁。失败时返回可直接打印给用户的原因。
 pub fn acquire(data_dir: &Path) -> Result<(), String> {
@@ -61,8 +65,10 @@ pub fn acquire(data_dir: &Path) -> Result<(), String> {
     let _ = writeln!(file, "pid={}", std::process::id());
     let _ = file.flush();
 
-    // 只有一个线程会走到这里；重复调用时 set 失败不影响已持有的锁
-    let _ = HOLDER.set(Mutex::new(file));
+    // 句柄交给全局保存，活到进程退出；push 失败（毒化）也不影响已持有的锁
+    if let Ok(mut holders) = HOLDERS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        holders.push(file);
+    }
     Ok(())
 }
 
