@@ -12,13 +12,13 @@ import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
 import PhotoTile from '../components/PhotoTile.vue'
+import VideoCard from '../components/VideoCard.vue'
 import {
   browseAlbums,
   browseMedia,
   coverUrl,
   libraryApi,
   placeholderColor,
-  placeholderFor,
   rawUrl,
   thumbUrl,
   type Album,
@@ -34,12 +34,6 @@ import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
 
-/** 缩略图加载失败（坏文件 / 无权限）时回落图标，别留一块空色块 */
-const failedThumbs = ref<Set<string>>(new Set())
-function markThumbFailed(path: string) {
-  failedThumbs.value = new Set(failedThumbs.value).add(path)
-}
-
 const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
 const { t } = useI18n()
 
@@ -53,6 +47,10 @@ watch(
   (value) => {
     if (value === 'photos' || value === 'cinema' || value === 'music') {
       tab.value = value
+      // 组件在三个路由间复用，挂载时只 load 过一次：影视库的文件夹卡片按需补拉
+      if (value === 'cinema' && cinemaAlbums.value.length === 0 && !cinemaAlbumsLoading.value) {
+        void loadCinemaAlbums()
+      }
     }
   },
 )
@@ -207,12 +205,6 @@ function resumeAt(path: string): number {
   return progressMap.value.get(path) ?? 0
 }
 
-function fmtSeconds(seconds: number): string {
-  const total = Math.floor(seconds)
-  const minutes = Math.floor(total / 60)
-  return `${minutes}:${String(total % 60).padStart(2, '0')}`
-}
-
 /** 照片分区只含图片与视频（音频归音乐库，否则时间线里会出现点不开的黑块） */
 const photoItems = computed(() =>
   items.value.filter((item) => item.kind === 'image' || item.kind === 'video'),
@@ -247,6 +239,8 @@ const progress = computed(() => {
 /** 相册视图看的是卡片，不是媒体流，这枚进度标签没有意义 */
 const showProgress = computed(() => {
   if (tab.value === 'photos' && photoView.value === 'albums') return false
+  // 影视库现在是「文件夹卡片 → 册内影片」两层，分子分母都跟媒体流对不上（v4.4.8）
+  if (tab.value === 'cinema') return false
   return progress.value.loaded < progress.value.total
 })
 
@@ -303,7 +297,6 @@ function groupByFolder(list: MediaItem[]): FolderGroup[] {
     return a.label.localeCompare(b.label, 'zh-Hans-CN')
   })
 }
-const videoGroups = computed(() => groupByFolder(videos.value))
 const audioGroups = computed(() => groupByFolder(audios.value))
 /** 曲目在完整列表里的行号（分组渲染后仍按全局序号播放） */
 const audioRowIndex = computed(() => {
@@ -451,9 +444,134 @@ function closeAlbum() {
   albumHasMore.value = false
 }
 
+// ---------------- 影视库文件夹（v4.4.8：与照片相册同构） ----------------
+//
+// 照片库的相册卡片来自 `/api/media/albums?kind=image`——后端统一算「直接含这类媒体的
+// 目录」，count 只数第一层。影视库此前是在前端拿「已加载那几页里每个视频的 folder」
+// 现场分区，两边口径完全不一致：同一棵树，图片是一张卡片，视频却按完整相对路径各占
+// 一区，深目录还会把同一部剧拆成好几段。现在同样走 albums 接口（kind=video），
+// 层级、计数、卡片样式都与照片库对齐。
+const cinemaAlbums = ref<Album[]>([])
+const cinemaAlbumsLoading = ref(false)
+const cinemaAlbumsError = ref('')
+const cinemaAlbumsCursor = ref<string | null>(null)
+const cinemaAlbumsHasMore = ref(false)
+const cinemaAlbumsTotal = ref(0)
+const activeCinemaAlbum = ref<Album | null>(null)
+const cinemaItems = ref<MediaItem[]>([])
+const cinemaLoading = ref(false)
+const cinemaCursor = ref<string | null>(null)
+const cinemaHasMore = ref(false)
+const cinemaCoverFailed = ref(new Set<string>())
+
+function markCinemaCoverFailed(path: string) {
+  cinemaCoverFailed.value = new Set(cinemaCoverFailed.value).add(path)
+}
+
+async function loadCinemaAlbums(refresh = false) {
+  if (cinemaAlbumsLoading.value) return
+  cinemaAlbumsLoading.value = true
+  cinemaAlbumsError.value = ''
+  try {
+    const result = await browseAlbums(undefined, 3, { kind: 'video', limit: PAGE_SIZE, refresh })
+    cinemaAlbums.value = result.items
+    cinemaAlbumsTotal.value = result.total
+    cinemaAlbumsCursor.value = result.next_cursor ?? null
+    cinemaAlbumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    cinemaAlbumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
+  } finally {
+    cinemaAlbumsLoading.value = false
+  }
+}
+
+async function loadMoreCinemaAlbums() {
+  const cursor = cinemaAlbumsCursor.value
+  if (!cinemaAlbumsHasMore.value || !cursor || cinemaAlbumsLoading.value || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await browseAlbums(undefined, 3, { kind: 'video', limit: PAGE_SIZE, cursor })
+    const seen = new Set(cinemaAlbums.value.map((album) => album.path))
+    cinemaAlbums.value = [
+      ...cinemaAlbums.value,
+      ...result.items.filter((album) => !seen.has(album.path)),
+    ]
+    cinemaAlbumsTotal.value = result.total
+    cinemaAlbumsCursor.value = result.next_cursor ?? null
+    cinemaAlbumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+async function openCinemaAlbum(album: Album) {
+  activeCinemaAlbum.value = album
+  cinemaLoading.value = true
+  cinemaItems.value = []
+  cinemaCursor.value = null
+  cinemaHasMore.value = false
+  try {
+    // depth=0：只列这一层，与卡片上的 count 口径一致（同照片相册）
+    const result = await browseMedia(album.path, 'video', 0, { limit: PAGE_SIZE })
+    cinemaItems.value = result.items
+    cinemaCursor.value = result.next_cursor ?? null
+    cinemaHasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    cinemaLoading.value = false
+  }
+}
+
+async function loadMoreCinemaItems() {
+  const album = activeCinemaAlbum.value
+  const cursor = cinemaCursor.value
+  if (!album || !cinemaHasMore.value || !cursor || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await browseMedia(album.path, 'video', 0, { limit: PAGE_SIZE, cursor })
+    const seen = new Set(cinemaItems.value.map((item) => item.path))
+    cinemaItems.value = [...cinemaItems.value, ...result.items.filter((item) => !seen.has(item.path))]
+    cinemaCursor.value = result.next_cursor ?? null
+    cinemaHasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+function closeCinemaAlbum() {
+  activeCinemaAlbum.value = null
+  cinemaItems.value = []
+  cinemaLoading.value = false
+  cinemaCursor.value = null
+  cinemaHasMore.value = false
+}
+
+/** 影视文件夹标题：根目录那本显示「根目录」，其余用目录名（与照片相册同口径） */
+function cinemaAlbumLabel(album: Album): string {
+  return album.is_root ? t('gallery.photos.rootFolder') : album.name
+}
+
+function cinemaAlbumSubtitle(album: Album): string {
+  return t('gallery.cinema.albumItems', { count: album.count })
+}
+
+function cinemaAlbumColor(album: Album): string {
+  return album.cover_color ?? placeholderColor(album.path)
+}
+
+function cinemaAlbumHash(album: Album): string | null {
+  return thumbHashToDataUrl(album.cover_hash)
+}
+
 // 相册详情与视频全屏在真机上都是一层历史：返回键先退这一层，
 // 而不是把整个媒体库都退掉（此前按返回直接离开页面，返回过后还要重新载入列表）
 useBackClose(computed(() => Boolean(activeAlbum.value)), closeAlbum)
+useBackClose(computed(() => Boolean(activeCinemaAlbum.value)), closeCinemaAlbum)
 useBackClose(computed(() => Boolean(playing.value)), () => {
   playing.value = null
 })
@@ -593,11 +711,6 @@ async function copyDirectLink(item: MediaItem) {
   }
 }
 
-/** ThumbHash 模糊占位（设计文档 3.4.3）：真图未到时先给一张同构图的小图，避免整块跳色 */
-function hashPlaceholder(item: MediaItem): string | null {
-  return thumbHashToDataUrl(item.hash)
-}
-
 function onKey(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null
   // 输入框里不抢键
@@ -611,6 +724,9 @@ function onKey(event: KeyboardEvent) {
   // 这里判 defaultPrevented，避免一次 Esc 连退两层
   if (event.key === 'Escape' && !event.defaultPrevented && activeAlbum.value) {
     closeAlbum()
+  }
+  if (event.key === 'Escape' && !event.defaultPrevented && activeCinemaAlbum.value) {
+    closeCinemaAlbum()
   }
 }
 
@@ -638,6 +754,11 @@ async function load(options: { refresh?: boolean } = {}) {
     if (tab.value === 'photos') {
       closeAlbum()
       void loadAlbums(options.refresh)
+    }
+    // 影视库同构：进页面就把文件夹卡片拉出来
+    if (tab.value === 'cinema') {
+      closeCinemaAlbum()
+      void loadCinemaAlbums(options.refresh)
     }
   } catch (err) {
     error.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
@@ -670,6 +791,11 @@ async function loadMore() {
   if (tab.value === 'photos' && photoView.value === 'albums') {
     if (activeAlbum.value) await loadMoreAlbumItems()
     else await loadMoreAlbums()
+    return
+  }
+  if (tab.value === 'cinema') {
+    if (activeCinemaAlbum.value) await loadMoreCinemaItems()
+    else await loadMoreCinemaAlbums()
     return
   }
   await loadMoreMedia()
@@ -1012,106 +1138,167 @@ useEventListener(window, 'keydown', onKey)
       </div>
     </div>
 
-    <!-- 影视库 -->
-    <div v-else-if="tab === 'cinema'" class="min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-6 md:py-6">
-      <div class="mb-4 flex items-center justify-between">
-        <h1 class="text-xl font-bold text-ink md:text-2xl">{{ t('gallery.cinema.title') }}</h1>
-        <span class="hidden text-sm text-muted md:block">
-          {{ t('gallery.cinema.count', { count: counts.video }) }}
-        </span>
-      </div>
-      <div v-if="videos.length === 0" class="grid h-full place-items-center text-center">
-        <div>
-          <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-            <AppIcon name="video" :size="22" />
-          </span>
-          <p class="text-sm text-ink">{{ t('gallery.cinema.empty') }}</p>
-          <p class="mt-1 text-xs text-muted">{{ t('gallery.cinema.emptyHint') }}</p>
+    <!-- 影视库（v4.4.8：与照片库同构，先文件夹卡片、点进去看影片） -->
+    <div v-else-if="tab === 'cinema'" class="flex min-h-0 min-w-0 flex-1 flex-col">
+      <!-- 文件夹详情 -->
+      <div v-if="activeCinemaAlbum" class="flex h-full flex-col" data-testid="cinema-album">
+        <header
+          class="sticky top-0 z-10 flex shrink-0 items-center gap-3 border-b border-line bg-base/85 px-4 py-2 backdrop-blur md:px-6"
+        >
+          <button
+            class="flex shrink-0 items-center gap-0.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+            data-testid="cinema-album-back"
+            @click="closeCinemaAlbum"
+          >
+            <AppIcon name="chevronLeft" :size="13" />
+            {{ t('gallery.cinema.backToFolders') }}
+          </button>
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-sm font-semibold text-ink">{{ cinemaAlbumLabel(activeCinemaAlbum) }}</p>
+            <p class="truncate text-[12px] text-muted">{{ cinemaAlbumSubtitle(activeCinemaAlbum) }}</p>
+          </div>
+        </header>
+
+        <div class="min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-6 md:py-6">
+          <div
+            v-if="cinemaLoading"
+            class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+          >
+            <div v-for="i in 8" :key="i" class="skeleton aspect-video rounded-xl" />
+          </div>
+          <div v-else-if="cinemaItems.length === 0" class="grid h-full place-items-center text-center">
+            <p class="text-sm text-muted">{{ t('gallery.cinema.empty') }}</p>
+          </div>
+          <div
+            v-else
+            class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+            data-testid="cinema-videos"
+          >
+            <VideoCard
+              v-for="video in cinemaItems"
+              :key="video.path"
+              :video="video"
+              :favorite="isFavorite(video.path)"
+              :resume-at="resumeAt(video.path)"
+              @play="playing = video"
+              @menu="openMediaMenu($event, video, 'cinema')"
+              @favorite="toggleFavorite(video)"
+            />
+          </div>
+          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+            {{ t('gallery.toolbar.loadingMore') }}
+          </div>
+          <div v-if="cinemaHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+          <p
+            v-else-if="cinemaItems.length > 0 && !loadingMore"
+            class="py-4 text-center text-[11px] text-muted"
+          >
+            {{ t('gallery.toolbar.allLoaded') }}
+          </p>
         </div>
       </div>
-      <div
-        v-else
-        class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
-      >
-        <template v-for="group in videoGroups" :key="group.key">
-          <!-- 分组标题：多个文件夹时按文件夹分区（v3.5.5） -->
-          <div
-            v-if="videoGroups.length > 1"
-            class="col-span-full mb-1 flex items-baseline gap-2 border-b border-line/60 pb-1.5"
-          >
-            <h2 class="text-sm font-semibold text-ink">{{ group.label }}</h2>
-            <span class="text-xs text-muted">{{ group.items.length }}</span>
+
+      <!-- 文件夹卡片：封面取文件夹里最新的视频首帧，空文件夹后端已剔除 -->
+      <div v-else class="h-full overflow-y-auto px-4 py-4 md:px-6 md:py-6" data-testid="cinema-albums">
+        <div class="mb-4 flex items-center justify-between">
+          <h1 class="text-xl font-bold text-ink md:text-2xl">{{ t('gallery.cinema.title') }}</h1>
+          <span class="hidden text-sm text-muted md:block">
+            {{ t('gallery.cinema.count', { count: cinemaAlbumsTotal || counts.video }) }}
+          </span>
+        </div>
+
+        <div
+          v-if="cinemaAlbumsLoading"
+          class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+        >
+          <div v-for="i in 8" :key="i" class="skeleton aspect-video rounded-xl" />
+        </div>
+
+        <div v-else-if="cinemaAlbumsError" class="grid h-full place-items-center text-center">
+          <div>
+            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+              <AppIcon name="alert" :size="22" />
+            </span>
+            <p class="text-sm text-ink">{{ t('gallery.toolbar.loadFailed') }}</p>
+            <p class="mt-1 text-xs text-muted">{{ cinemaAlbumsError }}</p>
           </div>
+        </div>
+
+        <div v-else-if="cinemaAlbums.length === 0" class="grid h-full place-items-center text-center">
+          <div>
+            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+              <AppIcon name="video" :size="22" />
+            </span>
+            <p class="text-sm text-ink">{{ t('gallery.cinema.folderEmpty') }}</p>
+            <p class="mt-1 text-xs text-muted">{{ t('gallery.cinema.folderEmptyHint') }}</p>
+          </div>
+        </div>
+
+        <div
+          v-else
+          class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+        >
           <button
-            v-for="video in group.items"
-            :key="video.path"
+            v-for="album in cinemaAlbums"
+            :key="album.path"
+            type="button"
             class="group text-left"
-            :data-video="video.path"
-            @click="playing = video"
-            @contextmenu.prevent="openMediaMenu($event, video, 'cinema')"
+            :data-cinema-album="album.name"
+            :title="cinemaAlbumLabel(album)"
+            @click="openCinemaAlbum(album)"
           >
-          <div
-            class="relative aspect-video overflow-hidden rounded-xl border border-line bg-black"
-            :style="{ backgroundColor: placeholderFor(video) }"
-          >
-            <!-- ThumbHash 模糊占位（影视库同样用，避免海报墙一片黑后突然跳出画面） -->
-            <img
-              v-if="hashPlaceholder(video)"
-              :src="hashPlaceholder(video)!"
-              class="absolute inset-0 size-full scale-110 object-cover blur-md"
-              aria-hidden="true"
-              alt=""
-            />
-            <!-- 视频封面走后端 ffmpeg 首帧（v2.9），拿不到再退回图标占位 -->
-            <img
-              v-if="!failedThumbs.has(video.path)"
-              :src="thumbUrl(video.path, 480)"
-              class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-              loading="lazy"
-              alt=""
-              @error="markThumbFailed(video.path)"
-            />
-            <div v-else class="absolute inset-0 grid place-items-center text-white/40">
-              <AppIcon name="video" :size="30" />
-            </div>
-            <div class="absolute inset-0 grid place-items-center">
+            <div
+              class="relative aspect-video overflow-hidden rounded-xl border border-line"
+              :style="{ backgroundColor: cinemaAlbumColor(album) }"
+            >
+              <img
+                v-if="cinemaAlbumHash(album)"
+                :src="cinemaAlbumHash(album)!"
+                class="absolute inset-0 size-full scale-110 object-cover blur-md"
+                aria-hidden="true"
+                alt=""
+              />
+              <img
+                v-if="album.cover && !cinemaCoverFailed.has(album.path)"
+                :src="thumbUrl(album.cover, 480)"
+                class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                loading="lazy"
+                alt=""
+                @error="markCinemaCoverFailed(album.path)"
+              />
+              <span v-else class="relative grid size-full place-items-center text-white/60">
+                <AppIcon name="video" :size="26" />
+              </span>
+              <span class="absolute inset-0 grid place-items-center">
+                <span
+                  class="grid size-9 place-items-center rounded-full bg-black/50 text-white backdrop-blur transition-transform group-hover:scale-110"
+                >
+                  <AppIcon name="play" :size="15" />
+                </span>
+              </span>
               <span
-                class="grid size-11 place-items-center rounded-full bg-black/50 text-white backdrop-blur transition-transform group-hover:scale-110"
+                class="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
               >
-                <AppIcon name="video" :size="18" />
+                {{ t('gallery.cinema.albumItems', { count: album.count }) }}
               </span>
             </div>
-            <span
-              v-if="resumeAt(video.path) > 10"
-              class="absolute left-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
-            >
-              {{ t('gallery.cinema.resume', { time: fmtSeconds(resumeAt(video.path)) }) }}
-            </span>
-            <span class="absolute right-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] text-white">
-              {{ formatSize(video.size) }}
-            </span>
-            <button
-              class="absolute right-1.5 top-1.5 grid size-7 place-items-center rounded-full bg-black/45 text-white/80 backdrop-blur transition-colors hover:text-white"
-              :class="isFavorite(video.path) ? 'fg-danger' : ''"
-              :title="isFavorite(video.path) ? t('gallery.favorite.remove') : t('gallery.favorite.add')"
-              @click.stop="toggleFavorite(video)"
-            >
-              <AppIcon name="heart" :size="13" :class="isFavorite(video.path) ? 'fill-current' : ''" />
-            </button>
-          </div>
-          <p class="mt-2 truncate text-sm font-medium text-ink">{{ video.name }}</p>
-        </button>
-        </template>
+            <p class="mt-2 truncate text-sm font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
+          </button>
+        </div>
+
+        <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+          <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+          {{ t('gallery.toolbar.loadingMore') }}
+        </div>
+        <div v-if="cinemaAlbumsHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+        <p
+          v-else-if="cinemaAlbums.length > 0 && !loadingMore"
+          class="py-4 text-center text-[11px] text-muted"
+        >
+          {{ t('gallery.toolbar.allLoaded') }}
+        </p>
       </div>
-      <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
-      <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
-        <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
-        {{ t('gallery.toolbar.loadingMore') }}
-      </div>
-      <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
-      <p v-else-if="videos.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
-        {{ t('gallery.toolbar.allLoaded') }}
-      </p>
     </div>
 
     <!-- 音乐库（原型版式：封面头 + 播放全部 + 曲目表） -->
@@ -1180,6 +1367,7 @@ useEventListener(window, 'keydown', onKey)
                 v-for="track in group.items"
                 :key="track.path"
                 class="group cursor-pointer transition-colors hover:bg-elevated/50"
+                :data-track="track.path"
                 @click="player.play(audios, audioRowIndex.get(track.path) ?? 0)"
                 @contextmenu.prevent="openMediaMenu($event, track, 'music')"
               >

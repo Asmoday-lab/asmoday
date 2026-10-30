@@ -182,8 +182,23 @@ impl Thumbnailer {
         Self::digest(path)
     }
 
-    /// 源文件的版本戳：长度 + mtime 秒。变了就说明源文件被改过，缓存作废。
+    /// 源文件的版本戳：缓存格式版本 + 长度 + mtime 秒。变了就说明源文件被改过、
+    /// 或生成规则换过，缓存作废。
+    ///
+    /// `v2` 是一次**格式升版**：v4.4.2 之前 `render_thumbnail` 会把小于请求宽度的
+    /// 图放大（300×200 的照片被生成成 960 宽的缩略图），灯箱用 960 缩略图打底时
+    /// 画面先按放大版铺开、原图一到又缩回去，看起来就是「打开预览先大后小」。
+    /// 只改生成代码没用——旧文件 stamp 与源文件仍然吻合，永远命中旧图；加上版本
+    /// 前缀后旧 stamp 对不上，会在同一个文件名上就地重生（不产生孤儿文件）。
+    const CACHE_VERSION: &str = "v2";
+
     fn stamp_of(path: &Path) -> String {
+        let (len, mtime) = Self::source_stamp(path);
+        format!("{}:{len}:{mtime}", Self::CACHE_VERSION)
+    }
+
+    /// 视频首帧的戳：只有源文件的长度 + mtime，不含缓存格式版本（理由见 `video_poster`）。
+    fn poster_stamp_of(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
         format!("{len}:{mtime}")
     }
@@ -367,7 +382,9 @@ impl Thumbnailer {
     pub async fn video_poster(&self, path: &Path, bin: &Path, width: u32) -> ThumbOutcome {
         let width = width.clamp(64, 1024);
         let dir = self.entry_dir(path);
-        let stamp = Self::stamp_of(path);
+        // 海报用不带格式版本的戳：视频首帧本来就是「按容器尺寸截」，没有放大失真问题，
+        // 跟着图片一起升版只会让几千个视频白白重跑一遍 FFmpeg
+        let stamp = Self::poster_stamp_of(path);
 
         if let Some(outcome) = Self::cached_poster(&dir, &stamp, width).await {
             return outcome;
@@ -763,6 +780,28 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 缓存戳带**格式版本**：v4.4.2 之前生成的「放大版」缩略图只靠 mtime 永远命中，
+    /// 灯箱拿 960 缩略图打底就会「先大后小」。版本前缀是让老缓存就地重生的唯一开关，
+    /// 删掉它这条回归会立刻变红。
+    #[test]
+    fn thumbnail_stamp_carries_format_version() {
+        let dir = scratch_dir("thumb-stamp");
+        let file = dir.join("a.png");
+        image::RgbaImage::from_pixel(12, 9, image::Rgba([1, 2, 3, 255]))
+            .save(&file)
+            .unwrap();
+
+        let stamp = Thumbnailer::stamp_of(&file);
+        assert!(stamp.starts_with("v2:"), "缩略图戳必须带格式版本：{stamp}");
+        // 海报（视频首帧）不跟版本：它没有放大失真问题，跟着升版只是白跑一遍 FFmpeg
+        assert!(
+            !Thumbnailer::poster_stamp_of(&file).starts_with("v2:"),
+            "海报戳不该带缩略图格式版本"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// 请求尺寸大于原图时不得放大：灯箱拿缩略图做加载占位，

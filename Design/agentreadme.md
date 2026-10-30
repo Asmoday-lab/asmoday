@@ -1248,6 +1248,9 @@ GWT-PHOTO-10 Given 灯箱视频  When 按 →  Then 快进 5 秒且不切条目�
 GWT-PHOTO-11 Given 灯箱打开  When 点击左右箭头或缩放胶囊  Then 正常生效且灯箱不关（onTap 按 closest('button, a') 豁免 stage 内控件）
 GWT-PHOTO-12 Given 图片模式  When 看底部  Then 缩放胶囊常驻显示百分比，未放大淡显、放大变亮，点击复位
 GWT-PHOTO-13 Given 快速连按翻页  When 旧图 load 晚到  Then 不污染新图 ready，无空白闪帧；打底图与原图均已预载
+GWT-PHOTO-14 Given 打开预览小图  When 打底图与原始图交替  Then 可见图尺寸全程不变（不得先大后小；缩略图戳带 v2 版本）
+GWT-PHOTO-15 Given 灯箱  When 连点两次左右箭头  Then 正常翻两页且缩放仍是 100%（dblclick 在控件上不触发缩放）
+GWT-PHOTO-16 Given 灯箱  When 长按 +/−  Then 只放大一档；When 长按 ←/→  Then 每次 ≥110ms 才翻一张
 ```
 
 #### 依赖红线
@@ -1288,6 +1291,8 @@ GWT-PHOTO-13 Given 快速连按翻页  When 旧图 load 晚到  Then 不污染�
 
 ```gwt
 GWT-CINEMA-01 Given 影视库  When 进入  Then 卡片 16:9，无图显示占位
+GWT-CINEMA-05 Given 影视库  When 进入  Then 先出文件夹卡片（封面+数量），与图片库相册同源（albums?kind=video）
+GWT-CINEMA-06 Given 影视文件夹  When 点开  Then 只列本层影片（depth=0），返回/Esc/系统返回都能退回卡片列表
 GWT-CINEMA-02 Given 打开视频  When loadedmetadata  Then 容器比例按视频调整
 GWT-CINEMA-03 Given 关闭视频  When 执行关闭  Then pause + src='' + load，释放资源
 GWT-CINEMA-04 Given 多个视频  When 切换  Then 旧视频销毁，新视频创建（不并存在 DOM）
@@ -1296,6 +1301,8 @@ GWT-MUSIC-02 Given 点击播放  When 播放  Then 底部播放条出现
 GWT-MUSIC-03 Given 未播放  When 进入  Then 播放条不显示
 GWT-MUSIC-04 Given 音量调整  When 关闭后重开  Then 从 localStorage 恢复（默认 35%）
 GWT-MUSIC-05 Given 列表含 100 首  When 加载  Then 只有播放条一个 `<audio>` 元素（禁用列表循环生成）
+GWT-MUSIC-06 Given 桌面窗口  When 播放条出现  Then 宽度≈70%（min 660 / max 1180）且水平居中，播放键落在条几何中心
+GWT-MUSIC-07 Given 移动端  When 播放条出现  Then 铺满底部、单行、无圆角，进度用顶端 2px 线表示
 ```
 
 #### 依赖红线

@@ -39,6 +39,15 @@ const modeIcon = computed<IconName>(
 )
 
 const playIcon = computed<IconName>(() => (player.state.playing ? 'pause' : 'play'))
+
+/** 移动端条顶那根 2px 进度线：没有横向拖动条的位置，也不该没有进度感 */
+const progressPercent = computed(() => {
+  const total = player.state.duration
+  if (!Number.isFinite(total) || total <= 0) return '0%'
+  const ratio = Math.min(1, Math.max(0, player.state.currentTime / total))
+  return `${(ratio * 100).toFixed(2)}%`
+})
+
 const volumeIcon = computed<IconName>(() => (volume.muted ? 'volumeMute' : 'volume'))
 const volumeTitle = computed(() =>
   volume.muted ? t('gallery.player.unmute') : t('gallery.player.mute'),
@@ -194,7 +203,7 @@ watch(
     <Transition name="fade">
       <div
         v-if="expanded"
-        class="fixed inset-x-0 bottom-20 z-40 mx-auto flex h-64 w-full max-w-md flex-col overflow-hidden rounded-2xl border border-line bg-panel/90 shadow-2xl backdrop-blur md:bottom-[88px] md:max-w-lg"
+        class="fixed inset-x-0 bottom-[calc(80px+env(safe-area-inset-bottom,0px))] z-40 mx-auto flex h-64 w-full max-w-md flex-col overflow-hidden rounded-2xl border border-line bg-panel/90 shadow-2xl backdrop-blur md:bottom-[calc(104px+env(safe-area-inset-bottom,0px))] md:max-w-lg"
       >
         <div class="border-b border-line/60 px-4 py-2 text-center">
           <p class="truncate text-sm font-medium text-ink">{{ displayTitle }}</p>
@@ -224,7 +233,7 @@ watch(
     <Transition name="fade">
       <div
         v-if="listOpen"
-        class="fixed inset-x-0 bottom-[calc(4rem+env(safe-area-inset-bottom,0px))] z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur md:inset-x-auto md:right-3 md:bottom-[calc(72px+env(safe-area-inset-bottom,0px))] md:h-auto md:max-h-[60vh] md:w-80 md:rounded-2xl"
+        class="fixed inset-x-0 bottom-[calc(64px+env(safe-area-inset-bottom,0px))] z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur md:inset-x-auto md:right-4 md:bottom-[calc(96px+env(safe-area-inset-bottom,0px))] md:h-auto md:max-h-[60vh] md:w-80 md:rounded-2xl"
       >
         <div class="flex shrink-0 items-center gap-2 border-b border-line/60 px-4 py-2.5">
           <p class="min-w-0 flex-1 truncate text-sm font-medium text-ink">
@@ -283,128 +292,201 @@ watch(
       </div>
     </Transition>
 
-    <!-- 播放条（原型尺寸：移动 64px / 桌面 72px） -->
+    <!--
+      播放条（v4.4.8）：
+      - 桌面：居中浮动条，宽 70%（随窗口自适应，min/max 兜住极端窗口），
+        三栏布局 —— 左曲目、中控件、右工具，播放键真正落在条的几何中心；
+      - 移动端：铺满底部（不浮动、不带圆角），单行 + 顶部一根 2px 进度线，
+        不额外占高度。
+    -->
     <div
-      class="fixed inset-x-0 bottom-0 z-40 min-h-16 border-t border-line bg-panel/95 backdrop-blur shadow-2xl md:min-h-[72px]"
+      class="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center"
       style="padding-bottom: env(safe-area-inset-bottom, 0px)"
     >
-      <div class="mx-auto flex h-full max-w-5xl items-center gap-3 px-3 md:px-5">
-        <span
-          class="relative grid size-9 shrink-0 place-items-center overflow-hidden rounded-lg text-accent"
-          :style="{ backgroundColor: placeholderColor(currentTrack.path) }"
-        >
-          <AppIcon v-if="!showCover" name="audio" :size="16" />
-          <img
-            v-else
-            :src="coverUrl(currentTrack.path)"
-            alt=""
-            class="size-full object-cover"
-            @error="coverFailed = true"
-          />
-        </span>
-
-        <div class="min-w-0 w-32 md:w-56">
-          <button
-            class="block w-full truncate text-left text-[13px] font-medium text-ink hover:text-accent"
-            :title="displayTitle"
-            @click="toggleLyrics"
+      <div
+        class="pointer-events-auto w-full border-t border-line bg-panel/95 shadow-2xl backdrop-blur md:mb-3 md:w-[70%] md:min-w-[660px] md:max-w-[1180px] md:rounded-2xl md:border"
+        data-testid="music-bar"
+      >
+        <!-- 移动端：单行 -->
+        <div class="relative flex h-16 items-center gap-2.5 px-3 md:hidden">
+          <span class="absolute inset-x-0 top-0 h-[2px] bg-line/70" aria-hidden="true">
+            <span class="block h-full bg-accent" :style="{ width: progressPercent }" />
+          </span>
+          <span
+            class="relative grid size-9 shrink-0 place-items-center overflow-hidden rounded-lg text-accent"
+            :style="{ backgroundColor: placeholderColor(currentTrack.path) }"
           >
-            {{ displayTitle }}
-          </button>
-          <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
-        </div>
-
-        <div class="flex shrink-0 items-center gap-1">
+            <AppIcon v-if="!showCover" name="audio" :size="16" />
+            <img
+              v-else
+              :src="coverUrl(currentTrack.path)"
+              alt=""
+              class="size-full object-cover"
+              @error="coverFailed = true"
+            />
+          </span>
+          <div class="min-w-0 flex-1">
+            <button
+              class="block w-full truncate text-left text-[13px] font-medium text-ink"
+              :title="displayTitle"
+              @click="toggleLyrics"
+            >
+              {{ displayTitle }}
+            </button>
+            <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
+          </div>
           <button
-            class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
-            :title="modeLabel"
-            @click="cycleMode"
-          >
-            <AppIcon :name="modeIcon" :size="15" />
-          </button>
-          <button
-            class="grid size-8 place-items-center rounded-md text-ink transition-colors hover:bg-elevated"
+            class="grid size-8 shrink-0 place-items-center rounded-md text-ink transition-colors hover:bg-elevated"
             :title="t('gallery.player.prev')"
             @click="player.prev()"
           >
             <AppIcon name="prev" :size="16" />
           </button>
           <button
-            class="grid size-9 place-items-center rounded-full bg-accent text-white transition-transform hover:scale-105"
+            class="grid size-10 shrink-0 place-items-center rounded-full bg-accent text-white transition-transform active:scale-95"
             :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
             @click="player.toggle()"
           >
-            <AppIcon :name="playIcon" :size="16" />
+            <AppIcon :name="playIcon" :size="17" />
           </button>
           <button
-            class="grid size-8 place-items-center rounded-md text-ink transition-colors hover:bg-elevated"
+            class="grid size-8 shrink-0 place-items-center rounded-md text-ink transition-colors hover:bg-elevated"
             :title="t('gallery.player.next')"
             @click="player.next()"
           >
             <AppIcon name="next" :size="16" />
           </button>
-        </div>
-
-        <div class="hidden min-w-0 flex-1 items-center gap-2 sm:flex">
-          <span class="shrink-0 text-[11px] text-muted tabular-nums">{{ fmt(player.state.currentTime) }}</span>
-          <input
-            type="range"
-            min="0"
-            :max="Math.max(player.state.duration, 0.1)"
-            step="0.1"
-            :value="player.state.currentTime"
-            class="h-1 min-w-0 flex-1 cursor-pointer accent-[var(--accent)]"
-            @input="onSeekInput"
-            @change="onSeekCommit"
-            @pointerdown="seeking = true"
-          />
-          <span class="shrink-0 text-[11px] text-muted tabular-nums">{{ fmt(player.state.duration) }}</span>
-        </div>
-
-        <!-- 音量（8.4 音乐条：PC 常驻滑块；移动端隐藏，交给手机物理按键） -->
-        <div class="hidden shrink-0 items-center gap-1 md:flex">
           <button
-            class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
-            :title="volumeTitle"
-            @click="volume.toggle()"
+            class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
+            :title="t('gallery.player.close')"
+            @click="closePlayer"
           >
-            <AppIcon :name="volumeIcon" :size="15" />
+            <AppIcon name="close" :size="15" />
           </button>
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.01"
-            :value="volume.sliderValue"
-            :title="t('gallery.player.volume')"
-            class="h-1 w-20 cursor-pointer accent-[var(--accent)]"
-            @input="onVolumeInput"
-          />
         </div>
 
-        <button
-          class="ml-auto grid size-8 shrink-0 place-items-center rounded-md transition-colors sm:ml-0"
-          :class="listOpen ? 'text-accent' : 'text-muted hover:text-ink'"
-          :title="t('gallery.player.playlist')"
-          @click="toggleList"
-        >
-          <AppIcon name="list" :size="16" />
-        </button>
-        <button
-          class="grid size-8 shrink-0 place-items-center rounded-md transition-colors"
-          :class="expanded ? 'text-accent' : 'text-muted hover:text-ink'"
-          :title="t('gallery.player.lyrics')"
-          @click="toggleLyrics"
-        >
-          <AppIcon name="fileText" :size="15" />
-        </button>
-        <button
-          class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
-          :title="t('gallery.player.close')"
-          @click="closePlayer"
-        >
-          <AppIcon name="close" :size="15" />
-        </button>
+        <!-- 桌面：左曲目 / 中控件 / 右工具 -->
+        <div class="hidden h-[76px] grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-4 px-4 md:grid">
+          <div class="flex min-w-0 items-center gap-2.5">
+          <span
+            class="relative grid size-10 shrink-0 place-items-center overflow-hidden rounded-lg text-accent"
+            :style="{ backgroundColor: placeholderColor(currentTrack.path) }"
+          >
+            <AppIcon v-if="!showCover" name="audio" :size="16" />
+            <img
+              v-else
+              :src="coverUrl(currentTrack.path)"
+              alt=""
+              class="size-full object-cover"
+              @error="coverFailed = true"
+            />
+          </span>
+            <div class="min-w-0">
+              <button
+                class="block w-full truncate text-left text-[13px] font-medium text-ink hover:text-accent"
+                :title="displayTitle"
+                @click="toggleLyrics"
+              >
+                {{ displayTitle }}
+              </button>
+              <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
+            </div>
+          </div>
+
+          <div class="flex w-[min(34vw,400px)] min-w-[280px] flex-col items-center gap-1">
+            <div class="flex items-center gap-4">
+              <button
+                class="grid size-8 place-items-center rounded-full text-ink transition-colors hover:bg-elevated"
+                :title="t('gallery.player.prev')"
+                @click="player.prev()"
+              >
+                <AppIcon name="prev" :size="17" />
+              </button>
+              <button
+                class="grid size-10 place-items-center rounded-full bg-accent text-white transition-transform hover:scale-105 active:scale-95"
+                :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
+                data-testid="music-bar-play"
+                @click="player.toggle()"
+              >
+                <AppIcon :name="playIcon" :size="17" />
+              </button>
+              <button
+                class="grid size-8 place-items-center rounded-full text-ink transition-colors hover:bg-elevated"
+                :title="t('gallery.player.next')"
+                @click="player.next()"
+              >
+                <AppIcon name="next" :size="17" />
+              </button>
+            </div>
+            <div class="flex w-full items-center gap-2">
+              <span class="shrink-0 text-[11px] text-muted tabular-nums">{{ fmt(player.state.currentTime) }}</span>
+              <input
+                type="range"
+                min="0"
+                :max="Math.max(player.state.duration, 0.1)"
+                step="0.1"
+                :value="player.state.currentTime"
+                class="h-1 min-w-0 flex-1 cursor-pointer accent-[var(--accent)]"
+                @input="onSeekInput"
+                @change="onSeekCommit"
+                @pointerdown="seeking = true"
+              />
+              <span class="shrink-0 text-[11px] text-muted tabular-nums">{{ fmt(player.state.duration) }}</span>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-end gap-1">
+            <button
+              class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+              :title="modeLabel"
+              @click="cycleMode"
+            >
+              <AppIcon :name="modeIcon" :size="15" />
+            </button>
+            <div class="hidden items-center gap-1 lg:flex">
+              <button
+                class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+                :title="volumeTitle"
+                @click="volume.toggle()"
+              >
+                <AppIcon :name="volumeIcon" :size="15" />
+              </button>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                :value="volume.sliderValue"
+                :title="t('gallery.player.volume')"
+                class="h-1 w-20 cursor-pointer accent-[var(--accent)]"
+                @input="onVolumeInput"
+              />
+            </div>
+            <button
+              class="grid size-8 place-items-center rounded-md transition-colors"
+              :class="listOpen ? 'text-accent' : 'text-muted hover:text-ink'"
+              :title="t('gallery.player.playlist')"
+              @click="toggleList"
+            >
+              <AppIcon name="list" :size="16" />
+            </button>
+            <button
+              class="grid size-8 place-items-center rounded-md transition-colors"
+              :class="expanded ? 'text-accent' : 'text-muted hover:text-ink'"
+              :title="t('gallery.player.lyrics')"
+              @click="toggleLyrics"
+            >
+              <AppIcon name="fileText" :size="15" />
+            </button>
+            <button
+              class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:text-ink"
+              :title="t('gallery.player.close')"
+              @click="closePlayer"
+            >
+              <AppIcon name="close" :size="15" />
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 

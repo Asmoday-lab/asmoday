@@ -171,6 +171,9 @@ function onStageWheel(event: WheelEvent) {
 
 function onStageDblClick(event: MouseEvent) {
   if (item.value?.kind !== 'image') return
+  // 落在自己的控件上不算「双击画面」：连点两次「下一张」会在按钮上凑出一次
+  // dblclick，冒泡到这里就把刚翻过去的那张放大到 200%（用户报的「偶尔变 200%」）
+  if ((event.target as HTMLElement | null)?.closest('button, a')) return
   if (zoom.zoomed.value) zoom.reset()
   else zoom.zoomAt(event.clientX, event.clientY, 2)
 }
@@ -254,9 +257,29 @@ const infoRows = computed(() => {
   return rows
 })
 
+/** 长按翻页的最小间隔：约 9 张/秒，够快又不会让解码排队到卡顿 */
+const PAGE_REPEAT_MS = 110
+let lastPageAt = 0
+
 function onKey(event: KeyboardEvent) {
   if (!isOpen.value) return
   noteActivity()
+
+  // 长按（键盘 auto-repeat）分两类处理：
+  // - 离散动作（Esc / 空格 / k / 0 / ± ）只认首次按下：按住空格会在播放与暂停
+  //   之间狂闪，按住 + 会一路顶到上限，放开时停在哪一档完全随机；
+  // - 翻页允许连发（长按连续翻是合理诉求），但要节流：原速约 30ms 一次，
+  //   一次长按能翻过几十张，解码根本跟不上，观感就是一串跳帧。
+  const paging = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+  if (event.repeat) {
+    if (!paging) return
+    const now = Date.now()
+    if (now - lastPageAt < PAGE_REPEAT_MS) return
+    lastPageAt = now
+  } else if (paging) {
+    lastPageAt = Date.now()
+  }
+
   if (event.key === 'Escape') {
     // 信息层是浮层里的一层，先收它
     if (infoOpen.value) {

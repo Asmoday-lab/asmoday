@@ -99,14 +99,16 @@ export interface AlbumsResult {
   next_cursor?: string | null
 }
 
-/** 相册清单：回「直接含图片的目录」（含挂载目录），无图目录后端已过滤 */
+/** 相册清单：回「直接含该类媒体的目录」（含挂载目录），空目录后端已过滤。
+ *  `kind` 与照片相册同一套口径，影视库传 `video` 就得到「影视文件夹」清单。 */
 export async function browseAlbums(
   path?: string,
   depth = 3,
-  options: PageOptions = {},
+  options: PageOptions & { kind?: 'image' | 'video' | 'audio' } = {},
 ): Promise<AlbumsResult> {
   const params = new URLSearchParams({ depth: String(depth) })
   if (path) params.set('path', path)
+  if (options.kind) params.set('kind', options.kind)
   if (options.limit) params.set('limit', String(options.limit))
   if (options.cursor) params.set('cursor', options.cursor)
   if (options.refresh) params.set('refresh', '1')
