@@ -1571,6 +1571,15 @@ GWT-UX-05 Given 长按过程中滑动 >10px  When 释放  Then 不触发菜单
 GWT-UX-06 Given 长按触发菜单  When 释放  Then 不触发 click（不打开文件）
 GWT-UX-07 Given 底部播放条  When iPhone 安全区  Then 有 padding-bottom
 GWT-UX-08 Given 任意组件  When 执行 alert/confirm  Then 禁止（用封装 Modal）
+GWT-UX-09 Given 浮层里点「下载」  When 关闭浮层  Then 下载仍落盘（iframe 触发，不被 history.back 中止）
+GWT-UX-10 Given 多选 N 项（含目录）  When 点下载  Then 只发 1 个 archive 请求，得到含 N 个顶层条目的 zip
+GWT-UX-11 Given 窄屏 390px  When 打开文件页  Then 面包屑独占第二行、搜索按钮可展开搜索行、条目有「⋯」
+GWT-UX-12 Given 窄屏  When 触发条目菜单  Then 底部动作面板（data-sheet=1，贴底全宽，含取消）
+GWT-UX-13 Given 窄屏  When 打开任意弹窗  Then 贴底全宽（顶角 20px、底部安全区），桌面仍居中
+GWT-UX-14 Given 窄屏多选  When 操作栏出现  Then 两行：已选 N 项 + 取消，四个动作带文字
+GWT-UX-15 Given 触屏  When 渲染工具栏/操作栏  Then 可点区 ≥36px（touch-target/touch-chip）
+GWT-UX-16 Given 触屏长按照片/音乐行 500ms  Then 弹出底部动作面板，且不打开大图、不开始播放、面板不被补发的 click 关掉
+GWT-UX-17 Given 触屏短按照片  Then 正常打开大图（长按的 click 拦截不能误伤普通点击）
 ```
 
 ---

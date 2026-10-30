@@ -254,8 +254,18 @@ export const filesApi = {
   rawUrl: (path: string, options: { download?: boolean } = {}) =>
     `/api/files/raw?path=${encodePath(path)}${options.download ? '&download=1' : ''}`,
 
-  /** 目录打包下载：后端 store 模式流式 zip（不压缩、不落临时文件） */
-  archiveUrl: (path: string) => `/api/files/archive?path=${encodePath(path)}`,
+  /**
+   * 打包下载：后端 store 模式流式 zip（不压缩、不落临时文件）。
+   *
+   * 单个路径走 `path=`（目录按 `<目录名>/…` 打包，与历史行为一致）；
+   * 多选走 `paths=`（JSON 数组，逗号/重复 key 在路径里都不安全），
+   * 由后端打进同一个 zip —— 逐个触发下载会被浏览器当成「多文件下载」拦掉。
+   */
+  archiveUrl: (paths: string | string[]) => {
+    const list = typeof paths === 'string' ? [paths] : paths
+    if (list.length === 1) return `/api/files/archive?path=${encodePath(list[0])}`
+    return `/api/files/archive?paths=${encodeURIComponent(JSON.stringify(list))}`
+  },
 
   async readText(path: string): Promise<string> {
     const res = await fetch(filesApi.rawUrl(path))

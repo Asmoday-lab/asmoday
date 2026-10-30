@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FILE_BYTES: u64 = u32::MAX as u64 - 1;
 /// 条目总数上限（16 位中央目录计数）。
 pub const MAX_ENTRIES: usize = u16::MAX as usize;
+/// 一次请求最多打包多少个顶层目标（多选打包的硬闸门，与配置里的批量上限无关）。
+pub const MAX_TARGETS: usize = 1000;
 
 /// zip 内的一个条目。
 pub struct Entry {
@@ -32,17 +34,62 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// 把目录摊平成条目清单（顶层是 `root` 自己的名字）。
+/// 把一批目标摊平成条目清单（目录以自身名字为顶层，文件用它自己的名字）。
+///
+/// 单目标 = 老行为（`plan(&[dir])` 与旧的 `plan(&dir)` 完全一致）；多目标是
+/// 「多选打包成一个 zip」——浏览器不允许一次手势触发多个下载，只能合成一个响应。
 ///
 /// 顺序：目录先于其内容、同级按名字排序——解压工具按顺序建目录，先来的目录
 /// 还能顺手继承权限。软链接、临时文件、打不开的项直接跳过（打包失败比漏几个文件更糟）。
-pub fn plan(root: &Path) -> std::io::Result<Vec<Entry>> {
-    let base = root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string());
+pub fn plan(targets: &[PathBuf]) -> std::io::Result<Vec<Entry>> {
+    if targets.len() > MAX_TARGETS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("一次最多打包 {MAX_TARGETS} 项"),
+        ));
+    }
+
     let mut entries = Vec::new();
-    push_dir(root, &base, &mut entries)?;
+    // 多选可能横跨目录（搜索结果）：同名条目补序号，否则解压时互相覆盖
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for target in targets {
+        let meta = std::fs::symlink_metadata(target)?;
+        let mut base = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".to_string());
+        if !used.insert(base.clone()) {
+            let mut index = 2;
+            loop {
+                let candidate = numbered(&base, index, meta.is_dir());
+                if used.insert(candidate.clone()) {
+                    base = candidate;
+                    break;
+                }
+                index += 1;
+            }
+        }
+
+        if meta.is_dir() {
+            push_dir(target, &base, &mut entries)?;
+        } else {
+            if meta.len() >= MAX_FILE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{base} 超过 4 GiB，请单独下载"),
+                ));
+            }
+            entries.push(Entry {
+                abs: target.clone(),
+                name: base,
+                size: meta.len(),
+                mtime: meta.modified().ok(),
+                is_dir: false,
+            });
+        }
+    }
+
     if entries.len() > MAX_ENTRIES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -50,6 +97,17 @@ pub fn plan(root: &Path) -> std::io::Result<Vec<Entry>> {
         ));
     }
     Ok(entries)
+}
+
+/// 重名条目补序号：`same.txt` → `same (2).txt`（文件保留扩展名，解压后双击还能打开）。
+fn numbered(name: &str, index: usize, is_dir: bool) -> String {
+    if is_dir {
+        return format!("{name} ({index})");
+    }
+    match name.rfind('.') {
+        Some(pos) if pos > 0 => format!("{} ({index}){}", &name[..pos], &name[pos..]),
+        _ => format!("{name} ({index})"),
+    }
 }
 
 fn push_dir(dir: &Path, name: &str, out: &mut Vec<Entry>) -> std::io::Result<()> {
@@ -327,7 +385,7 @@ mod tests {
         std::fs::write(folder.join("a.txt"), b"hello").unwrap();
         std::fs::write(folder.join("sub/b.bin"), vec![7u8; 1024]).unwrap();
 
-        let entries = plan(&folder).unwrap();
+        let entries = plan(&[folder]).unwrap();
         assert_eq!(entries.len(), 4, "Album + a.txt + sub + sub/b.bin");
         assert_eq!(entries[0].name, "Album/", "目录条目必须以斜杠结尾");
 
@@ -363,11 +421,60 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/", folder.join("escape")).unwrap();
 
-        let entries = plan(&folder).unwrap();
+        let entries = plan(&[folder]).unwrap();
         assert!(
             entries.iter().all(|entry| !entry.name.ends_with("escape")),
             "软链接不能进 zip"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn multi_targets_share_one_zip_and_dedupe_names() {
+        let root = scratch("multi");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // 不同目录下的同名文件：多选打包时必须补序号，否则解压互相覆盖
+        std::fs::write(a.join("same.txt"), b"first").unwrap();
+        std::fs::write(b.join("same.txt"), b"second").unwrap();
+        std::fs::write(root.join("loose.txt"), b"loose").unwrap();
+
+        let entries = plan(&[
+            a.join("same.txt"),
+            b.join("same.txt"),
+            root.join("loose.txt"),
+        ])
+        .unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["same.txt", "same (2).txt", "loose.txt"]);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let writer_task = tokio::spawn(async move {
+            stream_zip(entries, &mut writer).await.unwrap();
+        });
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        writer_task.await.unwrap();
+        let eocd = &bytes[bytes.len() - 22..];
+        assert_eq!(u16::from_le_bytes([eocd[10], eocd[11]]), 3, "三个条目");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_and_file_mix_keeps_directory_prefix() {
+        let root = scratch("mix");
+        let folder = root.join("Album");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.txt"), b"x").unwrap();
+        std::fs::write(root.join("note.md"), b"y").unwrap();
+
+        let entries = plan(&[folder, root.join("note.md")]).unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["Album/", "Album/a.txt", "note.md"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

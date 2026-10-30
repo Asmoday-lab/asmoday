@@ -462,3 +462,56 @@ body {
 .fade-leave-to {
   opacity: 0;
 }
+
+/* ===== 移动端弹层与触控尺寸（设计文档 8.6） =====
+ *
+ * 手机上没有「居中的小卡片」这种习惯：一旦弹窗在屏幕中央，键盘一起就把它顶走，
+ * 拇指也够不着底部按钮。窄屏统一改成**贴底面板**（抽屉式），全宽、顶部圆角、
+ * 底部让出安全区，内部可滚动——内容再长也不会顶出屏幕。
+ *
+ * 用法：容器加 `modal-overlay`，卡片加 `modal-card`，其余留白/字号由组件自己决定。
+ */
+@media (max-width: 639.98px) {
+  .modal-overlay.modal-overlay {
+    align-items: end;
+    padding: 0;
+  }
+  .modal-overlay > .modal-card {
+    width: 100%;
+    max-width: 100%;
+    max-height: 88dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-radius: 20px 20px 0 0;
+    padding-bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px));
+    animation: sheet-in 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  /* 贴底面板的标题留一条抓手的位置感：顶部多给一点，不出抓手也不突兀 */
+  .modal-overlay > .modal-card {
+    padding-top: 1.25rem;
+  }
+}
+
+@keyframes sheet-in {
+  from {
+    transform: translateY(14px);
+    opacity: 0.6;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* 触屏（粗指针）：可点区域统一抬到 40px，避免 28px 图标按钮「点不准」 */
+@media (pointer: coarse) {
+  .touch-target {
+    min-width: 2.5rem;
+    min-height: 2.5rem;
+  }
+  .touch-chip {
+    min-height: 2.25rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+}

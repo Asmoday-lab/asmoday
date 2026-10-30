@@ -30,6 +30,7 @@ import { formatSize } from '../lib/format'
 import { triggerDownload } from '../lib/download'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
+import { useLongPress } from '../composables/useLongPress'
 import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
@@ -635,6 +636,26 @@ function openMediaMenu(event: MouseEvent, item: MediaItem, context: MediaTab) {
   mediaMenu.value = { x: event.clientX, y: event.clientY, item, context }
 }
 
+/**
+ * 触屏没有右键：长按 = 打开同一个菜单（窄屏下 ContextMenu 自己会变成底部面板）。
+ * 长按后紧跟的那次 click 由 `press.takeFired()` 吞掉，避免「弹菜单的同时打开大图/开始播放」。
+ */
+const press = useLongPress<{ item: MediaItem; context: MediaTab }>(({ item, context }) => {
+  mediaMenu.value = { x: 0, y: 0, item, context }
+})
+
+/** 照片单击：长按已经弹过菜单就不再打开大图 */
+function openPhotoTile(list: MediaItem[], index: number) {
+  if (press.takeFired()) return
+  openViewer(list, index)
+}
+
+/** 音乐行单击：同上 */
+function playTrackAt(track: MediaItem) {
+  if (press.takeFired()) return
+  player.play(audios.value, audioRowIndex.value.get(track.path) ?? 0)
+}
+
 const mediaMenuItems = computed<ContextMenuItem[]>(() => {
   const current = mediaMenu.value
   if (!current) return []
@@ -984,8 +1005,12 @@ useEventListener(window, 'keydown', onKey)
               v-for="(item, index) in albumItems"
               :key="item.path"
               :item="item"
-              @click="openViewer(albumItems, index)"
+              @click="openPhotoTile(albumItems, index)"
               @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
+              @touchstart.passive="press.start($event, { item, context: 'photos' })"
+              @touchmove.passive="press.move"
+              @touchend="press.cancel"
+              @touchcancel="press.cancel"
             />
           </div>
           <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
@@ -1116,8 +1141,12 @@ useEventListener(window, 'keydown', onKey)
                 v-for="(item, index) in group.items"
                 :key="item.path"
                 :item="item"
-                @click="openViewer(group.items, index)"
+                @click="openPhotoTile(group.items, index)"
                 @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
+                @touchstart.passive="press.start($event, { item, context: 'photos' })"
+                @touchmove.passive="press.move"
+                @touchend="press.cancel"
+                @touchcancel="press.cancel"
               />
             </div>
           </div>
@@ -1364,8 +1393,12 @@ useEventListener(window, 'keydown', onKey)
                 :key="track.path"
                 class="group cursor-pointer transition-colors hover:bg-elevated/50"
                 :data-track="track.path"
-                @click="player.play(audios, audioRowIndex.get(track.path) ?? 0)"
+                @click="playTrackAt(track)"
                 @contextmenu.prevent="openMediaMenu($event, track, 'music')"
+                @touchstart.passive="press.start($event, { item: track, context: 'music' })"
+                @touchmove.passive="press.move"
+                @touchend="press.cancel"
+                @touchcancel="press.cancel"
               >
               <td class="px-2 py-3 md:px-3">
                 <span class="group-hover:hidden" :class="player.isCurrent(track.path) ? 'text-accent' : ''">
@@ -1491,6 +1524,7 @@ useEventListener(window, 'keydown', onKey)
       :x="mediaMenu?.x ?? 0"
       :y="mediaMenu?.y ?? 0"
       :items="mediaMenuItems"
+      :title="mediaMenu?.item.name"
       @select="onMediaMenuSelect"
       @close="mediaMenu = null"
     />

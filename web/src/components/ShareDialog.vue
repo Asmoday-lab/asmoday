@@ -69,11 +69,11 @@ async function copyLink() {
   <Teleport to="body">
     <div
       v-if="shareTarget"
-      class="fixed inset-0 z-[85] grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-[85] grid place-items-center modal-overlay bg-black/50 p-4"
       data-testid="share-dialog"
       @click.self="closeShare()"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <template v-if="!result">
           <p class="text-sm font-medium text-ink">{{ t('files.share.create') }}</p>
           <p class="mt-0.5 truncate text-[12px] text-muted">{{ shareTarget.name }}</p>

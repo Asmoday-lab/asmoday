@@ -20,6 +20,7 @@
     "refresh": "Refresh",
     "home": "Back to mounts",
     "searchPlaceholder": "Search this folder…",
+    "search": "Search",
     "searching": "Searching…",
     "clearSearch": "Clear search",
     "grid": "Grid view",
@@ -95,6 +96,7 @@
     "rename": "Rename…",
     "copyTo": "Copy to…",
     "moveTo": "Move to…",
+    "more": "More actions",
     "properties": "Properties"
   },
   "delete": {
@@ -232,8 +234,8 @@
     "copy": "Copy",
     "delete": "Delete",
     "noDownloadable": "None of the selected items is a file",
-    "downloadConfirm": "About to download {count} files",
-    "downloadHint": "Your browser may block multiple downloads; allow them for this site",
+    "downloadConfirm": "Pack {count} items into one ZIP",
+    "downloadHint": "Folders are packed with everything inside; large selections take a while before the first byte",
     "toggle": "Select this item"
   },
   "sort": {

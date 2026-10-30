@@ -9,7 +9,7 @@
  * - 首次渲染后按实际尺寸把菜单夹回视口内（8px 安全边距）；
  * - Esc / 点击遮罩 / 滚动 都关闭；置灰项带 `hint` 当 Tooltip（只读挂载点场景）。
  */
-import { useEventListener } from '@vueuse/core'
+import { useEventListener, useMediaQuery } from '@vueuse/core'
 import { computed, nextTick, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
@@ -32,12 +32,20 @@ const props = defineProps<{
   x: number
   y: number
   items: ContextMenuItem[]
+  /** 移动端底部面板的标题（通常是目标名字，让用户确认操作对象） */
+  title?: string
 }>()
 
 const emit = defineEmits<{
   (e: 'select', id: string): void
   (e: 'close'): void
 }>()
+
+/**
+ * 窄屏（手机）改成**底部动作面板**：右键在触屏上根本不存在，靠「…」按钮唤起，
+ * 面板贴底 = 拇指可及区，条目高度 48px 也才够点。宽屏保持跟随光标的浮层。
+ */
+const isSheet = useMediaQuery('(max-width: 639.98px)')
 
 const root = ref<HTMLElement | null>(null)
 const pos = ref({ x: props.x, y: props.y })
@@ -47,6 +55,7 @@ const margin = 8
 /** 菜单实际高度在渲染前未知，先按请求坐标摆一次，再按 rect 夹回视口 */
 async function clamp() {
   pos.value = { x: props.x, y: props.y }
+  if (isSheet.value) return
   await nextTick()
   const el = root.value
   if (!el) return
@@ -85,7 +94,7 @@ function onKey(event: KeyboardEvent) {
 
 useEventListener(window, 'keydown', onKey)
 
-const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px` }))
+const style = computed(() => (isSheet.value ? undefined : { left: `${pos.value.x}px`, top: `${pos.value.y}px` }))
 </script>
 
 <template>
@@ -93,6 +102,7 @@ const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px
     <div
       v-if="open"
       class="fixed inset-0 z-[90]"
+      :class="isSheet ? 'bg-black/40 backdrop-blur-[2px]' : ''"
       data-testid="context-menu-backdrop"
       @click="close"
       @contextmenu.prevent="close"
@@ -100,11 +110,30 @@ const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px
     <div
       v-if="open"
       ref="root"
-      class="fixed z-[91] max-h-[calc(100dvh-16px)] w-48 overflow-x-hidden overflow-y-auto rounded-lg border border-line bg-panel py-1 shadow-xl"
+      class="fixed z-[91] overflow-x-hidden overflow-y-auto border-line bg-panel shadow-xl"
+      :class="
+        isSheet
+          ? 'inset-x-0 bottom-0 max-h-[72dvh] rounded-t-2xl border-t pt-1'
+          : 'max-h-[calc(100dvh-16px)] w-48 rounded-lg border py-1'
+      "
       :style="style"
       role="menu"
       data-testid="context-menu"
+      :data-sheet="isSheet ? '1' : undefined"
     >
+      <!-- 底部面板：先给一条抓手 + 目标名，避免「这些操作到底作用在谁身上」 -->
+      <template v-if="isSheet">
+        <div class="flex items-center justify-center pt-1.5 pb-1">
+          <span class="h-1 w-9 rounded-full bg-line" />
+        </div>
+        <p
+          v-if="title"
+          class="truncate border-b border-line/60 px-4 pb-2.5 text-[13px] font-medium text-ink"
+        >
+          {{ title }}
+        </p>
+      </template>
+
       <template v-for="item in items" :key="item.id">
         <div v-if="item.divider" class="my-1 border-t border-line" />
         <span :title="item.disabled ? item.hint : undefined" class="block">
@@ -115,12 +144,13 @@ const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px
             :class="[
               item.danger ? 'menu-item--danger' : '',
               item.disabled ? 'menu-item--off' : '',
+              isSheet ? 'menu-item--sheet' : '',
             ]"
             :disabled="item.disabled"
             :data-menu="item.id"
             @click="pick(item)"
           >
-            <AppIcon v-if="item.icon" :name="item.icon" :size="14" />
+            <AppIcon v-if="item.icon" :name="item.icon" :size="isSheet ? 17 : 14" />
             {{ item.label }}
           </button>
         </span>
@@ -133,6 +163,16 @@ const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px
       >
         {{ items.find((item) => item.disabled && item.hint)?.hint }}
       </p>
+
+      <div v-if="isSheet" class="px-3 pt-1" style="padding-bottom: env(safe-area-inset-bottom, 0px)">
+        <button
+          type="button"
+          class="mb-2 h-11 w-full rounded-xl bg-elevated text-[13px] text-muted"
+          @click="close"
+        >
+          {{ $t('common.action.cancel') }}
+        </button>
+      </div>
     </div>
   </Teleport>
 </template>
@@ -149,6 +189,16 @@ const style = computed(() => ({ left: `${pos.value.x}px`, top: `${pos.value.y}px
   transition: background-color 0.15s ease;
 }
 .menu-item:hover {
+  background: var(--bg-elevated);
+}
+/* 底部面板：拇指点得中的高度（48px），左对齐、图标更大 */
+.menu-item--sheet {
+  min-height: 48px;
+  padding: 0 18px;
+  font-size: 14px;
+  gap: 12px;
+}
+.menu-item--sheet:active {
   background: var(--bg-elevated);
 }
 .menu-item--danger {

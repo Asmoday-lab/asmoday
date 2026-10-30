@@ -17,6 +17,7 @@ import {
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useMediaQuery } from '@vueuse/core'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
@@ -38,6 +39,7 @@ import {
   type TextEncoding,
 } from '../api/files'
 import { localizedCode, messageFromBody } from '../lib/errors'
+import { triggerDownload } from '../lib/download'
 import { sharesApi } from '../api/shares'
 import { thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
@@ -70,9 +72,13 @@ function openTerminal(entry: EntryInfo) {
   router.push({ path: '/terminal', query: { path: target } })
 }
 
+/** 下载一个条目：目录走流式 zip，文件走 `?download=1`（服务端补 attachment） */
 function downloadEntry(entry: EntryInfo) {
   menu.value = null
-  triggerDownload(entry)
+  const url = entry.is_dir
+    ? filesApi.archiveUrl(entry.path)
+    : filesApi.rawUrl(entry.path, { download: true })
+  triggerDownload(url)
 }
 
 function menuOpenEntry() {
@@ -649,49 +655,38 @@ function onPressMove(event: TouchEvent) {
   if (dx > LONG_PRESS_SLOP || dy > LONG_PRESS_SLOP) cancelPress()
 }
 
-// ---- 批量下载（设计文档 3.2.6.6：逐个触发浏览器下载，不排队到一条连接上） ----
+// ---- 批量下载（设计文档 3.2.6.6） ----
+//
+// 一次手势只允许一个下载：连着开 N 个 `<a>`/iframe，浏览器会把第 2 个起当成
+// 「多文件下载」拦掉（手机上连提示都没有），所以多选一律交给后端打成**一个** zip。
+// 目录也一起打包 —— 以前多选只挑文件，选中文件夹等于被静默忽略。
 const bulkDownloadConfirm = ref<EntryInfo[] | null>(null)
 
-/**
- * 触发一次下载：目录走流式 zip，文件走 `?download=1`。
- *
- * 以前一律 `window.open(raw)`：浏览器会就地渲染，TOML / 日志变成一页乱码，
- * 目录则直接报「目标是目录」。`download=1` 让后端补 Content-Disposition，
- * 才是真正可靠的存盘方式。
- */
-function triggerDownload(entry: EntryInfo) {
-  const url = entry.is_dir
-    ? filesApi.archiveUrl(entry.path)
-    : filesApi.rawUrl(entry.path, { download: true })
-  const link = document.createElement('a')
-  link.href = url
-  link.rel = 'noopener'
-  link.style.display = 'none'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-}
-
 function downloadSelected() {
-  const targets = selectedEntries.value.filter((entry) => !entry.is_dir)
-  if (!targets.length) {
-    showToast(t('files.select.noDownloadable'))
-    return
-  }
-  // > 10 个时浏览器多半会拦，先让用户确认
+  const targets = selectedEntries.value
+  if (!targets.length) return
+  // 打包要读一遍文件、体积也不小，先让用户知道自己在拉什么
   if (targets.length > 10) {
     bulkDownloadConfirm.value = targets
     return
   }
-  for (const entry of targets) triggerDownload(entry)
+  runBulkDownload(targets)
+}
+
+/** 多选下载的唯一出口：1 个文件直接存盘，其余（含目录）合成一个 zip */
+function runBulkDownload(targets: EntryInfo[]) {
+  if (targets.length === 1 && !targets[0].is_dir) {
+    triggerDownload(filesApi.rawUrl(targets[0].path, { download: true }))
+  } else {
+    triggerDownload(filesApi.archiveUrl(targets.map((entry) => entry.path)))
+  }
   exitSelect()
 }
 
 function confirmBulkDownload() {
   const targets = bulkDownloadConfirm.value ?? []
   bulkDownloadConfirm.value = null
-  for (const entry of targets) triggerDownload(entry)
-  exitSelect()
+  if (targets.length) runBulkDownload(targets)
 }
 
 // ---------------- 删除（设计文档 3.2.6.5） ----------------
@@ -984,6 +979,25 @@ async function applySort(key: SortKey) {
 
 /** 触屏设备没有双击语义，单击即打开 */
 const coarsePointer = window.matchMedia?.('(hover: none)').matches ?? false
+/** 窄屏（手机）：工具栏放不下搜索框，改成一个可展开的搜索行 + 「…」动作面板 */
+const isMobile = useMediaQuery('(max-width: 639.98px)')
+const mobileSearchOpen = ref(false)
+const mobileSearchInput = ref<HTMLInputElement | null>(null)
+
+function toggleMobileSearch() {
+  mobileSearchOpen.value = !mobileSearchOpen.value
+  if (mobileSearchOpen.value) {
+    void nextTick(() => mobileSearchInput.value?.focus())
+  } else if (searchTerm.value) {
+    clearSearch()
+  }
+}
+
+/** 手机上的「…」：没有右键，所有条目操作都从这里进 */
+function openSheet(entry: EntryInfo) {
+  menu.value = { x: 0, y: 0, entry }
+  selected.value = entry.path
+}
 
 // ---------------- 搜索 ----------------
 /**
@@ -2616,11 +2630,11 @@ onBeforeUnmount(() => {
     <Teleport to="body">
       <div
         v-if="closePrompt"
-        class="fixed inset-0 z-[75] grid place-items-center bg-black/50 p-4"
+        class="fixed inset-0 z-[75] grid place-items-center modal-overlay bg-black/50 p-4"
         @click.self="answerClose('cancel')"
       >
         <div
-          class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl"
+          class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl"
           data-testid="editor-unsaved"
         >
           <p class="text-sm font-medium text-ink">{{ t('files.editor.confirmCloseTitle') }}</p>
@@ -2757,9 +2771,15 @@ onBeforeUnmount(() => {
 
       <template v-else>
       <!-- 工具栏 -->
-            <header class="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-panel px-2 md:px-3">
+            <!--
+              窄屏把面包屑折到第二行：一行里塞「操作 + 路径」的结果是路径被压成几个像素，
+              手机上等于无法回退（设计文档 8.6）。宽屏仍然是单行。
+            -->
+            <header
+              class="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-panel px-2 py-1.5 md:h-11 md:flex-nowrap md:px-3 md:py-0"
+            >
         <button
-          class="grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+          class="touch-target grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
           :title="t('files.toolbar.refresh')"
           data-testid="toolbar-refresh"
           @click="open(currentPath)"
@@ -2770,7 +2790,7 @@ onBeforeUnmount(() => {
         <!-- 新建（设计文档 3.2 工具栏 / 3.2.6.1） -->
         <div class="relative shrink-0">
           <button
-            class="flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
+            class="touch-chip flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
             :disabled="readonly"
             :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
             data-testid="new-entry"
@@ -2797,7 +2817,7 @@ onBeforeUnmount(() => {
         </div>
 
         <button
-          class="flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+          class="touch-chip flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           :disabled="readonly"
           :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
           @click="pickFiles"
@@ -2808,7 +2828,7 @@ onBeforeUnmount(() => {
         <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
 
         <nav
-          class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[13px]"
+          class="order-last flex w-full min-w-0 items-center gap-0.5 overflow-x-auto border-t border-line/50 pt-1 text-[13px] md:order-none md:w-auto md:flex-1 md:border-0 md:pt-0"
           data-testid="breadcrumb"
         >
           <button
@@ -2892,10 +2912,22 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
+        <!-- 窄屏没有常驻搜索框：一个按钮展开第二行，手机也能搜（设计文档 8.6） -->
+        <button
+          class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors hover:bg-elevated sm:hidden"
+          :class="mobileSearchOpen ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
+          :title="t('files.toolbar.search')"
+          data-testid="mobile-search-toggle"
+          :aria-expanded="mobileSearchOpen"
+          @click="toggleMobileSearch"
+        >
+          <AppIcon name="search" :size="15" />
+        </button>
+
         <!-- 排序（设计文档 v2.7.0 3.2.1：名称/修改时间/大小 + 升降序，状态持久化） -->
         <div class="relative shrink-0">
           <button
-            class="flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+            class="touch-chip flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
             :title="t('files.sort.label')"
             data-testid="sort-menu"
             :aria-expanded="sortMenuOpen"
@@ -2931,7 +2963,7 @@ onBeforeUnmount(() => {
         </div>
 
         <button
-          class="grid size-7 shrink-0 place-items-center rounded-md transition-colors"
+          class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors"
           :class="showHidden ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-elevated hover:text-ink'"
           :title="showHidden ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden')"
           data-testid="toggle-hidden"
@@ -2961,10 +2993,62 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
+      <!-- 窄屏搜索行：与工具栏分两行，输入框才够宽（不抢面包屑的位置） -->
+      <div
+        v-if="mobileSearchOpen"
+        class="flex shrink-0 items-center gap-1.5 border-b border-line bg-panel px-2 py-1.5 sm:hidden"
+        data-testid="mobile-search-row"
+      >
+        <div class="relative min-w-0 flex-1">
+          <span class="absolute left-2 top-1/2 -translate-y-1/2 text-muted">
+            <AppIcon name="search" :size="13" />
+          </span>
+          <input
+            ref="mobileSearchInput"
+            v-model="searchTerm"
+            :placeholder="
+              searching
+                ? t('files.toolbar.searching')
+                : recursiveSearch
+                  ? t('files.toolbar.searchPlaceholderDeep')
+                  : t('files.toolbar.searchPlaceholder')
+            "
+            class="w-full rounded-full border border-line bg-elevated py-1.5 pl-7 pr-7 text-[13px] text-ink outline-none focus:border-accent"
+            enterkeyhint="search"
+            @input="scheduleSearch"
+          />
+          <button
+            v-if="searchTerm"
+            class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted"
+            :title="t('files.toolbar.clearSearch')"
+            @click="clearSearch"
+          >
+            <AppIcon name="close" :size="12" />
+          </button>
+        </div>
+        <button
+          class="grid size-9 shrink-0 place-items-center rounded-lg transition-colors"
+          :class="recursiveSearch ? 'bg-accent-soft text-accent' : 'text-muted'"
+          :title="
+            recursiveSearch ? t('files.toolbar.searchScopeAll') : t('files.toolbar.searchScopeDir')
+          "
+          :aria-pressed="recursiveSearch"
+          @click="toggleRecursiveSearch"
+        >
+          <AppIcon :name="recursiveSearch ? 'folderOpen' : 'folder'" :size="15" />
+        </button>
+        <button
+          class="h-9 shrink-0 rounded-lg px-2.5 text-[13px] text-muted"
+          @click="toggleMobileSearch"
+        >
+          {{ t('common.action.cancel') }}
+        </button>
+      </div>
+
       <!-- 内容 -->
       <div
         class="relative min-h-0 flex-1 overflow-y-auto"
-        :class="selectMode ? 'pb-20' : ''"
+        :class="selectMode ? 'pb-32 sm:pb-20' : ''"
         data-testid="entry-scroll"
       >
         <div v-if="loading" class="p-3">
@@ -3048,6 +3132,17 @@ onBeforeUnmount(() => {
               @touchend="cancelPress"
               @touchcancel="cancelPress"
             >
+              <!-- 窄屏「…」：触屏没有右键，重命名/分享/属性只能从这里进（设计文档 8.6） -->
+              <span
+                v-if="isMobile"
+                role="button"
+                :aria-label="t('files.menu.more')"
+                class="absolute right-0.5 top-0.5 z-10 grid size-8 place-items-center rounded-full bg-panel/85 text-muted shadow-sm active:bg-elevated"
+                data-entry-more
+                @click.stop="openSheet(entry)"
+              >
+                <AppIcon name="more" :size="15" />
+              </span>
               <!-- 悬停浮现复选框（设计文档 3.2.1 / 8.4.12）：左上角，与缩略图角标区分 -->
               <span
                 role="checkbox"
@@ -3186,6 +3281,16 @@ onBeforeUnmount(() => {
               <span class="hidden w-36 shrink-0 text-right text-muted whitespace-nowrap sm:block">
                 {{ formatTime(entry.modified) }}
               </span>
+              <button
+                v-if="isMobile"
+                type="button"
+                class="grid size-9 shrink-0 place-items-center rounded-lg text-muted active:bg-elevated"
+                :title="t('files.menu.more')"
+                data-entry-more
+                @click.stop="openSheet(entry)"
+              >
+                <AppIcon name="more" :size="16" />
+              </button>
             </div>
           </template>
           </VirtualList>
@@ -3236,50 +3341,67 @@ onBeforeUnmount(() => {
           style="padding-bottom: env(safe-area-inset-bottom)"
           data-testid="select-bar"
         >
-          <div class="flex items-center gap-1.5 px-3 py-2">
-            <span class="min-w-0 flex-1 truncate text-[12px] text-muted">
-              {{ t('files.select.count', { count: selection.length }) }}
-            </span>
-            <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50"
-              @click="downloadSelected"
-            >
-              <AppIcon name="download" :size="12" />
-              <span class="hidden sm:inline">{{ t('files.select.download') }}</span>
-            </button>
-            <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
-              :disabled="readonly"
-              :title="readonly ? t('files.readonly.tooltip') : ''"
-              @click="openTransferDialog('move', selectedEntries)"
-            >
-              <AppIcon name="arrowRight" :size="12" />
-              <span class="hidden sm:inline">{{ t('files.select.move') }}</span>
-            </button>
-            <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40"
-              :disabled="readonly"
-              :title="readonly ? t('files.readonly.tooltip') : ''"
-              @click="openTransferDialog('copy', selectedEntries)"
-            >
-              <AppIcon name="gallery" :size="12" />
-              <span class="hidden sm:inline">{{ t('files.select.copy') }}</span>
-            </button>
-            <button
-              class="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] fg-danger transition-colors hover:border-red-400/50 disabled:cursor-not-allowed disabled:opacity-40"
-              :disabled="readonly"
-              :title="readonly ? t('files.readonly.tooltip') : ''"
-              @click="openDeleteDialog(selectedEntries)"
-            >
-              <AppIcon name="trash" :size="12" />
-              <span class="hidden sm:inline">{{ t('files.select.delete') }}</span>
-            </button>
-            <button
-              class="rounded-md bg-elevated px-2 py-1 text-[12px] text-ink transition-colors hover:bg-line"
-              @click="exitSelect"
-            >
-              {{ t('files.select.cancel') }}
-            </button>
+          <!--
+            手机上按钮只留图标等于让用户猜（下载/移动/复制/删除四个箭头和方块太像），
+            这里分两行：上面一行「已选 N 项 + 取消」，下面一行等宽图标+文字（设计文档 8.6）。
+          -->
+          <div class="px-3 py-2">
+            <div class="flex items-center gap-1.5 pb-2 sm:hidden">
+              <span class="min-w-0 flex-1 truncate text-[12px] text-muted">
+                {{ t('files.select.count', { count: selection.length }) }}
+              </span>
+              <button
+                class="touch-chip rounded-md bg-elevated px-3 py-1 text-[12px] text-ink"
+                @click="exitSelect"
+              >
+                {{ t('files.select.cancel') }}
+              </button>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="hidden min-w-0 flex-1 truncate text-[12px] text-muted sm:block">
+                {{ t('files.select.count', { count: selection.length }) }}
+              </span>
+              <button
+                class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 sm:flex-none"
+                @click="downloadSelected"
+              >
+                <AppIcon name="download" :size="12" />
+                <span>{{ t('files.select.download') }}</span>
+              </button>
+              <button
+                class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none"
+                :disabled="readonly"
+                :title="readonly ? t('files.readonly.tooltip') : ''"
+                @click="openTransferDialog('move', selectedEntries)"
+              >
+                <AppIcon name="arrowRight" :size="12" />
+                <span>{{ t('files.select.move') }}</span>
+              </button>
+              <button
+                class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none"
+                :disabled="readonly"
+                :title="readonly ? t('files.readonly.tooltip') : ''"
+                @click="openTransferDialog('copy', selectedEntries)"
+              >
+                <AppIcon name="gallery" :size="12" />
+                <span>{{ t('files.select.copy') }}</span>
+              </button>
+              <button
+                class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] fg-danger transition-colors hover:border-red-400/50 disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none"
+                :disabled="readonly"
+                :title="readonly ? t('files.readonly.tooltip') : ''"
+                @click="openDeleteDialog(selectedEntries)"
+              >
+                <AppIcon name="trash" :size="12" />
+                <span>{{ t('files.select.delete') }}</span>
+              </button>
+              <button
+                class="touch-chip hidden rounded-md bg-elevated px-2 py-1 text-[12px] text-ink transition-colors hover:bg-line sm:block"
+                @click="exitSelect"
+              >
+                {{ t('files.select.cancel') }}
+              </button>
+            </div>
           </div>
         </div>
       </Transition>
@@ -3292,6 +3414,7 @@ onBeforeUnmount(() => {
       :x="menu?.x ?? 0"
       :y="menu?.y ?? 0"
       :items="fileMenuItems"
+      :title="menu?.entry.name"
       @select="onMenuSelect"
       @close="menu = null"
     />
@@ -3299,10 +3422,10 @@ onBeforeUnmount(() => {
     <!-- 删除确认 -->
     <div
       v-if="deleteTargets.length"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="deleteTargets = []"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ deleteTitle }}</p>
         <p
           v-if="deleteTargets.length === 1"
@@ -3389,10 +3512,10 @@ onBeforeUnmount(() => {
     <!-- 多选下载确认（设计文档 3.2.6.6：> 10 个先提示会被浏览器拦截） -->
     <div
       v-if="bulkDownloadConfirm"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="bulkDownloadConfirm = null"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">
           {{ t('files.select.downloadConfirm', { count: bulkDownloadConfirm.length }) }}
         </p>
@@ -3417,10 +3540,10 @@ onBeforeUnmount(() => {
     <!-- 新建文件夹 / 空文件（设计文档 3.2.6.1） -->
     <div
       v-if="createDialog"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="createDialog = null"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">
           {{
             t(
@@ -3466,10 +3589,10 @@ onBeforeUnmount(() => {
     <!-- 重命名（设计文档 3.2.6.1） -->
     <div
       v-if="renameDialog"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="renameDialog = null"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ t('files.rename.title') }}</p>
         <p class="mt-0.5 break-all text-[12px] text-muted">{{ renameDialog.entry.name }}</p>
         <label class="mt-4 block text-[12px] text-muted">
@@ -3506,10 +3629,10 @@ onBeforeUnmount(() => {
     <!-- 移动 / 复制（设计文档 3.2.6.2：冲突必须由用户解析成具体策略） -->
     <div
       v-if="transferDialog"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="transferDialog = null"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">
           {{
             t(
@@ -3670,10 +3793,10 @@ onBeforeUnmount(() => {
     <!-- 批量结果汇总（设计文档 6.2：逐项展示后端中文 message，缺 message 才退回 error_code 翻译） -->
     <div
       v-if="resultDialog"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="resultDialog = null"
     >
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ t('files.result.title') }}</p>
         <p class="mt-2 text-xs text-muted">
           {{
@@ -3734,10 +3857,10 @@ onBeforeUnmount(() => {
     <!-- 属性（设计文档 3.2 右键菜单 / 6.2 stat） -->
     <div
       v-if="statDialog"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
       @click.self="statDialog = null"
     >
-      <div class="w-full max-w-md rounded-2xl border border-line bg-panel p-5 shadow-xl">
+      <div class="w-full max-w-md modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
         <p class="text-sm font-medium text-ink">{{ t('files.stat.title') }}</p>
         <!-- 只显示文件名：完整路径（含盘符）不给属性页（v2.9） -->
         <p class="mt-0.5 truncate text-[12px] text-muted">{{ statDialog.entry.name }}</p>

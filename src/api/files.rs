@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::AppState;
 use crate::core::config::Config;
@@ -361,29 +361,90 @@ pub async fn raw(
     }
 }
 
-/// GET /api/files/archive?path=…：把目录打成 ZIP 流式下发（设计文档 3.2.4）。
+/// `GET /api/files/archive` 的查询串（设计文档 3.2.4）。
+///
+/// 单目标走 `path=`（保持历史行为）；多选走 `paths=`，值是 JSON 字符串数组——
+/// 重复的 `path=` 在 `serde_urlencoded` 里拿不到全部值，而逗号分隔在路径里不安全
+/// （文件名本身可能带逗号），JSON 是唯一能无损传「一组路径」的朴素写法。
+#[derive(Debug, Deserialize)]
+pub struct ArchiveQuery {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub paths: Option<String>,
+}
+
+impl ArchiveQuery {
+    /// 解析出要打包的路径列表（去空、保序）。
+    fn targets(&self) -> Result<Vec<String>, String> {
+        if let Some(raw) = self
+            .paths
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let list: Vec<String> =
+                serde_json::from_str(raw).map_err(|_| "paths 参数必须是字符串数组".to_string())?;
+            return Ok(list
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect());
+        }
+        Ok(self
+            .path
+            .as_deref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .collect())
+    }
+}
+
+/// GET /api/files/archive?path=…（或 `?paths=[…]`）：打成 ZIP 流式下发（设计文档 3.2.4）。
 ///
 /// store 模式 + 数据描述符：不压缩、不落临时文件、内存恒定，首字节就是第一个
 /// 文件的读延迟。条目在阻塞线程里摊平（walk 是同步 IO），然后交给一条 duplex
 /// 管道边写边发；客户端断开时写端报错退出，任务自然结束。
-pub async fn archive(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+///
+/// 多选为什么合并成一个 zip：同一次用户手势里连开好几个下载，浏览器会当成
+/// 「多文件下载」拦掉（Chrome 只放行第一个），多选下载在手机上因此完全无效。
+pub async fn archive(State(state): State<AppState>, Query(query): Query<ArchiveQuery>) -> Response {
     let set = roots_for(&state).await;
-    let path = match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
-        Ok(path) => path,
-        Err(err) => return fs_error(err),
+    let requested = match query.targets() {
+        Ok(list) if list.is_empty() => {
+            return fs_error(FsError::BadRequest("没有指定要打包的路径".to_string()));
+        }
+        Ok(list) => list,
+        Err(message) => return fs_error(FsError::BadRequest(message)),
     };
-    if !path.is_dir() {
+    if requested.len() > crate::core::archive::MAX_TARGETS {
+        return fs_error(FsError::BadRequest(format!(
+            "一次最多打包 {} 项",
+            crate::core::archive::MAX_TARGETS
+        )));
+    }
+
+    let mut paths = Vec::with_capacity(requested.len());
+    for raw in &requested {
+        let path = match fs::resolve_existing(raw, &set.allowed, set.follow_symlinks) {
+            Ok(path) => path,
+            Err(err) => return fs_error(err),
+        };
+        // .asmoday-part 上传中间文件不进包（设计文档 3.2.6.4）
+        if path_guard::is_part_path(&path) {
+            return fs_error(FsError::NotFound("文件不存在".to_string()));
+        }
+        paths.push(path);
+    }
+
+    // 单目录保持老语义：目录名做顶层、下载名也叫它；单文件仍建议直接下载
+    if paths.len() == 1 && !paths[0].is_dir() {
         return fs_error(FsError::BadRequest("目标是文件，直接下载即可".to_string()));
     }
 
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string());
-
-    let walked = path.clone();
+    let filename = archive_filename(&paths);
     let entries =
-        match tokio::task::spawn_blocking(move || crate::core::archive::plan(&walked)).await {
+        match tokio::task::spawn_blocking(move || crate::core::archive::plan(&paths)).await {
             Ok(Ok(entries)) => entries,
             Ok(Err(err)) => return fs_error(FsError::Io(err.to_string())),
             Err(err) => return fs_error(FsError::Io(format!("打包失败：{err}"))),
@@ -395,7 +456,6 @@ pub async fn archive(State(state): State<AppState>, Query(query): Query<PathQuer
         let _ = crate::core::archive::stream_zip(entries, &mut writer).await;
     });
 
-    let filename = format!("{name}.zip");
     let mut response =
         (StatusCode::OK, Body::from_stream(ReaderStream::new(reader))).into_response();
     let headers_out = [
@@ -416,6 +476,29 @@ pub async fn archive(State(state): State<AppState>, Query(query): Query<PathQuer
         }
     }
     response
+}
+
+/// 打包下载的文件名（`Content-Disposition` 的 `filename*`）。
+///
+/// 单目录沿用 `<目录名>.zip`；多选时如果目标都在同一层目录里，用那个目录名
+/// （多选绝大多数发生在「当前目录」），跨目录的搜索结果才退回 `download.zip`。
+fn archive_filename(paths: &[PathBuf]) -> String {
+    let base = if paths.len() == 1 {
+        paths[0]
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    } else {
+        let parent = paths[0].parent();
+        if paths.iter().all(|path| path.parent() == parent) {
+            parent
+                .and_then(|dir| dir.file_name())
+                .map(|name| name.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    }
+    .unwrap_or_else(|| "download".to_string());
+    format!("{base}.zip")
 }
 
 /// RFC 5987 的 `filename*` 百分号编码：只有 attr-char 原样保留，其余按字节 %XX。

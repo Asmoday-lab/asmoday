@@ -129,7 +129,7 @@ defineExpose({ load })
   <div class="flex min-w-0 flex-1 flex-col">
     <header class="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-panel px-3">
       <button
-        class="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+        class="touch-chip flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
         @click="emit('close')"
       >
         <AppIcon name="arrowLeft" :size="14" />
@@ -149,7 +149,7 @@ defineExpose({ load })
         {{ t('files.preview.editSource') }}
       </button>
       <button
-        class="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+        class="touch-chip flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
         @click="download"
       >
         <AppIcon name="download" :size="13" />

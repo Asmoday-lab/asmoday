@@ -121,8 +121,10 @@ async function logout() {
     <AppSidebar :open="drawerOpen" @close="drawerOpen = false" />
 
     <main class="flex min-w-0 flex-1 flex-col">
+      <!-- 顶栏让出刘海/灵动岛：viewport-fit=cover 之后 env() 才有值（设计文档 8.6） -->
       <header
-        class="relative flex h-14 shrink-0 items-center gap-3 border-b border-line bg-panel px-4 md:px-6"
+        class="relative flex min-h-14 shrink-0 items-center gap-3 border-b border-line bg-panel px-4 md:px-6"
+        style="padding-top: env(safe-area-inset-top, 0px)"
       >
         <button
           class="-ml-1 grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-elevated hover:text-ink md:hidden"
@@ -229,8 +231,8 @@ async function logout() {
     <ShareDialog />
 
     <!-- 一次性密码强制改密（--init / --reset 后首登） -->
-    <div v-if="mustChangePassword" class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4">
-      <div class="w-full max-w-sm rounded-2xl border border-line bg-panel p-6 shadow-xl">
+    <div v-if="mustChangePassword" class="fixed inset-0 z-[60] grid place-items-center modal-overlay bg-black/60 p-4">
+      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-6 shadow-xl">
         <span class="mb-3 grid size-10 place-items-center rounded-full bg-amber-500/15 fg-warn">
           <AppIcon name="lock" :size="18" />
         </span>

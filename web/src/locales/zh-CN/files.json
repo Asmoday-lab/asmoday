@@ -20,6 +20,7 @@
     "refresh": "刷新",
     "home": "返回挂载点列表",
     "searchPlaceholder": "搜索当前目录…",
+    "search": "搜索",
     "searching": "搜索中…",
     "clearSearch": "清除搜索",
     "grid": "网格视图",
@@ -95,6 +96,7 @@
     "rename": "重命名…",
     "copyTo": "复制到…",
     "moveTo": "移动到…",
+    "more": "更多操作",
     "properties": "属性"
   },
   "delete": {
@@ -232,8 +234,8 @@
     "copy": "复制",
     "delete": "删除",
     "noDownloadable": "所选项目中没有可下载的文件",
-    "downloadConfirm": "将下载 {count} 个文件",
-    "downloadHint": "浏览器可能拦截多个并发下载，请允许本站的自动下载",
+    "downloadConfirm": "将 {count} 项打包成 ZIP 下载",
+    "downloadHint": "目录会连同其中的文件一起打进包里，体积较大时首字节要等一会儿",
     "toggle": "选择此项"
   },
   "sort": {
