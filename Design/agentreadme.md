@@ -1276,6 +1276,9 @@ GWT-BAR-12 Given 移动端 390px  When 看 classic 条  Then 曲目区三行（�
 GWT-BAR-13 Given `<lg`（如 838px）或触屏  When 点声音键  Then 播放条上方弹出 **36×96** 的竖排音量胶囊（`.vol-vertical` 旋转 -90°），胶囊底边距声音键 **4px**、72px 滑条**绝对定位居中**（`dxCenter=dyCenter=0`，可视底端到键顶 16px，左右各留 10px 不出胶囊），拖动写进 `asm_volume`；点弹层外收起；**lg+ 点声音键只切静音、不弹层**（条内已有横向滑轨）
 GWT-BAR-16 Given `<lg` 且设备有指针（`hover:hover`）  When 鼠标划过声音键  Then 弹层自动展开（opacity 0→1、下沉 4px 上浮，0.2s）；移到 4px 间隙或滑条上仍保持展开（透明桥接块）；移开收起；点击声音键则 `.is-open` 锁定展开，鼠标移开不收起，点外部才收起；隐藏态 `visibility:hidden` 且不接收指针、不被 Tab 聚焦
 GWT-BAR-17 Given 音量  When 依次取 0 / 40% / 80%  Then 声音键图标依次是 静音（实心喇叭 + 叉）/ 单弧（<55%）/ 双弧；喇叭体是 `fill`、声波弧是 `stroke`（`AppIcon` 的 `HEAD_SOLID`）
+GWT-BAR-18 Given 极简形态且面板已展开  When 点音量键  Then 同时静音/取消静音，并在键的正上方弹出 36×96 的竖排音量胶囊（`data-testid="music-mini-volume-popup"`，底边距键 4px、72px 滑条居中 `dxCenter=dyCenter=0`、不被胶囊裁切），拖动写进 `asm_volume`；有指针设备悬停即展开、移开 140ms 收起；点面板/弹层外收起
+GWT-BAR-19 Given 极简形态  When 用鼠标划过 64px 胶囊  Then 展开成 340px（`miniExpanded` 状态驱动，不能只靠 `group-hover`，否则宽度会被 `w-16` 盖掉），移开后回到 64px
+GWT-NAV-01 Given 移动端（<md）抽屉打开  When 点任一导航项  Then 抽屉在路由切换完成后收起，页面**真的换到目标页**（不得因 `history.back()` 把导航回滚）；点当前页的项则直接收起抽屉；按系统返回只收抽屉、不离开当前页
 GWT-BAR-14 Given 点条外右上角的锁定键  When 再看关闭键  Then 锁定态下关闭键 `disabled` 且 opacity≈0.4、点击不会关掉播放条；再点锁定键解锁后关闭键恢复可用；锁定状态刷新后保持
 GWT-BAR-15 Given 768~1023 宽度（如 838）  When 看 classic 条  Then 整条铺满底部（838×72、`border-t`、不浮起），曲目区两行（歌名 + 歌手）、内联歌词区可见且有竖线、控件含声音键；页面无横向溢出
 ```
@@ -1547,6 +1550,9 @@ GWT-I18N-04 Given 任意 .vue 文件  When ESLint  When 含中文字面量  Then
 - 禁止原生 `alert/confirm/prompt`（未保存关闭也已改成站内三选一，见 3.4）。
 - **系统返回 = 退一层浮层（v4.4.4，见设计文档 4.8）**：编辑器、灯箱、预览、弹窗、抽屉全部经 `useBackClose` 登记，
   按返回先关最上层（编辑器优先），关完才让路由收到返回；浮层一律不进 URL。
+- **关浮层不能打断导航（v4.5.7 修）**：抽屉里的导航项**不要**自己 `emit('close')`（只有「点的是当前页」才收），
+  否则 `history.back()` 会把还没落地的 `router.push` 一起回滚，手机上表现为「点左侧菜单没反应」；
+  `disarm()` 也必须延后一个宏任务并重新判定哨兵是否还在历史当前位置。
 
 #### 交付物
 

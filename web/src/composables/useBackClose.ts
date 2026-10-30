@@ -26,6 +26,10 @@ interface BackLayer {
 const layers: BackLayer[] = []
 /** 历史里当前是否压着一条我们自己塞的哨兵记录 */
 let trapArmed = false
+/** 已排期、还没执行的退栈（见 disarm 的注释） */
+let pendingDisarm: number | null = null
+/** 正在「吃掉」一条孤儿哨兵，防止连续空记录时一路退出去 */
+let skipOrphan = false
 let listening = false
 
 function isTrapEntry(): boolean {
@@ -35,6 +39,11 @@ function isTrapEntry(): boolean {
 
 /** 压哨兵：复制当前 state 再打标记，保留 vue-router 的 position/scroll 字段 */
 function arm() {
+  // 有待执行的退栈说明哨兵还在原地，取消退出、直接复用，别再多压一条
+  if (pendingDisarm !== null) {
+    window.clearTimeout(pendingDisarm)
+    pendingDisarm = null
+  }
   if (trapArmed) return
   trapArmed = true
   const current = history.state as Record<string, unknown> | null
@@ -46,16 +55,40 @@ function arm() {
 /**
  * 退哨兵。只在「哨兵仍停在当前历史位置」时才退：
  * 已经被返回键消费掉的不需要再退一次，否则会连累上一层页面。
+ *
+ * 退栈必须延后一个宏任务：点抽屉里的导航项时，「关浮层」和路由 pushState
+ * 在同一个 tick 里发生，立刻 back() 会把刚推进去的新路由一起回滚 ——
+ * 表现就是手机上点左侧菜单毫无反应、页面还停在原处。隔一轮重新判定，
+ * 发现历史已经不在哨兵记录上（说明有新页面推进来了）就直接放弃退栈。
  */
 function disarm() {
-  if (!trapArmed) return
-  trapArmed = false
-  if (isTrapEntry()) history.back()
+  if (!trapArmed || pendingDisarm !== null) return
+  pendingDisarm = window.setTimeout(() => {
+    pendingDisarm = null
+    if (!trapArmed) return
+    trapArmed = false
+    if (isTrapEntry()) history.back()
+  }, 0)
 }
 
 function onPopState() {
-  // disarm() 自己触发的 popstate：此时 trapArmed 已置 false，直接忽略
-  if (!trapArmed) return
+  if (!trapArmed) {
+    /*
+     * disarm() 自己触发的 popstate：此时 trapArmed 已置 false，一般直接忽略。
+     *
+     * 例外是「关浮层时页面已经切走」留下的孤儿哨兵：那种情况退不掉那条记录
+     * （back() 会把刚导航到的新页一起回滚），只能让它留在历史里。等用户下次
+     * 按返回落到它上面时，这里再退一步把它吃掉 —— 否则那一步什么都不变，
+     * 用户会觉得「返回键失灵，要按两次」。
+     */
+    if (!layers.length && !skipOrphan && isTrapEntry()) {
+      skipOrphan = true
+      history.back()
+    } else {
+      skipOrphan = false
+    }
+    return
+  }
   trapArmed = false
   if (!layers.length) return
 

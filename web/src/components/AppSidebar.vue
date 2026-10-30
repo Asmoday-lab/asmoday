@@ -61,6 +61,17 @@ const groups: NavGroup[] = [
 const route = useRoute()
 const isActive = (to: string) => (to === '/' ? route.path === '/' : route.path.startsWith(to))
 
+/**
+ * 导航点击：只有「点的是当前页」才自己收抽屉。
+ *
+ * 真正的路由切换必须交给 App.vue 里那个 `watch(route.fullPath)` —— 点了就同步收
+ * 会立刻退掉返回键哨兵，而 history.back() 会打断还在进行中的路由导航，
+ * 表现就是手机上点左侧菜单完全没反应、页面停在原处。
+ */
+function onNavClick(to: string) {
+  if (route.path === to) emit('close')
+}
+
 // 桌面折叠（移动端抽屉不受影响）
 const COLLAPSE_KEY = 'asmoday.sidebar.collapsed'
 const collapsed = ref(localStorage.getItem(COLLAPSE_KEY) === '1')
@@ -151,7 +162,7 @@ const itemClass = (to: string) => [
           :to="item.to"
           :class="itemClass(item.to)"
           :title="collapsed ? t(item.label) : undefined"
-          @click="emit('close')"
+          @click="onNavClick(item.to)"
         >
           <AppIcon :name="item.icon" :size="17" class="w-6 shrink-0 text-center" />
           <span v-if="!collapsed" class="ml-2 truncate">{{ t(item.label) }}</span>
@@ -169,7 +180,7 @@ const itemClass = (to: string) => [
         class="flex items-center gap-1.5 rounded text-[12px] transition-colors"
         :class="route.path === '/ecosystem' ? 'text-accent' : 'text-muted hover:text-accent'"
         :title="collapsed ? t('common.nav.ecosystem') : undefined"
-        @click="emit('close')"
+        @click="onNavClick('/ecosystem')"
       >
         <AppIcon name="sparkle" :size="12" />
         <span v-if="!collapsed">{{ t('common.nav.ecosystem') }}</span>

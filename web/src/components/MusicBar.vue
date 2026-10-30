@@ -30,6 +30,35 @@ const listOpen = ref(false)
 const miniOpen = ref(false)
 /** 音量竖排滑条弹层（参考稿 .vol-popup，窄屏与触屏都靠它调音量） */
 const volOpen = ref(false)
+/** 极简面板的竖排音量弹层（参考稿 .m-vol-popup） */
+const miniVolOpen = ref(false)
+/** 极简胶囊与音量键的 DOM 引用：弹层要贴着音量键向上弹，得量它的位置 */
+const miniCapsule = ref<HTMLElement | null>(null)
+const miniVolBtn = ref<HTMLElement | null>(null)
+/** 弹层锚点：相对胶囊左边缘的 px（胶囊展开动画期间逐帧更新） */
+const miniVolLeft = ref(0)
+let miniVolRaf: number | null = null
+let miniVolLeaveTimer: number | null = null
+/** 触屏不派 mouseenter 语义，悬停展开只在真指针设备上生效 */
+const canHover = typeof window !== 'undefined' && window.matchMedia('(hover: hover)').matches
+/** 桌面悬停展开（不用 group-hover：宽度规则会被同优先级的 w-16 盖掉） */
+const miniHover = ref(false)
+const miniExpanded = computed(() => miniOpen.value || miniHover.value)
+
+function onMiniPointerOver(event: MouseEvent) {
+  if (!canHover) return
+  const from = event.relatedTarget as Node | null
+  if (from && (event.currentTarget as HTMLElement).contains(from)) return
+  miniHover.value = true
+}
+
+function onMiniPointerOut(event: MouseEvent) {
+  if (!canHover) return
+  const to = event.relatedTarget as Node | null
+  if (to && (event.currentTarget as HTMLElement).contains(to)) return
+  miniHover.value = false
+  scheduleMiniVolClose()
+}
 /** 锁定常驻：锁上后关闭键置灰，避免误关（参考稿的 .window-btn.pinned） */
 const pinned = useStorage('asmoday.player.pinned', false)
 const lyricBox = ref<HTMLElement | null>(null)
@@ -100,12 +129,14 @@ function closePlayer() {
   expanded.value = false
   miniOpen.value = false
   volOpen.value = false
+  closeMiniVol()
   player.clearQueue()
 }
 
 /** 切换形态：顺手收起浮层面板与极简展开态，避免悬在旧位置 */
 function switchStyle(style: BarStyle) {
   miniOpen.value = false
+  closeMiniVol()
   player.setBarStyle(style)
 }
 
@@ -127,8 +158,10 @@ function onDiscClick() {
   }
   discTapTimer = window.setTimeout(() => {
     discTapTimer = null
-    if (window.matchMedia('(hover: none)').matches) miniOpen.value = !miniOpen.value
-    else player.toggle()
+    if (window.matchMedia('(hover: none)').matches) {
+      miniOpen.value = !miniOpen.value
+      if (!miniOpen.value) closeMiniVol()
+    } else player.toggle()
   }, 240)
 }
 
@@ -156,9 +189,72 @@ function toggleVolume() {
 
 /** 点到弹层外面就收起（与参考稿的 document click 一致） */
 function onDocumentClick(event: MouseEvent) {
-  if (!volOpen.value) return
   const target = event.target as HTMLElement | null
-  if (!target?.closest('[data-testid="music-volume-wrap"]')) volOpen.value = false
+  if (volOpen.value && !target?.closest('[data-testid="music-volume-wrap"]')) volOpen.value = false
+  if (
+    miniVolOpen.value &&
+    !target?.closest('[data-testid="music-bar-mini-volume"]') &&
+    !target?.closest('[data-testid="music-mini-volume-popup"]')
+  ) {
+    closeMiniVol()
+  }
+}
+
+/**
+ * 极简面板的竖排音量（参考稿 `.m-vol-popup` + `#vol3`）：
+ * 胶囊宽度是 400ms 动画，弹层横向锚点必须逐帧跟着音量键走，
+ * 否则展开过程中会停在上一帧的位置上。
+ */
+function measureMiniVol() {
+  const capsule = miniCapsule.value
+  const button = miniVolBtn.value
+  if (!capsule || !button) return
+  const box = capsule.getBoundingClientRect()
+  const rect = button.getBoundingClientRect()
+  if (!rect.width) return
+  miniVolLeft.value = rect.left - box.left + rect.width / 2
+}
+
+function trackMiniVol() {
+  measureMiniVol()
+  miniVolRaf = miniVolOpen.value ? window.requestAnimationFrame(trackMiniVol) : null
+}
+
+function openMiniVol() {
+  cancelMiniVolClose()
+  miniVolOpen.value = true
+  measureMiniVol()
+  if (miniVolRaf === null) miniVolRaf = window.requestAnimationFrame(trackMiniVol)
+}
+
+function closeMiniVol() {
+  miniVolOpen.value = false
+  if (miniVolRaf !== null) {
+    window.cancelAnimationFrame(miniVolRaf)
+    miniVolRaf = null
+  }
+}
+
+/** 键与弹层之间只有 4px，留一点宽限时间，鼠标滑过去不会闪断 */
+function scheduleMiniVolClose() {
+  if (!canHover) return
+  cancelMiniVolClose()
+  miniVolLeaveTimer = window.setTimeout(() => {
+    miniVolLeaveTimer = null
+    closeMiniVol()
+  }, 140)
+}
+
+function cancelMiniVolClose() {
+  if (miniVolLeaveTimer === null) return
+  window.clearTimeout(miniVolLeaveTimer)
+  miniVolLeaveTimer = null
+}
+
+/** 极简音量键：静音/取消静音 + 展开竖排滑条（参考稿 volBtn2 同款双动作） */
+function onMiniVolumeClick() {
+  volume.toggle()
+  openMiniVol()
 }
 
 const displayTitle = computed(() => {
@@ -290,6 +386,8 @@ onBeforeUnmount(() => {
   detachVolume?.()
   document.removeEventListener('click', onDocumentClick)
   if (discTapTimer !== null) window.clearTimeout(discTapTimer)
+  if (miniVolRaf !== null) window.cancelAnimationFrame(miniVolRaf)
+  if (miniVolLeaveTimer !== null) window.clearTimeout(miniVolLeaveTimer)
 })
 
 watch(
@@ -670,13 +768,19 @@ watch(
   <Transition name="slide-up">
     <div
       v-if="currentTrack && player.state.barStyle === 'minimal'"
-      class="group/mini pointer-events-none fixed right-5 z-40"
+      class="pointer-events-none fixed right-5 z-40"
       style="bottom: calc(20px + env(safe-area-inset-bottom, 0px))"
       data-testid="music-bar-minimal"
+      @mouseover="onMiniPointerOver"
+      @mouseout="onMiniPointerOut"
     >
       <button
-        class="pointer-events-auto absolute -top-3.5 right-2 z-20 grid size-6 place-items-center rounded-full border border-line bg-panel text-muted opacity-0 shadow-sm transition-all focus-visible:opacity-100 group-hover/mini:opacity-100 [@media(hover:none)]:opacity-100"
-        :class="pinned ? 'cursor-not-allowed opacity-40' : 'hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white'"
+        class="pointer-events-auto absolute -top-3.5 right-2 z-20 grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+        :class="
+          pinned
+            ? 'cursor-not-allowed opacity-40'
+            : ['hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white', miniExpanded ? 'opacity-100' : 'opacity-0']
+        "
         :title="pinned ? t('gallery.player.pinnedHint') : t('gallery.player.close')"
         :disabled="pinned"
         data-testid="music-bar-close"
@@ -686,20 +790,20 @@ watch(
       </button>
 
       <div
-        class="pointer-events-auto relative flex h-16 items-center overflow-hidden rounded-full border border-line bg-panel/95 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.55)] backdrop-blur-2xl backdrop-saturate-150 transition-[width] duration-[400ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-        :class="
-          miniOpen
-            ? 'w-[min(340px,calc(100vw-2.5rem))]'
-            : 'w-16 group-hover/mini:w-[min(340px,calc(100vw-2.5rem))]'
-        "
+        ref="miniCapsule"
+        class="pointer-events-auto relative flex h-16 items-center rounded-full border border-line bg-panel/95 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.55)] backdrop-blur-2xl backdrop-saturate-150 transition-[width] duration-[400ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
+        :class="miniExpanded ? 'w-[min(340px,calc(100vw-2.5rem))]' : 'w-16'"
       >
         <!--
           展开面板：右侧留 64px 给唱片；按钮顺序对齐参考稿 ——
           音量 / 模式 / 上一首 / 播放 / 下一首，末尾只多留一个本项目的歌单入口。
+          面板内容交给这层 overflow-hidden 裁剪（胶囊本身要 overflow 可见，
+          否则音量竖排弹层会被切掉 —— 参考稿 .mini-body 也是 overflow:visible）。
         -->
+        <div class="pointer-events-none absolute inset-0 overflow-hidden rounded-full">
         <div
           class="absolute inset-y-0 left-0 right-16 flex items-center pl-4 opacity-0 transition-opacity duration-200"
-          :class="miniOpen ? 'opacity-100' : 'group-hover/mini:opacity-100'"
+          :class="miniExpanded ? 'pointer-events-auto opacity-100' : 'opacity-0'"
         >
           <div class="mr-1.5 min-w-0 flex-1">
             <p class="truncate text-[13px] font-semibold leading-tight text-ink">
@@ -713,12 +817,16 @@ watch(
             </p>
           </div>
           <div class="flex shrink-0 items-center">
-            <!-- 音量：点一下静音 / 取消静音（极简面板放不下滑轨，参考稿那根竖向滑条不搬） -->
+            <!-- 音量：静音/取消静音 + 向上的竖排滑条（参考稿 .m-vol-popup + #vol3） -->
             <button
-              class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
+              ref="miniVolBtn"
+              class="grid size-6 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated hover:text-ink"
+              :class="volume.muted ? 'text-accent' : 'text-muted'"
               :title="volumeTitle"
               data-testid="music-bar-mini-volume"
-              @click="volume.toggle()"
+              @click="onMiniVolumeClick"
+              @mouseenter="canHover && openMiniVol()"
+              @mouseleave="scheduleMiniVolClose"
             >
               <AppIcon :name="volumeIcon" :size="14" />
             </button>
@@ -767,6 +875,33 @@ watch(
               <AppIcon name="list" :size="14" />
             </button>
           </div>
+        </div>
+        </div>
+
+        <!--
+          极简面板的竖排音量弹层（参考稿 .m-vol-popup）：贴在音量键正上方 4px，
+          胶囊 overflow 可见所以不会被裁；`.vol-popup` 自带 4px 下沉动画与桥接块。
+        -->
+        <div
+          class="vol-popup absolute bottom-12 z-30 h-24 w-9 rounded-[18px] border border-line bg-panel shadow-2xl"
+          :class="{ 'is-open': miniVolOpen }"
+          :style="{ left: `${miniVolLeft}px` }"
+          data-testid="music-mini-volume-popup"
+          @mouseenter="cancelMiniVolClose"
+          @mouseleave="scheduleMiniVolClose"
+        >
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            :value="volume.sliderValue"
+            :title="t('gallery.player.volume')"
+            class="music-range is-volume vol-vertical w-[72px]"
+            :style="{ backgroundImage: volumeBackground }"
+            data-testid="music-mini-volume-slider"
+            @input="onVolumeInput"
+          />
         </div>
 
         <!--
