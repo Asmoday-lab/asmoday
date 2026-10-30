@@ -71,6 +71,15 @@ const volumeTitle = computed(() =>
   volume.muted ? t('gallery.player.unmute') : t('gallery.player.mute'),
 )
 
+const volumeIcon = computed<IconName>(() => (volume.muted ? 'volumeMute' : 'volume'))
+
+/** 播放列表抽屉的贴底距离：极简形态下要落在胶囊上方，别压住唱片 */
+const drawerOffset = computed(() =>
+  player.state.barStyle === 'minimal'
+    ? 'bottom-[calc(96px+env(safe-area-inset-bottom,0px))]'
+    : 'bottom-[calc(78px+env(safe-area-inset-bottom,0px))] md:bottom-[calc(130px+env(safe-area-inset-bottom,0px))]',
+)
+
 function cycleMode() {
   const index = modes.findIndex((mode) => mode.key === player.state.mode)
   player.setMode(modes[(index + 1) % modes.length].key)
@@ -89,19 +98,27 @@ function switchStyle(style: BarStyle) {
   player.setBarStyle(style)
 }
 
-/** 触点设备没有 hover：点唱片 = 展开面板；桌面点唱片 = 播放/暂停 */
+/** 唱片单击/双击的合流计时器（参考稿 240ms 判定，触屏同样有效） */
+let discTapTimer: number | null = null
+
+/**
+ * 唱片点击（v4.5.2）：参考稿里唱片是**唯一**的还原入口，极简面板内不再放还原键 ——
+ * 单击 = 播放/暂停（触屏 = 展开/收起面板），双击 = 还原标准条。
+ * 浏览器先派 click 再派 dblclick，所以这里自己计时合并：
+ * 否则双击会先切换一次播放状态，手感很脏；触屏也压根不派 dblclick。
+ */
 function onDiscClick() {
-  if (window.matchMedia('(hover: none)').matches) {
-    miniOpen.value = !miniOpen.value
+  if (discTapTimer !== null) {
+    window.clearTimeout(discTapTimer)
+    discTapTimer = null
+    switchStyle('classic')
     return
   }
-  player.toggle()
-}
-
-/** 桌面双击唱片还原标准条（参考稿的双击还原手感） */
-function onDiscDblClick() {
-  if (window.matchMedia('(hover: none)').matches) return
-  switchStyle('classic')
+  discTapTimer = window.setTimeout(() => {
+    discTapTimer = null
+    if (window.matchMedia('(hover: none)').matches) miniOpen.value = !miniOpen.value
+    else player.toggle()
+  }, 240)
 }
 
 /** 歌词面板与播放列表互斥：两个都从底部弹，叠在一起会互相遮挡 */
@@ -231,6 +248,7 @@ watch(
 
 onBeforeUnmount(() => {
   detachVolume?.()
+  if (discTapTimer !== null) window.clearTimeout(discTapTimer)
 })
 
 watch(
@@ -297,7 +315,8 @@ watch(
     <div
       v-if="currentTrack && listOpen"
       data-testid="music-playlist"
-      class="fixed inset-x-0 bottom-[calc(78px+env(safe-area-inset-bottom,0px))] z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur md:inset-x-auto md:right-4 md:bottom-[calc(130px+env(safe-area-inset-bottom,0px))] md:h-auto md:max-h-[60vh] md:w-80 md:rounded-2xl"
+      :class="drawerOffset"
+      class="fixed inset-x-0 z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur md:inset-x-auto md:right-4 md:h-auto md:max-h-[60vh] md:w-80 md:rounded-2xl"
     >
       <div class="flex shrink-0 items-center gap-2 border-b border-line/60 px-4 py-2.5">
         <p class="min-w-0 flex-1 truncate text-sm font-medium text-ink">
@@ -439,6 +458,15 @@ watch(
               </p>
             </div>
             <button
+              class="grid size-7 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated active:scale-90"
+              :class="player.state.mode === 'loop' ? 'text-muted hover:text-ink' : 'text-accent'"
+              :title="modeLabel"
+              data-testid="music-bar-mode"
+              @click="cycleMode"
+            >
+              <AppIcon :name="modeIcon" :size="14" />
+            </button>
+            <button
               class="grid size-7 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
               :title="t('gallery.player.prev')"
               @click="player.prev()"
@@ -461,12 +489,21 @@ watch(
               <AppIcon name="next" :size="14" />
             </button>
             <button
+              class="grid size-7 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated active:scale-90"
+              :class="listOpen ? 'text-accent' : 'text-muted hover:text-ink'"
+              :title="t('gallery.player.playlist')"
+              data-testid="music-bar-playlist"
+              @click="toggleList"
+            >
+              <AppIcon name="list" :size="14" />
+            </button>
+            <button
               class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
               :title="t('gallery.player.styleMinimal')"
               data-testid="music-bar-minimize"
               @click="switchStyle('minimal')"
             >
-              <AppIcon name="chevronDown" :size="16" />
+              <AppIcon name="disc" :size="16" />
             </button>
             <button
               class="grid size-8 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-red-500/85 hover:text-white"
@@ -618,16 +655,19 @@ watch(
         class="pointer-events-auto relative flex h-16 items-center overflow-hidden rounded-full border border-line bg-panel/95 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.55)] backdrop-blur-2xl backdrop-saturate-150 transition-[width] duration-[400ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
         :class="
           miniOpen
-            ? 'w-[min(300px,calc(100vw-2.5rem))]'
-            : 'w-16 group-hover/mini:w-[min(300px,calc(100vw-2.5rem))]'
+            ? 'w-[min(340px,calc(100vw-2.5rem))]'
+            : 'w-16 group-hover/mini:w-[min(340px,calc(100vw-2.5rem))]'
         "
       >
-        <!-- 展开面板：右侧留 64px 给唱片 -->
+        <!--
+          展开面板：右侧留 64px 给唱片；按钮顺序对齐参考稿 ——
+          音量 / 模式 / 上一首 / 播放 / 下一首，末尾只多留一个本项目的歌单入口。
+        -->
         <div
-          class="absolute inset-y-0 left-0 right-16 flex items-center gap-0.5 pl-4 opacity-0 transition-opacity duration-200"
+          class="absolute inset-y-0 left-0 right-16 flex items-center pl-4 opacity-0 transition-opacity duration-200"
           :class="miniOpen ? 'opacity-100' : 'group-hover/mini:opacity-100'"
         >
-          <div class="mr-auto min-w-0">
+          <div class="mr-1.5 min-w-0 flex-1">
             <p class="truncate text-[13px] font-semibold leading-tight text-ink">
               {{ displayTitle }}
             </p>
@@ -638,28 +678,61 @@ watch(
               {{ displaySubtitle }}
             </p>
           </div>
-          <button
-            class="grid size-7 shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-transform active:scale-95"
-            :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
-            @click="player.toggle()"
-          >
-            <AppIcon :name="playIcon" :size="13" />
-          </button>
-          <button
-            class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
-            :title="t('gallery.player.next')"
-            @click="player.next()"
-          >
-            <AppIcon name="next" :size="13" />
-          </button>
-          <button
-            class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
-            :title="t('gallery.player.styleClassic')"
-            data-testid="music-bar-restore"
-            @click="switchStyle('classic')"
-          >
-            <AppIcon name="expand" :size="13" />
-          </button>
+          <div class="flex shrink-0 items-center">
+            <!-- 音量：点一下静音 / 取消静音（极简面板放不下滑轨，参考稿那根竖向滑条不搬） -->
+            <button
+              class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
+              :title="volumeTitle"
+              data-testid="music-bar-mini-volume"
+              @click="volume.toggle()"
+            >
+              <AppIcon :name="volumeIcon" :size="14" />
+            </button>
+            <!-- 模式：列表 / 单曲 / 随机，非列表循环时高亮 -->
+            <button
+              class="grid size-6 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated"
+              :class="player.state.mode === 'loop' ? 'text-muted hover:text-ink' : 'text-accent'"
+              :title="modeLabel"
+              data-testid="music-bar-mini-mode"
+              @click="cycleMode"
+            >
+              <AppIcon :name="modeIcon" :size="14" />
+            </button>
+            <button
+              class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
+              :title="t('gallery.player.prev')"
+              data-testid="music-bar-mini-prev"
+              @click="player.prev()"
+            >
+              <AppIcon name="prev" :size="14" />
+            </button>
+            <button
+              class="mx-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-transform active:scale-95"
+              :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
+              data-testid="music-bar-mini-play"
+              @click="player.toggle()"
+            >
+              <AppIcon :name="playIcon" :size="13" />
+            </button>
+            <button
+              class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
+              :title="t('gallery.player.next')"
+              data-testid="music-bar-mini-next"
+              @click="player.next()"
+            >
+              <AppIcon name="next" :size="14" />
+            </button>
+            <!-- 歌单：参考稿没有这个入口，本项目保留（否则极简形态下打不开列表） -->
+            <button
+              class="grid size-6 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated"
+              :class="listOpen ? 'text-accent' : 'text-muted hover:text-ink'"
+              :title="t('gallery.player.playlist')"
+              data-testid="music-bar-mini-playlist"
+              @click="toggleList"
+            >
+              <AppIcon name="list" :size="14" />
+            </button>
+          </div>
         </div>
 
         <!--
@@ -671,7 +744,6 @@ watch(
           class="absolute right-2 top-2 grid size-12 place-items-center rounded-full transition-transform duration-200 hover:scale-105 active:scale-95"
           :title="t('gallery.player.discHint')"
           @click="onDiscClick"
-          @dblclick="onDiscDblClick"
         >
           <span
             class="music-disc relative block size-12 rounded-full"
