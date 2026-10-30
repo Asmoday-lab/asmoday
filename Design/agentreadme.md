@@ -176,6 +176,7 @@ error.E_BUSY.action.cancel
 | `composables/usePagedList.ts` | 通用游标分页 | 排序切换自动清空 |
 | `composables/useUpload.ts` | 上传池（默认并发 3） | 支持取消、重试、进度事件 |
 | `composables/useBackClose.ts` | 浮层接管系统返回键（v4.4.4） | 一层浮层=一条同 URL 历史；`close()` 被取消必须重新武装；浮层不进 URL |
+| `composables/useImageZoom.ts` | 灯箱图片缩放/平移/滑动（v4.4.6） | 变换 = `translate3d` + `scale`；锚点用容器中心换算，禁用 `getBoundingClientRect()` 当参照 |
 | `lib/errors.ts` | envelope 拦截、code → i18n key 映射 | 未知 code 兜底 `message` + trace_id 复制按钮 |
 | `lib/base.ts` | `base_url` 前缀拼接/剥离 | 路由、Cookie Path、WS URL、静态资源、分享链接统一 |
 
@@ -1240,6 +1241,10 @@ GWT-PHOTO-03 Given 时间线  When 滚动  Then 年月标题吸顶，穿透所�
 GWT-PHOTO-04 Given 灯箱打开  When 点击左右箭头  Then 在同目录同类型数组内切换
 GWT-PHOTO-05 Given 灯箱  When 键盘 ← →  Then 同上
 GWT-PHOTO-06 Given 灯箱  When 关闭  Then 遮罩消失，页面滚动恢复
+GWT-PHOTO-07 Given 灯箱打开  When 闲置 2.6 秒  Then 顶栏与缩略图条隐去，鼠标一动立即回来
+GWT-PHOTO-08 Given 灯箱图片  When 滚轮放大到 200%  Then 光标下那一点不动；拖动可平移；双击回到 100%
+GWT-PHOTO-09 Given 手机灯箱  When 左滑  Then 下一张；When 下滑  Then 关闭灯箱（位移跟手，未到阈值回弹）
+GWT-PHOTO-10 Given 灯箱视频  When 按 →  Then 快进 5 秒且不切条目；视频铺满视口且只有顶栏一个关闭按钮
 ```
 
 #### 依赖红线

@@ -1749,6 +1749,8 @@ function toLightboxItem(entry: EntryInfo): LightboxItem {
     name: entry.name,
     kind: entry.kind as LightboxItem['kind'],
     subtitle: null,
+    size: entry.size,
+    modified: entry.modified,
   }
 }
 

@@ -87,6 +87,14 @@
     "close": "关闭",
     "original": "下载原文件",
     "openOriginal": "新窗口打开原文件",
-    "broken": "这张图片打不开"
+    "broken": "这张图片打不开",
+    "share": "分享",
+    "info": "文件信息",
+    "dimensions": "尺寸",
+    "duration": "时长",
+    "size": "体积",
+    "modified": "修改时间",
+    "infoPending": "正在读取媒体信息…",
+    "zoomReset": "恢复原始大小（双击或按 0）"
   }
 }

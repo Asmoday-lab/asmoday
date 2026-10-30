@@ -29,12 +29,21 @@ const props = defineProps<{
   startAt?: number
   /** 外挂字幕文件路径（.vtt/.srt），空则不加字幕轨 */
   subtitle?: string | null
+  /**
+   * 铺满父容器（灯箱用）：容器不再按视频比例收窄，改为 `object-contain` 铺满视口，
+   * 由黑边消化比例差 —— 全屏灯箱里再套一个 `max-w-4xl` 的盒子只会白白浪费两侧空间。
+   */
+  fill?: boolean
+  /** 是否显示组件自带的关闭按钮（灯箱自己有工具栏，重复一个 ✕ 会让人犯迷糊） */
+  showClose?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'progress', seconds: number): void
   (e: 'ended'): void
+  /** 元数据就绪：灯箱的信息层要显示分辨率与时长 */
+  (e: 'meta', info: { width: number; height: number; duration: number }): void
 }>()
 
 
@@ -53,10 +62,14 @@ let lastTime = 0
  * 不能写成 width:100% + max-height —— 那样宽度不跟着收，容器比例失真，
  * 竖屏视频（如 9:16）会被 overflow 裁掉上下半截。
  */
-const boxStyle = computed(() => ({
-  aspectRatio: ratio.value.toFixed(5),
-  width: `min(100%, calc(${MAX_VH}vh * ${ratio.value.toFixed(5)}))`,
-}))
+const boxStyle = computed(() =>
+  props.fill
+    ? { width: '100%', height: '100%' }
+    : {
+        aspectRatio: ratio.value.toFixed(5),
+        width: `min(100%, calc(${MAX_VH}vh * ${ratio.value.toFixed(5)}))`,
+      },
+)
 
 /** 常见但浏览器不支持的容器格式，用于给出可读提示而不是一片黑 */
 const RISKY_EXT = ['mkv', 'avi', 'wmv', 'flv', 'rmvb', 'rm', 'ts', 'm2ts', 'vob', 'iso']
@@ -84,6 +97,7 @@ function onLoadedMetadata(event: Event) {
     // 上下限只防异常值：0.25 ≈ 9:36 的超长竖屏，3 ≈ 32:9 的超宽，正常素材都在区间内
     ratio.value = Math.min(3, Math.max(0.25, w / h))
   }
+  if (w && h) emit('meta', { width: w, height: h, duration: media.duration })
   const startAt = props.startAt ?? 0
   if (startAt > 10 && Number.isFinite(media.duration) && startAt < media.duration - 5) {
     if (Math.abs(media.currentTime - startAt) > 1) media.currentTime = startAt
@@ -147,6 +161,22 @@ onMounted(() => {
   if (element) attachVolume(element)
 })
 
+/** 键盘 ←/→ 在视频上做快进，而不是切到上下一条（对齐 FileBrowser 的口径） */
+function seekBy(seconds: number) {
+  const element = mediaEl.value
+  if (!element || !Number.isFinite(element.duration)) return
+  element.currentTime = Math.min(element.duration, Math.max(0, element.currentTime + seconds))
+}
+
+function togglePlay() {
+  const element = mediaEl.value
+  if (!element) return
+  if (element.paused) void element.play().catch(() => {})
+  else element.pause()
+}
+
+defineExpose({ seekBy, togglePlay })
+
 onBeforeUnmount(() => {
   detachVolume?.()
   // 彻底销毁：只卸载 DOM 不够，浏览器可能继续缓冲下载（设计文档 8.4.9）
@@ -162,9 +192,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="root" class="relative w-full">
+  <div ref="root" :class="fill ? 'relative size-full' : 'relative w-full'">
     <div
-      class="relative mx-auto overflow-hidden rounded-2xl bg-black"
+      class="relative mx-auto overflow-hidden bg-black"
+      :class="fill ? 'size-full' : 'rounded-2xl'"
       :style="boxStyle"
     >
       <!-- 原生兜底：不经过皮肤，直接给浏览器控件 -->
@@ -221,6 +252,7 @@ onBeforeUnmount(() => {
       </video-player>
 
       <button
+        v-if="showClose !== false"
         class="absolute top-2 right-2 z-10 grid size-8 place-items-center rounded-full bg-black/55 text-white backdrop-blur transition-colors hover:bg-black/80"
         :title="t('gallery.video.close')"
         @click="emit('close')"
@@ -229,7 +261,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+    <div v-if="!fill" class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
       <p v-if="errorMsg" class="fg-warn">{{ errorMsg }}</p>
       <a
         :href="src"

@@ -19,6 +19,10 @@ export interface LightboxItem {
   kind: 'image' | 'video' | 'audio'
   /** 视频外挂字幕（同目录同名 .srt/.vtt） */
   subtitle?: string | null
+  /** 字节数（信息层展示；调用方有就带上，缺省则整行隐藏） */
+  size?: number
+  /** 修改时间（unix 秒），同上 */
+  modified?: number | null
 }
 
 export interface OpenOptions {

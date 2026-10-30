@@ -503,6 +503,8 @@ function openViewer(list: MediaItem[], index: number) {
       name: item.name,
       kind: item.kind,
       subtitle: item.subtitle ?? null,
+      size: item.size,
+      modified: item.modified,
     })),
     index,
     { onProgress: savePosition },

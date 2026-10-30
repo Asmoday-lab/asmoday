@@ -87,6 +87,14 @@
     "close": "Close",
     "original": "Download",
     "openOriginal": "Open original in new tab",
-    "broken": "This image can't be displayed"
+    "broken": "This image can't be displayed",
+    "share": "Share",
+    "info": "File info",
+    "dimensions": "Dimensions",
+    "duration": "Duration",
+    "size": "Size",
+    "modified": "Modified",
+    "infoPending": "Reading media info…",
+    "zoomReset": "Reset zoom (double-click or press 0)"
   }
 }
