@@ -91,8 +91,11 @@ export function useImageZoom(options: UseImageZoomOptions) {
     y.value = Math.min(limitY, Math.max(-limitY, y.value))
   }
 
-  function reset() {
-    moving.value = false
+  /**
+   * 复位。`instant` 用于「切换条目」：不要让旧画面当着新图的面做一次 220ms 回中动画
+   * （视觉上就是一闪），先把过渡关掉等新 transform 上屏再恢复。
+   */
+  function reset(instant = false) {
     scale.value = min
     x.value = 0
     y.value = 0
@@ -100,6 +103,12 @@ export function useImageZoom(options: UseImageZoomOptions) {
     dragY.value = 0
     pointers.clear()
     axis = null
+    if (instant) {
+      moving.value = true
+      requestAnimationFrame(() => requestAnimationFrame(() => (moving.value = false)))
+    } else {
+      moving.value = false
+    }
   }
 
   /** 以舞台中心为参照，把 (clientX, clientY) 对应的那一点固定在原地完成缩放 */

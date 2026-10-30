@@ -118,6 +118,11 @@ const zoom = useImageZoom({
   onSwipe: (delta) => stepLightbox(delta),
   onDismiss: () => closeLightbox(),
   onTap: () => {
+    // 按下点落在自己的控件（左右箭头、缩放角标）上时什么都不做：
+    // 这些按钮在 stage 里，pointerup 会先走到这里——早先把「点黑边关闭」
+    // 误判进来，灯箱当场关掉，按钮的 click 永远等不到（上下页失效的真凶）
+    const down = downTarget as HTMLElement | null
+    if (down?.closest('button, a, [data-lightbox-control]')) return
     // 信息层也算一层：点画面先把它收掉，别让面板和工具栏抢同一次点击
     if (infoOpen.value) {
       infoOpen.value = false
@@ -186,6 +191,11 @@ function preloadNeighbors() {
     const image = new Image()
     image.decoding = 'async'
     image.src = rawUrl(entry.path)
+    // 打底用的 960 缩略图是独立 URL（网格里是 320/480），不预载的话翻页瞬间
+    // 连打底都没就绪，整屏黑一下——这就是「预览闪烁」的另一半来源
+    const thumb = new Image()
+    thumb.decoding = 'async'
+    thumb.src = thumbUrl(entry.path, 960)
   }
 }
 
@@ -197,7 +207,8 @@ watch(
     natural.value = null
     videoMeta.value = null
     infoOpen.value = false
-    zoom.reset()
+    // 换条目瞬间复位缩放，但跳过回中动画：旧画面不该当着新图的面动一下
+    zoom.reset(true)
     if (isOpen.value) {
       chrome.value = true
       hideAfterIdle()
@@ -292,6 +303,9 @@ function markFailed(path: string) {
 
 function onImageLoad(event: Event) {
   const img = event.target as HTMLImageElement
+  // 快速翻页时旧图的 load 会晚到：target 已不是当前那张（:key 换了元素），
+  // 绝不能把 ready/natural 写成新 path——否则还没解码完的新原图被提前淡入，画面闪一帧空白
+  if (img !== imgEl.value) return
   ready.value = item.value?.path ?? null
   natural.value = { width: img.naturalWidth, height: img.naturalHeight }
 }
@@ -410,9 +424,12 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
+    <!-- Telegram 式观感：背景半透明 + 模糊，隐约透出下面的页面。
+         进场用一次性动画淡入；不能包 <Transition>——关闭时 items 已被清空，
+         离场帧里 item 是 null，模板里满屏的 item.name 会炸。 -->
     <div
       v-if="isOpen && item"
-      class="fixed inset-0 z-[80] overflow-hidden bg-[#08080a] select-none"
+      class="fixed inset-0 z-[80] overflow-hidden bg-black/90 select-none backdrop-blur-xl lightbox-in"
       :class="chrome ? '' : 'cursor-none'"
       data-testid="media-lightbox"
       @pointermove.passive="noteActivity"
@@ -531,11 +548,15 @@ onBeforeUnmount(() => {
           <AppIcon name="chevronRight" :size="18" />
         </button>
 
-        <!-- 缩放角标：只在放大后出现，点一下复位 -->
+        <!-- 缩放指示：Telegram 式底部胶囊，图片模式常驻——未放大时 100% 淡显，
+             放大后变亮，点一下复位；不随 chrome 隐藏（缩放状态不该没有去向） -->
         <button
-          v-if="item.kind === 'image' && zoom.zoomed.value"
-          class="absolute left-1/2 z-20 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-[11px] tabular-nums text-white/80 backdrop-blur transition-opacity hover:bg-black/80"
-          :class="total > 1 ? 'bottom-[84px]' : 'bottom-4'"
+          v-if="item.kind === 'image'"
+          class="absolute left-1/2 z-40 -translate-x-1/2 rounded-full border border-white/10 bg-black/55 px-3 py-1 text-[11px] tabular-nums backdrop-blur transition-colors hover:bg-black/75"
+          :class="[
+            total > 1 ? 'bottom-[84px]' : 'bottom-4',
+            zoom.zoomed.value ? 'text-white/90' : 'text-white/40',
+          ]"
           :title="t('gallery.viewer.zoomReset')"
           data-testid="lightbox-zoom"
           @click.stop="zoom.reset()"
@@ -698,6 +719,18 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* 进场淡入：一次性动画，不参与 Vue Transition（见模板注释） */
+.lightbox-in {
+  animation: lightbox-in 180ms ease-out;
+}
+@keyframes lightbox-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
 /* 滚动条在深色 backdrop 上默认几乎看不见：给缩略图条一条常驻的细滚动条 */
 .lightbox-strip {
   scrollbar-width: thin;
