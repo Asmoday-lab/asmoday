@@ -277,6 +277,82 @@ body {
   opacity: 0;
 }
 
+/*
+ * 播放条进度滑条（v4.5.0）：4px 细轨道 + accent 填充（--p 由模板按播放比例写入），
+ * 拇指平时隐藏、hover / 键盘聚焦才浮出 —— 参考稿里那根「一条线 + 亮点」的观感。
+ * 命中区靠上下 6px 的透明内边距撑开，视觉仍是 4px。
+ */
+.music-range {
+  -webkit-appearance: none;
+  appearance: none;
+  /* 盒子 16px 高（好点、好拖），画出来的轨道只有 4px，靠 background-size 压扁 */
+  height: 16px;
+  border-radius: 999px;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 100% 4px;
+  background-image: linear-gradient(to right, var(--accent) 0%, var(--border-color) 0%);
+  outline: none;
+  cursor: pointer;
+  padding: 0;
+}
+.music-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 22%, transparent);
+  transform: scale(0);
+  transition: transform 0.16s ease;
+}
+.music-range:hover::-webkit-slider-thumb,
+.music-range:focus-visible::-webkit-slider-thumb,
+.music-range:active::-webkit-slider-thumb {
+  transform: scale(1);
+}
+.music-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: scale(0);
+  transition: transform 0.16s ease;
+}
+.music-range:hover::-moz-range-thumb,
+.music-range:focus-visible::-moz-range-thumb {
+  transform: scale(1);
+}
+.music-range::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: transparent;
+}
+.music-range:active {
+  cursor: grabbing;
+}
+
+/* 播放键的柔和外发光（accent 半透明，深浅色都不刺眼） */
+.play-glow {
+  box-shadow: 0 6px 18px -6px color-mix(in oklab, var(--accent) 62%, transparent);
+}
+
+/* 极简模式的黑胶唱片：只在播放时转 */
+@keyframes music-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.music-disc {
+  animation: music-spin 9s linear infinite;
+  animation-play-state: paused;
+}
+.music-disc.is-playing {
+  animation-play-state: running;
+}
+
 /* 骨架屏脉冲 */
 .skeleton {
   background: linear-gradient(

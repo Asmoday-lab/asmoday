@@ -1265,6 +1265,8 @@ GWT-BAR-01 Given 播放条正在显示  When 点关闭  Then 播放条整体向�
 GWT-BAR-02 Given 正在播放且有同目录 .lrc  When 播放进度推进  Then 歌名下方副行显示当前歌词行（accent 弱化色），不显示目录名；无歌词时显示 ID3 歌手，再没有就留空
 GWT-BAR-03 Given 播放条为 classic  When 点右工具区极简按钮  Then 切换为右下角 340px 小卡（含播放/下一首/还原/关闭）；小卡里点还原回到 classic；两种形态刷新后保持
 GWT-BAR-04 Given 桌面 1440px  When 量右工具区按钮  Then 每个都是 36×36（不被 flex 压成 24px 宽）
+GWT-BAR-05 Given 播放条任意形态  When 看顶行  Then 有贯穿整条的 4px 进度条与两端时间；点击 60% 处 currentTime 跳到 60% 附近（命中区 16px 高）
+GWT-BAR-06 Given 极简形态  When 未 hover  Then 是 64px 唱片且播放中旋转（animation-play-state=running）；hover 展开 320px；双击唱片回到 classic
 ```
 
 #### 依赖红线
