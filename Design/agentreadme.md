@@ -1262,17 +1262,20 @@ GWT-SET-01 Given 桌面端设置页  Then 左侧竖排图标导航常驻、移�
 GWT-SET-02 Given 侧边栏左下角  Then 自上而下为「生态推荐」小字链接（当前页高亮）与 `v<version> · 由 Asmoday 提供`；折叠态只留图标且不占高度
 GWT-SET-03 Given 生态推荐  When 点左下角入口  Then 在右侧主内容区打开 `/ecosystem`，设置页的 Tab 里不再有该分区
 GWT-BAR-01 Given 播放条正在显示  When 点关闭  Then 播放条整体向下滑出（有真实 translateY 位移，不是纯淡出），滑完才卸载；进入同理自底部升起
-GWT-BAR-02 Given 正在播放且有同目录 .lrc  When 播放进度推进  Then 桌面曲目区副行显示 ID3 歌手（无则专辑、都没有留空），歌名右侧的**内联歌词区**（竖线分隔）显示当前歌词行；移动端与极简面板的副行仍显示当前歌词行（accent 弱化色），都不显示目录名
+GWT-BAR-02 Given 正在播放且有同目录 .lrc  When 播放进度推进  Then 曲目区固定显示 ID3 歌手（无则专辑、再没有写「未知歌手」），右侧**内联歌词区**（`sm` 起竖线分隔）滚动当前歌词行（13px accent）；**没有 .lrc 时内联区写「无歌词」**（muted 色），不留空白；都不显示目录名
 GWT-BAR-03 Given 播放条为 classic  When 点右工具区极简按钮（圆盘图标）  Then 切换为右下角 64px 胶囊（内含 48px 黑胶唱片）；展开后**双击唱片**回到 classic；两种形态刷新后保持
-GWT-BAR-04 Given 桌面 1440px  When 量 classic 条  Then 整条 **864×101**（视口 60%，内边距 14/24），播放键 44×44、上一首/下一首 36×36、模式/歌单/极简三个 32×32 且都带描边，都不被 flex 压窄；封面是 accent 底 + 8px 白点；切歌与播放是实心图形；音量轨拇指常显
+GWT-BAR-04 Given 桌面 1440px  When 量 classic 条  Then 整条 **864×101**（`lg:w-[60%]`、`lg:min-w-[820px]`、内边距 14/24），播放键 44×44、上一首/下一首 36×36、模式/歌单/极简三个 32×32 且都带描边、声音键 24×24 + 横向音量轨 64×16，都不被 flex 压窄；封面是 accent 底 + 8px 白点；切歌与播放是实心图形；内联歌词区宽 > 150px
 GWT-BAR-05 Given 播放条任意形态  When 看顶行  Then 有贯穿整条的 4px 进度条与两端 34px 定宽时间；点击 60% 处 currentTime 跳到 60% 附近（命中区 16px 高）；空轨用 `--range-track`，深色底上可见
 GWT-BAR-06 Given 极简形态  When 未 hover  Then 是 64px 胶囊 + 48px 黑胶唱片（同心纹路 + 中心封面标贴 + 轴孔），播放中旋转（animation-play-state=running）；hover 展开 340px；双击唱片回到 classic
-GWT-BAR-07 Given classic 条  When 未 hover  Then 条内没有关闭按钮（关闭键浮在条外右上方 `-top-3.5 right-5`，24×24）；hover 整条后关闭键 opacity=1 且可点
+GWT-BAR-07 Given classic 条  When 未 hover  Then 条内没有关闭按钮，条外右上方有**两个**窗口键（锁定常驻 24×24 + 关闭 24×24，`-top-3.5 right-3/5`）；hover 整条后两个键 opacity=1
 GWT-BAR-08 Given 触屏（hover:none）且为极简形态  When 点唱片展开后又想关掉  Then 胶囊外右上方的关闭键 opacity=1（不依赖 hover），点击后播放条消失
-GWT-BAR-09 Given 歌词面板或播放列表展开  When 量两者底边  Then 底边都在播放条顶边之上（桌面让位 130px、移动 78px；极简形态 96px，落在胶囊上方），不压住进度行
+GWT-BAR-09 Given 歌词面板或播放列表展开  When 量两者底边  Then 底边都在播放条顶边之上（桌面让位 130px、`<lg` 84px；极简形态 96px，落在胶囊上方），不压住进度行
 GWT-BAR-10 Given 极简面板展开  When 数里面的按钮  Then 依次是 音量 24×24 / 模式 24 / 上一首 24 / 播放 28 / 下一首 24 / 歌单 24（与参考稿逐项对齐，只多一个歌单），**没有还原键**；点音量键 title 在「静音 / 取消静音」间切换，点模式键循环 列表循环 → 单曲循环 → 随机
 GWT-BAR-11 Given 极简面板  When 点一次唱片（等待 >240ms）  Then 播放/暂停切换；在 240ms 内连点两次  Then 还原为 classic（触屏双击同样生效，不依赖 dblclick 事件）
-GWT-BAR-12 Given 移动端 390px  When 看 classic 条单行  Then 依次有 模式 / 上一首 / 播放 / 下一首 / 歌单 / 极简（圆盘图标）/ 关闭，标题不被挤到不可读，无横向溢出
+GWT-BAR-12 Given 移动端 390px  When 看 classic 条  Then 曲目区三行（歌名 12 / 歌手 10 / 歌词 10，无歌词写「无歌词」），控件依次是 声音键 26 / 模式 26 / 上一首 26 / 播放 32 / 下一首 26 / 歌单 26 / 极简 28，无横向溢出（整条 390×80），关闭与锁定键浮在条外右上角
+GWT-BAR-13 Given `<lg`（如 838px）或触屏  When 点声音键  Then 播放条上方弹出 42×102 的竖排音量滑条（`.vol-vertical` 旋转 -90°），拖动写进 `asm_volume`；点弹层外收起；**lg+ 点声音键只切静音、不弹层**（条内已有横向滑轨）
+GWT-BAR-14 Given 点条外右上角的锁定键  When 再看关闭键  Then 锁定态下关闭键 `disabled` 且 opacity≈0.4、点击不会关掉播放条；再点锁定键解锁后关闭键恢复可用；锁定状态刷新后保持
+GWT-BAR-15 Given 768~1023 宽度（如 838）  When 看 classic 条  Then 整条铺满底部（838×72、`border-t`、不浮起），曲目区两行（歌名 + 歌手）、内联歌词区可见且有竖线、控件含声音键；页面无横向溢出
 ```
 
 #### 依赖红线

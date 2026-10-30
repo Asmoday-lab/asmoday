@@ -64,6 +64,8 @@
     "close": "Close player bar",
     "lyricsLoading": "Loading lyrics…",
     "noLyrics": "No .lrc file next to this track",
+    "noLyricText": "No lyrics",
+    "unknownArtist": "Unknown artist",
     "noTimeline": "The lyrics file has no usable timeline",
     "lyricsFailed": "Failed to load lyrics",
     "volume": "Volume",
@@ -76,7 +78,10 @@
     "styleMinimal": "Switch to the compact mini player",
     "styleClassic": "Restore the full player bar",
     "progress": "Playback progress",
-    "discHint": "Click to play/pause, double-click to restore the full player"
+    "discHint": "Click to play/pause, double-click to restore the full player",
+    "pin": "Keep the bar open",
+    "unpin": "Pinned — click to unlock",
+    "pinnedHint": "Pinned: unlock before closing"
   },
   "video": {
     "unsupportedExt": "The browser cannot decode .{ext} video. Transcode it to mp4 (H.264), or download it from Files and play locally",

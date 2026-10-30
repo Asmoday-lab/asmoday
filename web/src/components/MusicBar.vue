@@ -11,7 +11,8 @@
  * - 模式键改成描边胶囊，非列表循环时高亮；
  * - 极简形态改为右下角黑胶唱片：播放时旋转，hover 展开成胶囊面板。
  */
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useStorage } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
@@ -27,6 +28,10 @@ const expanded = ref(false)
 const listOpen = ref(false)
 /** 极简唱片在触屏上点开后保持展开（桌面靠 hover） */
 const miniOpen = ref(false)
+/** 音量竖排滑条弹层（参考稿 .vol-popup，窄屏与触屏都靠它调音量） */
+const volOpen = ref(false)
+/** 锁定常驻：锁上后关闭键置灰，避免误关（参考稿的 .window-btn.pinned） */
+const pinned = useStorage('asmoday.player.pinned', false)
 const lyricBox = ref<HTMLElement | null>(null)
 const seeking = ref(false)
 /** 内嵌封面加载失败时退回图标占位（老文件常常标注了 APIC 但数据是坏的） */
@@ -77,7 +82,7 @@ const volumeIcon = computed<IconName>(() => (volume.muted ? 'volumeMute' : 'volu
 const drawerOffset = computed(() =>
   player.state.barStyle === 'minimal'
     ? 'bottom-[calc(96px+env(safe-area-inset-bottom,0px))]'
-    : 'bottom-[calc(78px+env(safe-area-inset-bottom,0px))] md:bottom-[calc(130px+env(safe-area-inset-bottom,0px))]',
+    : 'bottom-[calc(84px+env(safe-area-inset-bottom,0px))] lg:bottom-[calc(130px+env(safe-area-inset-bottom,0px))]',
 )
 
 function cycleMode() {
@@ -86,9 +91,11 @@ function cycleMode() {
 }
 
 function closePlayer() {
+  if (pinned.value) return // 锁定常驻时关闭键不可用，先解锁
   listOpen.value = false
   expanded.value = false
   miniOpen.value = false
+  volOpen.value = false
   player.clearQueue()
 }
 
@@ -136,6 +143,20 @@ function onVolumeInput(event: Event) {
   volume.set(Number((event.target as HTMLInputElement).value))
 }
 
+/** 声音键：静音/取消静音 + 开合竖排滑条（参考稿 volBtn 同款双动作） */
+function toggleVolume() {
+  volume.toggle()
+  // lg 起条内就有横向滑轨，不再叠一个竖排弹层；窄屏/触屏只能靠弹层调音量
+  volOpen.value = window.matchMedia('(min-width: 1024px)').matches ? false : !volOpen.value
+}
+
+/** 点到弹层外面就收起（与参考稿的 document click 一致） */
+function onDocumentClick(event: MouseEvent) {
+  if (!volOpen.value) return
+  const target = event.target as HTMLElement | null
+  if (!target?.closest('[data-testid="music-volume-wrap"]')) volOpen.value = false
+}
+
 const displayTitle = computed(() => {
   const track = currentTrack.value
   if (!track) return ''
@@ -149,7 +170,7 @@ const displayTitle = computed(() => {
 const displayArtist = computed(() => {
   const track = currentTrack.value
   if (!track) return ''
-  return track.artist?.trim() || track.album?.trim() || ''
+  return track.artist?.trim() || track.album?.trim() || t('gallery.player.unknownArtist')
 })
 
 /**
@@ -162,9 +183,20 @@ const currentLyric = computed(() => {
   return lines[activeLyric.value]?.text?.trim() ?? ''
 })
 
-const displaySubtitle = computed(
-  () => currentLyric.value || currentTrack.value?.artist?.trim() || '',
-)
+const displaySubtitle = computed(() => currentLyric.value || displayArtist.value)
+
+/** 内联歌词区的文案：没有 LRC 时给出「无歌词」占位，不让那块空白着 */
+const inlineLyric = computed(() => {
+  const lines = player.state.lyrics
+  if (!lines || lines.length === 0) return t('gallery.player.noLyricText')
+  return currentLyric.value || lines[0]?.text?.trim() || t('gallery.player.noLyricText')
+})
+
+/** 占位文案（无歌词 / 还没开始唱）用 muted 色，真歌词才用 accent */
+const inlineLyricIsPlaceholder = computed(() => {
+  const lines = player.state.lyrics
+  return !lines || lines.length === 0 || !currentLyric.value
+})
 
 /** 副行是不是歌词（决定着色：歌词行用 accent 弱化色，歌手用 muted） */
 const subtitleIsLyric = computed(() => currentLyric.value.length > 0)
@@ -246,8 +278,13 @@ watch(
   () => applyVolume(audio.value),
 )
 
+onMounted(() => {
+  document.addEventListener('click', onDocumentClick)
+})
+
 onBeforeUnmount(() => {
   detachVolume?.()
+  document.removeEventListener('click', onDocumentClick)
   if (discTapTimer !== null) window.clearTimeout(discTapTimer)
 })
 
@@ -284,7 +321,7 @@ watch(
     <div
       v-if="currentTrack && expanded"
       data-testid="music-lyrics-panel"
-      class="fixed inset-x-0 bottom-[calc(80px+env(safe-area-inset-bottom,0px))] z-40 mx-auto flex h-64 w-full max-w-md flex-col overflow-hidden rounded-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur-xl md:bottom-[calc(130px+env(safe-area-inset-bottom,0px))] md:max-w-lg"
+      class="fixed inset-x-0 bottom-[calc(84px+env(safe-area-inset-bottom,0px))] z-40 mx-auto flex h-64 w-full max-w-md flex-col overflow-hidden rounded-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur-xl lg:bottom-[calc(130px+env(safe-area-inset-bottom,0px))] lg:max-w-lg"
     >
       <div class="border-b border-line/60 px-4 py-2 text-center">
         <p class="truncate text-sm font-medium text-ink">{{ displayTitle }}</p>
@@ -301,8 +338,8 @@ watch(
           {{ line.text || '···' }}
         </p>
       </div>
-      <p v-else class="grid flex-1 place-items-center px-6 text-center text-xs text-muted">
-        {{ player.state.lyricError || t('gallery.player.lyricsLoading') }}
+      <p class="grid flex-1 place-items-center px-6 text-center text-xs text-muted" v-else>
+        {{ player.state.lyricError || t('gallery.player.noLyricText') }}
       </p>
     </div>
   </Transition>
@@ -316,7 +353,7 @@ watch(
       v-if="currentTrack && listOpen"
       data-testid="music-playlist"
       :class="drawerOffset"
-      class="fixed inset-x-0 z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur md:inset-x-auto md:right-4 md:h-auto md:max-h-[60vh] md:w-80 md:rounded-2xl"
+      class="fixed inset-x-0 z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur lg:inset-x-auto lg:right-4 lg:h-auto lg:max-h-[60vh] lg:w-80 lg:rounded-2xl"
     >
       <div class="flex shrink-0 items-center gap-2 border-b border-line/60 px-4 py-2.5">
         <p class="min-w-0 flex-1 truncate text-sm font-medium text-ink">
@@ -369,12 +406,10 @@ watch(
   </Transition>
 
   <!--
-    播放条（v4.4.8 布局 / v4.4.11 动画 / v4.5.0 视觉）：
-    - 桌面：居中浮动条，宽 70%，顶部一整行细进度条，下面三栏 —— 左曲目、中控件、右工具；
-    - 移动端：铺满底部，进度条同样独占一行（终于能拖了），下面单行；
-    - slide-up 过渡必须直接包住这个**有真实高度**的 fixed 容器：
-      以前包在最外层零高度 div 上，translateY(100%) 对 0 高元素不产生位移，
-      收起时只剩 opacity 骤变，观感抽搐。
+    播放条（v4.5.4）：整体结构对齐参考稿 —— 进度独占顶行，下面**一行连排**：
+    曲目（封面 + 歌名 + 歌手）｜ 内联歌词（sm 起有竖线分隔）｜ 控件。
+    断点也跟参考稿一致：<lg 铺满底部（单行 + 浮在条外右上角的窗口键），
+    lg+ 才浮起来占 60% 宽。参考稿在 <900 时也是这套「一行 + 窗口键」结构。
   -->
   <Transition name="slide-up">
     <div
@@ -383,19 +418,39 @@ watch(
       style="padding-bottom: env(safe-area-inset-bottom, 0px)"
     >
       <div
-        class="group/bar pointer-events-auto relative w-full border-t border-line bg-panel/95 backdrop-blur-2xl backdrop-saturate-150 md:mb-6 md:w-[60%] md:min-w-[680px] md:rounded-[20px] md:border md:shadow-[0_10px_30px_-8px_rgba(0,0,0,0.45)]"
+        class="group/bar pointer-events-auto relative w-full border-t border-line bg-panel/95 backdrop-blur-2xl backdrop-saturate-150 lg:mb-6 lg:w-[60%] lg:min-w-[820px] lg:rounded-[20px] lg:border lg:shadow-[0_10px_30px_-8px_rgba(0,0,0,0.45)]"
         data-testid="music-bar"
       >
         <!--
-          右上角外侧关闭键（参考稿 .window-ctrl）：浮在条外 -14px，
-          hover 整条或键盘聚焦才浮现、平时完全隐形 —— 条内不必再挤一个灰按钮。
+          右上角外侧窗口键（参考稿 .window-ctrl，**两个键**）：锁定常驻 / 关闭。
+          浮在条外 -14px，hover 整条、键盘聚焦或触屏（无 hover）时常显。
+          锁定后关闭键置灰不可点，避免误关；条内不再挤这两个灰按钮。
         -->
         <div
-          class="absolute -top-3.5 right-5 z-20 hidden opacity-0 transition-opacity duration-200 group-hover/bar:opacity-100 focus-within:opacity-100 md:block"
+          class="absolute -top-3.5 right-3 z-20 flex gap-1.5 opacity-0 transition-opacity duration-200 group-hover/bar:opacity-100 focus-within:opacity-100 lg:right-5 [@media(hover:none)]:opacity-100"
         >
           <button
-            class="grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white"
-            :title="t('gallery.player.close')"
+            class="grid size-6 place-items-center rounded-full border bg-panel shadow-sm transition-all hover:scale-110"
+            :class="
+              pinned
+                ? 'border-accent bg-accent/10 text-accent'
+                : 'border-line text-muted hover:border-transparent hover:bg-accent hover:text-white'
+            "
+            :title="pinned ? t('gallery.player.unpin') : t('gallery.player.pin')"
+            data-testid="music-bar-pin"
+            @click="pinned = !pinned"
+          >
+            <AppIcon :name="pinned ? 'lock' : 'unlock'" :size="12" />
+          </button>
+          <button
+            class="grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all"
+            :class="
+              pinned
+                ? 'cursor-not-allowed opacity-40'
+                : 'hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white'
+            "
+            :title="pinned ? t('gallery.player.pinnedHint') : t('gallery.player.close')"
+            :disabled="pinned"
             data-testid="music-bar-close"
             @click="closePlayer"
           >
@@ -403,9 +458,9 @@ watch(
           </button>
         </div>
 
-        <div class="px-3 pb-2 pt-2 md:px-6 md:py-3.5">
+        <div class="px-3 pb-2 pt-2 lg:px-6 lg:py-3.5">
           <!-- ① 全宽进度行：时间 – 细滑条 – 时长 -->
-          <div class="flex items-center gap-3">
+          <div class="flex items-center gap-2.5 lg:gap-3">
             <span class="w-[34px] shrink-0 text-center text-[11px] tabular-nums text-muted">
               {{ fmt(player.state.currentTime) }}
             </span>
@@ -427,104 +482,13 @@ watch(
             </span>
           </div>
 
-          <!-- ② 移动端：单行，尺寸对齐参考稿窄屏断点（封面 32 / 播放 34 / 其它 28~32） -->
-          <div class="mt-1.5 flex items-center gap-1.5 md:hidden">
-            <span
-              class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-lg bg-accent"
-            >
-              <span v-if="!showCover" class="size-2 rounded-full bg-white/90" />
-              <img
-                v-else
-                :src="coverUrl(currentTrack.path)"
-                alt=""
-                class="size-full object-cover"
-                @error="coverFailed = true"
-              />
-            </span>
-            <div class="min-w-0 flex-1">
-              <button
-                class="block w-full truncate text-left text-[12px] font-semibold leading-tight text-ink"
-                :title="displayTitle"
-                @click="toggleLyrics"
-              >
-                {{ displayTitle }}
-              </button>
-              <p
-                class="truncate text-[10px] leading-tight"
-                :class="subtitleIsLyric ? 'text-accent/80' : 'text-muted'"
-              >
-                {{ displaySubtitle }}
-              </p>
-            </div>
-            <button
-              class="grid size-7 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated active:scale-90"
-              :class="player.state.mode === 'loop' ? 'text-muted hover:text-ink' : 'text-accent'"
-              :title="modeLabel"
-              data-testid="music-bar-mode"
-              @click="cycleMode"
-            >
-              <AppIcon :name="modeIcon" :size="14" />
-            </button>
-            <button
-              class="grid size-7 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
-              :title="t('gallery.player.prev')"
-              @click="player.prev()"
-            >
-              <AppIcon name="prevSolid" :size="15" filled />
-            </button>
-            <button
-              class="grid size-[34px] shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-transform active:scale-95"
-              :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
-              data-testid="music-bar-play"
-              @click="player.toggle()"
-            >
-              <AppIcon :name="playIcon" :size="15" filled />
-            </button>
-            <button
-              class="grid size-7 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
-              :title="t('gallery.player.next')"
-              @click="player.next()"
-            >
-              <AppIcon name="nextSolid" :size="15" filled />
-            </button>
-            <button
-              class="grid size-7 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated active:scale-90"
-              :class="listOpen ? 'text-accent' : 'text-muted hover:text-ink'"
-              :title="t('gallery.player.playlist')"
-              data-testid="music-bar-playlist"
-              @click="toggleList"
-            >
-              <AppIcon name="list" :size="14" />
-            </button>
-            <button
-              class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
-              :title="t('gallery.player.styleMinimal')"
-              data-testid="music-bar-minimize"
-              @click="switchStyle('minimal')"
-            >
-              <AppIcon name="disc" :size="16" />
-            </button>
-            <button
-              class="grid size-8 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-red-500/85 hover:text-white"
-              :title="t('gallery.player.close')"
-              data-testid="music-bar-close"
-              @click="closePlayer"
-            >
-              <AppIcon name="close" :size="15" />
-            </button>
-          </div>
-
-          <!--
-            ③ 桌面：曲目 | 内联歌词（竖线分隔、吃满中段）| 控件。
-            参考稿是一行连续排布（没有三栏 grid），中段留给歌词滚动，
-            控件按「音量 → 模式 → 上一首 → 播放 → 下一首 ｜ 列表 / 歌词 / 极简」排。
-          -->
-          <div class="mt-2.5 hidden items-center gap-3 md:flex">
-            <div class="flex min-w-0 max-w-[248px] shrink-0 items-center gap-2.5">
+          <!-- ② 单行：曲目 ｜ 内联歌词 ｜ 控件 -->
+          <div class="mt-1.5 flex items-center gap-2 lg:mt-2.5 lg:gap-3">
+            <div class="flex min-w-0 flex-1 items-center gap-2 sm:flex-none lg:gap-2.5">
               <span
-                class="relative grid size-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-accent shadow-[0_4px_12px_rgba(0,0,0,0.15)]"
+                class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-lg bg-accent lg:size-10 lg:rounded-xl lg:shadow-[0_4px_12px_rgba(0,0,0,0.15)]"
               >
-                <span v-if="!showCover" class="size-2 rounded-full bg-white/90" />
+                <span v-if="!showCover" class="size-1.5 rounded-full bg-white/90 lg:size-2" />
                 <img
                   v-else
                   :src="coverUrl(currentTrack.path)"
@@ -533,29 +497,86 @@ watch(
                   @error="coverFailed = true"
                 />
               </span>
-              <div class="min-w-0">
+              <div class="min-w-0 flex-1 sm:max-w-[190px] sm:flex-none lg:max-w-[180px]">
                 <button
-                  class="block w-full truncate text-left text-[13px] font-semibold leading-[1.3] text-ink transition-colors hover:text-accent"
+                  class="block w-full truncate text-left text-[12px] font-semibold leading-[1.25] text-ink transition-colors hover:text-accent lg:text-[13px]"
                   :title="displayTitle"
                   @click="toggleLyrics"
                 >
                   {{ displayTitle }}
                 </button>
-                <p class="mt-0.5 truncate text-[11px] leading-[1.3] text-muted" :title="displayArtist">
+                <!-- 歌手：永远占一行，没有 ID3 就写「未知歌手」，不让这块空掉 -->
+                <p
+                  class="truncate text-[10px] leading-[1.25] text-muted sm:mt-0.5 sm:text-[11px]"
+                  :title="displayArtist"
+                >
                   {{ displayArtist }}
+                </p>
+                <!-- 窄屏没有内联歌词区，第三行补上歌词 / 「无歌词」占位 -->
+                <p
+                  class="truncate text-[10px] leading-[1.25] sm:hidden"
+                  :class="inlineLyricIsPlaceholder ? 'text-muted' : 'text-accent/80'"
+                  :title="inlineLyric"
+                >
+                  {{ inlineLyric }}
                 </p>
               </div>
             </div>
 
-            <!-- 内联歌词：一条竖线隔开曲目区，剩下的宽度全给当前歌词行 -->
-            <div class="flex h-6 min-w-0 flex-1 items-center overflow-hidden border-l border-line px-3">
-              <p class="w-full truncate text-[13px] font-medium leading-none text-accent">
-                {{ currentLyric }}
+            <!-- 内联歌词（参考稿 .lyrics-inline）：sm 起有竖线分隔，剩下的宽度全给它 -->
+            <div
+              class="hidden h-6 min-w-0 flex-1 items-center overflow-hidden border-l border-line pl-3 sm:flex"
+              data-testid="music-bar-lyric"
+            >
+              <p
+                class="w-full truncate text-[12px] font-medium leading-none lg:text-[13px]"
+                :class="inlineLyricIsPlaceholder ? 'text-muted' : 'text-accent'"
+                :title="inlineLyric"
+              >
+                {{ inlineLyric }}
               </p>
             </div>
 
-            <div class="flex shrink-0 items-center gap-2">
-              <!-- 音量：只有一根细轨（参考稿如此），拖到 0 即静音，窄屏收起走物理键 -->
+            <div class="flex shrink-0 items-center gap-0.5 sm:gap-1 lg:gap-2">
+              <!--
+                音量（参考稿 .vol-popup）：声音键 + 上方竖排滑条。
+                桌面上同时保留参考稿那根横向细轨（lg 起），窄屏只有这颗键。
+              -->
+              <div class="relative" data-testid="music-volume-wrap" @click.stop>
+                <button
+                  class="grid size-[26px] shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated lg:size-6"
+                  :class="volume.muted ? 'text-accent' : 'text-muted hover:text-ink'"
+                  :title="volumeTitle"
+                  data-testid="music-bar-volume"
+                  @click="toggleVolume"
+                >
+                  <AppIcon :name="volumeIcon" :size="15" />
+                </button>
+                <Transition name="fade">
+                  <div
+                    v-if="volOpen"
+                    class="absolute bottom-full left-1/2 mb-2 -translate-x-1/2 rounded-[18px] border border-line bg-panel p-0.5 shadow-2xl"
+                    data-testid="music-volume-popup"
+                  >
+                    <div class="grid h-24 w-9 place-items-center">
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        :value="volume.sliderValue"
+                        :title="t('gallery.player.volume')"
+                        class="music-range is-volume vol-vertical w-[72px]"
+                        :style="{ backgroundImage: volumeBackground }"
+                        data-testid="music-volume-slider"
+                        @input="onVolumeInput"
+                      />
+                    </div>
+                  </div>
+                </Transition>
+              </div>
+
+              <!-- 桌面横向音量细轨（参考稿 .vol-horizontal，lg 起才有位置放） -->
               <input
                 type="range"
                 min="0"
@@ -568,57 +589,60 @@ watch(
                 @input="onVolumeInput"
               />
 
-              <!-- 模式键：32px 方角描边（参考稿 .mode-btn），非列表循环时 accent 高亮 -->
+              <!-- 模式键：桌面 32px 方角描边（参考稿 .mode-btn），非列表循环时 accent 高亮 -->
               <button
-                class="grid size-8 shrink-0 place-items-center rounded-lg border transition-colors active:scale-90"
+                class="grid size-[26px] shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated lg:size-8 lg:rounded-lg lg:border lg:active:scale-90"
                 :class="
                   player.state.mode === 'loop'
-                    ? 'border-line text-muted hover:border-muted/40 hover:bg-elevated hover:text-ink'
-                    : 'border-accent bg-accent/10 text-accent'
+                    ? 'text-muted hover:text-ink lg:border-line lg:hover:border-muted/40'
+                    : 'text-accent lg:border-accent lg:bg-accent/10'
                 "
                 :title="modeLabel"
+                data-testid="music-bar-mode"
                 @click="cycleMode"
               >
-                <AppIcon :name="modeIcon" :size="16" />
+                <AppIcon :name="modeIcon" :size="15" />
               </button>
 
               <button
-                class="grid size-9 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
+                class="grid size-[26px] shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90 lg:size-9"
                 :title="t('gallery.player.prev')"
                 @click="player.prev()"
               >
                 <AppIcon name="prevSolid" :size="16" filled />
               </button>
               <button
-                class="grid size-11 shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-all hover:scale-105 hover:brightness-110 active:scale-95"
+                class="grid size-8 shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-all hover:scale-105 hover:brightness-110 active:scale-95 lg:size-11"
                 :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
                 data-testid="music-bar-play"
                 @click="player.toggle()"
               >
-                <AppIcon :name="playIcon" :size="17" filled />
+                <AppIcon :name="playIcon" :size="15" filled />
               </button>
               <button
-                class="grid size-9 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
+                class="grid size-[26px] shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90 lg:size-9"
                 :title="t('gallery.player.next')"
                 @click="player.next()"
               >
                 <AppIcon name="nextSolid" :size="16" filled />
               </button>
 
+              <!-- 歌单：参考稿没有这个入口，本项目保留（否则桌面端打不开播放列表） -->
               <button
-                class="grid size-8 shrink-0 place-items-center rounded-lg border transition-colors"
+                class="grid size-[26px] shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated lg:size-8 lg:rounded-lg lg:border lg:active:scale-90"
                 :class="
                   listOpen
-                    ? 'border-accent bg-accent/10 text-accent'
-                    : 'border-line text-muted hover:border-muted/40 hover:bg-elevated hover:text-ink'
+                    ? 'text-accent lg:border-accent lg:bg-accent/10'
+                    : 'text-muted hover:text-ink lg:border-line lg:hover:border-muted/40'
                 "
                 :title="t('gallery.player.playlist')"
+                data-testid="music-bar-playlist"
                 @click="toggleList"
               >
-                <AppIcon name="list" :size="16" />
+                <AppIcon name="list" :size="15" />
               </button>
               <button
-                class="grid size-8 shrink-0 place-items-center rounded-lg border border-line text-muted transition-colors hover:border-muted/40 hover:bg-elevated hover:text-ink"
+                class="grid size-7 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink lg:size-8 lg:rounded-lg lg:border lg:border-line lg:hover:border-muted/40"
                 :title="t('gallery.player.styleMinimal')"
                 data-testid="music-bar-minimize"
                 @click="switchStyle('minimal')"
@@ -645,8 +669,10 @@ watch(
       data-testid="music-bar-minimal"
     >
       <button
-        class="pointer-events-auto absolute -top-3.5 right-2 z-20 grid size-6 place-items-center rounded-full border border-line bg-panel text-muted opacity-0 shadow-sm transition-all hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white focus-visible:opacity-100 group-hover/mini:opacity-100 [@media(hover:none)]:opacity-100 [@media(hover:none)]:opacity-100"
-        :title="t('gallery.player.close')"
+        class="pointer-events-auto absolute -top-3.5 right-2 z-20 grid size-6 place-items-center rounded-full border border-line bg-panel text-muted opacity-0 shadow-sm transition-all focus-visible:opacity-100 group-hover/mini:opacity-100 [@media(hover:none)]:opacity-100"
+        :class="pinned ? 'cursor-not-allowed opacity-40' : 'hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white'"
+        :title="pinned ? t('gallery.player.pinnedHint') : t('gallery.player.close')"
+        :disabled="pinned"
         data-testid="music-bar-close"
         @click="closePlayer"
       >

@@ -64,6 +64,8 @@
     "close": "关闭播放条",
     "lyricsLoading": "歌词加载中…",
     "noLyrics": "未找到同目录 .lrc 歌词",
+    "noLyricText": "无歌词",
+    "unknownArtist": "未知歌手",
     "noTimeline": "歌词文件没有可用时间轴",
     "lyricsFailed": "歌词加载失败",
     "volume": "音量",
@@ -76,7 +78,10 @@
     "styleMinimal": "切换到右下角极简模式",
     "styleClassic": "恢复标准播放条",
     "progress": "播放进度",
-    "discHint": "单击播放/暂停，双击还原完整播放条"
+    "discHint": "单击播放/暂停，双击还原完整播放条",
+    "pin": "锁定常驻",
+    "unpin": "已锁定，点此解锁",
+    "pinnedHint": "已锁定常驻，先解锁才能关闭"
   },
   "video": {
     "unsupportedExt": "浏览器无法解码 .{ext} 视频，请转码为 mp4(H.264)，或在文件管理里下载后本地播放",

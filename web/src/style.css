@@ -337,6 +337,12 @@ body {
 .music-range.is-volume::-moz-range-thumb {
   transform: scale(1);
 }
+
+/* 竖排音量条（参考稿 .vol-vertical）：横向 72px 的轨道整体转 -90°，向上为变大 */
+.vol-vertical {
+  flex: 0 0 auto;
+  transform: rotate(-90deg);
+}
 .music-range::-moz-range-track {
   height: 4px;
   border-radius: 999px;
