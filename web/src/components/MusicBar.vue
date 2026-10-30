@@ -555,10 +555,10 @@ watch(
                 <Transition name="fade">
                   <div
                     v-if="volOpen"
-                    class="absolute bottom-full left-1/2 mb-2 -translate-x-1/2 rounded-[18px] border border-line bg-panel p-0.5 shadow-2xl"
+                    class="absolute bottom-full left-1/2 mb-1 h-24 w-9 -translate-x-1/2 rounded-[18px] border border-line bg-panel shadow-2xl"
                     data-testid="music-volume-popup"
                   >
-                    <div class="grid h-24 w-9 place-items-center">
+                    <div class="grid h-full w-full place-items-center">
                       <input
                         type="range"
                         min="0"
