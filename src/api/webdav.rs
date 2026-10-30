@@ -442,7 +442,7 @@ async fn virtual_root(
                 "<!doctype html><meta charset=\"utf-8\"><title>Asmoday WebDAV</title>\
 <style>body{font:15px/1.6 system-ui,sans-serif;margin:2.5rem auto;max-width:38rem;padding:0 1rem}\
 a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}li{margin:.35rem 0}</style>\
-<h1>Asmoday WebDAV</h1><p>把下面的地址添加为 WebDAV 服务器（用户名 = 令牌名，密码 = 令牌）。</p><ul>",
+<h1>Asmoday WebDAV</h1><p>把下面的地址添加为 WebDAV 服务器。账号 = 令牌名、密码 = asm_ 令牌（推荐，可只读/限定目录）；也可用管理员账号 + 登录密码直连（全量权限）。</p><ul>",
             );
             for mount in &set.mounts {
                 if access
@@ -513,6 +513,13 @@ pub async fn handle(
         );
     }
     let Some(access) = crate::api::tokens::verify_token(&state, &creds.username, &creds.token)
+        .or_else(|| {
+            // v4.4.0 回退：管理员账号（用户名 + 登录密码）直连。
+            // 解决「首次部署还没有任何令牌」的冷启动问题；放行 = 全量权限，
+            // 令牌的只读 / 挂载点范围 / 过期语义完全不受影响。
+            // 两种凭证都失败才计一次防爆破失败，池子口径不变。
+            crate::api::tokens::verify_admin_password(&state, &creds.username, &creds.token)
+        })
     else {
         state.dav_guard.record_failure(&guard_key);
         return unauthorized();

@@ -128,7 +128,7 @@ If this project helps you, please give it a ⭐️ Star!
 | GET/POST | `/api/config` | Read/write config |
 | GET/POST | `/api/auth/totp` | 2FA setup |
 | any | `/proxy/{id}/*` | Reverse proxy |
-| any | `/dav/<mount_id>/*` | WebDAV server (Token required) |
+| any | `/dav/<mount_id>/*` | WebDAV server (dedicated token, or admin account + login password) |
 | GET | `/api/system/backup` | Download a hot DB backup (requires a recent password check) |
 
 </details>

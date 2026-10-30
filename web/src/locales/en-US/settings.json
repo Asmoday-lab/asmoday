@@ -94,7 +94,7 @@
     "forgotBody2": "to get a one-time password, then change it after signing in.",
     "tokens": "WebDAV tokens",
     "davUrl": "Mount URL",
-    "davHint": "Copy the full URL above and connect with any WebDAV client. Use the token name below as the username and the matching asm_-prefixed token as the password. Read-only tokens can only browse and download.",
+    "davHint": "Copy the full URL above and connect with any WebDAV client. You can sign in with your admin account and its login password (full access), or with a token below (name as username, asm_-prefixed token as password — recommended: read-only, mount scoping and expiry). Read-only tokens can only browse and download.",
     "createToken": "Create token",
     "tokenName": "Name, e.g. PhotoSync",
     "readonly": "Read-only",

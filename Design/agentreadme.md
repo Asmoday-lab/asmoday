@@ -162,7 +162,7 @@ error.E_BUSY.action.cancel
 |---|---|---|
 | 浏览器 SPA 读写 | Cookie `asmoday_session` | 写操作要求 `Origin` 或 `Referer` 至少一个与 Host 同源，**两者均缺失直接 403 `E_FORBIDDEN`** |
 | Bearer Token | `Authorization: Bearer asm_...` | 豁免 Origin 校验 |
-| WebDAV | Basic Auth（`token_name:asm_xxx`） | 不适用 |
+| WebDAV | Basic Auth（`token_name:asm_xxx`，或管理员账号 + 登录密码直连，v4.4.0） | 不适用 |
 | 公开分享 | 分享 Cookie / URL token | 分享写操作（如 verify）按分享池限流 |
 
 ### 1.5 前端 store 与 composable 约定
@@ -1359,7 +1359,8 @@ GWT-TERM-09 Given PowerShell  When 启动  Then `-NoProfile` 可选，纯净模�
 - 协议由 `dav-server` 实现，本项目只做认证 + 挂载点路由 + 安全边界。
 - URL：`/dav/<mount_id>/<path>`；`/dav` 与 `/dav/` 虚拟根列出挂载点。
 - 路由用 `nest("/dav")` + `route("/dav/")`。
-- Basic Auth：`token_name` : `asm_xxx`。
+- Basic Auth：`token_name` : `asm_xxx`；校验失败回退管理员账号 + 登录密码（全量权限，
+  待改密 / 开 2FA 拒绝；Argon2 结果带进程内缓存，改密即时失效）。
 - `CleanFs` 装饰层：过滤 `.part` 与系统垃圾、修 Windows 错误映射。
 
 #### GWT 验收
