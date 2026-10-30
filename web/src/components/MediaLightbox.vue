@@ -198,7 +198,7 @@ useEventListener(window, 'keydown', onKey)
   <Teleport to="body">
     <div
       v-if="isOpen && item"
-      class="fixed inset-0 z-[80] flex flex-col bg-black/[0.97]"
+      class="fixed inset-0 z-[80] flex flex-col bg-[#08080a]"
       data-testid="media-lightbox"
       @click.self="closeLightbox()"
       @contextmenu.prevent="openMenu"
@@ -242,11 +242,14 @@ useEventListener(window, 'keydown', onKey)
 
         <!-- 图片：缩略图打底 → 原图淡入（设计文档 3.4.4 渐进式加载，严禁黑屏） -->
         <template v-if="item.kind === 'image'">
-          <!-- 打底层：用已经缓存过的缩略图铺满舞台（模糊处理），点击瞬间就有画面 -->
+          <!-- 打底层：用缓存过的缩略图占位，原图就绪后**完全淡出**。
+               `object-scale-down` 而非 `contain`：小图不会被放大成比原图大一圈的
+               模糊块（contain 会把盒子撑满并放大内容），两者严格重合，撤下时无残影。 -->
           <img
             v-if="!failed.has(item.path)"
             :src="thumbUrl(item.path, 960)"
-            class="pointer-events-none absolute inset-0 z-0 m-auto max-h-full max-w-full object-contain opacity-70 blur-md"
+            class="pointer-events-none absolute inset-0 z-0 m-auto max-h-full max-w-full rounded-lg object-scale-down transition-opacity duration-300"
+            :class="ready === item.path ? 'opacity-0' : 'opacity-100'"
             aria-hidden="true"
             alt=""
           />

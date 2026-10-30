@@ -474,7 +474,11 @@ fn render_thumbnail(path: &Path, width: u32) -> Option<(image::RgbaImage, Vec<u8
         small.as_raw(),
     );
 
-    Some((image.thumbnail(width, width).to_rgba8(), hash))
+    // 不放大：`thumbnail` 是等比缩放，请求尺寸比原图大时会真的把小图拉大
+    // （340×475 的图请求 960 会得到 687×960）。灯箱用缩略图做加载占位，
+    // 放大后的占位比原图大一圈，撤下时会露出边——按原图长边封顶即可。
+    let bound = width.min(image.width().max(image.height()));
+    Some((image.thumbnail(bound, bound).to_rgba8(), hash))
 }
 
 /// 编码缩略图：WebP 优先（外部 FFmpeg 的 libwebp），不可用则内置 JPEG。
@@ -759,6 +763,31 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 请求尺寸大于原图时不得放大：灯箱拿缩略图做加载占位，
+    /// 放大版会比原图大一圈，原图淡入后撤下会露出边框。
+    #[test]
+    fn thumbnail_never_upscales() {
+        let dir = scratch_dir("thumb-noup");
+        let small = dir.join("small.png");
+        image::RgbaImage::from_pixel(34, 47, image::Rgba([10, 20, 30, 255]))
+            .save(&small)
+            .unwrap();
+        let (thumb, _) = render_thumbnail(&small, 960).unwrap();
+        assert_eq!(
+            (thumb.width(), thumb.height()),
+            (34, 47),
+            "比请求尺寸小的图必须原样返回"
+        );
+
+        // 大图照旧等比缩到请求宽度
+        let big = dir.join("big.png");
+        image::RgbaImage::from_pixel(1200, 800, image::Rgba([1, 2, 3, 255]))
+            .save(&big)
+            .unwrap();
+        let (scaled, _) = render_thumbnail(&big, 240).unwrap();
+        assert_eq!((scaled.width(), scaled.height()), (240, 160));
     }
 
     /// 带透明通道的 PNG 也要能落到 JPEG（JPEG 无 alpha，必须先降为 RGB）
