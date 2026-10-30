@@ -17,11 +17,11 @@ jobs:
   prepare-frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -34,7 +34,7 @@ jobs:
           pnpm run build
 
       - name: Upload frontend dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           # 你的 Vite 输出在项目根目录的 dist
@@ -64,10 +64,10 @@ jobs:
             target: x86_64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Download frontend dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           # 下载到项目根目录的 dist，供 rust-embed 吸收
@@ -122,7 +122,7 @@ jobs:
           Compress-Archive -Path $DIR -DestinationPath "$DIR.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -140,7 +140,7 @@ jobs:
     runs-on: macos-13
     steps:
       - name: Download Mac Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: '*-apple-darwin'
           merge-multiple: false
@@ -165,7 +165,7 @@ jobs:
           tar czf "${DIR}.tar.gz" "$DIR"
 
       - name: Upload Universal Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           path: asmoday-macos-universal.tar.gz
@@ -181,7 +181,7 @@ jobs:
     steps:
       # 1. 将刚才所有构建产物拉下来
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
 
@@ -197,7 +197,7 @@ jobs:
 
       # 3. 发布
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: final_release/*
           generate_release_notes: true
