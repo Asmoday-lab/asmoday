@@ -26,11 +26,24 @@ const submitting = ref(false)
 
 const isSetup = computed(() => !authApi.initialized.value)
 
+// 内联校验提示：只在用户已输入内容且不满足规则时出现，避免一进页面就满屏红字
+const usernameShort = computed(
+  () => username.value.trim().length > 0 && username.value.trim().length < 2,
+)
+const passwordShort = computed(() => password.value.length > 0 && password.value.length < 8)
+const passwordDigits = computed(
+  () => password.value.length >= 8 && /^\d+$/.test(password.value),
+)
+const confirmMismatch = computed(
+  () => confirm.value.length > 0 && password.value !== confirm.value,
+)
+
 const canSubmit = computed(() => {
   if (isSetup.value) {
     return (
       username.value.trim().length >= 2 &&
       password.value.length >= 8 &&
+      !/^\d+$/.test(password.value) &&
       password.value === confirm.value &&
       !submitting.value
     )
@@ -118,6 +131,9 @@ function changeLocale(event: Event) {
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             placeholder="admin"
           />
+          <span v-if="isSetup && usernameShort" class="mt-1 block text-[11px] fg-danger">
+            {{ t('auth.login.usernameShort') }}
+          </span>
         </label>
 
         <label class="block">
@@ -129,6 +145,12 @@ function changeLocale(event: Event) {
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             :placeholder="isSetup ? t('auth.login.passwordPlaceholder') : '••••••••'"
           />
+          <span
+            v-if="isSetup && (passwordShort || passwordDigits)"
+            class="mt-1 block text-[11px] fg-danger"
+          >
+            {{ passwordShort ? t('auth.login.passwordShort') : t('auth.login.passwordDigits') }}
+          </span>
         </label>
 
         <label v-if="isSetup" class="block">
@@ -140,6 +162,9 @@ function changeLocale(event: Event) {
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             :placeholder="t('auth.login.confirmPlaceholder')"
           />
+          <span v-if="confirmMismatch" class="mt-1 block text-[11px] fg-danger">
+            {{ t('auth.login.confirmMismatch') }}
+          </span>
         </label>
 
         <template v-if="!isSetup">
