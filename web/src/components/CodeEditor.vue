@@ -35,6 +35,8 @@ const props = defineProps<{
   content: string
   language: LanguageKey
   dark: boolean
+  /** 正文字号（px）。整屏编辑器让用户自己调，小屏默认 13、桌面默认 14 */
+  fontSize?: number
 }>()
 
 const emit = defineEmits<{
@@ -48,6 +50,7 @@ let view: EditorView | null = null
 let syncing = false
 const languageSlot = new Compartment()
 const themeSlot = new Compartment()
+const fontSlot = new Compartment()
 
 /**
  * CSV / TSV 没有官方语法包：给一个极简 tokenizer 就够用（引号串 + 单元格）。
@@ -168,6 +171,23 @@ async function resolveLanguage(key: LanguageKey): Promise<Extension> {
   }
 }
 
+function currentFontSize(): number {
+  const size = props.fontSize ?? 14
+  return Number.isFinite(size) ? Math.min(24, Math.max(10, Math.round(size))) : 14
+}
+
+/**
+ * 字号单独成段：顶栏的 A−/A+ 只重配这个 compartment，
+ * 编辑器实例本身不重建（撤销栈、滚动位置、光标都保住）。
+ */
+function fontTheme(): Extension {
+  const size = currentFontSize()
+  return EditorView.theme({
+    '&': { height: '100%', fontSize: `${size}px` },
+    '.cm-gutters': { fontSize: `${Math.max(10, size - 1)}px` },
+  })
+}
+
 function baseExtensions(): Extension[] {
   return [
     lineNumbers(),
@@ -199,11 +219,9 @@ function baseExtensions(): Extension[] {
       emit('change', update.state.doc.toString())
     }),
     EditorView.theme({
-      // 源码模式字号 14px（13px 在 1080p 上偏小，用户反馈看不清）
-      '&': { height: '100%', fontSize: '14px' },
+      // 字号见 fontTheme()：源码模式 14px 起步（13px 在 1080p 上偏小，用户反馈看不清）
       '.cm-scroller': { fontFamily: 'var(--font-app-mono)', lineHeight: '1.7' },
       '.cm-content': { padding: '14px 0' },
-      '.cm-gutters': { fontSize: '13px' },
     }),
   ]
 }
@@ -220,6 +238,7 @@ async function mountEditor() {
         ...baseExtensions(),
         languageSlot.of(language),
         themeSlot.of(props.dark ? oneDark : []),
+        fontSlot.of(fontTheme()),
       ],
     }),
   })
@@ -261,6 +280,14 @@ watch(
   () => props.dark,
   (next) => {
     view?.dispatch({ effects: themeSlot.reconfigure(next ? oneDark : []) })
+  },
+)
+
+// 顶栏改字号：只重配字号段，不重建实例
+watch(
+  () => props.fontSize,
+  () => {
+    view?.dispatch({ effects: fontSlot.reconfigure(fontTheme()) })
   },
 )
 

@@ -44,6 +44,7 @@ import { formatSize, formatTime } from '../lib/format'
 import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
+import { useKeyboardInset } from '../composables/useKeyboardInset'
 import { openLightbox, type LightboxItem } from '../stores/lightbox'
 import { openShare, shareTarget } from '../stores/share'
 
@@ -811,7 +812,7 @@ async function confirmDelete() {
     await filesApi.remove(paths, confirmName)
     deleteTargets.value = []
     for (const entry of targets) {
-      if (editor.value?.path === entry.path) closeEditor()
+      if (editor.value?.path === entry.path) forceCloseEditor()
       if (selected.value === entry.path) selected.value = null
     }
     exitSelect()
@@ -1284,6 +1285,72 @@ const metaMenu = ref(false)
 const preview = ref<EntryInfo | null>(null)
 const editorLoading = ref(false)
 const toast = ref('')
+/** 整屏编辑器根节点：手机软键盘弹出时靠它算出要让位的高度 */
+const editorShell = ref<HTMLElement | null>(null)
+
+/**
+ * 正文字号（px）：编辑器是整屏的，字号是用户自己的抬头习惯，存本地。
+ * 桌面 14 起步，窄屏 13（手机上 14 一行放不下多少字符）。
+ */
+const FONT_MIN = 11
+const FONT_MAX = 20
+const FONT_KEY = 'asmoday.editor.fontSize'
+const fontSize = ref(readFontSize())
+
+function readFontSize(): number {
+  const fallback = typeof window !== 'undefined' && window.innerWidth < 640 ? 13 : 14
+  try {
+    const raw = Number(localStorage.getItem(FONT_KEY))
+    if (Number.isFinite(raw) && raw >= FONT_MIN && raw <= FONT_MAX) return raw
+  } catch {
+    /* 隐私模式下 localStorage 可能不可用，用默认值即可 */
+  }
+  return fallback
+}
+
+/**
+ * 软键盘遮挡高度。整屏编辑器在手机上会被键盘盖掉底栏和光标附近的行：
+ * 把遮挡高度补成根容器的 padding-bottom，整块内容顶到键盘上方（收起自动归零）。
+ */
+const editorKbInset = useKeyboardInset(editorShell)
+
+function stepFont(delta: number) {
+  const next = Math.min(FONT_MAX, Math.max(FONT_MIN, fontSize.value + delta))
+  if (next === fontSize.value) return
+  fontSize.value = next
+  try {
+    localStorage.setItem(FONT_KEY, String(next))
+  } catch {
+    /* 存不下就算了，本次会话仍然生效 */
+  }
+}
+
+/**
+ * 未保存修改的关闭确认（取消 / 保存更改 / 放弃）。
+ *
+ * 不再用原生 `window.confirm`：它只有两态，用户想「存一下就关」还得先取消、
+ * 再点保存、再关一次；而且原生弹窗在移动端样式完全不受控。
+ * 弹层本身是 Promise，调用方 `await` 结果决定后续动作。
+ */
+const closePrompt = ref(false)
+let closeAnswer: ((choice: 'cancel' | 'discard' | 'save') => void) | null = null
+
+function askUnsaved(): Promise<'cancel' | 'discard' | 'save'> {
+  // 已经有一层在问：当成取消，绝不叠两个弹窗
+  if (closePrompt.value) return Promise.resolve('cancel')
+  closePrompt.value = true
+  metaMenu.value = false
+  return new Promise((resolve) => {
+    closeAnswer = resolve
+  })
+}
+
+function answerClose(choice: 'cancel' | 'discard' | 'save') {
+  closePrompt.value = false
+  const resolve = closeAnswer
+  closeAnswer = null
+  resolve?.(choice)
+}
 
 const entries = computed(() => listing.value?.entries ?? [])
 const total = computed(() => listing.value?.total ?? 0)
@@ -1353,6 +1420,41 @@ const crumbs = computed(() => {
     // Windows 盘符（C:）后面必须紧跟斜杠，否则会被解析成「当前盘符相对路径」
     acc = acc ? `${acc}/${part}` : part.endsWith(':') ? `${part}/` : part
     result.push({ label: part, path: acc })
+  }
+  return result
+})
+
+/**
+ * 编辑器路径行：挂载点名 + 相对目录 + 文件名。
+ *
+ * 与列表面包屑同源同口径——界面上绝不摊开真实盘符路径，
+ * 也绝不因为路径长就把文件名挤掉（路径行本身可横向滚动）。
+ */
+const editorCrumbs = computed(() => {
+  const state = editor.value
+  if (!state) return [] as { label: string }[]
+  const normalized = state.path.replace(/\\/g, '/')
+
+  let matched: MountPoint | null = null
+  let matchedPrefix = ''
+  for (const root of roots.value) {
+    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (
+      prefix &&
+      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
+      prefix.length > matchedPrefix.length
+    ) {
+      matched = root
+      matchedPrefix = prefix
+    }
+  }
+
+  // 不在任何挂载点下（理论上不会发生）：只显示文件名，绝不退化成真实路径
+  if (!matched) return [{ label: state.name }]
+
+  const result: { label: string }[] = [{ label: matched.name }]
+  for (const part of normalized.slice(matchedPrefix.length).split('/').filter(Boolean)) {
+    result.push({ label: part })
   }
   return result
 })
@@ -1443,7 +1545,7 @@ async function openRoot(root: MountPoint, options: { push?: boolean } = {}) {
     return
   }
   // 有未保存修改时用户可能选「取消」：那就别换目录了，不然还得再问一次
-  if (editor.value && !closeEditor()) return
+  if (editor.value && !(await closeEditor())) return
   activeMount.value = root
   await open(root.path, 1, { push: options.push })
 }
@@ -1454,11 +1556,11 @@ function enterRoot(root: MountPoint) {
 }
 
 /** 面包屑首段：多挂载点回卡片页，单挂载点回该挂载点根目录 */
-function goHome() {
+async function goHome() {
   const home = activeMount.value ?? (singleMount.value ? onlineMounts.value[0] : null)
   if (singleMount.value && home) {
     if (currentPath.value !== home.path) {
-      if (editor.value && !closeEditor()) return
+      if (editor.value && !(await closeEditor())) return
       preview.value = null
       void open(home.path)
       return
@@ -1466,7 +1568,7 @@ function goHome() {
     // 已在挂载点根：按文档 3.2.1 单挂载点语义「点第一级回根」，原地不动
     return
   }
-  if (editor.value) closeEditor()
+  if (editor.value && !(await closeEditor())) return
   preview.value = null
   currentPath.value = ''
   listing.value = null
@@ -1689,7 +1791,7 @@ async function activate(entry: EntryInfo) {
 
   // Markdown / CSV / PDF：只读预览面板
   if (PREVIEW_EXTS.has(ext)) {
-    if (editor.value && !closeEditor()) return
+    if (editor.value && !(await closeEditor())) return
     preview.value = entry
     return
   }
@@ -1701,7 +1803,7 @@ async function activate(entry: EntryInfo) {
   }
 
   // Office / CAD / 压缩包 / 未知二进制：不引入解析库，只提示下载
-  if (editor.value && !closeEditor()) return
+  if (editor.value && !(await closeEditor())) return
   preview.value = entry
 }
 
@@ -1809,9 +1911,9 @@ function convertToUtf8() {
   state.encoding = 'utf-8'
 }
 
-async function saveEditor() {
+async function saveEditor(): Promise<boolean> {
   const state = editor.value
-  if (!state || state.saving) return
+  if (!state || state.saving) return false
   state.saving = true
   state.error = null
   try {
@@ -1834,18 +1936,37 @@ async function saveEditor() {
       const data = await filesApi.list(currentPath.value, 1, showHidden.value, sortKey.value, sortDir.value)
       listing.value = { ...data, entries: [...data.entries] }
     }
+    return true
   } catch (err) {
     state.error = describe(err).message
+    return false
   } finally {
     state.saving = false
   }
 }
 
-/** 关闭编辑器。@returns 是否真的关掉了（有未保存修改时用户可能点「取消」） */
-function closeEditor(): boolean {
-  if (dirty.value && !window.confirm(t('files.editor.confirmClose'))) return false
+/** 无条件关掉编辑器（文件被删掉、被改名这类场景，问也没意义） */
+function forceCloseEditor() {
   editor.value = null
   editorLoading.value = false
+  metaMenu.value = false
+  if (closePrompt.value) answerClose('discard')
+}
+
+/**
+ * 关闭编辑器。@returns 是否真的关掉了（有未保存修改时用户可能点「取消」，
+ * 也可能选「保存更改」但保存失败——那都不该继续后面的换目录/开预览）
+ */
+async function closeEditor(): Promise<boolean> {
+  if (!editor.value) return true
+  if (!dirty.value) {
+    forceCloseEditor()
+    return true
+  }
+  const choice = await askUnsaved()
+  if (choice === 'cancel') return false
+  if (choice === 'save' && !(await saveEditor())) return false
+  forceCloseEditor()
   return true
 }
 
@@ -2001,6 +2122,7 @@ function anyOverlayOpen(): boolean {
       resultDialog.value ||
       statDialog.value ||
       bulkDownloadConfirm.value ||
+      closePrompt.value ||
       preview.value ||
       editor.value,
   )
@@ -2008,6 +2130,10 @@ function anyOverlayOpen(): boolean {
 
 /** Esc 的关闭顺序：先关最上面那层，再退多选，最后取消高亮 */
 function closeTopLayer(): boolean {
+  if (closePrompt.value) {
+    answerClose('cancel')
+    return true
+  }
   if (menu.value) {
     menu.value = null
     return true
@@ -2063,7 +2189,17 @@ function closeTopLayer(): boolean {
  * 不能顺手把编辑器关掉。预览面板同理。
  */
 function closeOverlayForBack(): boolean {
-  if (editor.value) return closeEditor()
+  // 确认弹窗本身也是一层：返回键等于「取消」，不然会越关越乱
+  if (closePrompt.value) {
+    answerClose('cancel')
+    return true
+  }
+  // closeEditor 是异步的（可能要用户选保存），这里只负责发起；
+  // 浮层是否留下由 useBackClose 在下一轮 tick 重新判定并补哨兵
+  if (editor.value) {
+    void closeEditor()
+    return true
+  }
   if (preview.value) {
     preview.value = null
     return true
@@ -2080,9 +2216,12 @@ useBackClose(computed(anyOverlayOpen), closeOverlayForBack)
  * 只问不改状态：确认后由路由自己把组件卸掉，别在这里 closeEditor()，
  * 否则组件还没卸载就先触发一次多余的响应式更新。
  */
-onBeforeRouteLeave(() => {
+onBeforeRouteLeave(async () => {
   if (!editor.value || !dirty.value) return true
-  return window.confirm(t('files.editor.confirmClose'))
+  const choice = await askUnsaved()
+  if (choice === 'cancel') return false
+  if (choice === 'save' && !(await saveEditor())) return false
+  return true
 })
 
 async function onKeydown(event: KeyboardEvent) {
@@ -2305,138 +2444,273 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 右栏：编辑器 或 列表 -->
-    <div v-if="editor" class="flex min-w-0 flex-1 flex-col">
-      <header class="flex h-11 shrink-0 items-center gap-3 border-b border-line bg-panel px-3">
-        <button
-          class="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
-          @click="closeEditor"
-        >
-          <AppIcon name="arrowLeft" :size="14" />
-          {{ t('files.editor.back') }}
-        </button>
-        <p class="min-w-0 flex-1 truncate text-[14px] text-ink">
-          {{ editor.name }}
-          <span
-            v-if="dirty"
-            class="text-accent"
-            :title="t('files.editor.unsaved')"
-            data-testid="editor-dirty"
-            >●</span
-          >
-        </p>
-        <select
-          v-model="editor.language"
-          class="rounded-md border border-line bg-elevated px-1.5 py-1 text-xs text-ink outline-none focus:border-accent"
-          :title="t('files.editor.switchLanguage')"
-        >
-          <option v-for="option in LANGUAGES" :key="option.key" :value="option.key">
-            {{ option.key === 'plain' ? t('files.language.plain') : option.label }}
-          </option>
-        </select>
-        <button
-          class="flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          :disabled="editor.saving"
-          @click="saveEditor"
-        >
-          <AppIcon name="save" :size="13" />
-          {{ editor.saving ? t('files.editor.saving') : t('files.editor.save') }}
-          <kbd class="ml-1 rounded bg-black/25 px-1 text-[11px]">Ctrl+S</kbd>
-        </button>
-      </header>
-
-      <p
-        v-if="editor.error"
-        class="border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs fg-danger"
+    <!--
+      编辑器：整屏接管（参考 FileBrowser 的编辑页，样式全用本站的）。
+      Teleport 到 body 是刻意的——文件页在 #app-scroll 里，且路由过渡期祖先带 transform，
+      fixed 会被当成相对祖先定位而错位；挂到 body 上才是真的「铺满浏览器」。
+      列表不卸载：关掉编辑器立刻回到原来的目录与滚动位置，不重新拉一遍。
+    -->
+    <Teleport to="body">
+      <div
+        v-if="editor"
+        ref="editorShell"
+        class="fixed inset-0 z-[70] flex flex-col bg-canvas text-ink"
+        :style="editorKbInset ? { paddingBottom: `${editorKbInset}px` } : undefined"
+        data-testid="editor-fullscreen"
       >
-        {{ editor.error }}
-      </p>
+        <header
+          class="flex min-h-12 shrink-0 items-center gap-1.5 border-b border-line bg-panel px-2 sm:gap-3 sm:px-3"
+          style="padding-top: env(safe-area-inset-top, 0px)"
+        >
+          <button
+            type="button"
+            class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+            :title="t('files.editor.close')"
+            data-testid="editor-close"
+            @click="closeEditor"
+          >
+            <AppIcon name="close" :size="16" />
+          </button>
 
-      <div class="relative min-h-0 flex-1">
-        <div v-if="editorLoading" class="absolute inset-0 z-10 grid place-items-center bg-panel">
-          <div class="w-2/3 space-y-2">
-            <div v-for="i in 6" :key="i" class="skeleton h-3 rounded" :style="{ width: `${95 - i * 9}%` }" />
+          <p class="min-w-0 flex-1 truncate text-[14px] text-ink" :title="editor.name">
+            {{ editor.name }}<span
+              v-if="dirty"
+              class="ml-1 text-accent"
+              :title="t('files.editor.unsaved')"
+              data-testid="editor-dirty"
+              >●</span
+            >
+          </p>
+
+          <!-- 字号步进器（FileBrowser 的「+ 14px −」）：中间那格按一下回默认值 -->
+          <div
+            class="hidden shrink-0 items-center overflow-hidden rounded-md border border-line bg-elevated sm:flex"
+            data-testid="editor-font"
+          >
+            <button
+              type="button"
+              class="grid size-7 place-items-center text-muted transition-colors hover:text-ink disabled:opacity-30 disabled:hover:text-muted"
+              :disabled="fontSize <= FONT_MIN"
+              :title="t('files.editor.fontSmaller')"
+              @click="stepFont(-1)"
+            >
+              <AppIcon name="minus" :size="12" />
+            </button>
+            <button
+              type="button"
+              class="h-7 w-12 border-x border-line text-center font-mono text-[11px] text-muted transition-colors hover:bg-panel hover:text-ink"
+              :title="t('files.editor.fontReset')"
+              @click="stepFont(14 - fontSize)"
+            >
+              {{ fontSize }}px
+            </button>
+            <button
+              type="button"
+              class="grid size-7 place-items-center text-muted transition-colors hover:text-ink disabled:opacity-30 disabled:hover:text-muted"
+              :disabled="fontSize >= FONT_MAX"
+              :title="t('files.editor.fontLarger')"
+              @click="stepFont(1)"
+            >
+              <AppIcon name="plus" :size="12" />
+            </button>
+          </div>
+
+          <select
+            v-model="editor.language"
+            class="w-[86px] shrink-0 rounded-md border border-line bg-elevated px-1.5 py-1 text-xs text-ink outline-none focus:border-accent sm:w-auto sm:max-w-[130px]"
+            :title="t('files.editor.switchLanguage')"
+            data-testid="editor-language"
+          >
+            <option v-for="option in LANGUAGES" :key="option.key" :value="option.key">
+              {{ option.key === 'plain' ? t('files.language.plain') : option.label }}
+            </option>
+          </select>
+
+          <button
+            type="button"
+            class="flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            :disabled="editor.saving"
+            data-testid="editor-save"
+            @click="saveEditor"
+          >
+            <AppIcon name="save" :size="13" />
+            <span class="hidden sm:inline">
+              {{ editor.saving ? t('files.editor.saving') : t('files.editor.save') }}
+            </span>
+            <kbd class="ml-1 hidden rounded bg-black/25 px-1 text-[11px] md:inline">Ctrl+S</kbd>
+          </button>
+        </header>
+
+        <!-- 路径行：虚拟路径（挂载点名 › 目录 › 文件名），长路径横向滚动也不挤掉文件名 -->
+        <nav
+          class="flex h-7 shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-panel/60 px-2 text-[11px] text-muted sm:px-3"
+          data-testid="editor-path"
+        >
+          <AppIcon name="folder" :size="11" class="shrink-0 opacity-60" />
+          <template v-for="(crumb, index) in editorCrumbs" :key="`${index}-${crumb.label}`">
+            <AppIcon
+              v-if="index > 0"
+              name="chevronRight"
+              :size="10"
+              class="shrink-0 opacity-40"
+            />
+            <span
+              class="max-w-[220px] shrink-0 truncate"
+              :class="index === editorCrumbs.length - 1 ? 'text-ink' : ''"
+              :title="crumb.label"
+            >
+              {{ crumb.label }}
+            </span>
+          </template>
+        </nav>
+
+        <p
+          v-if="editor.error"
+          class="shrink-0 border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs fg-danger"
+        >
+          {{ editor.error }}
+        </p>
+
+        <div class="relative min-h-0 flex-1">
+          <div v-if="editorLoading" class="absolute inset-0 z-10 grid place-items-center bg-panel">
+            <div class="w-2/3 space-y-2">
+              <div
+                v-for="i in 6"
+                :key="i"
+                class="skeleton h-3 rounded"
+                :style="{ width: `${95 - i * 9}%` }"
+              />
+            </div>
+          </div>
+          <CodeEditor
+            :content="editor.content"
+            :language="editor.language"
+            :dark="isDark"
+            :font-size="fontSize"
+            @change="onEditorChange"
+            @save="saveEditor"
+          />
+        </div>
+
+        <!-- 状态栏：编码 + 换行符（设计文档 3.2.2.1），点击可手动转换 -->
+        <footer
+          class="relative flex min-h-8 shrink-0 items-center gap-2 border-t border-line bg-panel px-2 text-[11px] text-muted"
+          style="padding-bottom: env(safe-area-inset-bottom, 0px)"
+        >
+          <button
+            type="button"
+            class="flex items-center gap-1.5 rounded-md px-1.5 py-0.5 transition-colors hover:bg-elevated hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
+            :title="t('files.editor.meta.toggle')"
+            :disabled="editor.readonly"
+            @click="metaMenu = !metaMenu"
+          >
+            <span class="font-mono">{{ encodingLabel(editor.encoding) }}</span>
+            <span class="opacity-40">·</span>
+            <span class="font-mono">{{ eolLabel(editor.eol) }}</span>
+            <span
+              v-if="editor.hasBom"
+              class="rounded bg-elevated px-1 text-[10px] tracking-wide"
+              :title="t('files.editor.meta.bomHint')"
+            >
+              BOM
+            </span>
+          </button>
+          <span v-if="editor.mixedEol" class="fg-warn">
+            {{ t('files.editor.meta.mixed', { eol: eolLabel(editor.eol) }) }}
+          </span>
+          <span v-if="editor.readonly" class="ml-auto">{{ t('files.editor.meta.readonly') }}</span>
+
+          <div v-if="metaMenu" class="fixed inset-0 z-30" @click="metaMenu = false" />
+          <div
+            v-if="metaMenu"
+            class="absolute bottom-full left-2 z-40 mb-1 w-56 overflow-hidden rounded-lg border border-line bg-elevated py-1 shadow-xl"
+          >
+            <p class="px-2.5 py-1 text-[10px] tracking-wide text-muted uppercase">
+              {{ t('files.editor.meta.eol') }}
+            </p>
+            <button
+              v-for="option in EOL_OPTIONS"
+              :key="option.value"
+              type="button"
+              class="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-panel"
+              :class="editor.eol === option.value ? 'text-accent' : 'text-ink'"
+              @click="pickEol(option.value)"
+            >
+              <span class="font-mono">{{ option.label }}</span>
+              <span class="text-[10px] text-muted">{{ option.hint }}</span>
+            </button>
+            <div class="my-1 border-t border-line" />
+            <p class="px-2.5 py-1 text-[10px] tracking-wide text-muted uppercase">
+              {{ t('files.editor.meta.encoding') }}
+            </p>
+            <button
+              v-if="editor.encoding !== 'utf-8'"
+              type="button"
+              class="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs text-ink transition-colors hover:bg-panel"
+              @click="convertToUtf8"
+            >
+              <span>{{ t('files.editor.meta.toUtf8') }}</span>
+              <span class="text-[10px] text-muted">UTF-8</span>
+            </button>
+            <p v-else class="flex items-center justify-between px-2.5 py-1.5 text-xs text-muted">
+              <span class="font-mono">UTF-8</span>
+              <span class="text-accent">✓</span>
+            </p>
+          </div>
+        </footer>
+      </div>
+    </Teleport>
+
+    <!--
+      未保存修改的关闭确认：取消 / 保存更改 / 放弃修改。
+      取代原来的原生 confirm —— 原生只有两态，想「存一下就关」得先取消再存再关。
+    -->
+    <Teleport to="body">
+      <div
+        v-if="closePrompt"
+        class="fixed inset-0 z-[75] grid place-items-center bg-black/50 p-4"
+        @click.self="answerClose('cancel')"
+      >
+        <div
+          class="w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl"
+          data-testid="editor-unsaved"
+        >
+          <p class="text-sm font-medium text-ink">{{ t('files.editor.confirmCloseTitle') }}</p>
+          <p class="mt-2 truncate text-[12px] text-muted">{{ editor?.name }}</p>
+          <p class="mt-1 text-[12px] text-muted">{{ t('files.editor.confirmCloseHint') }}</p>
+          <div class="mt-4 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              class="rounded-md px-3 py-1.5 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
+              data-testid="editor-cancel-close"
+              @click="answerClose('cancel')"
+            >
+              {{ t('common.action.cancel') }}
+            </button>
+            <button
+              type="button"
+              class="rounded-md bg-accent px-3 py-1.5 text-xs text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+              :disabled="editor?.saving"
+              data-testid="editor-save-and-close"
+              @click="answerClose('save')"
+            >
+              {{ t('files.editor.saveClose') }}
+            </button>
+            <button
+              type="button"
+              class="rounded-md px-3 py-1.5 text-xs fg-danger transition-colors hover:bg-red-500/10"
+              data-testid="editor-discard"
+              @click="answerClose('discard')"
+            >
+              {{ t('files.editor.discard') }}
+            </button>
           </div>
         </div>
-        <CodeEditor
-          :content="editor.content"
-          :language="editor.language"
-          :dark="isDark"
-          @change="onEditorChange"
-          @save="saveEditor"
-        />
       </div>
-
-      <!-- 状态栏：编码 + 换行符（设计文档 3.2.2.1），点击可手动转换 -->
-      <footer
-        class="relative flex h-8 shrink-0 items-center gap-2 border-t border-line bg-panel px-2 text-[11px] text-muted"
-      >
-        <button
-          type="button"
-          class="flex items-center gap-1.5 rounded-md px-1.5 py-0.5 transition-colors hover:bg-elevated hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
-          :title="t('files.editor.meta.toggle')"
-          :disabled="editor.readonly"
-          @click="metaMenu = !metaMenu"
-        >
-          <span class="font-mono">{{ encodingLabel(editor.encoding) }}</span>
-          <span class="opacity-40">·</span>
-          <span class="font-mono">{{ eolLabel(editor.eol) }}</span>
-          <span
-            v-if="editor.hasBom"
-            class="rounded bg-elevated px-1 text-[10px] tracking-wide"
-            :title="t('files.editor.meta.bomHint')"
-          >
-            BOM
-          </span>
-        </button>
-        <span v-if="editor.mixedEol" class="fg-warn">
-          {{ t('files.editor.meta.mixed', { eol: eolLabel(editor.eol) }) }}
-        </span>
-        <span v-if="editor.readonly" class="ml-auto">{{ t('files.editor.meta.readonly') }}</span>
-
-        <div v-if="metaMenu" class="fixed inset-0 z-30" @click="metaMenu = false" />
-        <div
-          v-if="metaMenu"
-          class="absolute bottom-full left-2 z-40 mb-1 w-56 overflow-hidden rounded-lg border border-line bg-elevated py-1 shadow-xl"
-        >
-          <p class="px-2.5 py-1 text-[10px] tracking-wide text-muted uppercase">
-            {{ t('files.editor.meta.eol') }}
-          </p>
-          <button
-            v-for="option in EOL_OPTIONS"
-            :key="option.value"
-            type="button"
-            class="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-panel"
-            :class="editor.eol === option.value ? 'text-accent' : 'text-ink'"
-            @click="pickEol(option.value)"
-          >
-            <span class="font-mono">{{ option.label }}</span>
-            <span class="text-[10px] text-muted">{{ option.hint }}</span>
-          </button>
-          <div class="my-1 border-t border-line" />
-          <p class="px-2.5 py-1 text-[10px] tracking-wide text-muted uppercase">
-            {{ t('files.editor.meta.encoding') }}
-          </p>
-          <button
-            v-if="editor.encoding !== 'utf-8'"
-            type="button"
-            class="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs text-ink transition-colors hover:bg-panel"
-            @click="convertToUtf8"
-          >
-            <span>{{ t('files.editor.meta.toUtf8') }}</span>
-            <span class="text-[10px] text-muted">UTF-8</span>
-          </button>
-          <p v-else class="flex items-center justify-between px-2.5 py-1.5 text-xs text-muted">
-            <span class="font-mono">UTF-8</span>
-            <span class="text-accent">✓</span>
-          </p>
-        </div>
-      </footer>
-    </div>
-
+    </Teleport>
     <!-- 中栏：只读预览（Markdown / CSV / PDF / 不支持格式） -->
     <FilePreviewPane
-      v-else-if="preview"
+      v-if="preview"
       :key="preview.path"
       :entry="preview"
       @close="closePreview"
