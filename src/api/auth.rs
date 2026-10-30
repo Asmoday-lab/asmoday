@@ -29,8 +29,6 @@ pub struct AuthUser {
     pub username: String,
     /// 是否还是一次性密码（`--init` / `--reset-password`）会话：改密前只放行改密自身
     pub must_change_password: bool,
-    /// 最近一次重新验证密码的时间戳（0 = 从未）。敏感操作用它做时间闸门。
-    pub verified_at: i64,
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -161,37 +159,12 @@ fn authority_of(candidate: &str) -> &str {
         .unwrap_or("")
 }
 
-/// 一次性密码会话在改密前唯一能碰的几个接口。
-///
-/// `/api/auth/status` 是公开路由，不走中间件，所以这里不用列。
+/// `/api/auth/verify` 已随二次验证闸门移除，这里只剩改密自身的最小闭环。
 fn is_password_change_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/auth/password" | "/api/auth/me" | "/api/auth/logout" | "/api/auth/verify"
+        "/api/auth/password" | "/api/auth/me" | "/api/auth/logout"
     )
-}
-
-/// 需要「最近 5 分钟内输过密码」的接口（设计文档 3.1.3 的补强）。
-///
-/// 只收最危险的三类：开系统 shell、建/删访问令牌、改配置。普通读写文件
-/// 每次都弹窗会毁掉体验，而这三类一旦被借用浏览器就是「整机接管」。
-fn requires_recent_verify(method: &Method, path: &str) -> bool {
-    if path == "/api/terminal/ws" {
-        return true;
-    }
-    // 读方法里的例外：整库备份导出的就是密码哈希与会话，比任何写操作都敏感
-    if path == "/api/system/backup" {
-        return true;
-    }
-    let write = matches!(
-        *method,
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
-    if !write {
-        return false;
-    }
-    matches!(path, "/api/tokens" | "/api/config" | "/api/config/raw")
-        || path.starts_with("/api/tokens/")
 }
 
 /// 统一的「客户端 IP 字符串」入口：`normalize_ip` 折叠 v4-mapped。
@@ -491,8 +464,6 @@ async fn sso_user(
         id: user.id,
         username: user.username,
         must_change_password: user.must_change_password,
-        // 代理信任是「由上级 IdP 认证过」的强证据，直接视为刚验证过
-        verified_at: crate::core::auth::now_secs(),
     })
 }
 
@@ -530,7 +501,6 @@ pub async fn require_auth(
                         id: user.id,
                         username: user.username,
                         must_change_password: user.must_change_password,
-                        verified_at: session.verified_at,
                     });
                     via_cookie = true;
                 }
@@ -593,18 +563,6 @@ pub async fn require_auth(
             StatusCode::FORBIDDEN,
             "E_PASSWORD_CHANGE_REQUIRED",
             "Initial password must be changed before using the API",
-        );
-    }
-
-    // 敏感操作的时间闸门：会话再长也不能凭一个「一直在后台开着的标签页」
-    // 直接开系统级 shell、建令牌或改配置——要求 5 分钟内重新输过密码。
-    if requires_recent_verify(request.method(), request.uri().path())
-        && crate::core::auth::now_secs() - user.verified_at > crate::core::auth::REAUTH_WINDOW
-    {
-        return json_error_code(
-            StatusCode::FORBIDDEN,
-            "E_REAUTH_REQUIRED",
-            "Please confirm your password again for this action",
         );
     }
 
@@ -939,68 +897,6 @@ pub async fn change_password(
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
-}
-
-/// GET /api/auth/reauth：当前会话是否还需要二次验证（前端据此决定要不要弹窗）
-pub async fn reauth_status(auth_user: AuthUser) -> Response {
-    let required = now_secs() - auth_user.verified_at > crate::core::auth::REAUTH_WINDOW;
-    Json(json!({ "required": required })).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VerifyRequest {
-    pub password: String,
-}
-
-/// POST /api/auth/verify（受保护）：敏感操作前的二次验证。
-///
-/// 只刷新当前会话的 `verified_at`，不动登录态；密码错误计入主登录池的
-/// 防爆破计数（与登录同一口径，避免这里成为绕过通道）。
-pub async fn verify_recent(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    auth_user: AuthUser,
-    Json(body): Json<VerifyRequest>,
-) -> Response {
-    let ip = client_ip(&state, &headers, Some(peer)).await;
-    let guard_key = format!("{ip}|{}", auth_user.username);
-    if let Err(remaining) = state.login_guard.check(&guard_key) {
-        return json_error_code(
-            StatusCode::TOO_MANY_REQUESTS,
-            "E_TOO_MANY_REQUESTS",
-            format!("Too many failed attempts, retry in {remaining}s"),
-        );
-    }
-
-    let found = match state.auth.find_user(&auth_user.username) {
-        Ok(found) => found,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    };
-    let Some((_user, hash, _)) = found else {
-        return json_error_code(
-            StatusCode::UNAUTHORIZED,
-            "AUTH_USER_MISSING",
-            "User not found",
-        );
-    };
-    if !verify_password(&hash, &body.password) {
-        state.login_guard.record_failure(&guard_key);
-        return json_error_code(
-            StatusCode::FORBIDDEN,
-            "E_REAUTH_FAILED",
-            "Password is incorrect",
-        );
-    }
-    state.login_guard.record_success(&guard_key);
-    let Some(token) = cookie_token(&headers) else {
-        // 代理信任（SSO）没有本站会话可标记，但它的 verified_at 本来就是当前时间
-        return Json(json!({ "status": "ok" })).into_response();
-    };
-    if let Err(err) = state.auth.mark_verified(&token) {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
-    }
-    Json(json!({ "status": "ok" })).into_response()
 }
 
 /// GET /api/auth/totp/setup（受保护）：生成密钥、otpauth 链接与二维码

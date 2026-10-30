@@ -11,7 +11,6 @@ import AppIcon from './components/AppIcon.vue'
 import AppSidebar from './components/AppSidebar.vue'
 import MediaLightbox from './components/MediaLightbox.vue'
 import MusicBar from './components/MusicBar.vue'
-import ReauthDialog from './components/ReauthDialog.vue'
 import ShareDialog from './components/ShareDialog.vue'
 import { currentTrack } from './stores/player'
 import { authApi } from './api/auth'
@@ -220,7 +219,6 @@ async function logout() {
 
     <!-- 全局分享弹窗（单实例；文件右键与各媒体库共用） -->
     <ShareDialog />
-    <ReauthDialog />
 
     <!-- 一次性密码强制改密（--init / --reset 后首登） -->
     <div v-if="mustChangePassword" class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4">

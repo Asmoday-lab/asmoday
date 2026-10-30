@@ -193,7 +193,6 @@ pub async fn cleanup_parts(State(state): State<AppState>) -> Response {
 /// GET /api/system/backup：下载一份数据库热备份（设计文档 4.1）
 ///
 /// 备份里是密码哈希、TOTP 密钥与会话，属于高敏操作，所以：
-/// - 中间件要求「5 分钟内验证过密码」（`E_REAUTH_REQUIRED`，见 `require_auth`）；
 /// - 响应 `no-store` + `attachment`，绝不能被缓存或内联渲染。
 pub async fn backup(State(state): State<AppState>) -> Response {
     let stamp = crate::core::auth::now_secs();

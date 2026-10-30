@@ -65,7 +65,5 @@
   "E_INTERNAL": "Internal server error",
   "E_INIT_REQUIRED": "The instance is not initialized yet",
   "SHARE_RATE_LIMITED": "Too many password attempts, please retry later",
-  "E_REAUTH_REQUIRED": "Please confirm your password again for this action (valid for 5 minutes)",
-  "E_REAUTH_FAILED": "Incorrect password",
   "E_TOO_MANY_REQUESTS": "Too many attempts, please try again later"
 }

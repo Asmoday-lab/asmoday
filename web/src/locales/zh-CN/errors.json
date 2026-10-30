@@ -65,7 +65,5 @@
   "E_INTERNAL": "服务器内部错误",
   "E_INIT_REQUIRED": "系统尚未初始化",
   "SHARE_RATE_LIMITED": "口令尝试过于频繁，请稍后再试",
-  "E_REAUTH_REQUIRED": "该操作需要重新验证密码（5 分钟内有效）",
-  "E_REAUTH_FAILED": "密码不正确",
   "E_TOO_MANY_REQUESTS": "尝试过于频繁，请稍后再试"
 }

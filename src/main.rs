@@ -522,9 +522,6 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/system/test-ffmpeg", post(api::system::test_ffmpeg))
         .route("/api/auth/password", post(api::auth::change_password))
-        // 敏感操作前的二次验证（终端 / 令牌 / 配置写操作要求 5 分钟内验证过）
-        .route("/api/auth/reauth", get(api::auth::reauth_status))
-        .route("/api/auth/verify", post(api::auth::verify_recent))
         .route("/api/auth/totp/setup", get(api::auth::totp_setup))
         .route("/api/auth/totp/enable", post(api::auth::totp_enable))
         .route("/api/auth/totp/disable", post(api::auth::totp_disable))

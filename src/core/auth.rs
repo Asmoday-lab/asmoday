@@ -23,15 +23,11 @@ use serde::Serialize;
 pub const SESSION_TTL: i64 = 7 * 24 * 3600;
 /// 会话绝对上限：30 天（无论怎么续期都不能超过，设计文档 3.1.3）
 pub const SESSION_ABSOLUTE_TTL: i64 = 30 * 86_400;
-/// 敏感操作的时间闸门：最近一次输密码必须在 5 分钟内
-pub const REAUTH_WINDOW: i64 = 5 * 60;
 
 /// 会话的服务端状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionState {
     pub user_id: i64,
-    /// 最近一次「重新输入密码」的时间戳（登录时等于 created_at）
-    pub verified_at: i64,
 }
 /// 连续失败次数上限
 pub const MAX_ATTEMPTS: u32 = 5;
@@ -103,8 +99,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    -- 最近一次「重新输入密码」的时刻：敏感操作（终端/令牌/配置）要求它足够新，
-    -- 防止一个 30 天的会话被 XSS 或借用浏览器后直接拿到系统级权限
+    -- v4.4.1 前的「5 分钟二次验证闸门」依据，闸门已移除；
+    -- 保留列只为存量库平滑升级，代码不再读写
     verified_at INTEGER NOT NULL DEFAULT 0
 );
 
@@ -218,7 +214,7 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
         "mount_scope",
         "ALTER TABLE access_tokens ADD COLUMN mount_scope TEXT",
     ),
-    // 敏感操作二次验证时间戳（默认 0 = 从未验证）
+    // v4.4.1 前的二次验证时间戳；闸门已移除，仅为存量库兼容保留
     (
         "sessions",
         "verified_at",
@@ -805,44 +801,33 @@ impl AuthStore {
         let conn = self.connect()?;
         let now = now_secs();
         conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, expires_at, verified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![token, user_id, now, now + SESSION_TTL, now],
+            "INSERT INTO sessions (token, user_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![token, user_id, now, now + SESSION_TTL],
         )
         .map_err(|e| format!("创建会话失败：{e}"))?;
         Ok(token)
     }
 
-    /// 记下「刚刚重新验证过密码」：敏感操作的时间闸门依据。
-    pub fn mark_verified(&self, token: &str) -> Result<(), String> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE sessions SET verified_at = ?1 WHERE token = ?2",
-            params![now_secs(), token],
-        )
-        .map_err(|e| format!("更新验证时间失败：{e}"))?;
-        Ok(())
-    }
-
-    /// 会话的完整状态（user_id + 最近验证时间）。
+    /// 会话状态（user_id）。
     ///
     /// 滑动续期（设计文档 3.1.3）：剩余不足半个 TTL 时把过期时间往后推，
     /// 但**不超过** `created_at + SESSION_ABSOLUTE_TTL`（绝对上限 30 天）。
     /// 只在临近过期时写库，避免每个请求都产生一次 UPDATE。
     pub fn session_state(&self, token: &str) -> Result<Option<SessionState>, String> {
         let conn = self.connect()?;
-        let row: Option<(i64, i64, i64, i64)> = conn
+        let row: Option<(i64, i64, i64)> = conn
             .query_row(
-                "SELECT user_id, expires_at, created_at, verified_at FROM sessions WHERE token = ?1",
+                "SELECT user_id, expires_at, created_at FROM sessions WHERE token = ?1",
                 params![token],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| format!("查询会话失败：{e}"))?;
 
         let now = now_secs();
         match row {
-            Some((user_id, expires_at, created_at, verified_at)) if expires_at > now => {
+            Some((user_id, expires_at, created_at)) if expires_at > now => {
                 if expires_at - now <= SESSION_TTL / 2 {
                     let ceiling = created_at.saturating_add(SESSION_ABSOLUTE_TTL);
                     let renewed = (now + SESSION_TTL).min(ceiling);
@@ -853,10 +838,7 @@ impl AuthStore {
                         );
                     }
                 }
-                Ok(Some(SessionState {
-                    user_id,
-                    verified_at,
-                }))
+                Ok(Some(SessionState { user_id }))
             }
             Some(_) => {
                 let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);

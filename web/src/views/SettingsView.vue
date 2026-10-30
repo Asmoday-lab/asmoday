@@ -15,7 +15,6 @@ import { authApi } from '../api/auth'
 import { cacheApi, type CacheStats } from '../api/media'
 import { systemApi, type FfmpegInfo, type FfmpegSource } from '../api/system'
 import { ApiError, readApiError } from '../lib/errors'
-import { ensureVerified } from '../stores/reauth'
 import { filesApi, type MountPoint } from '../api/files'
 import { APP_BASE } from '../lib/base'
 import { formatSize } from '../lib/format'
@@ -290,8 +289,7 @@ async function createToken() {
     tokenError.value = t('settings.security.tokenNameRequired')
     return
   }
-  // 建令牌 = 造一把能进全库的钥匙：先过二次验证
-  if (!(await ensureVerified())) return
+  // 建令牌 = 造一把能进全库的钥匙
   try {
     const res = await fetch('/api/tokens', {
       method: 'POST',
@@ -314,7 +312,6 @@ async function createToken() {
 }
 
 async function deleteToken(id: number) {
-  if (!(await ensureVerified())) return
   try {
     const res = await fetch(`/api/tokens/${id}`, { method: 'DELETE' })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
@@ -335,8 +332,6 @@ const backupBusy = ref(false)
 /** 下载一份 SQLite 热备份（后端 `VACUUM INTO`，服务运行中也能备）。 */
 async function downloadBackup() {
   if (backupBusy.value) return
-  // 备份里是密码哈希与会话：与令牌同级敏感，先过二次验证
-  if (!(await ensureVerified())) return
   backupBusy.value = true
   try {
     const res = await fetch('/api/system/backup')
@@ -412,7 +407,6 @@ function onRawChange(value: string) {
 /** 保存整份配置（表单模式）。媒体面板的复位也走这里，保证只改 `[media]`。 */
 async function saveForm(successMessage?: string) {
   if (!draft.value) return
-  if (!(await ensureVerified())) return
   saving.value = true
   error.value = ''
   try {
@@ -433,7 +427,6 @@ async function saveForm(successMessage?: string) {
 }
 
 async function saveRaw() {
-  if (!(await ensureVerified())) return
   saving.value = true
   error.value = ''
   try {

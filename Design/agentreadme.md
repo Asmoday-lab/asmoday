@@ -41,7 +41,7 @@
 | **i18n key** | 前端 i18n 词条键，如 `error.E_BUSY.title` |
 | **DoD** | Definition of Done，模块完成定义 |
 | **GWT** | Given-When-Then 验收用例格式 |
-| **REAUTH** | 敏感操作二次验证（`verified_at` 5 分钟内） |
+| **REAUTH** | ~~敏感操作二次验证~~ **v4.4.1 已移除**（历史词条，见 §3.9 备注） |
 
 ---
 
@@ -137,8 +137,6 @@
 | `E_NAME_MISMATCH` | 400 | 确认名不符 / Name mismatch | 输入的确认名与目标不一致 / Confirmation name does not match | `action.close` | 否（重输） |
 | `E_NOT_TEXT` | 415 | 非文本文件 / Not a text file | 该文件不是可编辑的文本 / Not an editable text file | `action.close` | 否 |
 | `E_ENCODING` | 415/422 | 编码问题 / Encoding error | 无法识别或无法按原编码写回 / Cannot detect or write back encoding | `action.pickEncoding`, `action.cancel` | 否 |
-| `E_REAUTH_REQUIRED` | 403 | 需要验证身份 / Re-authentication required | 此操作需要重新输入密码 / Please re-enter your password | `action.verify` | 是（验证后重放） |
-| `E_REAUTH_FAILED` | 401 | 验证失败 / Verification failed | 密码错误 / Incorrect password | `action.retry`, `action.cancel` | 是 |
 | `E_TOO_MANY_REQUESTS` | 429 | 请求过于频繁 / Rate limited | 请稍后再试 / Please try again later | `action.close` | 是（倒计时） |
 | `E_VALIDATION` | 400 | 参数无效 / Invalid parameter | 请检查输入 / Please check your input | `action.close` | 否 |
 | `E_UNSUPPORTED_PREVIEW` | 400 | 无法预览 / Preview unavailable | 该类型不支持预览 / Preview not supported | `action.download`, `action.close` | 否 |
@@ -169,7 +167,7 @@ error.E_BUSY.action.cancel
 
 | store / composable | 职责 | 关键约束 |
 |---|---|---|
-| `stores/auth.ts` | 当前用户、权限、`verified_at` 派生状态、REAUTH 弹窗开关 | `reauthRequiredAt` 是响应式时间戳，组件通过 `useReauth()` 请求验证 |
+| `stores/auth.ts` | 当前用户与登录态 | ~~`verified_at` 派生状态、REAUTH 弹窗~~ **v4.4.1 已移除** |
 | `stores/player.ts` | 全局音频播放条单实例 | 列表循环**禁止**生成 `<audio>`；仅此 store 持有一个 |
 | `stores/lightbox.ts` | 全局图片灯箱单实例 | 同上，仅一个 |
 | `stores/terminal.ts` | 终端会话池 | 单实例容器 |
@@ -392,9 +390,11 @@ GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任�
 
 ### 3.2 会话与二次验证（M1）
 
+> **⚠️ v4.4.1 变更**：二次验证（REAUTH）整体移除——`verified_at` 闸门、`/api/auth/reauth`、`/api/auth/verify` 与前端弹窗都不存在了，敏感操作随登录会话直接放行。本节以下内容仅作历史设计记录。
+
 #### 范围
 - 自研 `sessions` 表：滑动续期 7 天 + 绝对上限 30 天。
-- `verified_at`：敏感操作（终端、令牌增删、配置写、DB 备份下载）要求 5 分钟内。
+- ~~`verified_at`：敏感操作（终端、令牌增删、配置写、DB 备份下载）要求 5 分钟内。~~（已移除）
 - CSRF：Cookie 认证写操作要求 Origin/Referer 至少一个同源。
 
 #### 状态机
@@ -1136,6 +1136,8 @@ GWT-SHARE-10 Given 分享访问  When 请求任意接口  Then 响应中无物�
 ---
 
 ### 3.9 二次验证（REAUTH）与终端、令牌、配置、备份的交互（M2）
+
+> **⚠️ v4.4.1 变更**：本节所述的 REAUTH 交互已整体移除，四个入口均随登录会话直接放行，不再弹窗。以下仅作历史设计记录。
 
 > 本章节是横切关注点，与 §3.2 会话共用同一 `useReauth.ts`，验证以下 4 个入口均正确触发：
 

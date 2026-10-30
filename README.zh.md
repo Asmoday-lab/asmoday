@@ -137,8 +137,7 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/api/config` | 读写解析后的配置 |
-| GET | `/api/system/backup` | 下载数据库热备份（需 5 分钟内验证过密码） |
-| GET/POST | `/api/auth/reauth` `/verify` | 敏感操作二次验证状态与验证入口 |
+| GET | `/api/system/backup` | 下载数据库热备份 |
 | GET/POST | `/api/auth/totp` | 2FA 动态验证码设置 |
 | any | `/proxy/{id}/*` | 外部服务反向代理透传 |
 | any | `/dav/<mount_id>/*` | 标准 WebDAV 服务 (独立 Token 或管理员账号 + 登录密码) |
@@ -147,6 +146,8 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 
 <details>
 <summary><b>点击展开查看历史更新日志</b></summary>
+
+- **v4.4.1 (移除敏感操作 5 分钟二次验证闸门)**：开终端、建/删令牌、保存配置、下载备份不再要求「5 分钟内重新输过密码」，登录会话直接可用，`/api/auth/reauth` 与 `/api/auth/verify` 接口及前端弹窗一并移除。会话防线回到登录本身：7 天滑动续期 + 30 天绝对上限 + 2FA + CSRF 同源 + 防爆破限流不变。`sessions.verified_at` 列保留仅为存量库平滑升级，代码不再读写。
 
 - **v4.4.0 (WebDAV 支持管理员账号直连，去掉「建令牌先输一遍密码」的冷启动摩擦)**：WebDAV Basic Auth 在令牌校验失败后回退校验**管理员账号（用户名 + 登录密码）**——首次部署还没有任何令牌时，直接拿登录账号就能挂载，不必先登录网页、过 5 分钟二次验证闸门、再创建令牌。安全边界不变：令牌的只读 / 挂载点范围 / 有效期语义原样保留（推荐继续用令牌，范围收口是它的价值）；密码直连 = 全量管理员权限，一次性密码未改密与已开启 2FA 的账号一律拒绝（Basic Auth 表达不了第二因子，这类账号请用令牌），防爆破仍走 WebDAV 独立池。Argon2 逐请求校验太贵（客户端一次同步几十个请求），进程内缓存验证结果：键是「用户名+密码」的 SHA-1 不落明文，值存验证时的哈希快照——改密后旧凭证即时失效，不依赖缓存过期。
 
