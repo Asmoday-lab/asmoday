@@ -731,7 +731,14 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
         budget: crate::core::search::DEFAULT_BUDGET,
     };
 
-    let page = match crate::core::search::run(&target, &options, query.cursor.as_deref()).await {
+    let page = match crate::core::search::run(
+        &target,
+        &options,
+        query.cursor.as_deref(),
+        Some(state.dir_cache.as_ref()),
+    )
+    .await
+    {
         Ok(page) => page,
         Err(err) => return fs_error(err),
     };

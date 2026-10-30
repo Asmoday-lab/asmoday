@@ -57,6 +57,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// 用户/会话存储（SQLite）
     pub auth: Arc<AuthStore>,
+    /// 目录快照缓存（SQLite，递归搜索用；见 core/dir_cache.rs）
+    pub dir_cache: Arc<core::dir_cache::DirCache>,
     /// 登录失败限流
     pub login_guard: Arc<core::auth::LoginGuard>,
     /// 分享口令尝试限流（与登录池**完全隔离**，设计文档 3.1.5）
@@ -291,6 +293,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             std::time::Duration::from_secs(terminal.idle_kill_seconds),
         ),
         auth: Arc::clone(&auth),
+        dir_cache: Arc::new(core::dir_cache::DirCache::new(auth.db_path().clone())),
         login_guard: Arc::new(core::auth::LoginGuard::new()),
         share_guard: Arc::new(core::auth::LoginGuard::new()),
         dav_guard: Arc::new(core::auth::LoginGuard::new()),

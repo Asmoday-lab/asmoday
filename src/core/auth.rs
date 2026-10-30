@@ -231,6 +231,7 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
 /// - **v1** 基线：全部 `CREATE TABLE IF NOT EXISTS` + 缺列才补的钩子。新库和存量库
 ///   （user_version 都是 0）走同一段，幂等由钩子里的列判断保证。
 /// - **v2** 收藏/播放历史主键升级成 `(mount_id, file_path)`。
+/// - **v3** 目录快照缓存（`dir_snapshots`，见 `core/dir_cache.rs`）。
 ///
 /// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
 fn migrations() -> Migrations<'static> {
@@ -247,6 +248,18 @@ fn migrations() -> Migrations<'static> {
             rebuild_media_tables(tx)?;
             Ok(())
         }),
+        // v3：目录快照缓存。只是加速用的旁路数据，清空也不影响任何功能，
+        // 所以不设外键、不随业务表迁移；`entries` 是自定义二进制（见 dir_cache.rs）
+        M::up(
+            "CREATE TABLE IF NOT EXISTS dir_snapshots (
+                path TEXT PRIMARY KEY,
+                stamp INTEGER NOT NULL,
+                entries BLOB NOT NULL,
+                entry_count INTEGER NOT NULL,
+                used_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dir_snapshots_used_at ON dir_snapshots(used_at);",
+        ),
     ])
 }
 

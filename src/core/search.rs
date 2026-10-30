@@ -17,12 +17,19 @@
 //!   `follow_symlinks = true` 时才进，并用 canonicalize 结果去重防环，
 //!   配合 `MAX_DEPTH` 兜底。
 //! - 无权限目录直接跳过，不中断整次搜索：搜索的语义是「能找到的都给你」。
+//! - **只为命中的条目付一次 `stat`**：`readdir` 已经给出名字与类型，大小只有
+//!   真正要展示的那几条才需要；十万条的目录不该为了一个 size 打十万次 `stat`。
+//! - **目录快照缓存**（`core/dir_cache.rs`，v4.3.0）：同一个目录如果 mtime 没变，
+//!   名字集合必然没变（创建/删除/改名都会推进 mtime），于是下次只 `stat` 目录本身，
+//!   不必再 `readdir`。重复搜索一棵没动过的树从「N 次 readdir + N 次 stat」降到
+//!   「N 次 stat」。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::dir_cache::{self, CachedEntry, DirCache, KIND_DIR, KIND_LINK};
 use super::fs::{self, FsError};
 
 /// 单页默认条数（与原「当前目录 200 条」一致，避免前端行为突变）
@@ -92,11 +99,11 @@ pub struct SearchPage {
     pub next_cursor: Option<String>,
 }
 
-/// 遍历栈中的一层：某目录下已经按确定序排好的名字列表 + 下一个待访问下标
+/// 遍历栈中的一层：某目录下已经按确定序排好的条目 + 下一个待访问下标
 struct Frame {
     rel: String,
     abs: PathBuf,
-    names: Vec<String>,
+    entries: Vec<CachedEntry>,
     pos: usize,
 }
 
@@ -111,10 +118,12 @@ struct CursorFrame {
 /// 递归搜索一页。
 ///
 /// `cursor = None` 从根开始；否则从上次停下的位置继续。
+/// `cache` 为 `None` 时退化成「每次都 readdir」（单测与无库场景）。
 pub async fn run(
     root: &Path,
     opts: &SearchOptions,
     cursor: Option<&str>,
+    cache: Option<&DirCache>,
 ) -> Result<SearchPage, FsError> {
     let limit = opts.limit.clamp(1, MAX_LIMIT);
     let budget = opts.budget.max(1);
@@ -138,13 +147,13 @@ pub async fn run(
         for frame in &resume {
             // 游标里的目录可能已经被删掉/改名：这一层直接放弃，
             // 让上层帧接着往后走（搜索必须能在变化的目录树上继续）。
-            if let Ok(opened) = open_frame(root, &frame.dir, Some(&frame.next)).await {
+            if let Ok(opened) = open_frame(root, &frame.dir, Some(&frame.next), cache).await {
                 stack.push(opened);
             }
         }
     }
     if stack.is_empty() {
-        stack.push(open_frame(root, "", None).await?);
+        stack.push(open_frame(root, "", None, cache).await?);
     }
 
     let mut page = SearchPage::default();
@@ -158,61 +167,69 @@ pub async fn run(
         }
 
         let Some(top) = stack.last() else { break };
-        if top.pos >= top.names.len() {
+        if top.pos >= top.entries.len() {
             // 这一层走完了，回到父层继续
             stack.pop();
             continue;
         }
 
-        let (name, abs, rel, depth) = {
+        let (entry, abs, rel, depth) = {
             let top = stack.last_mut().expect("上一层刚判过非空");
-            let name = top.names[top.pos].clone();
+            let entry = top.entries[top.pos].clone();
             top.pos += 1;
-            let abs = top.abs.join(&name);
+            let abs = top.abs.join(&entry.name);
             let rel = if top.rel.is_empty() {
-                name.clone()
+                entry.name.clone()
             } else {
-                format!("{}/{}", top.rel, name)
+                format!("{}/{}", top.rel, entry.name)
             };
-            (name, abs, rel, stack.len())
+            (entry, abs, rel, stack.len())
         };
         page.scanned += 1;
 
-        // lstat：不跟随链接（与列表同口径，链接不冒充目录）
-        let Ok(lmeta) = tokio::fs::symlink_metadata(&abs).await else {
-            continue;
-        };
-        let ft = lmeta.file_type();
-        let is_link = ft.is_symlink();
-        let mut is_dir = ft.is_dir();
-        let mut size = lmeta.len();
-        let mut descend = is_dir;
+        let name = entry.name;
+        let matched = name.to_lowercase().contains(&keyword);
+        // 类型由 readdir 给定，不必为每条都 stat；大小只有「要展示」时才有意义
+        let mut is_dir = entry.kind == KIND_DIR;
+        let mut size = 0u64;
+        let mut descend = entry.kind == KIND_DIR;
 
-        if is_link {
+        if entry.kind == KIND_LINK {
             descend = false;
             // 链接目录：默认当作「可以点开但不能穿过去」，
             // 只有显式 follow 时才递归，并且必须没在本次遍历里见过同一真实目录
-            if opts.follow_symlinks {
-                if let Ok(target) = tokio::fs::metadata(&abs).await {
-                    if target.is_dir() {
+            let Ok(lmeta) = tokio::fs::symlink_metadata(&abs).await else {
+                // 链接本体已经没了：不给点不开的结果
+                continue;
+            };
+            size = lmeta.len();
+            if let Ok(target) = tokio::fs::metadata(&abs).await {
+                if target.is_dir() {
+                    if opts.follow_symlinks {
                         is_dir = true;
-                        match tokio::fs::canonicalize(&abs).await {
-                            Ok(real) => descend = seen_links.insert(real),
-                            Err(_) => descend = false,
-                        }
+                        descend = match tokio::fs::canonicalize(&abs).await {
+                            Ok(real) => seen_links.insert(real),
+                            Err(_) => false,
+                        };
                     } else {
+                        // 不跟随也要把大小报对（目标可读时）
                         size = target.len();
                     }
+                } else {
+                    size = target.len();
                 }
-            } else if let Ok(target) = tokio::fs::metadata(&abs).await {
-                // 不跟随也要把大小报对（目标可读时），但不递归
-                size = target.len();
+            }
+        } else if matched {
+            // 命中才付一次 lstat：与列表同一套展示口径（目录也给自身大小）
+            match tokio::fs::symlink_metadata(&abs).await {
+                Ok(lmeta) => size = lmeta.len(),
+                Err(_) => continue,
             }
         }
 
-        if name.to_lowercase().contains(&keyword) {
+        if matched {
             page.hits.push(Hit {
-                name: name.clone(),
+                name,
                 abs: abs.clone(),
                 rel: rel.clone(),
                 is_dir,
@@ -222,7 +239,7 @@ pub async fn run(
 
         if opts.recursive && descend && depth < MAX_DEPTH {
             // 打不开（权限 / 竞态删除）就跳过这一支，不让整次搜索失败
-            if let Ok(child) = open_frame(root, &rel, None).await {
+            if let Ok(child) = open_frame(root, &rel, None, cache).await {
                 stack.push(child);
             }
         }
@@ -233,7 +250,7 @@ pub async fn run(
         // 续页时白跑一趟（结果没错，但多一次 readdir）。
         while stack
             .last()
-            .map(|frame| frame.pos >= frame.names.len())
+            .map(|frame| frame.pos >= frame.entries.len())
             .unwrap_or(false)
         {
             stack.pop();
@@ -247,8 +264,16 @@ pub async fn run(
     Ok(page)
 }
 
-/// 打开一层目录：读出名字、按「目录优先 + 名称升序」排序，并把位置挪到 `resume_at` 之后。
-async fn open_frame(root: &Path, rel: &str, resume_at: Option<&str>) -> Result<Frame, FsError> {
+/// 打开一层目录：拿到条目、按「目录优先 + 名称升序」排序（缓存命中时顺序已是如此），
+/// 并把位置挪到 `resume_at` 之后。
+///
+/// 缓存命中只需一次 `stat`（目录 mtime 对得上），不必 `readdir`。
+async fn open_frame(
+    root: &Path,
+    rel: &str,
+    resume_at: Option<&str>,
+    cache: Option<&DirCache>,
+) -> Result<Frame, FsError> {
     let abs = if rel.is_empty() {
         root.to_path_buf()
     } else {
@@ -259,11 +284,55 @@ async fn open_frame(root: &Path, rel: &str, resume_at: Option<&str>) -> Result<F
         path
     };
 
-    let mut reader = tokio::fs::read_dir(&abs)
+    let entries = match (cache, stamp_of_dir(&abs).await) {
+        (Some(cache), Some((key, stamp))) => match cache.load(&key, stamp) {
+            Some(hit) => hit,
+            None => {
+                let fresh = read_entries(&abs).await?;
+                cache.store(&key, stamp, &fresh);
+                fresh
+            }
+        },
+        // 目录刚被动过（戳不可信）或调用方没给缓存：照常读
+        _ => read_entries(&abs).await?,
+    };
+
+    let pos = match resume_at.filter(|name| !name.is_empty()) {
+        // 游标记的是「下一个待访问条目」本身，所以位置就是它 —— 不能再 +1。
+        // 名字在目录里唯一，精确匹配比按排序键二分更稳（大小写折叠后可能并列）；
+        // 名字找不到（目录内容变了）就当这一层从头来：宁可重复一条，也不漏。
+        Some(target) => entries
+            .iter()
+            .position(|entry| entry.name == target)
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    Ok(Frame {
+        rel: rel.to_string(),
+        abs,
+        entries,
+        pos,
+    })
+}
+
+/// 目录的缓存键与戳；戳不可信（刚动过 / 取不到 mtime）时返回 `None`
+async fn stamp_of_dir(abs: &Path) -> Option<(String, i64)> {
+    let meta = tokio::fs::metadata(abs).await.ok()?;
+    let stamp = dir_cache::stamp_of(meta.modified().ok()?)?;
+    Some((fs::normalize_display(abs), stamp))
+}
+
+/// 真正读目录：一次 `readdir` 拿名字与类型，按确定序排好。
+///
+/// 确定序（目录在前、同组按小写名）是游标能复现位置的唯一依据 ——
+/// `readdir` 的顺序不可依赖，缓存里存的也必须是这个顺序。
+async fn read_entries(abs: &Path) -> Result<Vec<CachedEntry>, FsError> {
+    let mut reader = tokio::fs::read_dir(abs)
         .await
         .map_err(|e| FsError::Io(format!("读取目录失败：{e}")))?;
 
-    let mut entries: Vec<(String, bool)> = Vec::new();
+    let mut entries: Vec<CachedEntry> = Vec::new();
     while let Some(entry) = reader
         .next_entry()
         .await
@@ -271,31 +340,19 @@ async fn open_frame(root: &Path, rel: &str, resume_at: Option<&str>) -> Result<F
     {
         let name = entry.file_name().to_string_lossy().to_string();
         // 搜索一律显示隐藏项：用户敲了关键词就是明确想看，别被 show_hidden 挡住
-        if fs::skip_listing_name(&abs, &name, true) {
+        if fs::skip_listing_name(abs, &name, true) {
             continue;
         }
-        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-        entries.push((name, is_dir));
+        // file_type 不跟随链接（Windows 上 readdir 自带属性，这里不产生额外系统调用）
+        let kind = match entry.file_type().await {
+            Ok(ft) if ft.is_symlink() => KIND_LINK,
+            Ok(ft) if ft.is_dir() => KIND_DIR,
+            _ => dir_cache::KIND_FILE,
+        };
+        entries.push(CachedEntry { name, kind });
     }
-    // 确定序：目录在前，同组按小写名 —— 与列表的「名称升序」一致，
-    // 也是游标能复现位置的唯一依据（readdir 顺序不可依赖）
-    entries.sort_by_cached_key(|(name, is_dir)| (!*is_dir, name.to_lowercase()));
-    let names: Vec<String> = entries.into_iter().map(|(name, _)| name).collect();
-
-    let pos = match resume_at.filter(|name| !name.is_empty()) {
-        // 游标记的是「下一个待访问条目」本身，所以位置就是它 —— 不能再 +1。
-        // 名字在目录里唯一，精确匹配比按排序键二分更稳（大小写折叠后可能并列）；
-        // 名字找不到（目录内容变了）就当这一层从头来：宁可重复一条，也不漏。
-        Some(target) => names.iter().position(|name| name == target).unwrap_or(0),
-        None => 0,
-    };
-
-    Ok(Frame {
-        rel: rel.to_string(),
-        abs,
-        names,
-        pos,
-    })
+    entries.sort_by_cached_key(|entry| (!entry.is_dir(), entry.name.to_lowercase()));
+    Ok(entries)
 }
 
 /// 把当前遍历栈编码成游标；栈空表示「已经走完整棵树」，不返回游标。
@@ -306,9 +363,9 @@ fn snapshot(stack: &[Frame]) -> Option<String> {
     let frames: Vec<CursorFrame> = stack
         .iter()
         .filter_map(|frame| {
-            frame.names.get(frame.pos).map(|next| CursorFrame {
+            frame.entries.get(frame.pos).map(|next| CursorFrame {
                 dir: frame.rel.clone(),
-                next: next.clone(),
+                next: next.name.clone(),
             })
         })
         .collect();
@@ -361,16 +418,21 @@ mod tests {
     #[tokio::test]
     async fn non_recursive_only_searches_the_first_level() {
         let root = tree("flat");
-        let page = run(&root, &SearchOptions::new("report"), None)
+        let page = run(&root, &SearchOptions::new("report"), None, None)
             .await
             .unwrap();
         let names: Vec<&str> = page.hits.iter().map(|hit| hit.name.as_str()).collect();
         assert_eq!(names, vec!["report-2024.pdf"]);
         assert!(!page.has_more);
 
-        let deep = run(&root, &SearchOptions::new("report").recursive(true), None)
-            .await
-            .unwrap();
+        let deep = run(
+            &root,
+            &SearchOptions::new("report").recursive(true),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let mut rels: Vec<&str> = deep.hits.iter().map(|hit| hit.rel.as_str()).collect();
         rels.sort();
         assert_eq!(
@@ -391,6 +453,7 @@ mod tests {
             &root,
             &SearchOptions::new(".ds_store").recursive(true),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -400,6 +463,7 @@ mod tests {
         let hidden = run(
             &root,
             &SearchOptions::new("report-hidden").recursive(true),
+            None,
             None,
         )
         .await
@@ -424,7 +488,7 @@ mod tests {
         let mut collected: Vec<String> = Vec::new();
         let mut pages = 0;
         loop {
-            let page = run(&root, &opts, cursor.as_deref()).await.unwrap();
+            let page = run(&root, &opts, cursor.as_deref(), None).await.unwrap();
             pages += 1;
             assert!(page.hits.len() <= 7);
             for hit in &page.hits {
@@ -457,7 +521,7 @@ mod tests {
         let mut opts = SearchOptions::new("needle");
         opts.budget = 10;
 
-        let first = run(&root, &opts, None).await.unwrap();
+        let first = run(&root, &opts, None, None).await.unwrap();
         assert!(first.hits.is_empty());
         assert!(first.has_more, "预算用完必须给游标，而不是当作搜完");
         assert_eq!(first.scanned, 10);
@@ -467,7 +531,7 @@ mod tests {
         let mut hops = 0;
         while let Some(current) = cursor {
             hops += 1;
-            let page = run(&root, &opts, Some(&current)).await.unwrap();
+            let page = run(&root, &opts, Some(&current), None).await.unwrap();
             if page.hits.iter().any(|hit| hit.name == "zzz-needle.txt") {
                 found = true;
                 break;
@@ -485,10 +549,56 @@ mod tests {
             &root,
             &SearchOptions::new("report"),
             Some("!!!not-a-cursor"),
+            None,
         )
         .await
         .unwrap();
         assert!(!page.hits.is_empty());
+    }
+
+    /// 目录快照缓存只对「已经落定」的目录生效；一旦目录真的变了，必须重扫。
+    ///
+    /// 这里等 2.1 秒让 mtime 越过 `SETTLE`（缓存只收 mtime 至少 2 秒前的目录），
+    /// 剩下的全是真实路径：首次不缓存 → 落定后写入 → 命中结果一致 → 新增文件立刻可见。
+    #[tokio::test]
+    async fn cache_is_used_only_for_settled_directories() {
+        let root = tree("cacheuse");
+        let db_dir =
+            std::env::temp_dir().join(format!("asmoday-search-cache-{}", std::process::id()));
+        let cache = dir_cache::test_cache(&db_dir);
+        let opts = SearchOptions::new("report").recursive(true).limit(100);
+
+        let fresh = run(&root, &opts, None, Some(&cache)).await.unwrap();
+        assert_eq!(cache.count(), 0, "刚写过的目录不该进缓存");
+
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        let cached = run(&root, &opts, None, Some(&cache)).await.unwrap();
+        assert!(
+            cache.count() >= 3,
+            "落定后应当写入目录快照，实际只有 {}",
+            cache.count()
+        );
+        let mut fresh_rels: Vec<String> = fresh.hits.iter().map(|hit| hit.rel.clone()).collect();
+        fresh_rels.sort();
+        let mut cached_rels: Vec<String> = cached.hits.iter().map(|hit| hit.rel.clone()).collect();
+        cached_rels.sort();
+        assert_eq!(cached_rels, fresh_rels, "缓存命中的结果必须与现扫一致");
+
+        // 再走一次：读的是缓存，结果仍然一样
+        let again = run(&root, &opts, None, Some(&cache)).await.unwrap();
+        let mut again_rels: Vec<String> = again.hits.iter().map(|hit| hit.rel.clone()).collect();
+        again_rels.sort();
+        assert_eq!(again_rels, fresh_rels);
+
+        // 新增文件：`sub` 的 mtime 变了 → 只有这一层重扫，新条目必须能搜到
+        touch(&root.join("sub/report-new.md"));
+        let after = run(&root, &opts, None, Some(&cache)).await.unwrap();
+        assert!(
+            after.hits.iter().any(|hit| hit.rel == "sub/report-new.md"),
+            "目录变了却只吃了缓存：{:?}",
+            after.hits.iter().map(|hit| &hit.rel).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
