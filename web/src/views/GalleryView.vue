@@ -361,12 +361,12 @@ const albumHasMore = ref(false)
 /** 相册封面加载失败（坏图）时回退纯色，不再重复请求 */
 const albumCoverFailed = ref(new Set<string>())
 
-async function loadAlbums() {
+async function loadAlbums(refresh = false) {
   if (albumsLoading.value) return
   albumsLoading.value = true
   albumsError.value = ''
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, refresh })
     albums.value = result.items
     albumsTotal.value = result.total
     albumsCursor.value = result.next_cursor ?? null
@@ -604,11 +604,18 @@ function onKey(event: KeyboardEvent) {
   }
 }
 
-async function load() {
+/**
+ * 首屏加载。`refresh` 只由工具栏的「重新扫描」按钮传 true：
+ * 后端其余时候都读目录快照（毫秒级），只有用户明确要求时才整树重扫。
+ */
+async function load(options: { refresh?: boolean } = {}) {
   loading.value = true
   error.value = ''
   try {
-    const result = await browseMedia(undefined, 'media', 2, { limit: PAGE_SIZE })
+    const result = await browseMedia(undefined, 'media', 2, {
+      limit: PAGE_SIZE,
+      refresh: options.refresh,
+    })
     items.value = []
     loadedPaths.clear()
     appendItems(result.items)
@@ -620,7 +627,7 @@ async function load() {
     // 照片库同时刷新相册清单（后端会剔除空相册）
     if (tab.value === 'photos') {
       closeAlbum()
-      void loadAlbums()
+      void loadAlbums(options.refresh)
     }
   } catch (err) {
     error.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
@@ -769,7 +776,7 @@ useEventListener(window, 'keydown', onKey)
         <button
           class="grid size-7 place-items-center rounded-md transition-colors hover:bg-elevated hover:text-ink"
           :title="t('gallery.toolbar.rescan')"
-          @click="load"
+          @click="load({ refresh: true })"
         >
           <AppIcon name="refresh" :size="14" />
         </button>

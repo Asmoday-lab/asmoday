@@ -49,6 +49,8 @@ export interface BrowseResult {
 export interface PageOptions {
   limit?: number
   cursor?: string | null
+  /** 强制穿透后端目录快照重扫（「重新扫描」按钮用；默认走缓存） */
+  refresh?: boolean
 }
 
 /**
@@ -65,6 +67,7 @@ export async function browseMedia(
   if (path) params.set('path', path)
   if (options.limit) params.set('limit', String(options.limit))
   if (options.cursor) params.set('cursor', options.cursor)
+  if (options.refresh) params.set('refresh', '1')
   const res = await fetch(`/api/media/browse?${params.toString()}`)
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as BrowseResult
@@ -106,6 +109,7 @@ export async function browseAlbums(
   if (path) params.set('path', path)
   if (options.limit) params.set('limit', String(options.limit))
   if (options.cursor) params.set('cursor', options.cursor)
+  if (options.refresh) params.set('refresh', '1')
   const res = await fetch(`/api/media/albums?${params.toString()}`)
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as AlbumsResult

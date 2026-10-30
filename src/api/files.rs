@@ -92,6 +92,17 @@ fn fail_code(status: StatusCode, code: &str, message: impl Into<String>) -> Resp
 }
 
 /// GET /api/files/roots
+/// 文件内容被原地覆盖后，丢掉它所在目录的媒体快照。
+///
+/// 目录快照以「目录 mtime」为失效依据，而**覆盖写既有文件不会推进目录 mtime**
+/// （名字集合没变），只有创建 / 删除 / 改名才会。所以这一类写必须自己补一刀，
+/// 否则媒体库里那张图的体积与时间会一直是旧的、排序也停在老位置。
+fn forget_parent_snapshot(state: &AppState, path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        state.dir_cache.forget(&fs::normalize_display(parent));
+    }
+}
+
 pub async fn roots(State(state): State<AppState>) -> Response {
     let set = roots_for(&state).await;
     let default_root = set.default_root().map(|r| r.path.clone());
@@ -524,6 +535,10 @@ pub async fn write_text(
         return fs_error(FsError::Io(format!("替换文件失败：{e}")));
     }
 
+    // 原地覆盖：文件内容变了但**父目录 mtime 没变**，媒体库的目录快照会把
+    // 旧的 size / mtime 一直当真的用。改完主动丢掉这一层（见 dir_cache 模块注释）
+    forget_parent_snapshot(&state, &path);
+
     Json(json!({
         "status": "ok",
         "path": fs::normalize_display(&path),
@@ -657,6 +672,9 @@ pub async fn upload(
         let _ = tokio::fs::remove_file(&tmp).await;
         return fs_error(FsError::Io(format!("落盘失败：{e}")));
     }
+    // 覆盖上传（同名替换）同样不推进目录 mtime，必须主动失效；
+    // 新建文件的场景目录 mtime 本来就会变，这一刀只是顺手，没有副作用
+    forget_parent_snapshot(&state, &target);
 
     Json(json!({
         "status": "ok",

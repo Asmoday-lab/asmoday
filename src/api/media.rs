@@ -43,6 +43,9 @@ pub struct BrowseQuery {
     pub limit: Option<usize>,
     /// 上一页返回的 `next_cursor`；为空即第一页
     pub cursor: Option<String>,
+    /// 强制穿透目录快照重扫（前端「重新扫描」按钮；默认走缓存）
+    #[serde(default, deserialize_with = "crate::api::boolish")]
+    pub refresh: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +141,9 @@ pub struct AlbumsQuery {
     pub limit: Option<usize>,
     /// 上一页返回的 `next_cursor`
     pub cursor: Option<String>,
+    /// 强制穿透目录快照重扫（与媒体列表同一口径）
+    #[serde(default, deserialize_with = "crate::api::boolish")]
+    pub refresh: Option<bool>,
 }
 
 /// 相册清单分页结果（与媒体列表同一套游标口径）
@@ -362,8 +368,16 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
 
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
+    let dir_cache = Arc::clone(&state.dir_cache);
+    let refresh = query.refresh.unwrap_or(false);
     let outcome = tokio::task::spawn_blocking(move || {
-        let (raw, scanned, counts) = scan_raw(&scan_root, &wanted, depth);
+        let (raw, scanned, counts) = scan_raw(
+            &scan_root,
+            &wanted,
+            depth,
+            Some(dir_cache.as_ref()),
+            refresh,
+        );
         // 稳定排序：mtime 降序（新的在前），同 mtime 用展示路径兜底，保证翻页不重不漏
         let mut raw = raw;
         raw.sort_by(|a, b| {
@@ -434,8 +448,16 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
 
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
+    let dir_cache = Arc::clone(&state.dir_cache);
+    let refresh = query.refresh.unwrap_or(false);
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut raw = scan_albums(&scan_root, depth, &wanted);
+        let mut raw = scan_albums(
+            &scan_root,
+            depth,
+            &wanted,
+            Some(dir_cache.as_ref()),
+            refresh,
+        );
         // 新的在前；同 mtime 用路径兜底，保证翻页稳定
         raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
         let total = raw.len();
@@ -523,35 +545,109 @@ struct RawMedia {
     ext: String,
 }
 
+/// 读一个目录的条目（带 `size` / `mtime`）：命中快照就既不 `readdir` 也不逐条 `stat`。
+///
+/// 这是媒体库从「每次整树重扫」变成「一次读库」的唯一入口，也是**唯一**读目录的地方。
+/// `refresh = true` 时穿透缓存（前端的「重新扫描」按钮），但照样把结果写回。
+///
+/// 目录自己还是要 `stat` 一次的 —— 快照的失效判定全靠它（`dir_cache::stamp_of`）。
+fn read_dir_entries(
+    dir: &Path,
+    cache: Option<&crate::core::dir_cache::DirCache>,
+    refresh: bool,
+) -> Vec<crate::core::dir_cache::MediaEntry> {
+    use crate::core::dir_cache::{self, KIND_DIR, KIND_FILE, KIND_LINK, MediaEntry};
+
+    let display = fs::normalize_display(dir);
+    let stamp = std::fs::metadata(dir)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(dir_cache::stamp_of);
+
+    if !refresh
+        && let (Some(cache), Some(stamp)) = (cache, stamp)
+        && let Some(entries) = cache.load_media(&display, stamp)
+    {
+        return entries;
+    }
+
+    let mut entries: Vec<MediaEntry> = Vec::new();
+    if let Ok(reader) = std::fs::read_dir(dir) {
+        for entry in reader.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let (kind, size, mtime) = if file_type.is_dir() {
+                (KIND_DIR, 0, 0)
+            } else if file_type.is_file() {
+                // 只有文件需要 size / mtime；目录与链接省掉这次 metadata
+                match entry.metadata() {
+                    Ok(meta) => (
+                        KIND_FILE,
+                        meta.len(),
+                        meta.modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                            .map(|delta| delta.as_secs())
+                            .unwrap_or(0),
+                    ),
+                    // stat 失败（权限 / 竞态删除）仍保留条目：下一层过滤会丢掉它，
+                    // 但如果这里直接跳过，快照就会「少一条」，比多一条更难查
+                    Err(_) => (KIND_FILE, 0, 0),
+                }
+            } else {
+                (KIND_LINK, 0, 0)
+            };
+            entries.push(MediaEntry::new(name, kind, size, mtime));
+        }
+    }
+    // 顺序必须自己定死：`readdir` 的顺序不可依赖，快照命中时要复现同一顺序，
+    // 相册封面这类「并列取第一个」的逻辑才不会因为缓存而换个结果
+    entries.sort_by_cached_key(|entry| entry.name.to_lowercase());
+
+    if let Some(cache) = cache
+        && let Some(stamp) = stamp
+    {
+        cache.store_media(&display, stamp, &entries);
+    }
+    entries
+}
+
 /// 走一遍目录树，只做 readdir + 分类 + 一次 metadata。
 ///
 /// **没有扫描上限**：媒体库和文件管理一样，必须能看到最后一条。`counts` 统计的是
 /// 全部媒体文件（不受 `wanted` 限制），前端据此显示「库里到底有多少」。
-fn scan_raw(root: &Path, wanted: &[&str], depth: usize) -> (Vec<RawMedia>, usize, KindCounts) {
+fn scan_raw(
+    root: &Path,
+    wanted: &[&str],
+    depth: usize,
+    cache: Option<&crate::core::dir_cache::DirCache>,
+    refresh: bool,
+) -> (Vec<RawMedia>, usize, KindCounts) {
+    use crate::core::dir_cache::{KIND_DIR, KIND_FILE};
+
     let mut out = Vec::new();
     let mut counts = KindCounts::default();
     let mut scanned = 0usize;
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, level)) = queue.pop() {
-        let Ok(reader) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in reader.flatten() {
-            scanned += 1;
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().to_string();
+        let entries = read_dir_entries(&dir, cache, refresh);
+        scanned += entries.len();
+        // 一次 normalize 给这一层的所有条目复用（原来每条都算一次）
+        let folder = fs::normalize_display(&dir);
 
+        for entry in entries {
+            let name = entry.name;
             // 系统垃圾（Thumbs.db / .DS_Store / ._* / ~$*）一律不进媒体库，
             // 否则相册里会混进一堆打不开的元数据文件（设计文档 3.3.7）
             if crate::core::junk::is_system_junk(&name) {
                 continue;
             }
+            let path = dir.join(&name);
 
-            if file_type.is_dir() {
+            if entry.kind == KIND_DIR {
                 // 应用数据目录（缩略图缓存就在里面）绝不进媒体库：
                 // 缓存里的图会被再缩略图一遍，产物写回同一目录，越扫越多。
                 if level < depth
@@ -563,7 +659,7 @@ fn scan_raw(root: &Path, wanted: &[&str], depth: usize) -> (Vec<RawMedia>, usize
                 }
                 continue;
             }
-            if !file_type.is_file() {
+            if entry.kind != KIND_FILE {
                 continue;
             }
 
@@ -583,18 +679,13 @@ fn scan_raw(root: &Path, wanted: &[&str], depth: usize) -> (Vec<RawMedia>, usize
                 continue;
             }
 
-            let meta = entry.metadata().ok();
             out.push(RawMedia {
                 name,
                 display: fs::normalize_display(&path),
-                folder: fs::normalize_display(&dir),
+                folder: folder.clone(),
                 path,
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                mtime: meta
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                size: entry.size,
+                mtime: entry.mtime,
                 kind,
                 ext,
             });
@@ -678,7 +769,15 @@ struct RawAlbum {
     mtime: u64,
 }
 
-fn scan_albums(root: &Path, depth: usize, wanted: &[&str]) -> Vec<RawAlbum> {
+fn scan_albums(
+    root: &Path,
+    depth: usize,
+    wanted: &[&str],
+    cache: Option<&crate::core::dir_cache::DirCache>,
+    refresh: bool,
+) -> Vec<RawAlbum> {
+    use crate::core::dir_cache::{KIND_DIR, KIND_FILE};
+
     let mut albums: Vec<RawAlbum> = Vec::new();
 
     // 与 v2.8 相册视图同一口径（设计文档 3.4.3）：遍历目录树，**每个直接含有
@@ -689,35 +788,31 @@ fn scan_albums(root: &Path, depth: usize, wanted: &[&str]) -> Vec<RawAlbum> {
     let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, true)];
 
     while let Some((dir, level, is_root)) = stack.pop() {
-        let Ok(reader) = std::fs::read_dir(&dir) else {
-            continue;
-        };
+        let entries = read_dir_entries(&dir, cache, refresh);
         let mut count = 0usize;
         // (mtime, path)：相册封面取最新的一张图
         let mut newest: Option<(u64, PathBuf)> = None;
 
-        for entry in reader.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().to_string();
+        for entry in entries {
+            let name = entry.name;
             // 系统垃圾（Thumbs.db / .DS_Store / ._*）一律不进媒体库（设计文档 3.3.7）
             if crate::core::junk::is_system_junk(&name) {
                 continue;
             }
+            let path = dir.join(&name);
 
-            if file_type.is_dir() {
+            if entry.kind == KIND_DIR {
                 // 同上：数据目录不是相册
                 if level < depth
                     && !name.starts_with('.')
                     && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
-                    && !crate::core::reserved::is_reserved_lexical(&entry.path())
+                    && !crate::core::reserved::is_reserved_lexical(&path)
                 {
-                    stack.push((entry.path(), level + 1, false));
+                    stack.push((path, level + 1, false));
                 }
                 continue;
             }
-            if !file_type.is_file() {
+            if entry.kind != KIND_FILE {
                 continue;
             }
 
@@ -731,19 +826,12 @@ fn scan_albums(root: &Path, depth: usize, wanted: &[&str]) -> Vec<RawAlbum> {
                 continue;
             }
             count += 1;
-            let mtime = entry
-                .metadata()
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|delta| delta.as_secs())
-                .unwrap_or(0);
             if newest
                 .as_ref()
-                .map(|(best, _)| mtime > *best)
+                .map(|(best, _)| entry.mtime > *best)
                 .unwrap_or(true)
             {
-                newest = Some((mtime, entry.path()));
+                newest = Some((entry.mtime, path));
             }
         }
 
@@ -1024,7 +1112,7 @@ mod tests {
         touch(&root, "clip.mp4", 1_700_000_000);
         touch(&root, "song.mp3", 1_700_000_000);
 
-        let (raw, _scanned, counts) = scan_raw(&root, &["image"], 0);
+        let (raw, _scanned, counts) = scan_raw(&root, &["image"], 0, None, false);
         assert_eq!(raw.len(), 5000, "旧实现到 4000 就截断，现在必须全都在");
         // counts 统计全部媒体文件，与 wanted 无关
         assert_eq!(counts.image, 5000);
@@ -1041,7 +1129,7 @@ mod tests {
             touch(&root, &format!("p{index:02}.jpg"), 1_700_000_000 + index);
         }
 
-        let (mut raw, _, _) = scan_raw(&root, &["image"], 0);
+        let (mut raw, _, _) = scan_raw(&root, &["image"], 0, None, false);
         raw.sort_by(|a, b| {
             b.mtime
                 .cmp(&a.mtime)
@@ -1087,7 +1175,7 @@ mod tests {
         for index in 0..9u64 {
             touch(&root, &format!("same{index}.jpg"), 1_700_000_000);
         }
-        let (mut raw, _, _) = scan_raw(&root, &["image"], 0);
+        let (mut raw, _, _) = scan_raw(&root, &["image"], 0, None, false);
         raw.sort_by(|a, b| {
             b.mtime
                 .cmp(&a.mtime)
@@ -1138,7 +1226,7 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         touch(&data, "cache.jpg", 1_700_000_009);
 
-        let mut raw = scan_albums(&root, 3, &["image"]);
+        let mut raw = scan_albums(&root, 3, &["image"], None, false);
         raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
         assert_eq!(raw.len(), 3, "只该有 a/b/c 三本，空目录与数据目录都不算");
 
@@ -1164,5 +1252,77 @@ mod tests {
         assert_eq!(seen.len(), 3);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 快照缓存：落定的目录第二次只读库；目录变了自动重扫；`refresh` 强制穿透。
+    #[test]
+    fn scan_reuses_snapshot_and_refresh_bypasses_it() {
+        use crate::core::dir_cache;
+
+        let root = scratch("snapshot");
+        touch(&root, "a.jpg", 1_700_000_001);
+        touch(&root, "b.jpg", 1_700_000_002);
+        let db_dir =
+            std::env::temp_dir().join(format!("asmoday-media-cache-{}", std::process::id()));
+        let cache = dir_cache::test_cache(&db_dir);
+
+        let snapshot = |refresh: bool| {
+            let (mut raw, _, _) = scan_raw(&root, &["image"], 0, Some(&cache), refresh);
+            raw.sort_by(|a, b| a.name.cmp(&b.name));
+            raw.iter()
+                .map(|item| (item.name.clone(), item.size, item.mtime))
+                .collect::<Vec<_>>()
+        };
+
+        let first = snapshot(false);
+        assert_eq!(first.len(), 2);
+        assert_eq!(cache.count_media(), 0, "刚写过的目录不该进缓存");
+
+        // 目录 mtime 要「落定」2 秒才可信，等过去再读一次，这时才会写库
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert_eq!(snapshot(false), first, "缓存命中的结果必须与现扫一致");
+        assert_eq!(cache.count_media(), 1, "落定后应当写入媒体快照");
+
+        // 结构变化（新增文件）会推进目录 mtime —— 不 refresh 也能看到
+        touch(&root, "c.jpg", 1_700_000_003);
+        let after_add = snapshot(false);
+        assert_eq!(after_add.len(), 3, "目录变了却只吃了缓存：{after_add:?}");
+
+        // 刚动过的目录又回到「不可缓存」状态，等落定后重扫一次把新快照写进去，
+        // 下面才谈得上「读到旧值」
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert_eq!(snapshot(false).len(), 3);
+
+        // 原地覆盖：文件内容与大小变了，但目录 mtime 不动。
+        // 不 refresh 会读到缓存里的旧 size —— 这正是「重新扫描」按钮存在的理由。
+        std::fs::write(root.join("a.jpg"), vec![b'x'; 4096]).unwrap();
+        let cached_size = snapshot(false)
+            .into_iter()
+            .find(|(name, _, _)| name == "a.jpg")
+            .map(|(_, size, _)| size)
+            .unwrap_or(0);
+        assert_eq!(
+            cached_size, 1,
+            "缓存本就应该给出旧的大小（否则这个测试没有意义）"
+        );
+
+        let refreshed = snapshot(true)
+            .into_iter()
+            .find(|(name, _, _)| name == "a.jpg")
+            .map(|(_, size, _)| size)
+            .unwrap_or(0);
+        assert_eq!(refreshed, 4096, "refresh 必须真的穿透缓存重扫");
+        // 穿透之后顺手把新结果写回，下次不 refresh 也是新的
+        assert_eq!(
+            snapshot(false)
+                .into_iter()
+                .find(|(name, _, _)| name == "a.jpg")
+                .map(|(_, size, _)| size)
+                .unwrap_or(0),
+            4096
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&db_dir);
     }
 }

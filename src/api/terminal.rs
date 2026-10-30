@@ -31,27 +31,8 @@ pub struct TerminalQuery {
     pub rows: Option<u16>,
     pub session_id: Option<String>,
     /// 纯净模式（设计文档 3.3.7）：跳过 profile/rc，用于配置文件把终端卡死的救急场景
-    #[serde(default, deserialize_with = "boolish")]
+    #[serde(default, deserialize_with = "crate::api::boolish")]
     pub no_profile: Option<bool>,
-}
-
-/// 宽松布尔查询参数：接受 `1/0`、`true/false`、`yes/no`、`on/off`。
-///
-/// 用 `Option<bool>` 直接反序列化时，`?no_profile=1` 会让整条查询串解析失败，
-/// 表现为 WebSocket 握手 400 —— 浏览器只会看到「连接已断开，正在重连」，
-/// 排查成本极高，所以这里一律自己吞下并转成布尔。
-fn boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.map(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }))
 }
 
 /// WS /api/terminal/ws?path=&cols=&rows=&session_id=

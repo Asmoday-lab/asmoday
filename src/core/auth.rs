@@ -232,6 +232,7 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
 ///   （user_version 都是 0）走同一段，幂等由钩子里的列判断保证。
 /// - **v2** 收藏/播放历史主键升级成 `(mount_id, file_path)`。
 /// - **v3** 目录快照缓存（`dir_snapshots`，见 `core/dir_cache.rs`）。
+/// - **v4** 媒体库快照（`media_snapshots`，带 size / mtime，见 `core/dir_cache.rs`）。
 ///
 /// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
 fn migrations() -> Migrations<'static> {
@@ -259,6 +260,18 @@ fn migrations() -> Migrations<'static> {
                 used_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_dir_snapshots_used_at ON dir_snapshots(used_at);",
+        ),
+        // v4：媒体库快照（带 size / mtime）。与 v3 同一套思路、不同的条目格式，
+        // 所以单独一张表 —— 两张表的 blob 互相喂给对方都会解码失败，混存只会更难排查
+        M::up(
+            "CREATE TABLE IF NOT EXISTS media_snapshots (
+                path TEXT PRIMARY KEY,
+                stamp INTEGER NOT NULL,
+                entries BLOB NOT NULL,
+                entry_count INTEGER NOT NULL,
+                used_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_snapshots_used_at ON media_snapshots(used_at);",
         ),
     ])
 }

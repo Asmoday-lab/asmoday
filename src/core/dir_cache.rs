@@ -15,8 +15,13 @@
 //! 缓存是**尽力而为**：任何 SQLite 错误都当 miss，绝不让搜索失败；库被删掉、
 //! 表结构变了、路径换了挂载点，最坏结果只是回到「每次都 readdir」。
 //!
-//! 只缓存**名字与类型**，不缓存大小 / mtime：那两项才是会原地变化的东西，
+//! 搜索只缓存**名字与类型**，不缓存大小 / mtime：那两项才是会原地变化的东西，
 //! 交给命中时的一次 `symlink_metadata`（每页最多 `limit` 次）现取。
+//!
+//! 媒体库（v4.3.1，设计文档 6.6）需要按 mtime 排序、按大小展示，光有名字不够，
+//! 所以另有一张 `media_snapshots` 表，条目里带上 `size` / `mtime`。失效判定与
+//! 搜索同一套（目录 mtime），另有两条补充：应用自己**原地覆盖**写文件后主动
+//! `forget`（覆盖不动目录 mtime），以及前端的「重新扫描」走 `refresh` 强制穿透。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -36,6 +41,8 @@ pub const KIND_LINK: u8 = 2;
 const SETTLE: Duration = Duration::from_secs(2);
 /// blob 头部的格式版本：改了编码就让老行自然失效
 const FORMAT: u8 = 1;
+/// 媒体快照的格式版本（与上面刻意不同：两种 blob 互相喂给对方都会解码失败）
+const FORMAT_MEDIA: u8 = 2;
 /// 最多留多少个目录的快照（按 `used_at` 做 LRU 裁剪）
 const MAX_DIRS: i64 = 4096;
 /// 每写这么多次顺手裁一次，而不是每次都扫表
@@ -63,11 +70,40 @@ impl CachedEntry {
     }
 }
 
+/// 媒体快照里的一条：除了名字与类型，还带**大小**与**修改时间（秒）**。
+///
+/// 媒体库要按 mtime 降序排、要显示体积，而这两项 `readdir` 不给（只有 `stat` 给）。
+/// 缓存它们是为了省掉「每条一次 `stat`」，代价是**原地覆盖写**（改名 / 增删以外
+/// 的改动）不会推进目录 mtime，只能靠调用方主动 `forget` 或前端强制重扫兜底。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaEntry {
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+    pub mtime: u64,
+}
+
+impl MediaEntry {
+    pub fn new(name: impl Into<String>, kind: u8, size: u64, mtime: u64) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            size,
+            mtime,
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.kind == KIND_DIR
+    }
+}
+
 /// 目录快照缓存。一个进程一个实例，内部复用一条连接。
 pub struct DirCache {
     db_path: PathBuf,
     conn: Mutex<Option<Connection>>,
     stores: AtomicU64,
+    media_stores: AtomicU64,
 }
 
 impl DirCache {
@@ -76,6 +112,7 @@ impl DirCache {
             db_path,
             conn: Mutex::new(None),
             stores: AtomicU64::new(0),
+            media_stores: AtomicU64::new(0),
         }
     }
 
@@ -129,12 +166,63 @@ impl DirCache {
         }
     }
 
-    /// 丢掉单个目录（该项改名 / 删除后由调用方补一刀；不依赖 mtime 也正确）
-    #[cfg(test)]
+    /// 丢掉单个目录（改名 / 删除 / 原地覆盖写之后由调用方补一刀）。
+    ///
+    /// 结构变化本身会被目录 mtime 抓到，这里主要是给「原地覆盖」用：内容变了但
+    /// 目录 mtime 不动，缓存里的 `size` / `mtime` 就是旧的，排序会停在老位置。
     pub fn forget(&self, path: &str) {
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM dir_snapshots WHERE path = ?1", params![path])
+            conn.execute("DELETE FROM dir_snapshots WHERE path = ?1", params![path])?;
+            conn.execute("DELETE FROM media_snapshots WHERE path = ?1", params![path])
         });
+    }
+
+    /// 读一次媒体快照（带 size / mtime 的版本）。`stamp` 不一致就是 miss。
+    pub fn load_media(&self, path: &str, stamp: i64) -> Option<Vec<MediaEntry>> {
+        self.with_conn(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT entries, used_at FROM media_snapshots WHERE path = ?1 AND stamp = ?2",
+                    params![path, stamp],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((blob, used_at)) = row else {
+                return Ok(None);
+            };
+            let now = now_secs();
+            if now - used_at > TOUCH_AFTER {
+                let _ = conn.execute(
+                    "UPDATE media_snapshots SET used_at = ?2 WHERE path = ?1",
+                    params![path, now],
+                );
+            }
+            Ok(decode_media(&blob))
+        })
+        .flatten()
+    }
+
+    /// 写一次媒体快照。`stamp` 不合规（太新 / 取不到）时直接跳过。
+    ///
+    /// 顺序由调用方决定：调用方按名字排好再存，命中时按原顺序还原 —— 遍历顺序
+    /// 稳定，分页游标才稳定（`readdir` 的顺序是不可依赖的）。
+    pub fn store_media(&self, path: &str, stamp: i64, entries: &[MediaEntry]) {
+        if decode_guard(stamp).is_none() {
+            return;
+        }
+        let blob = encode_media(entries);
+        let now = now_secs();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO media_snapshots (path, stamp, entries, entry_count, used_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![path, stamp, blob, entries.len() as i64, now],
+            )
+        });
+        let stores = self.media_stores.fetch_add(1, Ordering::Relaxed) + 1;
+        if stores.is_multiple_of(GC_EVERY) {
+            self.gc();
+        }
     }
 
     /// 当前缓存了多少个目录（测试 / 观测用）
@@ -148,16 +236,32 @@ impl DirCache {
         .unwrap_or(0)
     }
 
-    /// LRU 裁剪：超出 `MAX_DIRS` 的旧快照直接删
+    /// 当前缓存了多少个目录的**媒体**快照（测试 / 观测用）
+    #[cfg(test)]
+    pub fn count_media(&self) -> i64 {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM media_snapshots", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .unwrap_or(0)
+    }
+
+    /// LRU 裁剪：超出 `MAX_DIRS` 的旧快照直接删（两张表各裁各的）
     fn gc(&self) {
         self.with_conn(|conn| {
             // rowid 兜底：一次搜索里几千个目录的 `used_at` 往往是同一秒，
             // 只按它排序等于随机淘汰；REPLACE 会换新 rowid，正好反映「最近写入」
-            conn.execute(
-                "DELETE FROM dir_snapshots WHERE path NOT IN \
-                 (SELECT path FROM dir_snapshots ORDER BY used_at DESC, rowid DESC LIMIT ?1)",
-                params![MAX_DIRS],
-            )
+            for table in ["dir_snapshots", "media_snapshots"] {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE path NOT IN \
+                         (SELECT path FROM {table} ORDER BY used_at DESC, rowid DESC LIMIT ?1)"
+                    ),
+                    params![MAX_DIRS],
+                )?;
+            }
+            Ok(())
         });
     }
 
@@ -262,6 +366,62 @@ fn decode_entries(blob: &[u8]) -> Option<Vec<CachedEntry>> {
         entries.push(CachedEntry { name, kind });
     }
     Some(entries)
+}
+
+/// `[版本 u8][条数 u32]{kind u8, size u64, mtime u64, 名长 u16, 名字字节}…`
+///
+/// 固定宽度而不是 varint：媒体库一次几十万条，多占几 MB 换「一眼能看懂、
+/// 不会因为移位写错而悄悄读歪」是划算的（`size` / `mtime` 都是 8 字节小端）。
+fn encode_media(entries: &[MediaEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + entries.len() * 32);
+    out.push(FORMAT_MEDIA);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        let bytes = entry.name.as_bytes();
+        let len = bytes.len().min(u16::MAX as usize);
+        out.push(entry.kind);
+        out.extend_from_slice(&entry.size.to_le_bytes());
+        out.extend_from_slice(&entry.mtime.to_le_bytes());
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+        out.extend_from_slice(&bytes[..len]);
+    }
+    out
+}
+
+/// 解码媒体快照；版本不认 / 数据被截断就返回 `None`（当作 miss）。
+fn decode_media(blob: &[u8]) -> Option<Vec<MediaEntry>> {
+    if blob.first() != Some(&FORMAT_MEDIA) {
+        return None;
+    }
+    let mut rest = blob.get(1..)?;
+    let count = read_u32(&mut rest)? as usize;
+    // 每条至少 19 字节（kind 1 + size 8 + mtime 8 + 名长 2）
+    if count > rest.len() / 19 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = *rest.first()?;
+        rest = rest.get(1..)?;
+        let size = read_u64(&mut rest)?;
+        let mtime = read_u64(&mut rest)?;
+        let len = read_u16(&mut rest)? as usize;
+        let name = std::str::from_utf8(rest.get(..len)?).ok()?.to_string();
+        rest = rest.get(len..)?;
+        entries.push(MediaEntry {
+            name,
+            kind,
+            size,
+            mtime,
+        });
+    }
+    Some(entries)
+}
+
+fn read_u64(rest: &mut &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    *rest = rest.get(8..)?;
+    Some(u64::from_le_bytes(bytes))
 }
 
 fn read_u32(rest: &mut &[u8]) -> Option<u32> {
@@ -382,5 +542,53 @@ mod tests {
         cache.store("Z:/gone", stamp, &[]);
         assert_eq!(cache.load("Z:/gone", stamp), Some(Vec::new()));
         let _ = Path::new("Z:/gone");
+    }
+
+    fn media_sample() -> Vec<MediaEntry> {
+        vec![
+            MediaEntry::new("img_0001.jpg", KIND_FILE, 4_312_777, 1_730_000_001),
+            MediaEntry::new("2024 旅行", KIND_DIR, 0, 0),
+            MediaEntry::new("超大.iso", KIND_FILE, 5_368_709_120, 1_700_000_000),
+            MediaEntry::new("链接", KIND_LINK, 0, 0),
+        ]
+    }
+
+    #[test]
+    fn media_roundtrip_keeps_size_mtime_and_unicode() {
+        let entries = media_sample();
+        assert_eq!(decode_media(&encode_media(&entries)), Some(entries));
+    }
+
+    #[test]
+    fn media_and_search_blobs_never_mix() {
+        // 两张表各存各的格式，喂错了必须解码失败（而不是读出半截乱码）
+        assert!(decode_media(&encode_entries(&sample())).is_none());
+        assert!(decode_entries(&encode_media(&media_sample())).is_none());
+        assert!(decode_media(&[]).is_none());
+    }
+
+    #[test]
+    fn store_media_hits_only_with_same_stamp_and_forget_clears_both() {
+        let cache = cache("media-hit");
+        let stamp = old_stamp();
+        let key = "C:/data/photos";
+        assert!(cache.load_media(key, stamp).is_none(), "空库必须 miss");
+
+        cache.store_media(key, stamp, &media_sample());
+        assert_eq!(cache.load_media(key, stamp), Some(media_sample()));
+        assert!(
+            cache.load_media(key, stamp + 1).is_none(),
+            "戳变了必须 miss"
+        );
+        // 两张表互不干扰：媒体快照不影响搜索快照
+        assert!(cache.load(key, stamp).is_none());
+        assert_eq!(cache.count_media(), 1);
+
+        // 原地覆盖写之后调用方会 forget —— 两张表一起清
+        cache.store(key, stamp, &sample());
+        cache.forget(key);
+        assert!(cache.load_media(key, stamp).is_none());
+        assert!(cache.load(key, stamp).is_none());
+        assert_eq!(cache.count_media(), 0);
     }
 }
