@@ -175,6 +175,7 @@ error.E_BUSY.action.cancel
 | `composables/useReauth.ts` | 包裹任意写操作：请求前检查 `verified_at`，过期则弹 Modal 并重放 | 重放**只一次**，避免死循环 |
 | `composables/usePagedList.ts` | 通用游标分页 | 排序切换自动清空 |
 | `composables/useUpload.ts` | 上传池（默认并发 3） | 支持取消、重试、进度事件 |
+| `composables/useBackClose.ts` | 浮层接管系统返回键（v4.4.4） | 一层浮层=一条同 URL 历史；`close()` 被取消必须重新武装；浮层不进 URL |
 | `lib/errors.ts` | envelope 拦截、code → i18n key 映射 | 未知 code 兜底 `message` + trace_id 复制按钮 |
 | `lib/base.ts` | `base_url` 前缀拼接/剥离 | 路由、Cookie Path、WS URL、静态资源、分享链接统一 |
 
@@ -723,6 +724,8 @@ GWT-TEXT-08 Given 用户已修改文件  When 外部同时修改并保存  Then 
 GWT-TEXT-09 Given 二进制文件  When 打开  Then 415 E_NOT_TEXT，UI 提示"无法编辑"
 GWT-TEXT-10 Given CSV 6MB  When 打开  Then 提示"超过 5MB 已截断"
 GWT-TEXT-11 Given CSV 2000 行  When 打开  Then 提示"超过 1000 行已截断"
+GWT-TEXT-12 Given 有未保存修改  When 按系统返回/浏览器后退  Then 弹未保存确认；选取消则留在编辑器且不改变 URL
+GWT-TEXT-13 Given 编辑器已打开  When 点侧边栏切走或刷新  Then 有未保存修改必须先确认（`onBeforeRouteLeave` + `beforeunload`）
 ```
 
 #### 依赖红线
@@ -1488,6 +1491,8 @@ GWT-I18N-04 Given 任意 .vue 文件  When ESLint  When 含中文字面量  Then
 - 底部悬浮条 `env(safe-area-inset-bottom)`。
 - 软键盘监听 `visualViewport.resize`。
 - 禁止原生 `alert/confirm/prompt`。
+- **系统返回 = 退一层浮层（v4.4.4，见设计文档 4.8）**：编辑器、灯箱、预览、弹窗、抽屉全部经 `useBackClose` 登记，
+  按返回先关最上层（编辑器优先），关完才让路由收到返回；浮层一律不进 URL。
 
 #### 交付物
 

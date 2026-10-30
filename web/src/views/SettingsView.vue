@@ -8,7 +8,8 @@
  * 2. 「恢复默认」是分区块的，且**永远不碰** SQLite（用户、会话、分享都保留）；
  * 3. 界面文本一律走 `$t()`（设计文档 1.4 / 3.8）。
  */
-import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import AppIcon from '../components/AppIcon.vue'
 import { authApi } from '../api/auth'
@@ -620,12 +621,39 @@ async function copyDavUrl() {
   }
 }
 
+/**
+ * 未保存的配置改动（表单或源码任一模式）。
+ *
+ * 判据是「草稿与服务端快照的序列化结果不同」：`draft` 只在加载时与 `config` 同源，
+ * 之后只有用户改动会写它，所以能准确反映「有没有真的改过」，不会因为默认值填充而误报。
+ */
+const unsavedConfig = computed(() => {
+  if (configMode.value === 'source') return rawDirty.value
+  if (!draft.value || !config.value) return false
+  return JSON.stringify(draft.value) !== JSON.stringify(config.value)
+})
+
+/** 配置页同样不能一走了之：切页面 / 刷新 / 关标签页都要先把未保存的改动问清楚 */
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!unsavedConfig.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
+onBeforeRouteLeave(() => !unsavedConfig.value || window.confirm(t('settings.advanced.unsavedLeave')))
+
 onMounted(() => {
+  window.addEventListener('beforeunload', onBeforeUnload)
   void loadConfig()
   void loadCache()
   void loadFfmpeg()
   void loadSafety()
   void loadDavMounts()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', onBeforeUnload)
+  if (davCopyTimer !== null) window.clearTimeout(davCopyTimer)
 })
 </script>
 

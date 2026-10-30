@@ -17,7 +17,7 @@ import {
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
 import FilePreviewPane from '../components/FilePreviewPane.vue'
@@ -43,6 +43,7 @@ import { thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
 import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
+import { useBackClose } from '../composables/useBackClose'
 import { openLightbox, type LightboxItem } from '../stores/lightbox'
 import { openShare, shareTarget } from '../stores/share'
 
@@ -1441,7 +1442,8 @@ async function openRoot(root: MountPoint, options: { push?: boolean } = {}) {
     showToast(t('files.roots.missingToast'))
     return
   }
-  if (editor.value) closeEditor()
+  // 有未保存修改时用户可能选「取消」：那就别换目录了，不然还得再问一次
+  if (editor.value && !closeEditor()) return
   activeMount.value = root
   await open(root.path, 1, { push: options.push })
 }
@@ -1456,7 +1458,7 @@ function goHome() {
   const home = activeMount.value ?? (singleMount.value ? onlineMounts.value[0] : null)
   if (singleMount.value && home) {
     if (currentPath.value !== home.path) {
-      if (editor.value) closeEditor()
+      if (editor.value && !closeEditor()) return
       preview.value = null
       void open(home.path)
       return
@@ -1687,7 +1689,7 @@ async function activate(entry: EntryInfo) {
 
   // Markdown / CSV / PDF：只读预览面板
   if (PREVIEW_EXTS.has(ext)) {
-    if (editor.value) closeEditor()
+    if (editor.value && !closeEditor()) return
     preview.value = entry
     return
   }
@@ -1699,7 +1701,7 @@ async function activate(entry: EntryInfo) {
   }
 
   // Office / CAD / 压缩包 / 未知二进制：不引入解析库，只提示下载
-  if (editor.value) closeEditor()
+  if (editor.value && !closeEditor()) return
   preview.value = entry
 }
 
@@ -1839,10 +1841,12 @@ async function saveEditor() {
   }
 }
 
-function closeEditor() {
-  if (dirty.value && !window.confirm(t('files.editor.confirmClose'))) return
+/** 关闭编辑器。@returns 是否真的关掉了（有未保存修改时用户可能点「取消」） */
+function closeEditor(): boolean {
+  if (dirty.value && !window.confirm(t('files.editor.confirmClose'))) return false
   editor.value = null
   editorLoading.value = false
+  return true
 }
 
 /** 断链：后端无法跟随解析（目标不存在或逃出挂载点），target_is_dir 缺省/null */
@@ -2051,6 +2055,36 @@ function closeTopLayer(): boolean {
   return false
 }
 
+/**
+ * 系统返回键的关闭顺序。
+ *
+ * 与 Esc（closeTopLayer）刻意不同：编辑器排在弹窗之前——手机上用户想退出编辑
+ * 一定是按返回，而不是先关掉某个弹窗；而 Esc 在 CodeMirror 里有补全等自身用途，
+ * 不能顺手把编辑器关掉。预览面板同理。
+ */
+function closeOverlayForBack(): boolean {
+  if (editor.value) return closeEditor()
+  if (preview.value) {
+    preview.value = null
+    return true
+  }
+  return closeTopLayer()
+}
+
+// 浮层在真机上是「一层历史」：返回键先退浮层，再退页面（此前按返回等于直接离开）
+useBackClose(computed(anyOverlayOpen), closeOverlayForBack)
+
+/**
+ * 未保存的编辑内容绝不静默丢弃（离开页面 = 点侧边栏、点面包屑回卡片页）。
+ *
+ * 只问不改状态：确认后由路由自己把组件卸掉，别在这里 closeEditor()，
+ * 否则组件还没卸载就先触发一次多余的响应式更新。
+ */
+onBeforeRouteLeave(() => {
+  if (!editor.value || !dirty.value) return true
+  return window.confirm(t('files.editor.confirmClose'))
+})
+
 async function onKeydown(event: KeyboardEvent) {
   const key = event.key
   const meta = event.ctrlKey || event.metaKey
@@ -2223,10 +2257,19 @@ function probeMounts() {
   void ensureMountAlive()
 }
 
+/** 刷新 / 关标签页 / 直接输新地址：浏览器只认「有没有未保存的编辑」，不问细节 */
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!editor.value || !dirty.value) return
+  event.preventDefault()
+  // 现代浏览器忽略自定义文案，但仍要求 returnValue 有值才会弹确认框
+  event.returnValue = ''
+}
+
 onMounted(() => {
   probeTimer = window.setInterval(probeMounts, MOUNT_PROBE_MS)
   document.addEventListener('visibilitychange', probeMounts)
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('beforeunload', onBeforeUnload)
 })
 
 onBeforeUnmount(() => {
@@ -2234,6 +2277,7 @@ onBeforeUnmount(() => {
   probeTimer = null
   document.removeEventListener('visibilitychange', probeMounts)
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   inflight?.abort()
   inflight = null
 })
@@ -2273,7 +2317,13 @@ onBeforeUnmount(() => {
         </button>
         <p class="min-w-0 flex-1 truncate text-[14px] text-ink">
           {{ editor.name }}
-          <span v-if="dirty" class="text-accent" :title="t('files.editor.unsaved')">●</span>
+          <span
+            v-if="dirty"
+            class="text-accent"
+            :title="t('files.editor.unsaved')"
+            data-testid="editor-dirty"
+            >●</span
+          >
         </p>
         <select
           v-model="editor.language"

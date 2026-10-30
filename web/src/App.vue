@@ -15,6 +15,7 @@ import ShareDialog from './components/ShareDialog.vue'
 import { currentTrack } from './stores/player'
 import { authApi } from './api/auth'
 import { useTheme, type ThemeMode } from './composables/useTheme'
+import { useBackClose } from './composables/useBackClose'
 
 const route = useRoute()
 const router = useRouter()
@@ -35,6 +36,12 @@ function pickTheme(next: ThemeMode) {
 
 const drawerOpen = ref(false)
 const accountOpen = ref(false)
+
+// 移动端抽屉与账号菜单也是一层历史：按返回先收起它，而不是直接退出当前页面
+useBackClose(computed(() => drawerOpen.value || accountOpen.value), () => {
+  drawerOpen.value = false
+  accountOpen.value = false
+})
 
 const isPublic = computed(() => route.meta.public === true)
 const username = authApi.username

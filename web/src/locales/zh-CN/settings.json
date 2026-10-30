@@ -143,6 +143,7 @@
     "loadFailed": "配置加载失败",
     "rawLoadFailed": "源码加载失败",
     "saveFailed": "保存失败",
+    "unsavedLeave": "配置有未保存的修改，确定离开？",
     "loadingRaw": "加载 config.toml …",
     "server": "服务器",
     "port": "监听端口",

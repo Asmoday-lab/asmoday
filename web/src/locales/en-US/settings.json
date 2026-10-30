@@ -143,6 +143,7 @@
     "loadFailed": "Failed to load the configuration",
     "rawLoadFailed": "Failed to load the source",
     "saveFailed": "Save failed",
+    "unsavedLeave": "You have unsaved configuration changes. Leave anyway?",
     "loadingRaw": "Loading config.toml …",
     "server": "Server",
     "port": "Listening port",

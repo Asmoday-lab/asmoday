@@ -28,6 +28,7 @@ import {
 import { sharesApi } from '../api/shares'
 import { formatSize } from '../lib/format'
 import { useScrollLock } from '../composables/useScrollLock'
+import { useBackClose } from '../composables/useBackClose'
 import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
@@ -449,6 +450,13 @@ function closeAlbum() {
   albumCursor.value = null
   albumHasMore.value = false
 }
+
+// 相册详情与视频全屏在真机上都是一层历史：返回键先退这一层，
+// 而不是把整个媒体库都退掉（此前按返回直接离开页面，返回过后还要重新载入列表）
+useBackClose(computed(() => Boolean(activeAlbum.value)), closeAlbum)
+useBackClose(computed(() => Boolean(playing.value)), () => {
+  playing.value = null
+})
 
 /** 当前正在浏览的照片列表：相册详情与时间线各自独立 */
 function currentPhotoList(): MediaItem[] {

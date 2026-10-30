@@ -19,6 +19,7 @@ import { coverUrl, rawUrl, thumbUrl } from '../api/media'
 import { sharesApi } from '../api/shares'
 import { openShare } from '../stores/share'
 import { useScrollLock } from '../composables/useScrollLock'
+import { useBackClose } from '../composables/useBackClose'
 import { bindVolume } from '../lib/volume'
 import {
   closeLightbox,
@@ -51,6 +52,9 @@ const stripEl = ref<HTMLElement | null>(null)
 const thumbRefs = ref<Record<number, HTMLElement | null>>({})
 
 useScrollLock(isOpen)
+
+// 灯箱是一层历史：手机上按返回键应该关掉大图，而不是退出整个页面
+useBackClose(isOpen, closeLightbox)
 
 /** 静默预加载前后各一张：停留当前图时后台把邻居下载到缓存（设计文档 3.4.4） */
 function preloadNeighbors() {
