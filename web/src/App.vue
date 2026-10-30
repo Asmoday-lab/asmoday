@@ -205,7 +205,7 @@ async function logout() {
           currentTrack
             ? player.state.barStyle === 'minimal'
               ? 'pb-24'
-              : 'pb-[calc(4rem+env(safe-area-inset-bottom,0px))] md:pb-[100px]'
+              : 'pb-[calc(5rem+env(safe-area-inset-bottom,0px))] md:pb-[132px]'
             : ''
         "
       >
