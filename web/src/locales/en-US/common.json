@@ -1,6 +1,4 @@
 {
-  "appName": "Asmoday",
-  "home": "Home",
   "nav": {
     "portal": "Dashboard",
     "files": "Files",
@@ -31,40 +29,21 @@
   },
   "action": {
     "save": "Save",
-    "saving": "Saving",
     "cancel": "Cancel",
     "close": "Close",
-    "confirm": "Confirm",
-    "delete": "Delete",
     "deleting": "Deleting…",
-    "back": "Back",
-    "open": "Open",
     "download": "Download",
-    "upload": "Upload",
-    "refresh": "Refresh",
-    "copy": "Copy",
     "copied": "Copied",
-    "retry": "Retry",
-    "edit": "Edit",
-    "add": "Add",
-    "test": "Test",
-    "create": "Create",
     "creating": "Creating…",
-    "loading": "Loading…",
-    "loadMore": "Load more",
-    "loadingMore": "Loading…",
-    "newWindow": "Open in new window"
+    "loading": "Loading…"
   },
   "state": {
-    "empty": "Nothing here yet",
     "unknownError": "Unknown error",
     "permanent": "Permanent",
     "enabled": "Enabled",
     "disabled": "Disabled",
     "yes": "Yes",
-    "no": "No",
-    "never": "Never",
-    "none": "None"
+    "no": "No"
   },
   "theme": {
     "light": "Light",
@@ -84,14 +63,6 @@
     "zh-CN": "简体中文",
     "en-US": "English"
   },
-  "unit": {
-    "items": "{count} items",
-    "files": "{count} files",
-    "pieces": "{count}",
-    "photos": "{count} photos",
-    "tracks": "{count} tracks",
-    "days": "{count} days"
-  },
   "time": {
     "permanent": "Never expires",
     "expiresAt": "Expires {time}",
@@ -99,7 +70,6 @@
     "unknown": "Unknown date"
   },
   "clipboard": {
-    "copied": "Copied",
     "linkCopied": "Link copied",
     "denied": "Copy failed: the browser denied clipboard access"
   },

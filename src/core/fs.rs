@@ -62,7 +62,6 @@ pub enum FsError {
 
 impl FsError {
     /// 细节文本（错误码与状态码的映射在 `api::error`，避免两处各写一套）
-    #[allow(dead_code)]
     pub fn message(&self) -> String {
         match self {
             FsError::Forbidden(m)

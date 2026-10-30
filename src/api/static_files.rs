@@ -126,9 +126,3 @@ pub async fn serve(
 
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
-
-/// 供 main 判断前端产物是否已内嵌。
-#[allow(dead_code)]
-pub fn embedded_files() -> usize {
-    Assets::iter().count()
-}

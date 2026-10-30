@@ -783,8 +783,7 @@ async fn read_style_snapshot(
     }
 }
 
-/// 供其它模块复用的配置快照读取（阶段三终端联动会用到挂载点校验）。
-#[allow(dead_code)]
+/// 配置快照（属性页探测视频分辨率时需要 `media.ffmpeg_path`）。
 pub async fn config_snapshot(state: &AppState) -> Config {
     state.config.read().await.clone()
 }

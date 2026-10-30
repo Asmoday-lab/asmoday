@@ -26,8 +26,8 @@ pub struct TrackTags {
 }
 
 impl TrackTags {
-    /// 只在测试里用（正常流程直接读字段），避免非测试构建报 dead_code。
-    #[allow(dead_code)]
+    /// 只在测试里用（正常流程直接读字段）
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.title.is_none() && self.artist.is_none() && self.album.is_none() && !self.has_cover
     }

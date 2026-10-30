@@ -51,11 +51,9 @@
     "uploadFirst": "Open a mount before uploading",
     "searchFailed": "Search failed",
     "scanned": "{count} scanned",
-    "scopeAll": "with subfolders",
-    "loadingMore": "Searching…"
+    "scopeAll": "with subfolders"
   },
   "editor": {
-    "back": "Back",
     "close": "Close editor",
     "unsaved": "Unsaved changes",
     "switchLanguage": "Switch language",
@@ -84,13 +82,10 @@
     "edit": "Edit",
     "open": "Open",
     "terminal": "Open in terminal",
-    "copyRelativePath": "Copy relative path",
-    "copyAbsolutePath": "Copy absolute path",
     "download": "Download",
     "share": "Share…",
     "directLink": "Copy image URL",
     "delete": "Delete…",
-    "pathCopied": "Path copied",
     "directLinkCopied": "Image URL copied",
     "directLinkFailed": "Failed to create the direct URL",
     "rename": "Rename…",
@@ -107,7 +102,6 @@
     "confirm": "Delete",
     "doneDir": "Folder deleted",
     "doneFile": "File deleted",
-    "failed": "Delete failed",
     "confirmNameLabel": "Type the folder name to confirm",
     "confirmNameHint": "Deletion stays blocked until the name matches",
     "titleBatch": "Delete selected items",
@@ -129,7 +123,6 @@
     "permanent": "Never",
     "allowDownload": "Allow download",
     "submit": "Create share",
-    "creating": "Creating…",
     "copyLink": "Copy link",
     "hint": "Folder shares can be browsed and downloaded in the browser; revoke the link on the Shares page.",
     "failed": "Failed to create the share"
@@ -169,15 +162,13 @@
     "titleFile": "New file",
     "placeholder": "Name",
     "submit": "Create",
-    "done": "Created",
-    "failed": "Create failed"
+    "done": "Created"
   },
   "rename": {
     "title": "Rename",
     "label": "New name",
     "submit": "Save",
-    "done": "Renamed",
-    "failed": "Rename failed"
+    "done": "Renamed"
   },
   "transfer": {
     "titleCopy": "Copy to folder",
@@ -194,7 +185,6 @@
     "submit": "Start",
     "busy": "Processing {count} items, keep this page open",
     "done": "Done",
-    "failed": "Operation failed",
     "noTarget": "Enter a destination folder",
     "conflictRequired": "Choose how to handle an existing name first"
   },
@@ -212,7 +202,6 @@
   },
   "stat": {
     "title": "Properties",
-    "name": "Name",
     "size": "Size",
     "mime": "Type",
     "modified": "Modified",
@@ -221,7 +210,6 @@
     "inode": "inode",
     "symlink": "Symlink target",
     "readonly": "Read-only",
-    "failed": "Cannot read properties",
     "directory": "Location",
     "resolution": "Resolution",
     "bytes": "{count} bytes"
@@ -233,7 +221,6 @@
     "move": "Move",
     "copy": "Copy",
     "delete": "Delete",
-    "noDownloadable": "None of the selected items is a file",
     "downloadConfirm": "Pack {count} items into one ZIP",
     "downloadHint": "Folders are packed with everything inside; large selections take a while before the first byte",
     "toggle": "Select this item"
@@ -256,8 +243,7 @@
     "play": "Play",
     "download": "Download",
     "share": "Share",
-    "directLink": "Copy direct link",
-    "properties": "Properties"
+    "directLink": "Copy direct link"
   },
   "symlink": {
     "broken": "Broken link",

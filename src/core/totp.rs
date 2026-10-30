@@ -43,12 +43,6 @@ pub fn code_at(secret: &str, unix_secs: u64) -> Option<u32> {
     Some(binary % 1_000_000)
 }
 
-/// 当前时间片的动态码（调试/测试辅助）
-#[allow(dead_code)]
-pub fn current_code(secret: &str) -> Option<u32> {
-    code_at(secret, crate::core::auth::now_secs() as u64)
-}
-
 /// 校验动态码，容忍前后各一个时间片（时钟漂移）
 pub fn verify(secret: &str, code: u32, unix_secs: u64) -> bool {
     const STEP: u64 = 30;

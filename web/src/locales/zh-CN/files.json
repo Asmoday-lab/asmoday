@@ -51,11 +51,9 @@
     "uploadFirst": "请先进入一个挂载点再上传",
     "searchFailed": "搜索失败",
     "scanned": "已扫描 {count} 项",
-    "scopeAll": "含子目录",
-    "loadingMore": "继续搜索…"
+    "scopeAll": "含子目录"
   },
   "editor": {
-    "back": "返回",
     "close": "关闭编辑器",
     "unsaved": "有未保存的修改",
     "switchLanguage": "手动切换语言",
@@ -84,13 +82,10 @@
     "edit": "编辑",
     "open": "打开",
     "terminal": "在终端中打开",
-    "copyRelativePath": "复制相对路径",
-    "copyAbsolutePath": "复制绝对路径",
     "download": "下载",
     "share": "分享…",
     "directLink": "复制图床直链",
     "delete": "删除…",
-    "pathCopied": "路径已复制",
     "directLinkCopied": "图床直链已复制",
     "directLinkFailed": "直链生成失败",
     "rename": "重命名…",
@@ -107,7 +102,6 @@
     "confirm": "确认删除",
     "doneDir": "目录已删除",
     "doneFile": "文件已删除",
-    "failed": "删除失败",
     "confirmNameLabel": "请输入目录名以确认",
     "confirmNameHint": "名称不匹配时无法删除",
     "titleBatch": "批量删除",
@@ -129,7 +123,6 @@
     "permanent": "永久",
     "allowDownload": "允许下载",
     "submit": "创建分享",
-    "creating": "创建中…",
     "copyLink": "复制链接",
     "hint": "目录分享支持在网页内浏览与下载子文件；链接可在「分享与图床」页撤销。",
     "failed": "创建分享失败"
@@ -169,15 +162,13 @@
     "titleFile": "新建文件",
     "placeholder": "名称",
     "submit": "创建",
-    "done": "已创建",
-    "failed": "创建失败"
+    "done": "已创建"
   },
   "rename": {
     "title": "重命名",
     "label": "新名称",
     "submit": "保存",
-    "done": "已重命名",
-    "failed": "重命名失败"
+    "done": "已重命名"
   },
   "transfer": {
     "titleCopy": "复制到目录",
@@ -194,7 +185,6 @@
     "submit": "开始",
     "busy": "正在处理 {count} 项，请勿关闭页面",
     "done": "完成",
-    "failed": "操作失败",
     "noTarget": "请填写目标目录",
     "conflictRequired": "请先选择同名冲突的处理方式"
   },
@@ -212,7 +202,6 @@
   },
   "stat": {
     "title": "属性",
-    "name": "名称",
     "size": "大小",
     "mime": "类型",
     "modified": "修改时间",
@@ -221,7 +210,6 @@
     "inode": "inode",
     "symlink": "符号链接目标",
     "readonly": "只读",
-    "failed": "无法读取属性",
     "directory": "所在目录",
     "resolution": "分辨率",
     "bytes": "{count} 字节"
@@ -233,7 +221,6 @@
     "move": "移动",
     "copy": "复制",
     "delete": "删除",
-    "noDownloadable": "所选项目中没有可下载的文件",
     "downloadConfirm": "将 {count} 项打包成 ZIP 下载",
     "downloadHint": "目录会连同其中的文件一起打进包里，体积较大时首字节要等一会儿",
     "toggle": "选择此项"
@@ -256,8 +243,7 @@
     "play": "播放",
     "download": "下载",
     "share": "分享",
-    "directLink": "复制直链",
-    "properties": "属性"
+    "directLink": "复制直链"
   },
   "symlink": {
     "broken": "断链",

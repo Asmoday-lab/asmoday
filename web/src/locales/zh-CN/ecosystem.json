@@ -17,6 +17,5 @@
     "tailscale": "不想暴露公网？用组网工具建立虚拟局域网，在外网安全访问家里的设备。",
     "picgo": "利用图床直链把 Asmoday 配成 PicGo 默认图床，配合 Typora / Obsidian 打造 Markdown 写作流。"
   },
-  "visit": "前往官网",
   "footer": "Asmoday 的成长离不开上述优秀开源/商业工具的生态支持，点击卡片可访问其官方网站。"
 }

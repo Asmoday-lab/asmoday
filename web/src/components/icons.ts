@@ -42,7 +42,6 @@ export const ICONS = {
   sparkle: ['M12 4.5 13.8 10l5.7 1.9-5.7 1.9L12 19.5l-1.8-5.7L4.5 12l5.7-2Z'],
   chevronRight: ['m9 5 7 7-7 7'],
   chevronLeft: ['m15 5-7 7 7 7'],
-  chevronDown: ['m5 9 7 7 7-7'],
   file: ['M6 3h7l5 5v13H6Z', 'M13 3v5h5'],
   fileText: ['M6 3h7l5 5v13H6Z', 'M13 3v5h5', 'M9 12h6', 'M9 16h6'],
   video: ['M4 6h16v12H4Z', 'm10 9.5 5 2.5-5 2.5Z'],
@@ -60,7 +59,6 @@ export const ICONS = {
   lock: ['M6 11h12v9H6Z', 'M9 11V8a3 3 0 0 1 6 0v3'],
   /** 开锁：锁体同 lock，锁梁向右上敞开（对应「锁定常驻」的未锁状态） */
   unlock: ['M6 11h12v9H6Z', 'M9 11V8a3 3 0 0 1 5.6-1.5'],
-  refreshClock: ['M12 7v5l3 2', 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z'],
   play: ['M8 5.5v13l11-6.5Z'],
   pause: ['M8 5.5h3v13H8Z', 'M13 5.5h3v13h-3Z'],
   prev: ['M6 5.5v13', 'M18 5.5 9 12l9 6.5Z'],
