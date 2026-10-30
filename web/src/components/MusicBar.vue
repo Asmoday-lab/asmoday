@@ -92,6 +92,24 @@ const displayArtist = computed(() => {
   return track.artist ?? folder
 })
 
+/**
+ * 歌名下方的副行（v4.4.12）：优先当前歌词行 —— 条上直接滚动显示 karaoke 字，
+ * 点歌名仍可展开完整歌词面板；没有歌词退回 ID3 歌手；两者都没有就留空，
+ * 不再回退到目录名（用户反馈「文件夹这个不需要」）。
+ */
+const currentLyric = computed(() => {
+  const lines = player.state.lyrics
+  if (!lines || activeLyric.value < 0) return ''
+  return lines[activeLyric.value]?.text?.trim() ?? ''
+})
+
+const displaySubtitle = computed(
+  () => currentLyric.value || currentTrack.value?.artist?.trim() || '',
+)
+
+/** 副行是不是歌词（决定着色：歌词行用 accent 弱化色，歌手用 muted） */
+const subtitleIsLyric = computed(() => currentLyric.value.length > 0)
+
 /** 当前曲目是否有可展示的内嵌封面 */
 const showCover = computed(() => Boolean(currentTrack.value?.cover) && !coverFailed.value)
 
@@ -306,12 +324,12 @@ watch(
     -->
     <Transition name="slide-up">
       <div
-        v-if="currentTrack"
+        v-if="currentTrack && player.state.barStyle === 'classic'"
         class="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center"
         style="padding-bottom: env(safe-area-inset-bottom, 0px)"
       >
       <div
-        class="pointer-events-auto w-full border-t border-line bg-panel/95 shadow-2xl backdrop-blur md:mb-3 md:w-[70%] md:min-w-[660px] md:max-w-[1180px] md:rounded-2xl md:border"
+        class="pointer-events-auto w-full border-t border-line bg-panel/95 shadow-2xl backdrop-blur md:mb-3 md:w-[70%] md:min-w-[720px] md:max-w-[1180px] md:rounded-2xl md:border"
         data-testid="music-bar"
       >
         <!-- 移动端：单行 -->
@@ -340,7 +358,12 @@ watch(
             >
               {{ displayTitle }}
             </button>
-            <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
+            <p
+              class="truncate text-[11px]"
+              :class="subtitleIsLyric ? 'text-accent/80' : 'text-muted'"
+            >
+              {{ displaySubtitle }}
+            </p>
           </div>
           <button
             class="grid size-8 shrink-0 place-items-center rounded-md text-ink transition-colors hover:bg-elevated"
@@ -362,6 +385,14 @@ watch(
             @click="player.next()"
           >
             <AppIcon name="next" :size="16" />
+          </button>
+          <button
+            class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
+            :title="t('gallery.player.styleMinimal')"
+            data-testid="music-bar-minimize"
+            @click="player.setBarStyle('minimal')"
+          >
+            <AppIcon name="chevronDown" :size="16" />
           </button>
           <button
             class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
@@ -396,11 +427,17 @@ watch(
               >
                 {{ displayTitle }}
               </button>
-              <p class="truncate text-[11px] text-muted">{{ displayArtist }}</p>
+              <p
+                class="truncate text-[11px]"
+                :class="subtitleIsLyric ? 'text-accent/80' : 'text-muted'"
+                :title="displaySubtitle"
+              >
+                {{ displaySubtitle }}
+              </p>
             </div>
           </div>
 
-          <div class="flex w-[min(34vw,400px)] min-w-[280px] flex-col items-center gap-1">
+          <div class="flex w-[min(34vw,380px)] min-w-[240px] flex-col items-center gap-1">
             <div class="flex items-center gap-4">
               <button
                 class="grid size-8 place-items-center rounded-full text-ink transition-colors hover:bg-elevated"
@@ -442,21 +479,22 @@ watch(
             </div>
           </div>
 
-          <div class="flex items-center justify-end gap-1">
+          <!-- 右工具（v4.4.12）：按钮从 size-8 放大到 size-9，图标 15→17 -->
+          <div class="flex items-center justify-end gap-1.5">
             <button
-              class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+              class="grid size-9 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
               :title="modeLabel"
               @click="cycleMode"
             >
-              <AppIcon :name="modeIcon" :size="15" />
+              <AppIcon :name="modeIcon" :size="17" />
             </button>
-            <div class="hidden items-center gap-1 lg:flex">
+            <div class="hidden min-w-0 items-center gap-1.5 lg:flex">
               <button
-                class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+                class="grid size-9 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
                 :title="volumeTitle"
                 @click="volume.toggle()"
               >
-                <AppIcon :name="volumeIcon" :size="15" />
+                <AppIcon :name="volumeIcon" :size="17" />
               </button>
               <input
                 type="range"
@@ -465,28 +503,116 @@ watch(
                 step="0.01"
                 :value="volume.sliderValue"
                 :title="t('gallery.player.volume')"
-                class="h-1 w-20 cursor-pointer accent-[var(--accent)]"
+                class="h-1 w-16 min-w-0 cursor-pointer accent-[var(--accent)] xl:w-20"
                 @input="onVolumeInput"
               />
             </div>
             <button
-              class="grid size-8 place-items-center rounded-md transition-colors"
+              class="grid size-9 shrink-0 place-items-center rounded-md transition-colors"
               :class="listOpen ? 'text-accent' : 'text-muted hover:text-ink'"
               :title="t('gallery.player.playlist')"
               @click="toggleList"
             >
-              <AppIcon name="list" :size="16" />
+              <AppIcon name="list" :size="17" />
             </button>
             <button
-              class="grid size-8 place-items-center rounded-md transition-colors"
+              class="grid size-9 shrink-0 place-items-center rounded-md transition-colors"
               :class="expanded ? 'text-accent' : 'text-muted hover:text-ink'"
               :title="t('gallery.player.lyrics')"
               @click="toggleLyrics"
             >
-              <AppIcon name="fileText" :size="15" />
+              <AppIcon name="fileText" :size="17" />
+            </button>
+            <!-- 形态切换：classic → minimal（minimal 卡里有还原按钮） -->
+            <button
+              class="grid size-9 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+              :title="t('gallery.player.styleMinimal')"
+              data-testid="music-bar-minimize"
+              @click="player.setBarStyle('minimal')"
+            >
+              <AppIcon name="chevronDown" :size="17" />
             </button>
             <button
-              class="grid size-8 place-items-center rounded-md text-muted transition-colors hover:text-ink"
+              class="grid size-9 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
+              :title="t('gallery.player.close')"
+              @click="closePlayer"
+            >
+              <AppIcon name="close" :size="17" />
+            </button>
+          </div>
+        </div>
+      </div>
+      </div>
+    </Transition>
+
+    <!--
+      极简模式（v4.4.12）：右下角小卡。只留 当前曲目两行 + 播放/下一首 + 还原/关闭，
+      进度用卡顶一根 2px 线；还原按钮把 barStyle 切回 classic。
+    -->
+    <Transition name="slide-up">
+      <div
+        v-if="currentTrack && player.state.barStyle === 'minimal'"
+        class="pointer-events-none fixed z-40 right-3"
+        style="bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px))"
+      >
+        <div
+          class="pointer-events-auto relative w-[min(92vw,340px)] overflow-hidden rounded-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur"
+          data-testid="music-bar-minimal"
+        >
+          <span class="absolute inset-x-0 top-0 h-[2px] bg-line/70" aria-hidden="true">
+            <span class="block h-full bg-accent" :style="{ width: progressPercent }" />
+          </span>
+          <div class="flex items-center gap-2.5 px-3 pb-2.5 pt-3">
+            <span
+              class="relative grid size-10 shrink-0 place-items-center overflow-hidden rounded-lg text-accent"
+              :style="{ backgroundColor: placeholderColor(currentTrack.path) }"
+            >
+              <AppIcon v-if="!showCover" name="audio" :size="16" />
+              <img
+                v-else
+                :src="coverUrl(currentTrack.path)"
+                alt=""
+                class="size-full object-cover"
+                @error="coverFailed = true"
+              />
+            </span>
+            <div class="min-w-0 flex-1">
+              <p class="truncate text-[13px] font-medium text-ink" :title="displayTitle">
+                {{ displayTitle }}
+              </p>
+              <p
+                class="truncate text-[11px]"
+                :class="subtitleIsLyric ? 'text-accent/80' : 'text-muted'"
+                :title="displaySubtitle"
+              >
+                {{ displaySubtitle }}
+              </p>
+            </div>
+            <button
+              class="grid size-9 shrink-0 place-items-center rounded-full bg-accent text-white transition-transform active:scale-95"
+              :title="player.state.playing ? t('gallery.player.pause') : t('gallery.player.play')"
+              data-testid="music-bar-play"
+              @click="player.toggle()"
+            >
+              <AppIcon :name="playIcon" :size="16" />
+            </button>
+            <button
+              class="grid size-8 shrink-0 place-items-center rounded-md text-ink transition-colors hover:bg-elevated"
+              :title="t('gallery.player.next')"
+              @click="player.next()"
+            >
+              <AppIcon name="next" :size="15" />
+            </button>
+            <button
+              class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+              :title="t('gallery.player.styleClassic')"
+              data-testid="music-bar-restore"
+              @click="player.setBarStyle('classic')"
+            >
+              <AppIcon name="expand" :size="15" />
+            </button>
+            <button
+              class="grid size-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:text-ink"
               :title="t('gallery.player.close')"
               @click="closePlayer"
             >
@@ -494,7 +620,6 @@ watch(
             </button>
           </div>
         </div>
-      </div>
       </div>
     </Transition>
 

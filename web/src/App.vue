@@ -12,7 +12,7 @@ import AppSidebar from './components/AppSidebar.vue'
 import MediaLightbox from './components/MediaLightbox.vue'
 import MusicBar from './components/MusicBar.vue'
 import ShareDialog from './components/ShareDialog.vue'
-import { currentTrack } from './stores/player'
+import { currentTrack, player } from './stores/player'
 import { authApi } from './api/auth'
 import { useTheme, type ThemeMode } from './composables/useTheme'
 import { useBackClose } from './composables/useBackClose'
@@ -203,7 +203,9 @@ async function logout() {
         class="min-h-0 flex-1 overflow-y-auto"
         :class="
           currentTrack
-            ? 'pb-[calc(4rem+env(safe-area-inset-bottom,0px))] md:pb-[100px]'
+            ? player.state.barStyle === 'minimal'
+              ? 'pb-24'
+              : 'pb-[calc(4rem+env(safe-area-inset-bottom,0px))] md:pb-[100px]'
             : ''
         "
       >

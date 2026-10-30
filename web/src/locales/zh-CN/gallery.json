@@ -72,7 +72,9 @@
     "playlist": "播放列表",
     "playlistClear": "清空列表",
     "playlistEmpty": "播放队列是空的",
-    "playlistCount": "共 {count} 首"
+    "playlistCount": "共 {count} 首",
+    "styleMinimal": "切换到右下角极简模式",
+    "styleClassic": "恢复标准播放条"
   },
   "video": {
     "unsupportedExt": "浏览器无法解码 .{ext} 视频，请转码为 mp4(H.264)，或在文件管理里下载后本地播放",

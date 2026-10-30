@@ -1262,6 +1262,9 @@ GWT-SET-01 Given 桌面端设置页  Then 左侧竖排图标导航常驻、移�
 GWT-SET-02 Given 侧边栏左下角  Then 自上而下为「生态推荐」小字链接（当前页高亮）与 `v<version> · 由 Asmoday 提供`；折叠态只留图标且不占高度
 GWT-SET-03 Given 生态推荐  When 点左下角入口  Then 在右侧主内容区打开 `/ecosystem`，设置页的 Tab 里不再有该分区
 GWT-BAR-01 Given 播放条正在显示  When 点关闭  Then 播放条整体向下滑出（有真实 translateY 位移，不是纯淡出），滑完才卸载；进入同理自底部升起
+GWT-BAR-02 Given 正在播放且有同目录 .lrc  When 播放进度推进  Then 歌名下方副行显示当前歌词行（accent 弱化色），不显示目录名；无歌词时显示 ID3 歌手，再没有就留空
+GWT-BAR-03 Given 播放条为 classic  When 点右工具区极简按钮  Then 切换为右下角 340px 小卡（含播放/下一首/还原/关闭）；小卡里点还原回到 classic；两种形态刷新后保持
+GWT-BAR-04 Given 桌面 1440px  When 量右工具区按钮  Then 每个都是 36×36（不被 flex 压成 24px 宽）
 ```
 
 #### 依赖红线

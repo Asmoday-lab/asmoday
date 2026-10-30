@@ -16,6 +16,9 @@ import { pinia } from './pinia'
 
 export type PlayMode = 'loop' | 'one' | 'shuffle'
 
+/** 播放条形态：classic = 居中浮动完整条；minimal = 右下角极简小卡 */
+export type BarStyle = 'classic' | 'minimal'
+
 export interface LyricLine {
   time: number
   text: string
@@ -33,6 +36,8 @@ export const usePlayerStore = defineStore('player', () => {
   const expanded = ref(false)
   const lyrics = ref<LyricLine[] | null>(null)
   const lyricError = ref('')
+  /** 播放条形态跨会话保留（v4.4.12） */
+  const barStyle = useStorage<BarStyle>('asmoday.player.barStyle', 'classic')
 
   /** 面板展示用：当前曲目（优先 ID3 标题） */
   const currentTrack = computed(() => queue.value[index.value] ?? null)
@@ -131,6 +136,12 @@ export const usePlayerStore = defineStore('player', () => {
     mode.value = value
   }
 
+  function setBarStyle(value: BarStyle) {
+    barStyle.value = value
+    // 换形态时收起浮层面板，避免旧位置的歌词/列表悬空
+    expanded.value = false
+  }
+
   function seek(time: number) {
     currentTime.value = time
     return time
@@ -156,6 +167,7 @@ export const usePlayerStore = defineStore('player', () => {
     expanded,
     lyrics,
     lyricError,
+    barStyle,
     currentTrack,
     play,
     toggle,
@@ -164,6 +176,7 @@ export const usePlayerStore = defineStore('player', () => {
     jump,
     clearQueue,
     setMode,
+    setBarStyle,
     seek,
     stop,
     isCurrent,
@@ -190,6 +203,7 @@ export const player = {
   jump: store.jump,
   clearQueue: store.clearQueue,
   setMode: store.setMode,
+  setBarStyle: store.setBarStyle,
   seek: store.seek,
   stop: store.stop,
   isCurrent: store.isCurrent,

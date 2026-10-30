@@ -72,7 +72,9 @@
     "playlist": "Playlist",
     "playlistClear": "Clear playlist",
     "playlistEmpty": "The queue is empty",
-    "playlistCount": "{count} tracks"
+    "playlistCount": "{count} tracks",
+    "styleMinimal": "Switch to the compact mini player",
+    "styleClassic": "Restore the full player bar"
   },
   "video": {
     "unsupportedExt": "The browser cannot decode .{ext} video. Transcode it to mp4 (H.264), or download it from Files and play locally",
