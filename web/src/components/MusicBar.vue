@@ -16,7 +16,7 @@ import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
 import { player, currentTrack, type BarStyle, type PlayMode } from '../stores/player'
-import { rawUrl, coverUrl, placeholderColor } from '../api/media'
+import { rawUrl, coverUrl } from '../api/media'
 import { volume, bindVolume, applyVolume } from '../lib/volume'
 
 const { t } = useI18n()
@@ -33,8 +33,8 @@ const seeking = ref(false)
 const coverFailed = ref(false)
 
 const modes: { key: PlayMode; icon: IconName; label: string }[] = [
-  { key: 'loop', icon: 'refresh', label: 'gallery.player.modeLoop' },
-  { key: 'one', icon: 'repeat', label: 'gallery.player.modeOne' },
+  { key: 'loop', icon: 'repeat', label: 'gallery.player.modeLoop' },
+  { key: 'one', icon: 'repeatOne', label: 'gallery.player.modeOne' },
   { key: 'shuffle', icon: 'shuffle', label: 'gallery.player.modeShuffle' },
 ]
 
@@ -46,7 +46,7 @@ const modeIcon = computed<IconName>(
   () => modes.find((mode) => mode.key === player.state.mode)?.icon ?? 'refresh',
 )
 
-const playIcon = computed<IconName>(() => (player.state.playing ? 'pause' : 'play'))
+const playIcon = computed<IconName>(() => (player.state.playing ? 'pauseSolid' : 'playSolid'))
 
 /** 进度比例（0~100 的数值，用来画滑条填充） */
 const progressRatio = computed(() => {
@@ -383,7 +383,7 @@ watch(
       style="padding-bottom: env(safe-area-inset-bottom, 0px)"
     >
       <div
-        class="group/bar pointer-events-auto relative w-full border-t border-line bg-panel/95 backdrop-blur-2xl backdrop-saturate-150 md:mb-6 md:w-[clamp(760px,85%,1200px)] md:rounded-[20px] md:border md:shadow-[0_10px_30px_-8px_rgba(0,0,0,0.45)]"
+        class="group/bar pointer-events-auto relative w-full border-t border-line bg-panel/95 backdrop-blur-2xl backdrop-saturate-150 md:mb-6 md:w-[60%] md:min-w-[680px] md:rounded-[20px] md:border md:shadow-[0_10px_30px_-8px_rgba(0,0,0,0.45)]"
         data-testid="music-bar"
       >
         <!--
@@ -403,7 +403,7 @@ watch(
           </button>
         </div>
 
-        <div class="px-3 pb-2 pt-2 md:px-6 md:py-3">
+        <div class="px-3 pb-2 pt-2 md:px-6 md:py-3.5">
           <!-- ① 全宽进度行：时间 – 细滑条 – 时长 -->
           <div class="flex items-center gap-3">
             <span class="w-[34px] shrink-0 text-center text-[11px] tabular-nums text-muted">
@@ -430,10 +430,9 @@ watch(
           <!-- ② 移动端：单行，尺寸对齐参考稿窄屏断点（封面 32 / 播放 34 / 其它 28~32） -->
           <div class="mt-1.5 flex items-center gap-1.5 md:hidden">
             <span
-              class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-lg text-accent"
-              :style="{ backgroundColor: placeholderColor(currentTrack.path) }"
+              class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-lg bg-accent"
             >
-              <AppIcon v-if="!showCover" name="audio" :size="14" />
+              <span v-if="!showCover" class="size-2 rounded-full bg-white/90" />
               <img
                 v-else
                 :src="coverUrl(currentTrack.path)"
@@ -471,7 +470,7 @@ watch(
               :title="t('gallery.player.prev')"
               @click="player.prev()"
             >
-              <AppIcon name="prev" :size="14" />
+              <AppIcon name="prevSolid" :size="15" filled />
             </button>
             <button
               class="grid size-[34px] shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-transform active:scale-95"
@@ -479,14 +478,14 @@ watch(
               data-testid="music-bar-play"
               @click="player.toggle()"
             >
-              <AppIcon :name="playIcon" :size="15" />
+              <AppIcon :name="playIcon" :size="15" filled />
             </button>
             <button
               class="grid size-7 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
               :title="t('gallery.player.next')"
               @click="player.next()"
             >
-              <AppIcon name="next" :size="14" />
+              <AppIcon name="nextSolid" :size="15" filled />
             </button>
             <button
               class="grid size-7 shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated active:scale-90"
@@ -523,10 +522,9 @@ watch(
           <div class="mt-2.5 hidden items-center gap-3 md:flex">
             <div class="flex min-w-0 max-w-[248px] shrink-0 items-center gap-2.5">
               <span
-                class="relative grid size-10 shrink-0 place-items-center overflow-hidden rounded-xl text-accent shadow-[0_4px_12px_rgba(0,0,0,0.15)]"
-                :style="{ backgroundColor: placeholderColor(currentTrack.path) }"
+                class="relative grid size-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-accent shadow-[0_4px_12px_rgba(0,0,0,0.15)]"
               >
-                <AppIcon v-if="!showCover" name="audio" :size="16" />
+                <span v-if="!showCover" class="size-2 rounded-full bg-white/90" />
                 <img
                   v-else
                   :src="coverUrl(currentTrack.path)"
@@ -565,7 +563,7 @@ watch(
                 step="0.01"
                 :value="volume.sliderValue"
                 :title="volumeTitle"
-                class="music-range hidden w-16 min-w-0 shrink-0 cursor-pointer lg:block"
+                class="music-range is-volume hidden w-16 min-w-0 shrink-0 cursor-pointer lg:block"
                 :style="{ backgroundImage: volumeBackground }"
                 @input="onVolumeInput"
               />
@@ -589,7 +587,7 @@ watch(
                 :title="t('gallery.player.prev')"
                 @click="player.prev()"
               >
-                <AppIcon name="prev" :size="17" />
+                <AppIcon name="prevSolid" :size="16" filled />
               </button>
               <button
                 class="grid size-11 shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-all hover:scale-105 hover:brightness-110 active:scale-95"
@@ -597,26 +595,30 @@ watch(
                 data-testid="music-bar-play"
                 @click="player.toggle()"
               >
-                <AppIcon :name="playIcon" :size="18" />
+                <AppIcon :name="playIcon" :size="17" filled />
               </button>
               <button
                 class="grid size-9 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink active:scale-90"
                 :title="t('gallery.player.next')"
                 @click="player.next()"
               >
-                <AppIcon name="next" :size="17" />
+                <AppIcon name="nextSolid" :size="16" filled />
               </button>
 
               <button
-                class="grid size-8 shrink-0 place-items-center rounded-lg transition-colors hover:bg-elevated"
-                :class="listOpen ? 'bg-accent/10 text-accent' : 'text-muted hover:text-ink'"
+                class="grid size-8 shrink-0 place-items-center rounded-lg border transition-colors"
+                :class="
+                  listOpen
+                    ? 'border-accent bg-accent/10 text-accent'
+                    : 'border-line text-muted hover:border-muted/40 hover:bg-elevated hover:text-ink'
+                "
                 :title="t('gallery.player.playlist')"
                 @click="toggleList"
               >
                 <AppIcon name="list" :size="16" />
               </button>
               <button
-                class="grid size-8 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-elevated hover:text-ink"
+                class="grid size-8 shrink-0 place-items-center rounded-lg border border-line text-muted transition-colors hover:border-muted/40 hover:bg-elevated hover:text-ink"
                 :title="t('gallery.player.styleMinimal')"
                 data-testid="music-bar-minimize"
                 @click="switchStyle('minimal')"
@@ -704,7 +706,7 @@ watch(
               data-testid="music-bar-mini-prev"
               @click="player.prev()"
             >
-              <AppIcon name="prev" :size="14" />
+              <AppIcon name="prevSolid" :size="15" filled />
             </button>
             <button
               class="mx-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-accent text-white play-glow transition-transform active:scale-95"
@@ -712,7 +714,7 @@ watch(
               data-testid="music-bar-mini-play"
               @click="player.toggle()"
             >
-              <AppIcon :name="playIcon" :size="13" />
+              <AppIcon :name="playIcon" :size="14" filled />
             </button>
             <button
               class="grid size-6 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-elevated hover:text-ink"
@@ -720,7 +722,7 @@ watch(
               data-testid="music-bar-mini-next"
               @click="player.next()"
             >
-              <AppIcon name="next" :size="14" />
+              <AppIcon name="nextSolid" :size="15" filled />
             </button>
             <!-- 歌单：参考稿没有这个入口，本项目保留（否则极简形态下打不开列表） -->
             <button

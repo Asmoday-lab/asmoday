@@ -329,6 +329,14 @@ body {
 .music-range:focus-visible::-moz-range-thumb {
   transform: scale(1);
 }
+/* 音量轨（.is-volume）：参考稿里拇指一直亮着，只有一圈柔光，没有进度轨那种外扩光环 */
+.music-range.is-volume::-webkit-slider-thumb {
+  transform: scale(1);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 45%, transparent);
+}
+.music-range.is-volume::-moz-range-thumb {
+  transform: scale(1);
+}
 .music-range::-moz-range-track {
   height: 4px;
   border-radius: 999px;
