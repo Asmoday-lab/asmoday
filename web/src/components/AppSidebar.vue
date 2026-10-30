@@ -94,9 +94,9 @@ const itemClass = (to: string) => [
       @click="router.push('/')"
     >
       <span
-        class="grid size-8 shrink-0 place-items-center rounded-lg bg-accent text-white shadow-[0_0_18px_var(--accent)]"
+        class="grid size-8 shrink-0 place-items-center rounded-lg bg-[linear-gradient(135deg,#818cf8,#4f46e5)] text-white shadow-md"
       >
-        <AppIcon name="sparkle" :size="17" :stroke-width="1.8" />
+        <AppIcon name="sparkle" :size="32" :stroke-width="1.75" />
       </span>
       <span v-if="!collapsed" class="ml-3 truncate text-lg font-bold tracking-wide text-ink">
         Asmoday

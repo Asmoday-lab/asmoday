@@ -98,9 +98,9 @@ function changeLocale(event: Event) {
     <div class="relative w-full max-w-sm">
       <div class="mb-6 flex flex-col items-center text-center">
         <span
-          class="mb-3 grid size-12 place-items-center rounded-2xl bg-accent text-white shadow-[0_0_24px_var(--accent)]"
+          class="mb-3 grid size-12 place-items-center rounded-2xl bg-[linear-gradient(135deg,#818cf8,#4f46e5)] text-white shadow-md"
         >
-          <AppIcon name="sparkle" :size="22" :stroke-width="1.8" />
+          <AppIcon name="sparkle" :size="48" :stroke-width="1.75" />
         </span>
         <h1 class="text-xl font-semibold text-ink">Asmoday</h1>
         <p class="mt-1 text-xs text-muted">
