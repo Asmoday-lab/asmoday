@@ -1323,6 +1323,7 @@ stateDiagram-v2
 
 - 外壳跟随全局主题，渲染区**强制深色**。
 - 移动端监听 `window.visualViewport.resize` 重新 `fit()`。
+- **v4.4.3 起**（见设计文档 5.4.1）：触屏滚动由 `touchstart/move/end` 自己换算成 `scrollLines`（xterm 6 的虚拟滚动条不认触摸）；快捷键条在文档流里并靠 `useKeyboardInset` 的 `padding-bottom` 随键盘上移；按键用 `pointerdown.prevent` 保住焦点（否则输入法收起）；`pointer: coarse` 下不自动聚焦。
 - `Tab` 键拦截，发送 `\t` 并 `return false`。
 
 #### API 契约
@@ -1609,7 +1610,9 @@ GWT-UX-08 Given 任意组件  When 执行 alert/confirm  Then 禁止（用封装
 ```
 [ ] 375 宽，所有页面无横向滚动
 [ ] 长按弹出菜单，滑动取消
-[ ] 软键盘弹出时终端/编辑器重新 fit
+[ ] 软键盘弹出时终端/编辑器重新 fit，按键条整块停在键盘上沿（不被压住半截）
+[ ] 终端里手指拖动 / 甩动能翻历史输出，轻点不会误滚
+[ ] 连按快捷键条时系统输入法不收起
 [ ] 底部安全区 padding
 [ ] 顶部安全区（刘海屏）不遮挡
 ```

@@ -12,6 +12,7 @@ import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import TerminalPane from '../components/TerminalPane.vue'
 import { listTerminalSessions, killTerminalSession, type TerminalSession } from '../api/terminal'
+import { useKeyboardInset } from '../composables/useKeyboardInset'
 import { useTerminalStore, saveSafeModeDefault, type TerminalStatus } from '../stores/terminal'
 
 // Pinia store 直接解构会丢响应性：状态用 storeToRefs 转回 ref（保持 .value 用法），
@@ -26,6 +27,16 @@ const showKeys = ref(true)
 const ctrl = ref(false)
 const alt = ref(false)
 const toast = ref('')
+
+/**
+ * 软键盘遮挡量：键盘弹出时给整块终端区补 padding-bottom，
+ * 快捷键条与状态栏随之内缩，停在键盘上沿而不是被压在下面（见 useKeyboardInset）。
+ */
+const shell = ref<HTMLElement | null>(null)
+const keyboardInset = useKeyboardInset(shell)
+const shellStyle = computed(() =>
+  keyboardInset.value > 0 ? { paddingBottom: `${keyboardInset.value}px` } : undefined,
+)
 
 const panes = new Map<string, InstanceType<typeof TerminalPane>>()
 
@@ -215,9 +226,15 @@ function toggleSticky(key: 'ctrl' | 'alt') {
 }
 
 function sendKey(sequence: string) {
-  activePane.value?.sendRaw(sequence)
+  const pane = activePane.value
+  // 只在「按键前就处于输入状态」时把焦点要回来：键盘本来就收着的时候
+  // 按 ESC / 方向键是为了翻输出，不该顺手把系统输入法弹出来
+  const hadFocus = pane?.hasFocus() ?? false
+  pane?.sendRaw(sequence)
   ctrl.value = false
   alt.value = false
+  // 触屏按键不能把焦点留在按钮上：否则 xterm 的隐藏输入框失焦，系统输入法直接收起
+  if (hadFocus) pane?.focus()
 }
 
 const statusLabel = computed<Record<TerminalStatus, string>>(() => ({
@@ -237,7 +254,11 @@ const statusTone: Record<TerminalStatus, string> = {
 
 <template>
   <!-- 外壳（标签栏/键盘/状态栏）跟随全局主题；只有 xterm 渲染区恒为深色（v2.7.0 3.3.5 / 8.4.4） -->
-  <section class="flex h-full min-h-0 flex-col bg-panel text-ink">
+  <section
+    ref="shell"
+    class="relative flex h-full min-h-0 flex-col bg-panel text-ink"
+    :style="shellStyle"
+  >
     <!-- 标签栏 -->
     <header
       class="flex h-10 shrink-0 items-center gap-1 border-b border-line bg-panel px-2"
@@ -349,7 +370,6 @@ const statusTone: Record<TerminalStatus, string> = {
         v-show="tab.id === activeId"
         :key="tab.id"
         class="absolute inset-0 p-2 md:p-3"
-        :class="{ 'pb-[80px] md:pb-3': showKeys }"
       >
         <!-- 浅色主题下的「画中画」缓冲：主区域浅色，终端壳圆角 + 阴影（8.4.4 第 2 条） -->
         <div
@@ -371,33 +391,46 @@ const statusTone: Record<TerminalStatus, string> = {
       </div>
     </div>
 
-    <!-- 移动端 Termux 两行键盘 -->
+    <!-- 移动端 Termux 两行键盘：正常文档流里的 flex 子项（不是 absolute），
+         占位由 flex 分配，键盘弹出时整块上移，不会被系统输入法压住半截 -->
     <div
       v-if="showKeys && tabs.length > 0"
-      class="absolute bottom-0 left-0 right-0 z-30 h-[72px] border-t border-line bg-panel md:hidden"
-      style="padding-bottom: env(safe-area-inset-bottom, 0px); height: calc(72px + env(safe-area-inset-bottom, 0px))"
+      class="flex shrink-0 flex-col border-t border-line bg-panel md:hidden"
+      style="
+        height: calc(72px + env(safe-area-inset-bottom, 0px));
+        padding-bottom: env(safe-area-inset-bottom, 0px);
+      "
+      data-testid="term-keypad"
     >
-      <div class="grid h-1/2 grid-cols-7 border-b border-line bg-elevated">
-        <button class="term-key" @click="sendKey('\x1b')">ESC</button>
-        <button class="term-key" @click="sendKey('/')">/</button>
-        <button class="term-key" @click="sendKey('-')">-</button>
-        <button class="term-key" @click="sendKey('\x1b[H')">HOME</button>
-        <button class="term-key" @click="sendKey('\x1b[A')">↑</button>
-        <button class="term-key" @click="sendKey('\x1b[F')">END</button>
-        <button class="term-key" @click="sendKey('\x1b[5~')">PGUP</button>
+      <div class="grid flex-1 grid-cols-7 border-b border-line bg-elevated">
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b')">ESC</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('/')">/</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('-')">-</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[H')">HOME</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[A')">↑</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[F')">END</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[5~')">PGUP</button>
       </div>
-      <div class="grid h-1/2 grid-cols-7">
-        <button class="term-key" @click="sendKey('\t')">TAB</button>
-        <button class="term-key" :class="{ 'term-key-active': ctrl }" @click="toggleSticky('ctrl')">
+      <div class="grid flex-1 grid-cols-7">
+        <button class="term-key" @pointerdown.prevent="sendKey('\t')">TAB</button>
+        <button
+          class="term-key"
+          :class="{ 'term-key-active': ctrl }"
+          @pointerdown.prevent="toggleSticky('ctrl')"
+        >
           CTRL
         </button>
-        <button class="term-key" :class="{ 'term-key-active': alt }" @click="toggleSticky('alt')">
+        <button
+          class="term-key"
+          :class="{ 'term-key-active': alt }"
+          @pointerdown.prevent="toggleSticky('alt')"
+        >
           ALT
         </button>
-        <button class="term-key" @click="sendKey('\x1b[D')">←</button>
-        <button class="term-key" @click="sendKey('\x1b[B')">↓</button>
-        <button class="term-key" @click="sendKey('\x1b[C')">→</button>
-        <button class="term-key" @click="sendKey('\x1b[6~')">PGDN</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[D')">←</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[B')">↓</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[C')">→</button>
+        <button class="term-key" @pointerdown.prevent="sendKey('\x1b[6~')">PGDN</button>
       </div>
     </div>
 
@@ -523,7 +556,7 @@ const statusTone: Record<TerminalStatus, string> = {
     <Transition name="fade">
       <div
         v-if="toast"
-        class="pointer-events-none absolute bottom-20 left-1/2 z-40 -translate-x-1/2 rounded-full border border-line bg-elevated px-4 py-2 text-xs text-ink shadow-lg"
+        class="pointer-events-none absolute bottom-28 left-1/2 z-40 -translate-x-1/2 rounded-full border border-line bg-elevated px-4 py-2 text-xs text-ink shadow-lg"
       >
         {{ toast }}
       </div>
@@ -541,6 +574,10 @@ const statusTone: Record<TerminalStatus, string> = {
   font-family: var(--font-app-mono);
   font-size: 12px;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  /* 连按不缩、不触发双击缩放：终端里方向键要能连击 */
+  touch-action: manipulation;
 }
 .term-key:last-child {
   border-right: none;

@@ -119,6 +119,31 @@ function sendResize() {
   socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
 }
 
+/**
+ * 把焦点还给 xterm 的隐藏输入框。
+ *
+ * 触屏上点任何 `<button>` 都会把焦点从 textarea 抢走，输入法立刻收起 ——
+ * 屏幕键盘（快捷键条）必须每次按完都把焦点要回来。`preventScroll` 是因为
+ * textarea 被 xterm 放在视口外（left:-9999em），浏览器会为了「露出焦点」
+ * 把整页横向滚一下，手机上表现为画面莫名偏移。
+ */
+function focusTerminal() {
+  const textarea = term?.textarea
+  if (textarea) {
+    textarea.focus({ preventScroll: true })
+    return
+  }
+  term?.focus()
+}
+
+/** 触屏设备不自动抢焦点：iOS 也不会因为脚本 focus 就弹输入法，
+ *  Android 却会 —— 一进页面就弹键盘挡住半屏，行为还因平台而异，不如统一交给用户点。 */
+function autoFocus() {
+  const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
+  if (coarse) return
+  focusTerminal()
+}
+
 /** 重新适配容器尺寸（ResizeObserver 与 visualViewport 共用） */
 function refit() {
   if (!fit || !term) return
@@ -188,7 +213,7 @@ function openSocket() {
   current.onopen = () => {
     if (socket !== current) return
     sendResize()
-    term?.focus()
+    autoFocus()
   }
 
   current.onmessage = (event) => {
@@ -282,6 +307,142 @@ function sendRaw(text: string) {
   socket.send(encoder.encode(text))
 }
 
+// ---------------- 触屏滚动 ----------------
+//
+// xterm 6 把滚动交给内部虚拟滚动条（`SmoothScrollableElement`），只有滚轮事件
+// 能驱动它，触摸拖动没有任何一条路径会走到滚动 —— 手机上等于「翻不了历史输出」。
+// 这里自己把纵向拖动换算成行：普通缓冲区走 `scrollLines`（公开 API，会同步
+// ydisp 与滚动条），全屏应用（vim / htop）没有 scrollback，就合成滚轮事件
+// 让 xterm 自己按方向键 / 鼠标上报处理。
+
+/** 拖动多少像素才认定是「滚」而不是「点」 */
+const TAP_SLOP = 8
+/** 惯性摩擦（每 16ms 保留的速度比例） */
+const FRICTION = 0.94
+
+let touchActive = false
+let touchScrolling = false
+let touchStartX = 0
+let touchStartY = 0
+let touchPrevY = 0
+let touchPrevT = 0
+let touchVelocity = 0
+/** 不足一行的高度的余量，攒够一整行才滚，避免抖动 */
+let touchAcc = 0
+let inertiaFrame = 0
+/** 手指当前位置：合成滚轮事件时要带上，否则鼠标上报的坐标会落在左上角 */
+let touchPointX = 0
+let touchPointY = 0
+
+/** 单行像素高度：拿 `.xterm-screen` 的实测高度除以行数，包含 line-height */
+function cellHeight(): number {
+  if (!term) return 16
+  const screen = term.element?.querySelector('.xterm-screen') as HTMLElement | null
+  const box = (screen ?? term.element)?.getBoundingClientRect()
+  if (!box || box.height <= 0 || term.rows <= 0) return 16
+  return box.height / term.rows
+}
+
+function stopInertia() {
+  if (inertiaFrame) cancelAnimationFrame(inertiaFrame)
+  inertiaFrame = 0
+}
+
+/** 按像素滚动：正数 = 手指下拉 = 看更早的输出 */
+function scrollByPixels(dy: number) {
+  if (!term || dy === 0) return
+  const cell = cellHeight()
+  touchAcc += dy
+  const lines = Math.trunc(touchAcc / cell)
+  if (!lines) return
+  touchAcc -= lines * cell
+  if (term.buffer.active.type === 'alternate') {
+    // 全屏应用：合成的 wheel 会被 xterm 翻译成方向键，或按应用是否开启
+    // 鼠标上报转成滚轮事件 —— 两种语义都由它自己判定，比我们猜更准
+    term.element?.dispatchEvent(
+      new WheelEvent('wheel', {
+        deltaY: lines > 0 ? -120 : 120,
+        clientX: touchPointX,
+        clientY: touchPointY,
+        bubbles: true,
+        cancelable: true,
+      }),
+    )
+    return
+  }
+  term.scrollLines(-lines)
+}
+
+function startInertia(velocity: number) {
+  stopInertia()
+  let last = performance.now()
+  let speed = velocity
+  const step = (now: number) => {
+    // 掉帧时别一次补太多，否则甩一下直接到底
+    const dt = Math.min(48, now - last)
+    last = now
+    speed *= FRICTION ** (dt / 16)
+    if (Math.abs(speed) < 0.05) {
+      inertiaFrame = 0
+      return
+    }
+    scrollByPixels(speed * dt)
+    inertiaFrame = requestAnimationFrame(step)
+  }
+  inertiaFrame = requestAnimationFrame(step)
+}
+
+function onTouchStart(event: TouchEvent) {
+  if (event.touches.length !== 1) {
+    touchActive = false
+    return
+  }
+  stopInertia()
+  const touch = event.touches[0]
+  touchActive = true
+  touchScrolling = false
+  touchStartX = touch.clientX
+  touchStartY = touch.clientY
+  touchPointX = touch.clientX
+  touchPointY = touch.clientY
+  touchPrevY = touch.clientY
+  touchPrevT = performance.now()
+  touchVelocity = 0
+  touchAcc = 0
+}
+
+function onTouchMove(event: TouchEvent) {
+  if (!touchActive || event.touches.length !== 1) return
+  const touch = event.touches[0]
+  const dy = touch.clientY - touchPrevY
+  const now = performance.now()
+  const dt = now - touchPrevT
+  if (!touchScrolling) {
+    const dx = touch.clientX - touchStartX
+    const travelY = touch.clientY - touchStartY
+    // 横向拖动（抽屉/横向滚动）与轻点都不接管
+    if (Math.abs(travelY) < TAP_SLOP || Math.abs(dx) > Math.abs(travelY)) return
+    touchScrolling = true
+  }
+  // 接管纵向拖动：不拦默认行为的话页面会跟着橡皮筋、还可能触发下拉刷新
+  if (event.cancelable) event.preventDefault()
+  if (dt > 0) touchVelocity = touchVelocity * 0.7 + (dy / dt) * 0.3
+  touchPointX = touch.clientX
+  touchPointY = touch.clientY
+  touchPrevY = touch.clientY
+  touchPrevT = now
+  scrollByPixels(dy)
+}
+
+function onTouchEnd() {
+  if (!touchActive) return
+  const flung = touchScrolling
+  touchActive = false
+  touchScrolling = false
+  // 甩动惯性：手指离开后按最后的速度继续减速
+  if (flung && Math.abs(touchVelocity) > 0.15) startInertia(touchVelocity)
+}
+
 onMounted(() => {
   if (!host.value) return
 
@@ -298,6 +459,12 @@ onMounted(() => {
   fit = new FitAddon()
   term.loadAddon(fit)
   term.open(host.value)
+
+  // 触屏滚动（见上方 scrollByPixels）：touchmove 必须非 passive 才能拦住默认滚动
+  host.value.addEventListener('touchstart', onTouchStart, { passive: true })
+  host.value.addEventListener('touchmove', onTouchMove, { passive: false })
+  host.value.addEventListener('touchend', onTouchEnd)
+  host.value.addEventListener('touchcancel', onTouchEnd)
 
   // Tab 键必须进 PTY：浏览器默认行为是移动焦点（自动补全直接失效）。
   // xterm 收到 return false 会走自己的键盘处理流程把 \t 发给 onData。
@@ -321,7 +488,7 @@ onMounted(() => {
         /* 容器尚未布局 */
       }
       sendResize()
-      term?.focus()
+      autoFocus()
     })
   })
 
@@ -352,6 +519,13 @@ onMounted(() => {
 onBeforeUnmount(() => {
   disposed = true
   clearRetry()
+  stopInertia()
+  if (host.value) {
+    host.value.removeEventListener('touchstart', onTouchStart)
+    host.value.removeEventListener('touchmove', onTouchMove)
+    host.value.removeEventListener('touchend', onTouchEnd)
+    host.value.removeEventListener('touchcancel', onTouchEnd)
+  }
   resizeObserver?.disconnect()
   resizeObserver = null
   if (viewportHandler && window.visualViewport) {
@@ -380,12 +554,17 @@ watch(
         /* ignore */
       }
       sendResize()
-      term?.focus()
+      autoFocus()
     })
   },
 )
 
-defineExpose({ sendRaw, reconnect, focus: () => term?.focus() })
+/** 隐藏输入框当前是否持有焦点（= 系统输入法是否处于弹出状态） */
+function hasFocus(): boolean {
+  return !!term?.textarea && document.activeElement === term.textarea
+}
+
+defineExpose({ sendRaw, reconnect, focus: focusTerminal, hasFocus })
 </script>
 
 <template>
@@ -398,5 +577,13 @@ defineExpose({ sendRaw, reconnect, focus: () => term?.focus() })
 .terminal-canvas {
   background: #1e1e1e;
   border-radius: 6px;
+}
+
+/* 触屏上纵向拖动由 scrollByPixels 接管：不声明 touch-action 的话，
+   浏览器会先自己滚一段（页面橡皮筋 / 下拉刷新），我们的 touchmove 再也拦不住 */
+@media (pointer: coarse) {
+  .terminal-canvas {
+    touch-action: none;
+  }
 }
 </style>
