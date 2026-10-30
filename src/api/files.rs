@@ -671,13 +671,27 @@ pub async fn upload(
 pub struct SearchQuery {
     pub path: Option<String>,
     pub q: String,
+    /// 是否递归子目录（默认 false，保持老客户端「只搜当前目录」的行为）
+    pub recursive: Option<bool>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
 
-/// GET /api/files/search：仅当前目录的文件名模糊匹配（设计文档 3.2 的「轻量搜索」）
+/// GET /api/files/search：文件名模糊匹配，递归可选，游标分页（设计文档 4.6）。
+///
+/// 返回 `items` / `scanned` / `has_more` / `next_cursor`。没有「结果上限」：
+/// 只要 `has_more` 为真，把 `next_cursor` 原样带回来就能接着往下搜。
 pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> Response {
     let keyword = query.q.trim().to_lowercase();
     if keyword.is_empty() {
-        return Json(json!({ "items": [], "truncated": false })).into_response();
+        return Json(json!({
+            "items": [],
+            "scanned": 0,
+            "has_more": false,
+            "next_cursor": null,
+            "recursive": query.recursive.unwrap_or(false),
+        }))
+        .into_response();
     }
 
     let roots = roots_for(&state).await;
@@ -708,51 +722,48 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
         return fail(StatusCode::BAD_REQUEST, "Search target is not a directory");
     }
 
-    const LIMIT: usize = 200;
-    let mut items = Vec::new();
-    let mut truncated = false;
-
-    let mut reader = match tokio::fs::read_dir(&target).await {
-        Ok(reader) => reader,
-        Err(e) => return fs_error(FsError::Io(format!("读取目录失败：{e}"))),
+    let recursive = query.recursive.unwrap_or(false);
+    let options = crate::core::search::SearchOptions {
+        keyword,
+        limit: query.limit.unwrap_or(crate::core::search::DEFAULT_LIMIT),
+        recursive,
+        follow_symlinks: roots.follow_symlinks,
+        budget: crate::core::search::DEFAULT_BUDGET,
     };
 
-    while let Ok(Some(entry)) = reader.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // 搜索同样不返回系统垃圾，避免用户搜 "ds" 搜出一堆 .DS_Store（设计文档 3.3.7）
-        if crate::core::junk::is_system_junk(&name) {
-            continue;
-        }
-        if !name.to_lowercase().contains(&keyword) {
-            continue;
-        }
-        // 应用数据目录不参与搜索（缩略图缓存里有成千上万个条目，搜出来也没意义）
-        if crate::core::reserved::is_reserved_lexical(&entry.path()) {
-            continue;
-        }
-        if items.len() >= LIMIT {
-            truncated = true;
-            break;
-        }
+    let page = match crate::core::search::run(&target, &options, query.cursor.as_deref()).await {
+        Ok(page) => page,
+        Err(err) => return fs_error(err),
+    };
 
-        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-        let path = entry.path();
-        let meta = entry.metadata().await.ok();
-        let ext = fs::extension_of_name(&name);
-        let (kind, editable) = fs::classify_name(&name, &ext, is_dir);
+    let items: Vec<_> = page
+        .hits
+        .iter()
+        .map(|hit| {
+            let ext = fs::extension_of_name(&hit.name);
+            let (kind, editable) = fs::classify_name(&hit.name, &ext, hit.is_dir);
+            json!({
+                "name": hit.name,
+                "path": fs::normalize_display(&hit.abs),
+                // 相对搜索根的 POSIX 路径：结果列表要告诉用户「这条在哪个子目录」
+                "rel": hit.rel,
+                "is_dir": hit.is_dir,
+                "size": hit.size,
+                "kind": kind,
+                "ext": ext,
+                "editable": editable,
+            })
+        })
+        .collect();
 
-        items.push(json!({
-            "name": name,
-            "path": fs::normalize_display(&path),
-            "is_dir": is_dir,
-            "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
-            "kind": kind,
-            "ext": ext,
-            "editable": editable,
-        }));
-    }
-
-    Json(json!({ "items": items, "truncated": truncated })).into_response()
+    Json(json!({
+        "items": items,
+        "scanned": page.scanned,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+        "recursive": recursive,
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------

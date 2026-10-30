@@ -50,6 +50,12 @@ export interface EntryInfo {
   editable: boolean
   /** 单条 stat 失败（权限 / 断链），前端显示占位而不是整页报错 */
   stat_error?: boolean
+  /**
+   * 搜索命中的相对路径（相对搜索根，POSIX）。
+   * 只有搜索结果带这个字段 —— 目录列表里条目的位置由当前目录决定，
+   * 而搜索结果可能来自任意子目录，不标出来用户不知道它藏在哪。
+   */
+  rel?: string
 }
 
 export interface Listing {
@@ -68,6 +74,34 @@ export interface Listing {
 
 /** 覆盖策略：后端不接受 ask，由弹窗在客户端解析成具体值 */
 export type OnConflict = 'overwrite' | 'rename' | 'skip'
+
+/** 一条搜索命中（设计文档 4.6） */
+export interface SearchHit {
+  name: string
+  path: string
+  /** 相对搜索根的 POSIX 路径：告诉用户这条命中的在哪个子目录 */
+  rel: string
+  is_dir: boolean
+  size: number
+  kind: FileKind
+  ext: string
+  editable: boolean
+}
+
+/**
+ * 一页搜索结果。
+ *
+ * `has_more` 为真时把 `next_cursor` 原样带回来继续搜 —— 结果没有条数上限，
+ * 只有「一页多少条」。`scanned` 是本页实际扫过的条目数（结果是它的子集），
+ * 关键词极窄时用户能看出「还在往里翻」而不是「没有」。
+ */
+export interface SearchPage {
+  items: SearchHit[]
+  scanned: number
+  has_more: boolean
+  next_cursor: string | null
+  recursive: boolean
+}
 
 export interface ItemResult {
   path: string
@@ -194,6 +228,26 @@ export const filesApi = {
     if (cursor) params.set('cursor', cursor)
     else params.set('page', String(page))
     return getJson<Listing>(`/api/files/list?${params.toString()}`, { signal })
+  },
+
+  /**
+   * 文件名搜索（设计文档 4.6）。`recursive` 打开就是搜整棵子树。
+   *
+   * 分页靠游标：第一页不带 `cursor`，之后带上一页的 `next_cursor`，
+   * 直到 `has_more` 为假。没有结果条数上限，只有单页扫描预算。
+   */
+  search: (
+    q: string,
+    path: string | null,
+    options: { recursive?: boolean; cursor?: string | null; limit?: number } = {},
+    signal?: AbortSignal,
+  ) => {
+    const params = new URLSearchParams({ q })
+    if (path) params.set('path', path)
+    if (options.recursive) params.set('recursive', 'true')
+    if (options.cursor) params.set('cursor', options.cursor)
+    if (options.limit) params.set('limit', String(options.limit))
+    return getJson<SearchPage>(`/api/files/search?${params.toString()}`, { signal })
   },
 
   /** 直接给 <img>/<video> 用；同样走挂载点校验 */

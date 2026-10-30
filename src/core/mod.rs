@@ -13,6 +13,7 @@ pub mod logging;
 pub mod path_guard;
 pub mod prefix;
 pub mod reserved;
+pub mod search;
 pub mod terminal;
 pub mod text_codec;
 pub mod thumbnail;

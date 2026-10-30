@@ -30,7 +30,10 @@
     "hideHidden": "Hide hidden files",
     "new": "New",
     "newFolder": "New folder",
-    "newFile": "New file"
+    "newFile": "New file",
+    "searchScopeDir": "This folder only (click to include subfolders)",
+    "searchScopeAll": "Including subfolders (click to limit to this folder)",
+    "searchPlaceholderDeep": "Search this folder and subfolders…"
   },
   "list": {
     "forbidden": "No access to this path",
@@ -45,7 +48,10 @@
     "found": "{count} results",
     "escToClear": "Press Esc to clear",
     "uploadFirst": "Open a mount before uploading",
-    "searchFailed": "Search failed"
+    "searchFailed": "Search failed",
+    "scanned": "{count} scanned",
+    "scopeAll": "with subfolders",
+    "loadingMore": "Searching…"
   },
   "editor": {
     "back": "Back",

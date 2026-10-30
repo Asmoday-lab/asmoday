@@ -507,6 +507,34 @@ async fn build_entry(
     }
 }
 
+/// 列表 / 搜索共用的「这个条目要不要跳过」判定。
+///
+/// 抽成一个函数是因为两边各写一份的时候会走偏：出现过「列表里看不到
+/// `.asmoday-part*`，搜索却能搜出来，点进去还 404」的不一致。搜索传
+/// `show_hidden = true`（用户既然明确敲了关键词，就不该被隐藏开关挡住），
+/// 其余三条与列表同口径：
+///
+/// - `.asmoday-part` 临时文件任何情况下都不显示（设计文档 3.2.6.4）；
+/// - 跨平台系统垃圾（desktop.ini / Thumbs.db / .DS_Store / ._* / ~$*）
+///   优先级高于 `show_hidden`：开关打开也不返回（设计文档 3.3.7）；
+/// - 应用数据目录（SQLite / 日志 / 缩略图缓存）永不出现。缩略图缓存若被当
+///   普通图片列出来，浏览器会把缓存再缩略图一遍 —— 产物写回同一目录，
+///   下一轮又成了新的「图片」，大小按倍数膨胀。
+pub fn skip_listing_name(dir: &Path, name: &str, show_hidden: bool) -> bool {
+    if crate::core::path_guard::is_part_file(name) {
+        return true;
+    }
+    if crate::core::junk::is_system_junk(name) {
+        return true;
+    }
+    if crate::core::reserved::is_reserved_lexical(&dir.join(name)) {
+        return true;
+    }
+    // 设计文档 3.2：默认隐藏以 `.` 开头的系统项（.git / .env …），
+    // 开关打开时才一并返回；点数仍在分页之前过滤，total/has_more 才是准的
+    !show_hidden && name.starts_with('.')
+}
+
 /// 读取目录第一层并分页。
 ///
 /// 排序固定「目录优先」，其余按指定键升降序；分页结果必须可重现，
@@ -547,24 +575,7 @@ pub async fn list_dir(
         .map_err(|e| FsError::Io(format!("遍历目录失败：{e}")))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
-        // `.asmoday-part` 临时文件任何情况下都不显示（设计文档 3.2.6.4）
-        if crate::core::path_guard::is_part_file(&name) {
-            continue;
-        }
-        // 跨平台系统垃圾（desktop.ini / Thumbs.db / .DS_Store / ._* / ~$*）
-        // 优先级高于 show_hidden：开关打开也不返回（设计文档 3.3.7）
-        if crate::core::junk::is_system_junk(&name) {
-            continue;
-        }
-        // 应用数据目录（SQLite / 日志 / 缩略图缓存）永不出现在列表里。
-        // 缩略图缓存若被当普通图片列出来，浏览器会把缓存再缩略图一遍 ——
-        // 产物写回同一目录，下一轮又成了新的「图片」，大小按倍数膨胀。
-        if crate::core::reserved::is_reserved_lexical(&dir.join(&name)) {
-            continue;
-        }
-        // 设计文档 3.2：默认隐藏以 `.` 开头的系统项（.git / .env …），
-        // 开关打开时才一并返回；点数仍在分页之前过滤，total/has_more 才是准的
-        if !show_hidden && name.starts_with('.') {
+        if skip_listing_name(dir, &name, show_hidden) {
             continue;
         }
         // file_type() 不跟随软链接，避免指向目录的链接被当作目录递归进去

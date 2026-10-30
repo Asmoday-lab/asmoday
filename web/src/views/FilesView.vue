@@ -34,6 +34,7 @@ import {
   type Listing,
   type MountPoint,
   type OnConflict,
+  type SearchHit,
   type TextEncoding,
 } from '../api/files'
 import { localizedCode, messageFromBody } from '../lib/errors'
@@ -1028,28 +1029,32 @@ async function applySort(key: SortKey) {
 }
 
 // ---------------- 无限滚动（8.4.5 第 4 条：到底自动加载 + 骨架屏） ----------------
-const sentinelEl = ref<HTMLElement | null>(null)
-let scrollObserver: IntersectionObserver | null = null
-watch(sentinelEl, (el) => {
-  scrollObserver?.disconnect()
-  if (!el) return
-  scrollObserver = new IntersectionObserver(
-    (entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) void loadMore()
-    },
-    { rootMargin: '160px' },
-  )
-  scrollObserver.observe(el)
-})
-onBeforeUnmount(() => scrollObserver?.disconnect())
+// 续页触发点挂在 VirtualList / VirtualGrid 的 `bottom` 事件上，而不是外层塞一个
+// 哨兵：这两个组件自己就是滚动容器（`h-full overflow-y-auto`），放在它们外面的
+// 哨兵永远处于「可见」状态，IntersectionObserver 只会响一次 —— 第一页之后再
+// 也不动。真正的滚动源在组件内部，判断就得在内部做。
 
 /** 触屏设备没有双击语义，单击即打开 */
 const coarsePointer = window.matchMedia?.('(hover: none)').matches ?? false
 
 // ---------------- 搜索 ----------------
+/**
+ * 搜索是「递归 + 游标续页」的（设计文档 4.6）：
+ * 默认只搜当前目录（跟以前一样），打开开关就搜整棵子树；
+ * 两种模式都没有结果条数上限，翻到底才停。
+ */
+const SEARCH_RECURSIVE_KEY = 'asmoday.files.searchRecursive'
 const searchTerm = ref('')
 const searchResults = ref<EntryInfo[] | null>(null)
 const searching = ref(false)
+const searchingMore = ref(false)
+/** 本页累计扫描过的条目数：关键词很窄时用它说明「还在往里翻」 */
+const searchScanned = ref(0)
+const searchHasMore = ref(false)
+const recursiveSearch = ref(localStorage.getItem(SEARCH_RECURSIVE_KEY) === '1')
+let searchCursor: string | null = null
+/** 竞态令牌：连续敲键时只接受最后一次请求的结果 */
+let searchToken = 0
 let searchTimer: number | undefined
 
 function scheduleSearch() {
@@ -1057,41 +1062,98 @@ function scheduleSearch() {
   searchTimer = window.setTimeout(runSearch, 260)
 }
 
+/** 切换「包含子目录」：持久化偏好并立刻重搜（否则开关看起来像没反应） */
+function toggleRecursiveSearch() {
+  recursiveSearch.value = !recursiveSearch.value
+  localStorage.setItem(SEARCH_RECURSIVE_KEY, recursiveSearch.value ? '1' : '0')
+  if (searchTerm.value.trim()) void runSearch()
+}
+
+function toSearchEntry(hit: SearchHit): EntryInfo {
+  return {
+    name: hit.name,
+    path: hit.path,
+    rel: hit.rel,
+    is_dir: hit.is_dir,
+    size: hit.size,
+    modified: null,
+    kind: hit.kind,
+    ext: hit.ext,
+    editable: hit.editable,
+  }
+}
+
 async function runSearch() {
   const keyword = searchTerm.value.trim()
   if (!keyword) {
     searchResults.value = null
+    searchCursor = null
+    searchHasMore.value = false
+    searchScanned.value = 0
     return
   }
+  const token = ++searchToken
   searching.value = true
+  searchCursor = null
+  searchHasMore.value = false
   try {
-    const params = new URLSearchParams({ q: keyword })
-    if (currentPath.value) params.set('path', currentPath.value)
-    const res = await fetch(`/api/files/search?${params.toString()}`)
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const data = (await res.json()) as {
-      items: { name: string; path: string; is_dir: boolean; size: number; kind: string; ext: string; editable: boolean }[]
-    }
-    searchResults.value = data.items.map((item) => ({
-      name: item.name,
-      path: item.path,
-      is_dir: item.is_dir,
-      size: item.size,
-      modified: null,
-      kind: item.kind as EntryInfo['kind'],
-      ext: item.ext,
-      editable: item.editable,
-    }))
+    const page = await filesApi.search(keyword, currentPath.value, {
+      recursive: recursiveSearch.value,
+    })
+    if (token !== searchToken) return
+    searchResults.value = page.items.map(toSearchEntry)
+    searchScanned.value = page.scanned
+    searchCursor = page.next_cursor
+    searchHasMore.value = page.has_more
   } catch (err) {
+    if (token !== searchToken) return
     showToast(err instanceof Error ? err.message : t('files.list.searchFailed'))
   } finally {
-    searching.value = false
+    if (token === searchToken) searching.value = false
   }
 }
 
+/** 搜索结果触底续页：带上一页游标，按路径去重后再追加 */
+async function loadMoreSearch() {
+  const keyword = searchTerm.value.trim()
+  if (!keyword || !searchHasMore.value || searchingMore.value || !searchCursor) return
+  const token = searchToken
+  searchingMore.value = true
+  try {
+    const page = await filesApi.search(keyword, currentPath.value, {
+      recursive: recursiveSearch.value,
+      cursor: searchCursor,
+    })
+    if (token !== searchToken) return
+    searchScanned.value += page.scanned
+    const seen = new Set((searchResults.value ?? []).map((entry) => entry.path))
+    const extra = page.items.filter((hit) => !seen.has(hit.path)).map(toSearchEntry)
+    searchResults.value = [...(searchResults.value ?? []), ...extra]
+    searchCursor = page.next_cursor
+    searchHasMore.value = page.has_more
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('files.list.searchFailed'))
+  } finally {
+    searchingMore.value = false
+  }
+}
+
+/** 搜索结果里这条命中的所在目录（相对搜索根；根下条目返回空串） */
+function searchParent(entry: EntryInfo): string {
+  const rel = entry.rel ?? ''
+  const index = rel.lastIndexOf('/')
+  return index < 0 ? '' : rel.slice(0, index)
+}
+
 function clearSearch() {
+  searchToken += 1
   searchTerm.value = ''
   searchResults.value = null
+  searchCursor = null
+  searchHasMore.value = false
+  searchScanned.value = 0
+  searching.value = false
+  searchingMore.value = false
 }
 
 // ---------------- 上传 ----------------
@@ -1313,7 +1375,7 @@ async function boot() {
   currentPath.value = ''
   listing.value = null
   selected.value = null
-  searchTerm.value = ''
+  clearSearch()
   preview.value = null
   try {
     // 每次进入都必须重新拉取，禁止本地缓存（设计文档 3.2.1）
@@ -1407,7 +1469,7 @@ function goHome() {
   currentPath.value = ''
   listing.value = null
   selected.value = null
-  searchTerm.value = ''
+  clearSearch()
   error.value = null
   activeMount.value = null
   // 回到卡片页时 URL 也要跟着回 /files（否则刷新又跳回目录）
@@ -1510,6 +1572,11 @@ function leaveMount(reason: 'removed' | 'offline') {
 }
 
 async function loadMore() {
+  // 搜索结果是另一条流：它的游标、去重和进度都跟目录列表独立
+  if (isSearching.value) {
+    await loadMoreSearch()
+    return
+  }
   if (!hasMore.value || loadingMore.value) return
   loadingMore.value = true
   try {
@@ -2509,17 +2576,40 @@ onBeforeUnmount(() => {
           {{ t('files.readonly.badge') }}
         </span>
 
-        <div class="relative hidden w-40 shrink-0 sm:block md:w-56">
+        <div class="relative hidden w-44 shrink-0 sm:block md:w-60">
           <span class="absolute left-2 top-1/2 -translate-y-1/2 text-muted">
             <AppIcon name="search" :size="13" />
           </span>
           <input
             v-model="searchTerm"
-            :placeholder="searching ? t('files.toolbar.searching') : t('files.toolbar.searchPlaceholder')"
-            class="w-full rounded-full border border-line bg-elevated py-1 pl-7 pr-7 text-[12px] text-ink outline-none focus:border-accent"
+            :placeholder="
+              searching
+                ? t('files.toolbar.searching')
+                : recursiveSearch
+                  ? t('files.toolbar.searchPlaceholderDeep')
+                  : t('files.toolbar.searchPlaceholder')
+            "
+            class="w-full rounded-full border border-line bg-elevated py-1 pl-7 text-[12px] text-ink outline-none focus:border-accent"
+            :class="searchTerm ? 'pr-12' : 'pr-7'"
             @input="scheduleSearch"
             @keydown.esc="clearSearch"
           />
+          <!-- 搜索范围开关：贴在输入框里，不额外占工具栏宽度 -->
+          <button
+            v-if="searchTerm"
+            class="absolute right-6 top-1/2 -translate-y-1/2 transition-colors"
+            :class="recursiveSearch ? 'text-accent' : 'text-muted hover:text-ink'"
+            :title="
+              recursiveSearch
+                ? t('files.toolbar.searchScopeAll')
+                : t('files.toolbar.searchScopeDir')
+            "
+            :aria-pressed="recursiveSearch"
+            data-testid="search-scope"
+            @click="toggleRecursiveSearch"
+          >
+            <AppIcon :name="recursiveSearch ? 'folderOpen' : 'folder'" :size="12" />
+          </button>
           <button
             v-if="searchTerm"
             class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
@@ -2600,7 +2690,11 @@ onBeforeUnmount(() => {
       </header>
 
       <!-- 内容 -->
-      <div class="relative min-h-0 flex-1 overflow-y-auto" :class="selectMode ? 'pb-20' : ''">
+      <div
+        class="relative min-h-0 flex-1 overflow-y-auto"
+        :class="selectMode ? 'pb-20' : ''"
+        data-testid="entry-scroll"
+      >
         <div v-if="loading" class="p-3">
           <div class="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2">
             <div v-for="i in 12" :key="i" class="flex flex-col items-center gap-2 p-3">
@@ -2629,7 +2723,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div
-          v-else-if="displayEntries.length === 0"
+          v-else-if="displayEntries.length === 0 && !searchHasMore && !searchingMore"
           class="grid h-full place-items-center px-6 py-10 text-center"
         >
           <div>
@@ -2652,6 +2746,7 @@ onBeforeUnmount(() => {
           :min-width="132"
           :gap="8"
           :ratio="1.42"
+          @bottom="loadMore"
         >
           <template #default="{ item: entry }">
             <button
@@ -2731,6 +2826,13 @@ onBeforeUnmount(() => {
               <span class="w-full truncate text-center text-[12px] leading-tight text-ink">
                 {{ entry.name }}
               </span>
+              <!-- 搜索结果可能来自任意子目录，标出它所在的位置 -->
+              <span
+                v-if="isSearching && searchParent(entry)"
+                class="-mt-1 w-full truncate text-center text-[10px] leading-tight text-muted"
+              >
+                {{ searchParent(entry) }}
+              </span>
             </button>
           </template>
         </VirtualGrid>
@@ -2746,7 +2848,7 @@ onBeforeUnmount(() => {
               t('files.header.time')
             }}</span>
           </div>
-          <VirtualList :items="displayEntries" :row-height="48">
+          <VirtualList :items="displayEntries" :row-height="48" @bottom="loadMore">
           <template #default="{ item: entry }">
             <div
               class="entry-tile flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[13px] transition-colors hover:bg-elevated/60"
@@ -2800,7 +2902,12 @@ onBeforeUnmount(() => {
                   <AppIcon name="arrowUpRight" :size="7" />
                 </span>
               </span>
-              <span class="min-w-0 flex-1 truncate text-ink" :title="entryTitle(entry)">{{ entry.name }}</span>
+              <span class="min-w-0 flex-1 truncate text-ink" :title="entryTitle(entry)">
+                {{ entry.name }}
+                <span v-if="isSearching && searchParent(entry)" class="ml-1 text-[11px] text-muted">
+                  {{ searchParent(entry) }}
+                </span>
+              </span>
               <span class="w-24 shrink-0 text-right text-muted whitespace-nowrap">
                 {{ entry.is_dir ? '—' : formatSize(entry.size) }}
               </span>
@@ -2812,9 +2919,11 @@ onBeforeUnmount(() => {
           </VirtualList>
         </template>
 
-        <!-- 无限滚动哨兵 + 加载骨架（8.4.5 第 4 条） -->
-        <div v-if="hasMore && !loading && !error" ref="sentinelEl" class="h-px" />
-        <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4">
+        <!-- 续页骨架（触底判定在虚拟列表内部，见 VirtualGrid/VirtualList 的 bottom 事件） -->
+        <div
+          v-if="loadingMore || searchingMore"
+          class="flex items-center justify-center gap-2 py-4"
+        >
           <span class="skeleton size-3.5 rounded-full" />
           <span class="skeleton h-2.5 w-24 rounded" />
         </div>
@@ -2827,6 +2936,12 @@ onBeforeUnmount(() => {
       >
         <span v-if="isSearching">
           {{ t('files.list.found', { count: displayEntries.length }) }}
+          <span v-if="recursiveSearch" class="hidden sm:inline">
+            · {{ t('files.list.scopeAll') }}
+          </span>
+          <span v-if="searchHasMore" class="hidden md:inline">
+            · {{ t('files.list.scanned', { count: searchScanned }) }}
+          </span>
           <span class="hidden sm:inline"> · {{ t('files.list.escToClear') }}</span>
         </span>
         <span v-else>
