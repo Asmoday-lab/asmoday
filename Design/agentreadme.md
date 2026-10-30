@@ -1258,6 +1258,10 @@ GWT-DL-01 Given 任意文件  When 请求 raw?download=1  Then Content-Dispositi
 GWT-DL-02 Given 文本文件  When 请求 raw（不带 download）  Then Content-Type 带 charset=utf-8（不得让浏览器按 GBK 猜成乱码）
 GWT-DL-03 Given 目录  When 请求 archive  Then 返回合法 zip（PK\x03\x04 开头，目录条目以 / 结尾），Windows 资源管理器可直接解压
 GWT-MENU-01 Given 文件或目录  When 右键  Then 有「下载」且没有「复制相对路径/绝对路径」；目录下载走 zip
+GWT-SET-01 Given 桌面端设置页  Then 左侧竖排图标导航常驻、移动端横向滑动；点分区只换右侧内容，标题统一「ink 小标题 + 12px 说明」
+GWT-SET-02 Given 侧边栏左下角  Then 自上而下为「生态推荐」小字链接（当前页高亮）与 `v<version> · 由 Asmoday 提供`；折叠态只留图标且不占高度
+GWT-SET-03 Given 生态推荐  When 点左下角入口  Then 在右侧主内容区打开 `/ecosystem`，设置页的 Tab 里不再有该分区
+GWT-BAR-01 Given 播放条正在显示  When 点关闭  Then 播放条整体向下滑出（有真实 translateY 位移，不是纯淡出），滑完才卸载；进入同理自底部升起
 ```
 
 #### 依赖红线

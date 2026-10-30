@@ -3,8 +3,7 @@
     "general": "General",
     "media": "Media",
     "security": "Security",
-    "advanced": "Advanced",
-    "ecosystem": "Ecosystem"
+    "advanced": "Advanced"
   },
   "general": {
     "appearance": "Appearance",
@@ -24,7 +23,6 @@
     "services": "External services",
     "count": "{count}",
     "open": "Open",
-    "ecosystemLink": "Browse the ecosystem",
     "reset": "Reset this panel to defaults",
     "resetHint": "Only resets theme and language — mounts and services are never touched.",
     "resetDone": "General panel reset to defaults",

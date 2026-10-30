@@ -201,11 +201,10 @@ async function logout() {
       <div
         id="app-scroll"
         class="min-h-0 flex-1 overflow-y-auto"
-        :class="currentTrack ? 'pb-16 md:pb-[72px]' : ''"
-        :style="
+        :class="
           currentTrack
-            ? { paddingBottom: 'calc(4rem + env(safe-area-inset-bottom, 0px))' }
-            : undefined
+            ? 'pb-[calc(4rem+env(safe-area-inset-bottom,0px))] md:pb-[100px]'
+            : ''
         "
       >
         <!-- 一次性密码会话：后端只放行改密接口，这里也别把主界面挂起来，

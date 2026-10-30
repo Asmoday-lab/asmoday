@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /**
- * 系统设置（设计文档 3.5）：按功能分 Tab —— 通用 / 媒体 / 安全 / 高级 / 生态推荐。
+ * 系统设置（设计文档 3.5，v4.4.11 重排）：按功能分 Tab —— 通用 / 媒体 / 安全 / 高级。
+ * 桌面端左侧竖排导航常驻，移动端横向滑动；生态推荐已独立为 /ecosystem 页面。
  *
  * 三条硬约束：
  * 1. `[[system.mounts]]` 与 `[[services]]` 属于高级配置，**绝不**被「恢复当前面板默认值」覆盖，
@@ -12,6 +13,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import { onBeforeRouteLeave } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import AppIcon from '../components/AppIcon.vue'
+import type { IconName } from '../components/icons'
 import { authApi } from '../api/auth'
 import { cacheApi, type CacheStats } from '../api/media'
 import { systemApi, type FfmpegInfo, type FfmpegSource } from '../api/system'
@@ -21,7 +23,6 @@ import { APP_BASE } from '../lib/base'
 import { formatSize } from '../lib/format'
 import { useTheme, type ThemeMode } from '../composables/useTheme'
 import { applyLocale, detectLocale, SUPPORTED_LOCALES, type Locale } from '../lib/i18n'
-import { ECOSYSTEM } from '../constants/ecosystem'
 
 const CodeEditor = defineAsyncComponent(() => import('../components/CodeEditor.vue'))
 
@@ -73,13 +74,12 @@ const MEDIA_DEFAULTS: MediaSettings = {
   ffmpeg_path: '',
 }
 
-type Tab = 'general' | 'media' | 'security' | 'advanced' | 'ecosystem'
-const tabs: { key: Tab; label: string }[] = [
-  { key: 'general', label: 'settings.tabs.general' },
-  { key: 'media', label: 'settings.tabs.media' },
-  { key: 'security', label: 'settings.tabs.security' },
-  { key: 'advanced', label: 'settings.tabs.advanced' },
-  { key: 'ecosystem', label: 'settings.tabs.ecosystem' },
+type Tab = 'general' | 'media' | 'security' | 'advanced'
+const tabs: { key: Tab; label: string; icon: IconName }[] = [
+  { key: 'general', label: 'settings.tabs.general', icon: 'chip' },
+  { key: 'media', label: 'settings.tabs.media', icon: 'image' },
+  { key: 'security', label: 'settings.tabs.security', icon: 'lock' },
+  { key: 'advanced', label: 'settings.tabs.advanced', icon: 'terminal' },
 ]
 const tab = ref<Tab>('general')
 
@@ -659,24 +659,33 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="mx-auto w-full max-w-5xl px-4 py-6 md:px-8 md:py-10">
-    <!-- 分区切换 -->
-    <nav class="mb-6 flex flex-wrap items-center gap-4 border-b border-line pb-2 text-sm">
-      <button
-        v-for="item in tabs"
-        :key="item.key"
-        class="transition-colors"
-        :class="
-          tab === item.key
-            ? 'border-b-2 border-accent pb-2 font-medium text-ink'
-            : 'pb-2 text-muted hover:text-ink'
-        "
-        @click="tab = item.key"
-      >
-        {{ t(item.label) }}
-      </button>
-      <span class="ml-auto text-[12px] text-muted">{{ authApi.username.value }}</span>
-    </nav>
+    <div class="md:flex md:items-start md:gap-8">
+      <!-- 分区导航（v4.4.11 重排）：桌面左侧竖排常驻，移动端横向滑动 -->
+      <nav class="mb-5 md:sticky md:top-8 md:mb-0 md:w-44 md:shrink-0">
+        <div
+          class="flex gap-1.5 overflow-x-auto pb-1 md:flex-col md:gap-1 md:overflow-visible md:pb-0"
+        >
+          <button
+            v-for="item in tabs"
+            :key="item.key"
+            class="flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors md:w-full"
+            :class="
+              tab === item.key
+                ? 'bg-accent-soft font-medium text-accent'
+                : 'text-muted hover:bg-elevated hover:text-ink'
+            "
+            @click="tab = item.key"
+          >
+            <AppIcon :name="item.icon" :size="15" />
+            {{ t(item.label) }}
+          </button>
+        </div>
+        <p class="mt-3 hidden truncate px-3 text-[12px] text-muted md:block">
+          {{ authApi.username.value }}
+        </p>
+      </nav>
 
+      <div class="min-w-0 flex-1">
     <p
       v-if="error"
       class="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
@@ -702,9 +711,10 @@ onBeforeUnmount(() => {
     <!-- ================= 通用 ================= -->
     <div v-if="tab === 'general'" class="space-y-6">
       <div class="rounded-xl border border-line p-6">
-        <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
-          {{ t('settings.general.appearance') }}
-        </p>
+        <div class="mb-4">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.general.appearance') }}</p>
+          <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.general.languageHint') }}</p>
+        </div>
         <div class="grid gap-3 sm:grid-cols-2">
           <div>
             <span class="mb-1 block text-[12px] text-muted">{{ t('settings.general.theme') }}</span>
@@ -734,15 +744,12 @@ onBeforeUnmount(() => {
             </select>
           </div>
         </div>
-        <p class="mt-2 text-[12px] text-muted">{{ t('settings.general.languageHint') }}</p>
       </div>
 
       <div class="rounded-xl border border-line p-6">
-        <div class="mb-3 flex items-center justify-between">
-          <p class="text-xs font-semibold tracking-wider text-muted uppercase">
-            {{ t('settings.general.overview') }}
-          </p>
-          <button class="text-[12px] text-accent hover:underline" @click="tab = 'advanced'">
+        <div class="mb-4 flex items-center justify-between gap-3">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.general.overview') }}</p>
+          <button class="shrink-0 text-[12px] text-accent hover:underline" @click="tab = 'advanced'">
             {{ t('settings.advanced.form') }} →
           </button>
         </div>
@@ -762,27 +769,10 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 生态推荐入口 -->
-      <button
-        class="glass-card flex w-full items-center gap-3 rounded-xl px-4 py-3 text-left"
-        @click="tab = 'ecosystem'"
-      >
-        <span class="grid size-9 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent">
-          <AppIcon name="sparkle" :size="16" />
-        </span>
-        <span class="min-w-0 flex-1">
-          <span class="block text-sm font-medium text-ink">{{ t('ecosystem.title') }}</span>
-          <span class="mt-0.5 block truncate text-[12px] text-muted">{{ t('ecosystem.intro') }}</span>
-        </span>
-        <AppIcon name="arrowRight" :size="14" class="shrink-0 text-muted" />
-      </button>
-
-      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-6">
-        <div class="min-w-0">
-          <p class="text-[12px] text-muted">{{ t('settings.general.resetHint') }}</p>
-        </div>
+      <div class="flex flex-wrap items-center justify-end gap-3">
+        <p class="mr-auto text-[12px] text-muted">{{ t('settings.general.resetHint') }}</p>
         <button
-          class="shrink-0 rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+          class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-ink"
           @click="resetGeneral"
         >
           {{ t('settings.general.reset') }}
@@ -793,10 +783,11 @@ onBeforeUnmount(() => {
     <!-- ================= 媒体 ================= -->
     <div v-else-if="tab === 'media'" class="space-y-6">
       <div class="rounded-xl border border-line p-6">
-        <div class="mb-3 flex items-center justify-between gap-3">
-          <p class="text-xs font-semibold tracking-wider text-muted uppercase">
-            {{ t('settings.media.cache') }}
-          </p>
+        <div class="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <p class="text-sm font-semibold text-ink">{{ t('settings.media.cache') }}</p>
+            <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.media.cacheHint') }}</p>
+          </div>
           <button
             class="shrink-0 rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:opacity-50"
             :disabled="cacheBusy"
@@ -815,7 +806,6 @@ onBeforeUnmount(() => {
             · {{ t('settings.media.cacheLimit', { mb: cache.limit_mb, days: cache.max_age_days }) }}
           </span>
         </p>
-        <p class="mt-1 text-[12px] text-muted/70">{{ t('settings.media.cacheHint') }}</p>
 
         <div v-if="draft" class="mt-3 grid gap-3 sm:grid-cols-2">
           <label class="block">
@@ -841,31 +831,27 @@ onBeforeUnmount(() => {
 
       <!-- FFmpeg：三层优先级 + 状态检测 + 测试连通性 -->
       <div class="rounded-xl border border-line p-6">
-        <div class="mb-3 flex flex-wrap items-center gap-2">
-          <p class="text-xs font-semibold tracking-wider text-muted uppercase">
-            {{ t('settings.media.ffmpeg') }}
+        <div class="mb-4">
+          <div class="flex flex-wrap items-center gap-2">
+            <p class="text-sm font-semibold text-ink">{{ t('settings.media.ffmpeg') }}</p>
+            <span
+              class="rounded-full px-2 py-0.5 text-[11px]"
+              :class="ffmpegBadge.ok ? 'bg-emerald-500/15 fg-ok' : 'bg-elevated text-muted'"
+            >
+              {{ ffmpegBadge.text }}
+            </span>
+            <span
+              v-if="ffmpeg?.status === 'ok'"
+              class="rounded-full px-2 py-0.5 text-[11px]"
+              :class="ffmpeg.webp_support ? 'bg-sky-500/15 fg-info' : 'bg-elevated text-muted'"
+              data-testid="webp-badge"
+            >
+              {{ ffmpeg.webp_support ? t('settings.media.webpOn') : t('settings.media.webpOff') }}
+            </span>
+          </div>
+          <p v-if="ffmpeg?.path" class="mt-1 truncate font-mono text-[11px] text-muted">
+            {{ ffmpeg.path }} · {{ t('settings.media.ffmpegSource', { source: ffmpegSourceLabel }) }}
           </p>
-          <span
-            class="rounded-full px-2 py-0.5 text-[11px]"
-            :class="ffmpegBadge.ok ? 'bg-emerald-500/15 fg-ok' : 'bg-elevated text-muted'"
-          >
-            {{ ffmpegBadge.text }}
-          </span>
-          <span v-if="ffmpeg?.path" class="truncate font-mono text-[11px] text-muted">
-            {{ ffmpeg.path }}
-          </span>
-          <span class="text-[11px] text-muted/70">
-            {{ t('settings.media.ffmpegSource', { source: ffmpegSourceLabel }) }}
-          </span>
-          <!-- libwebp 支持探测（设计文档 3.5）：决定缩略图能否输出 WebP -->
-          <span
-            v-if="ffmpeg?.status === 'ok'"
-            class="rounded-full px-2 py-0.5 text-[11px]"
-            :class="ffmpeg.webp_support ? 'bg-sky-500/15 fg-info' : 'bg-elevated text-muted'"
-            data-testid="webp-badge"
-          >
-            {{ ffmpeg.webp_support ? t('settings.media.webpOn') : t('settings.media.webpOff') }}
-          </span>
         </div>
 
         <label class="block">
@@ -890,69 +876,65 @@ onBeforeUnmount(() => {
         <p class="mt-1 text-[12px] fg-warn/80">{{ t('settings.media.note') }}</p>
       </div>
 
-      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line p-6">
-        <p class="text-[12px] text-muted">{{ t('settings.media.resetHint') }}</p>
-        <div class="flex shrink-0 items-center gap-2">
-          <button
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
-            @click="resetMedia"
-          >
-            {{ t('settings.media.reset') }}
-          </button>
-          <button
-            class="h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
-            :disabled="saving"
-            @click="saveForm()"
-          >
-            {{ t('common.action.save') }}
-          </button>
-        </div>
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <p class="mr-auto text-[12px] text-muted">{{ t('settings.media.resetHint') }}</p>
+        <button
+          class="rounded-lg border border-line px-3 py-2 text-xs text-muted transition-colors hover:border-accent/50 hover:text-ink"
+          @click="resetMedia"
+        >
+          {{ t('settings.media.reset') }}
+        </button>
+        <button
+          class="h-9 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
+          :disabled="saving"
+          @click="saveForm()"
+        >
+          {{ t('common.action.save') }}
+        </button>
       </div>
     </div>
 
     <!-- ================= 安全 ================= -->
     <div v-else-if="tab === 'security'" class="space-y-6">
       <div class="rounded-xl border border-line p-6">
-        <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
-          {{ t('settings.security.password') }}
-        </p>
-        <div class="grid gap-4 md:grid-cols-3">
+        <div class="mb-4">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.security.password') }}</p>
+          <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.security.hint') }}</p>
+        </div>
+        <div class="grid gap-3 md:grid-cols-3">
           <input
             v-model="currentPassword"
             type="password"
             :placeholder="t('settings.security.current')"
-            class="rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
           <input
             v-model="nextPassword"
             type="password"
             :placeholder="t('settings.security.next')"
-            class="rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
           <input
             v-model="confirmPassword"
             type="password"
             :placeholder="t('settings.security.confirm')"
-            class="rounded-lg h-10 border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
         </div>
-        <div class="mt-3 flex items-center gap-3">
+        <div class="mt-3">
           <button
-            class="h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
+            class="h-9 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
             :disabled="securityBusy"
             @click="changePassword"
           >
             {{ t('settings.security.submit') }}
           </button>
-          <span class="text-[12px] text-muted">{{ t('settings.security.hint') }}</span>
         </div>
       </div>
 
       <div class="rounded-xl border border-line p-6">
-        <div class="mb-3 flex items-center gap-2">
-          <p class="text-xs font-semibold tracking-wider text-muted uppercase">
-            {{ t('settings.security.totp') }}
-          </p>
+        <div class="mb-4 flex items-center gap-2">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.security.totp') }}</p>
           <span
             class="rounded-full px-2 py-0.5 text-[11px]"
             :class="totpEnabled ? 'bg-emerald-500/15 fg-ok' : 'bg-elevated text-muted'"
@@ -1054,7 +1036,7 @@ onBeforeUnmount(() => {
 
       <!-- WebDAV 令牌 -->
       <div class="rounded-xl border border-line p-6">
-        <p class="mb-1 text-xs font-semibold tracking-wider text-muted uppercase">
+        <p class="mb-3 text-sm font-semibold text-ink">
           {{ t('settings.security.davUrl') }}
         </p>
         <!-- 挂载点选择：仅一个时自动选中并隐藏下拉（设计文档 6.6 设置页联动） -->
@@ -1100,7 +1082,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="rounded-xl border border-line p-6">
-        <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
+        <p class="mb-4 text-sm font-semibold text-ink">
           {{ t('settings.security.createToken') }}
         </p>
         <div class="flex flex-wrap items-center gap-4">
@@ -1202,7 +1184,7 @@ onBeforeUnmount(() => {
       <div class="rounded-xl border border-line p-6">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div class="min-w-0">
-            <p class="text-xs font-semibold tracking-wider text-muted uppercase">
+            <p class="text-sm font-semibold text-ink">
               {{ t('settings.security.backupTitle') }}
             </p>
             <p class="mt-1 text-[12px] leading-relaxed text-muted">
@@ -1279,9 +1261,10 @@ onBeforeUnmount(() => {
       <!-- 表单模式 -->
       <div v-if="configMode === 'form' && draft" class="space-y-6">
         <div class="rounded-xl border border-line p-6">
-          <p class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase">
-            {{ t('settings.advanced.server') }}
-          </p>
+          <div class="mb-4">
+            <p class="text-sm font-semibold text-ink">{{ t('settings.advanced.server') }}</p>
+            <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.advanced.portHint') }}</p>
+          </div>
           <div class="grid gap-3 sm:grid-cols-2">
             <label class="block">
               <span class="mb-1 block text-[12px] text-muted">{{ t('settings.advanced.port') }}</span>
@@ -1306,7 +1289,6 @@ onBeforeUnmount(() => {
             <input v-model="draft.server.proxy.trust_proxy_headers" type="checkbox" />
             {{ t('settings.advanced.trustProxy') }}
           </label>
-          <p class="mt-2 text-[12px] text-muted">{{ t('settings.advanced.portHint') }}</p>
         </div>
 
         <p class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px] fg-warn">
@@ -1314,8 +1296,8 @@ onBeforeUnmount(() => {
         </p>
 
         <div class="rounded-xl border border-line p-6">
-          <div class="mb-3 flex items-center justify-between">
-            <p class="text-xs font-semibold tracking-wider text-muted uppercase">
+          <div class="mb-4 flex items-center justify-between">
+            <p class="text-sm font-semibold text-ink">
               {{ t('settings.advanced.mounts') }}
             </p>
             <button class="text-[12px] text-accent hover:underline" @click="addMount">
@@ -1352,8 +1334,8 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="rounded-xl border border-line p-6">
-          <div class="mb-3 flex items-center justify-between">
-            <p class="text-xs font-semibold tracking-wider text-muted uppercase">
+          <div class="mb-4 flex items-center justify-between">
+            <p class="text-sm font-semibold text-ink">
               {{ t('settings.advanced.services') }}
             </p>
             <button class="text-[12px] text-accent hover:underline" @click="addService">
@@ -1440,41 +1422,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
-
-    <!-- ================= 生态推荐（只读清单，设计文档 10） ================= -->
-    <div v-else class="space-y-5">
-      <p class="text-xs text-muted">{{ t('ecosystem.intro') }}</p>
-
-      <div v-for="category in ECOSYSTEM" :key="category.id" class="space-y-2">
-        <p class="text-[12px] font-semibold tracking-wider text-muted uppercase">
-          {{ t(`ecosystem.categories.${category.id}`) }}
-        </p>
-        <div class="grid gap-2 sm:grid-cols-2">
-          <a
-            v-for="item in category.items"
-            :key="item.id"
-            :href="item.url"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="glass-card flex items-start gap-3 rounded-xl px-4 py-3"
-          >
-            <span class="mt-0.5 grid size-9 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent">
-              <AppIcon :name="item.icon" :size="16" />
-            </span>
-            <span class="min-w-0 flex-1">
-              <span class="block truncate text-sm font-medium text-ink">{{ item.name }}</span>
-              <span class="mt-0.5 block text-[12px] leading-relaxed text-muted">
-                {{ t(`ecosystem.items.${item.id}`) }}
-              </span>
-            </span>
-            <AppIcon name="arrowRight" :size="14" class="mt-1 shrink-0 text-muted" />
-          </a>
-        </div>
       </div>
-
-      <p class="rounded-xl border border-line px-4 py-3 text-[12px] leading-relaxed text-muted">
-        {{ t('ecosystem.footer') }}
-      </p>
     </div>
 
     <Transition name="fade">

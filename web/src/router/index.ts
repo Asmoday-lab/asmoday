@@ -88,6 +88,13 @@ const routes: RouteRecordRaw[] = [
     component: () => import('../views/SettingsView.vue'),
     meta: { title: 'common.nav.settings', icon: 'gear', subtitle: 'common.subtitle.settings' },
   },
+  {
+    // 生态推荐（v4.4.11 从设置页迁出，入口在侧边栏左下角）
+    path: '/ecosystem',
+    name: 'ecosystem',
+    component: () => import('../views/EcosystemView.vue'),
+    meta: { title: 'common.nav.ecosystem', icon: 'sparkle' },
+  },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 

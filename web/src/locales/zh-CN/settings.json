@@ -3,8 +3,7 @@
     "general": "通用",
     "media": "媒体",
     "security": "安全",
-    "advanced": "高级",
-    "ecosystem": "生态推荐"
+    "advanced": "高级"
   },
   "general": {
     "appearance": "外观",
@@ -24,7 +23,6 @@
     "services": "外部服务",
     "count": "{count} 个",
     "open": "打开",
-    "ecosystemLink": "查看生态推荐",
     "reset": "恢复通用面板默认值",
     "resetHint": "只重置主题与语言，不触碰挂载点、外部服务等高级配置。",
     "resetDone": "已恢复通用面板默认值",

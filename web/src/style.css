@@ -253,16 +253,27 @@ body {
   }
 }
 
-/* 播放条入场：自底部滑入（原型 .slide-up） */
-.slide-up-enter-active,
+/*
+ * 播放条过渡：自底部滑入 / 滑出（MusicBar）。
+ * 进出场用不同曲线：升起用 ease-out（先快后缓、有「托住」感），
+ * 收起用 ease-in 且更短（果断离场，不拖泥带水）；
+ * translateY 加 16px 余量，兜住卡片 mb-3 与阴影，收起后不留一条边。
+ */
+.slide-up-enter-active {
+  transition:
+    transform 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+}
 .slide-up-leave-active {
   transition:
-    transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
-    opacity 0.3s;
+    transform 0.2s cubic-bezier(0.4, 0, 1, 1),
+    opacity 0.16s cubic-bezier(0.4, 0, 1, 1);
+  will-change: transform;
 }
 .slide-up-enter-from,
 .slide-up-leave-to {
-  transform: translateY(100%);
+  transform: translateY(calc(100% + 16px));
   opacity: 0;
 }
 

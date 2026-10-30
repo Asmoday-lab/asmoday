@@ -197,12 +197,14 @@ watch(
 </script>
 
 <template>
-  <Transition name="slide-up">
-    <div v-if="currentTrack">
-    <!-- 歌词面板 -->
-    <Transition name="fade">
+  <!--
+    歌词面板与播放列表：fixed 兄弟节点，各自淡入淡出。
+    注意 v-if 必须带上 currentTrack —— 过渡只能感知「自己子节点」的 v-if，
+    若改用外层 <template v-if> 包住整棵树，收歌时整棵子树会被瞬间卸载，动画全程不触发。
+  -->
+  <Transition name="fade">
       <div
-        v-if="expanded"
+        v-if="currentTrack && expanded"
         class="fixed inset-x-0 bottom-[calc(80px+env(safe-area-inset-bottom,0px))] z-40 mx-auto flex h-64 w-full max-w-md flex-col overflow-hidden rounded-2xl border border-line bg-panel/90 shadow-2xl backdrop-blur md:bottom-[calc(104px+env(safe-area-inset-bottom,0px))] md:max-w-lg"
       >
         <div class="border-b border-line/60 px-4 py-2 text-center">
@@ -232,7 +234,7 @@ watch(
     -->
     <Transition name="fade">
       <div
-        v-if="listOpen"
+        v-if="currentTrack && listOpen"
         class="fixed inset-x-0 bottom-[calc(64px+env(safe-area-inset-bottom,0px))] z-30 flex h-[50vh] flex-col overflow-hidden rounded-t-2xl border border-line bg-panel/95 shadow-2xl backdrop-blur md:inset-x-auto md:right-4 md:bottom-[calc(96px+env(safe-area-inset-bottom,0px))] md:h-auto md:max-h-[60vh] md:w-80 md:rounded-2xl"
       >
         <div class="flex shrink-0 items-center gap-2 border-b border-line/60 px-4 py-2.5">
@@ -293,16 +295,21 @@ watch(
     </Transition>
 
     <!--
-      播放条（v4.4.8）：
+      播放条（v4.4.8 布局 / v4.4.11 动画）：
       - 桌面：居中浮动条，宽 70%（随窗口自适应，min/max 兜住极端窗口），
         三栏布局 —— 左曲目、中控件、右工具，播放键真正落在条的几何中心；
       - 移动端：铺满底部（不浮动、不带圆角），单行 + 顶部一根 2px 进度线，
-        不额外占高度。
+        不额外占高度；
+      - slide-up 过渡必须直接包住这个**有真实高度**的 fixed 容器：
+        以前包在最外层零高度 div 上，translateY(100%) 对 0 高元素不产生位移，
+        收起时只剩 opacity 骤变，观感抽搐。
     -->
-    <div
-      class="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center"
-      style="padding-bottom: env(safe-area-inset-bottom, 0px)"
-    >
+    <Transition name="slide-up">
+      <div
+        v-if="currentTrack"
+        class="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center"
+        style="padding-bottom: env(safe-area-inset-bottom, 0px)"
+      >
       <div
         class="pointer-events-auto w-full border-t border-line bg-panel/95 shadow-2xl backdrop-blur md:mb-3 md:w-[70%] md:min-w-[660px] md:max-w-[1180px] md:rounded-2xl md:border"
         data-testid="music-bar"
@@ -488,9 +495,11 @@ watch(
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </Transition>
 
     <audio
+      v-if="currentTrack"
       ref="audio"
       data-testid="music-bar-audio"
       :src="rawUrl(currentTrack.path)"
@@ -502,6 +511,4 @@ watch(
       @ended="onEnded"
       @error="onError"
     />
-    </div>
-  </Transition>
 </template>

@@ -9,6 +9,7 @@ import { useI18n } from 'vue-i18n'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
+import { authApi } from '../api/auth'
 
 const props = defineProps<{
   open: boolean
@@ -157,5 +158,25 @@ const itemClass = (to: string) => [
         </RouterLink>
       </template>
     </nav>
+
+    <!-- 左下角：生态推荐入口 + 版本 + 署名（v4.4.11，从设置页迁出） -->
+    <div
+      class="shrink-0 border-t border-line px-4 py-3"
+      :class="collapsed ? 'md:grid md:place-items-center md:px-0' : ''"
+    >
+      <RouterLink
+        to="/ecosystem"
+        class="flex items-center gap-1.5 rounded text-[12px] transition-colors"
+        :class="route.path === '/ecosystem' ? 'text-accent' : 'text-muted hover:text-accent'"
+        :title="collapsed ? t('common.nav.ecosystem') : undefined"
+        @click="emit('close')"
+      >
+        <AppIcon name="sparkle" :size="12" />
+        <span v-if="!collapsed">{{ t('common.nav.ecosystem') }}</span>
+      </RouterLink>
+      <p v-if="!collapsed" class="mt-1 text-[11px] text-muted/70">
+        v{{ authApi.status.value.version ?? 'dev' }} · {{ t('common.sidebar.poweredBy') }}
+      </p>
+    </div>
   </aside>
 </template>

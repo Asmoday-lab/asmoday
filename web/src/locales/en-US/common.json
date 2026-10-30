@@ -107,6 +107,7 @@
     "collapse": "Collapse sidebar",
     "expand": "Expand sidebar",
     "openMenu": "Open menu",
-    "closeMenu": "Close menu"
+    "closeMenu": "Close menu",
+    "poweredBy": "Powered by Asmoday"
   }
 }
