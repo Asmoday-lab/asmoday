@@ -36,7 +36,7 @@ export const ICONS = {
   arrowRight: ['M5 12h13', 'm12.5 6 6 6-6 6'],
   arrowUpRight: ['M7 17 17 7', 'M8.5 7H17v8.5'],
   arrowLeft: ['M19 12H6', 'm11 6-6 6 6 6'],
-  sparkle: ['M12 3.5 13.8 9l5.7 1.9-5.7 1.9L12 18.5l-1.8-5.7L4.5 11l5.7-2Z'],
+  sparkle: ['M12 4.5 13.8 10l5.7 1.9-5.7 1.9L12 19.5l-1.8-5.7L4.5 12l5.7-2Z'],
   chevronRight: ['m9 5 7 7-7 7'],
   chevronLeft: ['m15 5-7 7 7 7'],
   chevronDown: ['m5 9 7 7 7-7'],
