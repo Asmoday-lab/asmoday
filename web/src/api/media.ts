@@ -27,20 +27,44 @@ export interface MediaItem {
   subtitle?: string | null
 }
 
+/** 各类型总数：切换分区时不必等全部翻完就知道库里到底有多少 */
+export interface KindCounts {
+  image: number
+  video: number
+  audio: number
+}
+
 export interface BrowseResult {
   root: string
   items: MediaItem[]
+  /** 本次 readdir 到的目录项数（诊断用） */
   scanned: number
-  truncated: boolean
+  /** 命中 kind 过滤的总条数（不是本页条数） */
+  total: number
+  counts: KindCounts
+  has_more: boolean
+  next_cursor?: string | null
 }
 
+export interface PageOptions {
+  limit?: number
+  cursor?: string | null
+}
+
+/**
+ * 媒体列表：游标分页（设计文档 3.4）。
+ * 传上一页的 `next_cursor` 取下一页；后端不再有「扫到上限就截断」这回事。
+ */
 export async function browseMedia(
   path: string | undefined,
   kind: 'media' | MediaKind = 'media',
   depth = 2,
+  options: PageOptions = {},
 ): Promise<BrowseResult> {
   const params = new URLSearchParams({ kind, depth: String(depth) })
   if (path) params.set('path', path)
+  if (options.limit) params.set('limit', String(options.limit))
+  if (options.cursor) params.set('cursor', options.cursor)
   const res = await fetch(`/api/media/browse?${params.toString()}`)
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as BrowseResult
@@ -67,13 +91,21 @@ export interface Album {
 export interface AlbumsResult {
   root: string
   items: Album[]
-  truncated: boolean
+  total: number
+  has_more: boolean
+  next_cursor?: string | null
 }
 
 /** 相册清单：回「直接含图片的目录」（含挂载目录），无图目录后端已过滤 */
-export async function browseAlbums(path?: string, depth = 3): Promise<AlbumsResult> {
+export async function browseAlbums(
+  path?: string,
+  depth = 3,
+  options: PageOptions = {},
+): Promise<AlbumsResult> {
   const params = new URLSearchParams({ depth: String(depth) })
   if (path) params.set('path', path)
+  if (options.limit) params.set('limit', String(options.limit))
+  if (options.cursor) params.set('cursor', options.cursor)
   const res = await fetch(`/api/media/albums?${params.toString()}`)
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as AlbumsResult

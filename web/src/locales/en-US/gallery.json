@@ -9,7 +9,6 @@
     "slideshow": "Slideshow",
     "backToAlbums": "Albums",
     "videoBadge": "Video",
-    "truncated": "Folder too large — only the first 4000 entries are indexed",
     "rootFolder": "Root",
     "albumEmpty": "No folders with photos yet",
     "albumEmptyHint": "Photos loose in the root still show up in the timeline"
@@ -40,7 +39,10 @@
     "onlyFavorites": "Favorites only",
     "rescan": "Rescan",
     "indexed": "Media indexed from mounts",
-    "loadFailed": "Failed to load the media index"
+    "loadFailed": "Failed to load the media index",
+    "loadingMore": "Loading more…",
+    "allLoaded": "All loaded",
+    "loadedOf": "{loaded} of {total} loaded"
   },
   "favorite": {
     "add": "Add to favorites",

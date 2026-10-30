@@ -9,7 +9,6 @@
     "slideshow": "幻灯片",
     "backToAlbums": "相册",
     "videoBadge": "视频",
-    "truncated": "目录过大，仅索引前 4000 项",
     "rootFolder": "根目录",
     "albumEmpty": "没有找到含图片的文件夹",
     "albumEmptyHint": "把图片放进挂载点（含根目录）就会出现在这里"
@@ -40,7 +39,10 @@
     "onlyFavorites": "只看收藏",
     "rescan": "重新扫描",
     "indexed": "已索引挂载点媒体",
-    "loadFailed": "媒体索引加载失败"
+    "loadFailed": "媒体索引加载失败",
+    "loadingMore": "正在加载更多…",
+    "allLoaded": "已全部加载",
+    "loadedOf": "已加载 {loaded} / 共 {total}"
   },
   "favorite": {
     "add": "收藏",

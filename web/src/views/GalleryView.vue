@@ -22,6 +22,7 @@ import {
   rawUrl,
   thumbUrl,
   type Album,
+  type KindCounts,
   type MediaItem,
 } from '../api/media'
 import { sharesApi } from '../api/shares'
@@ -59,7 +60,31 @@ const items = ref<MediaItem[]>([])
 const root = ref('')
 const loading = ref(true)
 const error = ref('')
-const truncated = ref(false)
+
+// ---------------- 游标分页（设计文档 3.4） ----------------
+//
+// 媒体库和文件管理同一口径：**没有扫描上限**，翻到最后一页为止。一页 300 条
+// （首屏 JSON 从「整个库」降到几百 KB），触底续接下一页，游标记的是
+// 「上一页最后一条的 (mtime, 路径)」，扫描期间新增/删除文件也不会重复或漏项。
+const PAGE_SIZE = 300
+const nextCursor = ref<string | null>(null)
+const hasMore = ref(false)
+const loadingMore = ref(false)
+const total = ref(0)
+/** 各类型总数：不受「已经翻了几页」影响，切分区时数字必须是对的 */
+const counts = ref<KindCounts>({ image: 0, video: 0, audio: 0 })
+/** 已进列表的路径：续接时去重，防止边界上（同一 mtime）出现重复卡片 */
+const loadedPaths = new Set<string>()
+
+/** 追加一页，按路径去重并保持后端给的新→旧顺序 */
+function appendItems(list: MediaItem[]) {
+  const fresh = list.filter((item) => {
+    if (loadedPaths.has(item.path)) return false
+    loadedPaths.add(item.path)
+    return true
+  })
+  if (fresh.length) items.value = [...items.value, ...fresh]
+}
 
 const playing = ref<MediaItem | null>(null)
 
@@ -76,6 +101,8 @@ function showToast(message: string) {
 }
 onBeforeUnmount(() => {
   if (toastTimer !== null) clearTimeout(toastTimer)
+  observer?.disconnect()
+  observer = null
 })
 
 // 影视库播放器是整屏遮罩，锁住底层滚动（设计文档 8.4）；灯箱自己管自己的锁
@@ -204,6 +231,24 @@ function trackTitle(item: MediaItem): string {
   return stripped || item.name
 }
 
+/**
+ * 分页进度（头部那枚小标签）：按**当前分区**取分子分母。
+ *
+ * 媒体流是按 mtime 混排的一条，所以影视库的「已加载」必须只数视频——
+ * 否则会出现「影视库显示已加载 300 / 共 1040」这种把图片算进来的怪数字。
+ */
+const progress = computed(() => {
+  if (tab.value === 'cinema') return { loaded: videos.value.length, total: counts.value.video }
+  if (tab.value === 'music') return { loaded: audios.value.length, total: counts.value.audio }
+  return { loaded: photoItems.value.length, total: counts.value.image + counts.value.video }
+})
+
+/** 相册视图看的是卡片，不是媒体流，这枚进度标签没有意义 */
+const showProgress = computed(() => {
+  if (tab.value === 'photos' && photoView.value === 'albums') return false
+  return progress.value.loaded < progress.value.total
+})
+
 /** 音乐副标题：歌手 · 专辑；没有标签就留空——目录位置不上桌面（v3.5.5） */
 function trackSubtitle(item: MediaItem): string {
   const parts = [item.artist, item.album].filter(Boolean) as string[]
@@ -303,10 +348,16 @@ const photoView = ref<PhotoView>(
 const albums = ref<Album[]>([])
 const albumsLoading = ref(false)
 const albumsError = ref('')
+/** 相册卡片同样分页（一个媒体根下几千本相册是常态） */
+const albumsCursor = ref<string | null>(null)
+const albumsHasMore = ref(false)
+const albumsTotal = ref(0)
 /** 已经点进去的那本相册；非空时相册视图展示册内图片 */
 const activeAlbum = ref<Album | null>(null)
 const albumItems = ref<MediaItem[]>([])
 const albumLoading = ref(false)
+const albumCursor = ref<string | null>(null)
+const albumHasMore = ref(false)
 /** 相册封面加载失败（坏图）时回退纯色，不再重复请求 */
 const albumCoverFailed = ref(new Set<string>())
 
@@ -315,12 +366,33 @@ async function loadAlbums() {
   albumsLoading.value = true
   albumsError.value = ''
   try {
-    const result = await browseAlbums(undefined, 3)
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE })
     albums.value = result.items
+    albumsTotal.value = result.total
+    albumsCursor.value = result.next_cursor ?? null
+    albumsHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
     albumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
     albumsLoading.value = false
+  }
+}
+
+async function loadMoreAlbums() {
+  const cursor = albumsCursor.value
+  if (!albumsHasMore.value || !cursor || albumsLoading.value || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, cursor })
+    const seen = new Set(albums.value.map((album) => album.path))
+    albums.value = [...albums.value, ...result.items.filter((album) => !seen.has(album.path))]
+    albumsTotal.value = result.total
+    albumsCursor.value = result.next_cursor ?? null
+    albumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -336,11 +408,15 @@ async function openAlbum(album: Album) {
   activeAlbum.value = album
   albumLoading.value = true
   albumItems.value = []
+  albumCursor.value = null
+  albumHasMore.value = false
   try {
     // 只列册内第一层（depth=0 = 不进子目录，与后端统计 count 的口径一致，
     // v2.8 相册视图同款；递归会把子目录的图也算进来，条数就对不上了）
-    const result = await browseMedia(album.path, 'image', 0)
+    const result = await browseMedia(album.path, 'image', 0, { limit: PAGE_SIZE })
     albumItems.value = result.items
+    albumCursor.value = result.next_cursor ?? null
+    albumHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
   } finally {
@@ -348,10 +424,30 @@ async function openAlbum(album: Album) {
   }
 }
 
+async function loadMoreAlbumItems() {
+  const album = activeAlbum.value
+  const cursor = albumCursor.value
+  if (!album || !albumHasMore.value || !cursor || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await browseMedia(album.path, 'image', 0, { limit: PAGE_SIZE, cursor })
+    const seen = new Set(albumItems.value.map((item) => item.path))
+    albumItems.value = [...albumItems.value, ...result.items.filter((item) => !seen.has(item.path))]
+    albumCursor.value = result.next_cursor ?? null
+    albumHasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    loadingMore.value = false
+  }
+}
+
 function closeAlbum() {
   activeAlbum.value = null
   albumItems.value = []
   albumLoading.value = false
+  albumCursor.value = null
+  albumHasMore.value = false
 }
 
 /** 当前正在浏览的照片列表：相册详情与时间线各自独立 */
@@ -512,10 +608,15 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const result = await browseMedia(undefined, 'media', 2)
-    items.value = result.items
+    const result = await browseMedia(undefined, 'media', 2, { limit: PAGE_SIZE })
+    items.value = []
+    loadedPaths.clear()
+    appendItems(result.items)
     root.value = result.root
-    truncated.value = result.truncated
+    total.value = result.total
+    counts.value = result.counts
+    nextCursor.value = result.next_cursor ?? null
+    hasMore.value = result.has_more && Boolean(result.next_cursor)
     // 照片库同时刷新相册清单（后端会剔除空相册）
     if (tab.value === 'photos') {
       closeAlbum()
@@ -526,6 +627,47 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+async function loadMoreMedia() {
+  const cursor = nextCursor.value
+  if (!hasMore.value || !cursor || loading.value || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await browseMedia(undefined, 'media', 2, { limit: PAGE_SIZE, cursor })
+    appendItems(result.items)
+    total.value = result.total
+    counts.value = result.counts
+    nextCursor.value = result.next_cursor ?? null
+    hasMore.value = result.has_more && Boolean(result.next_cursor)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+/** 触底续接：按当前视图决定续哪条流（媒体列表 / 相册卡片 / 册内图片） */
+async function loadMore() {
+  if (loading.value || loadingMore.value) return
+  if (tab.value === 'photos' && photoView.value === 'albums') {
+    if (activeAlbum.value) await loadMoreAlbumItems()
+    else await loadMoreAlbums()
+    return
+  }
+  await loadMoreMedia()
+}
+
+// ---------------- 触底观察器 ----------------
+//
+// 每个可滚动列表末尾放一个 1px 的 sentinel；只 observe 当前挂载的那一个
+// （v-if 分支互斥，模板 ref 同时只有一个实例）。
+const sentinel = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
+
+function observeSentinel(el: HTMLElement | null) {
+  observer?.disconnect()
+  if (el) observer?.observe(el)
 }
 
 async function loadLibraryState() {
@@ -543,9 +685,20 @@ async function loadLibraryState() {
 }
 
 onMounted(() => {
+  observer = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void loadMore()
+    },
+    // 提前一屏预取：等真的滚到底才请求，用户会看到明显的空白等待
+    { rootMargin: '800px 0px' },
+  )
+  observeSentinel(sentinel.value)
   void load()
   void loadLibraryState()
 })
+
+// 切换视图会换掉 sentinel 元素（v-if 分支互斥），这里跟着重新 observe
+watch(sentinel, (el) => observeSentinel(el), { flush: 'post' })
 
 // 快捷键：挂载/卸载由 useEventListener 成对处理
 useEventListener(window, 'keydown', onKey)
@@ -586,8 +739,12 @@ useEventListener(window, 'keydown', onKey)
       </div>
 
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
-        <span v-if="truncated" class="rounded bg-amber-500/15 px-2 py-0.5 fg-warn">
-          {{ t('gallery.photos.truncated') }}
+        <!-- 分页进度：翻到一半时也能看出库里还有多少（分母是后端给的真实总数） -->
+        <span
+          v-if="showProgress"
+          class="hidden rounded bg-accent-soft px-2 py-0.5 text-accent md:inline"
+        >
+          {{ t('gallery.toolbar.loadedOf', { loaded: progress.loaded, total: progress.total }) }}
         </span>
         <button
           v-if="tab === 'cinema' || tab === 'music'"
@@ -692,6 +849,15 @@ useEventListener(window, 'keydown', onKey)
               @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
             />
           </div>
+          <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
+          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+            {{ t('gallery.toolbar.loadingMore') }}
+          </div>
+          <div v-if="albumHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+          <p v-else-if="albumItems.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+            {{ t('gallery.toolbar.allLoaded') }}
+          </p>
         </div>
       </div>
 
@@ -771,6 +937,15 @@ useEventListener(window, 'keydown', onKey)
             <p class="truncate text-[12px] text-muted">{{ albumSubtitle(album) }}</p>
           </button>
         </div>
+          <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
+          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+            {{ t('gallery.toolbar.loadingMore') }}
+          </div>
+          <div v-if="albumsHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+          <p v-else-if="albums.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+            {{ t('gallery.toolbar.allLoaded') }}
+          </p>
       </div>
 
       <!-- 时间线：忽略目录层级、按月吸顶（设计文档 3.4.3 视图二） -->
@@ -808,6 +983,15 @@ useEventListener(window, 'keydown', onKey)
             </div>
           </div>
         </template>
+          <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
+          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+            {{ t('gallery.toolbar.loadingMore') }}
+          </div>
+          <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+          <p v-else-if="photoItems.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+            {{ t('gallery.toolbar.allLoaded') }}
+          </p>
       </div>
     </div>
 
@@ -816,7 +1000,7 @@ useEventListener(window, 'keydown', onKey)
       <div class="mb-4 flex items-center justify-between">
         <h1 class="text-xl font-bold text-ink md:text-2xl">{{ t('gallery.cinema.title') }}</h1>
         <span class="hidden text-sm text-muted md:block">
-          {{ t('gallery.cinema.count', { count: videos.length }) }}
+          {{ t('gallery.cinema.count', { count: counts.video }) }}
         </span>
       </div>
       <div v-if="videos.length === 0" class="grid h-full place-items-center text-center">
@@ -902,6 +1086,15 @@ useEventListener(window, 'keydown', onKey)
         </button>
         </template>
       </div>
+      <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
+      <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+        <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+        {{ t('gallery.toolbar.loadingMore') }}
+      </div>
+      <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+      <p v-else-if="videos.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+        {{ t('gallery.toolbar.allLoaded') }}
+      </p>
     </div>
 
     <!-- 音乐库（原型版式：封面头 + 播放全部 + 曲目表） -->
@@ -929,7 +1122,7 @@ useEventListener(window, 'keydown', onKey)
               {{ t('gallery.music.title') }}
             </p>
             <h1 class="mb-2 text-2xl font-bold text-ink md:mb-4 md:text-3xl">
-              {{ t('gallery.music.count', { count: audios.length }) }}
+              {{ t('gallery.music.count', { count: counts.audio }) }}
             </h1>
             <button
               class="inline-flex items-center rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
@@ -1035,6 +1228,15 @@ useEventListener(window, 'keydown', onKey)
           </tbody>
         </table>
       </div>
+      <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
+      <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+        <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+        {{ t('gallery.toolbar.loadingMore') }}
+      </div>
+      <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+      <p v-else-if="audios.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+        {{ t('gallery.toolbar.allLoaded') }}
+      </p>
     </div>
 
     <!-- 播放器（影视库） -->

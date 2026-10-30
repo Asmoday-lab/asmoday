@@ -20,8 +20,10 @@ use crate::core::ffmpeg;
 use crate::core::fs::{self, FsError};
 use crate::core::thumbnail::{PLACEHOLDER_SVG, ThumbOutcome};
 
-/// 单次扫描的条目上限，防超大目录拖垮后端
-const SCAN_LIMIT: usize = 4000;
+/// 单页条目数（游标分页，设计文档 3.4）：只影响「一次返回多少条」，
+/// 不再有「扫到上限就截断、后面的永远看不到」这回事。
+const DEFAULT_PAGE: usize = 300;
+const MAX_PAGE: usize = 1000;
 /// 默认扫描深度
 const DEFAULT_DEPTH: usize = 2;
 
@@ -37,6 +39,10 @@ pub struct BrowseQuery {
     /// image / video / audio / media（默认全部）
     pub kind: Option<String>,
     pub depth: Option<usize>,
+    /// 单页条数（默认 300，上限 1000）
+    pub limit: Option<usize>,
+    /// 上一页返回的 `next_cursor`；为空即第一页
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,12 +69,62 @@ pub struct MediaItem {
     pub subtitle: Option<String>,
 }
 
+/// 各类型总数：一键切换分区时不必等全部翻完就知道「库里到底有多少」
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct KindCounts {
+    pub image: usize,
+    pub video: usize,
+    pub audio: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BrowseResult {
     pub root: String,
     pub items: Vec<MediaItem>,
+    /// 本次真正 readdir 到的目录项数（诊断用，前端不展示）
     pub scanned: usize,
-    pub truncated: bool,
+    /// 命中 `kind` 过滤的总条数（不是本页条数）
+    pub total: usize,
+    pub counts: KindCounts,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// 游标：只记上一页最后一条的排序键（mtime 降序 + 展示路径升序）。
+///
+/// 刻意不用 offset —— 扫描期间新增/删除文件不会让下一页重复或漏项。
+/// 和文件列表（`core::fs`）同一套口径：稳定排序 + keyset。
+#[derive(Debug, Serialize, Deserialize)]
+struct MediaCursor {
+    m: u64,
+    p: String,
+}
+
+fn encode_cursor(mtime: u64, display: &str) -> String {
+    let cursor = MediaCursor {
+        m: mtime,
+        p: display.to_string(),
+    };
+    let json = serde_json::to_vec(&cursor).unwrap_or_default();
+    data_encoding::BASE64URL_NOPAD.encode(&json)
+}
+
+fn decode_cursor(raw: &str) -> Option<MediaCursor> {
+    let bytes = data_encoding::BASE64URL_NOPAD
+        .decode(raw.trim().as_bytes())
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 游标之后的起始下标（`raw` 必须已按 mtime 降序 + 路径升序排好）
+fn page_start(raw: &[RawMedia], cursor: Option<&MediaCursor>) -> usize {
+    match cursor {
+        Some(cur) => raw.partition_point(|item| {
+            item.mtime > cur.m || (item.mtime == cur.m && item.display.as_str() <= cur.p.as_str())
+        }),
+        None => 0,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +134,22 @@ pub struct AlbumsQuery {
     pub depth: Option<usize>,
     /// image / video / audio（默认 image）——影视库与音乐库的「按文件夹」视图共用本接口
     pub kind: Option<String>,
+    /// 单页相册数（默认 300，上限 1000）
+    pub limit: Option<usize>,
+    /// 上一页返回的 `next_cursor`
+    pub cursor: Option<String>,
+}
+
+/// 相册清单分页结果（与媒体列表同一套游标口径）
+#[derive(Debug, Serialize)]
+pub struct AlbumsResult {
+    pub root: String,
+    pub items: Vec<Album>,
+    /// 命中过滤的相册总数（不是本页条数）
+    pub total: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// 相册（媒体库「按文件夹」视图的卡片，设计文档 3.4.3）。
@@ -280,18 +352,50 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
     };
     // depth=0 合法：只扫起点目录第一层（相册详情用，卡片条数必须与看到的一致）
     let depth = query.depth.unwrap_or(DEFAULT_DEPTH).clamp(0, 4);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(decode_cursor);
 
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
-    let outcome =
-        tokio::task::spawn_blocking(move || scan(&scan_root, &wanted, depth, &auth_store)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let (raw, scanned, counts) = scan_raw(&scan_root, &wanted, depth);
+        // 稳定排序：mtime 降序（新的在前），同 mtime 用展示路径兜底，保证翻页不重不漏
+        let mut raw = raw;
+        raw.sort_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| a.display.cmp(&b.display))
+        });
+
+        let total = raw.len();
+        let start = page_start(&raw, cursor.as_ref());
+        let end = start.saturating_add(limit).min(total);
+        let has_more = end < total;
+        // 只对当前页做重活（ID3 解析、字幕探测、ThumbHash 查询）
+        let items = build_items(&raw[start.min(total)..end], &auth_store);
+        let next_cursor = if has_more && end > start {
+            Some(encode_cursor(raw[end - 1].mtime, &raw[end - 1].display))
+        } else {
+            None
+        };
+        (items, scanned, total, counts, has_more, next_cursor)
+    })
+    .await;
 
     match outcome {
-        Ok((items, scanned, truncated)) => Json(BrowseResult {
+        Ok((items, scanned, total, counts, has_more, next_cursor)) => Json(BrowseResult {
             root: fs::normalize_display(&root),
             items,
             scanned,
-            truncated,
+            total,
+            counts,
+            has_more,
+            next_cursor,
         })
         .into_response(),
         Err(err) => fs_error(FsError::Io(format!("扫描媒体目录失败：{err}"))),
@@ -320,18 +424,47 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
         Some(other) => return fs_error(FsError::BadRequest(format!("不支持的 kind：{other}"))),
         None => vec!["image"],
     };
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(decode_cursor);
+
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
-    let outcome =
-        tokio::task::spawn_blocking(move || scan_albums(&scan_root, depth, &wanted, &auth_store))
-            .await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut raw = scan_albums(&scan_root, depth, &wanted);
+        // 新的在前；同 mtime 用路径兜底，保证翻页稳定
+        raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+        let total = raw.len();
+        let start = match &cursor {
+            Some(cur) => raw.partition_point(|item| {
+                item.mtime > cur.m || (item.mtime == cur.m && item.path <= cur.p)
+            }),
+            None => 0,
+        };
+        let end = start.saturating_add(limit).min(total);
+        let has_more = end < total;
+        let items = build_albums(&raw[start.min(total)..end], &auth_store);
+        let next_cursor = if has_more && end > start {
+            Some(encode_cursor(raw[end - 1].mtime, &raw[end - 1].path))
+        } else {
+            None
+        };
+        (items, total, has_more, next_cursor)
+    })
+    .await;
 
     match outcome {
-        Ok((items, truncated)) => Json(json!({
-            "root": fs::normalize_display(&root),
-            "items": items,
-            "truncated": truncated,
-        }))
+        Ok((items, total, has_more, next_cursor)) => Json(AlbumsResult {
+            root: fs::normalize_display(&root),
+            items,
+            total,
+            has_more,
+            next_cursor,
+        })
         .into_response(),
         Err(err) => fs_error(FsError::Io(format!("扫描相册失败：{err}"))),
     }
@@ -347,9 +480,6 @@ const SKIP_DIRS: &[&str] = &[
     ".shots",
     "thumbnails",
 ];
-
-/// 单次扫描里最多为多少张图片读取 ThumbHash（避免上万条时把请求拖慢）
-const HASH_LIMIT: usize = 800;
 
 /// 找同目录同名外挂字幕：优先 .vtt，其次 .srt
 fn find_subtitle(video: &Path) -> Option<String> {
@@ -377,18 +507,30 @@ fn average_color(hash_b64: &str) -> Option<String> {
     ))
 }
 
-fn scan(
-    root: &Path,
-    wanted: &[&str],
-    depth: usize,
-    auth: &crate::core::auth::AuthStore,
-) -> (Vec<MediaItem>, usize, bool) {
-    let mut out = Vec::new();
-    let mut scanned = 0usize;
-    let mut truncated = false;
-    // 参与取色的图片下标 + 源路径（走完目录后统一批量查库，HASH_LIMIT 内）
-    let mut hash_candidates: Vec<(usize, PathBuf)> = Vec::new();
+/// 扫描阶段只保留「排序 + 分类」必需的最小字段。
+///
+/// ID3 标签、外挂字幕、ThumbHash 都推迟到分页切片之后再算：这几件事原来对目录里
+/// 每一条都执行，几千首歌的库点开一次要开几千个文件句柄，首屏全卡在这里。
+struct RawMedia {
+    name: String,
+    path: PathBuf,
+    display: String,
+    folder: String,
+    size: u64,
+    /// 归一化后的 mtime（缺失记 0，降序时自然沉底）
+    mtime: u64,
+    kind: &'static str,
+    ext: String,
+}
 
+/// 走一遍目录树，只做 readdir + 分类 + 一次 metadata。
+///
+/// **没有扫描上限**：媒体库和文件管理一样，必须能看到最后一条。`counts` 统计的是
+/// 全部媒体文件（不受 `wanted` 限制），前端据此显示「库里到底有多少」。
+fn scan_raw(root: &Path, wanted: &[&str], depth: usize) -> (Vec<RawMedia>, usize, KindCounts) {
+    let mut out = Vec::new();
+    let mut counts = KindCounts::default();
+    let mut scanned = 0usize;
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, level)) = queue.pop() {
@@ -397,11 +539,6 @@ fn scan(
         };
         for entry in reader.flatten() {
             scanned += 1;
-            if out.len() >= SCAN_LIMIT {
-                truncated = true;
-                return (out, scanned, truncated);
-            }
-
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -436,59 +573,84 @@ fn scan(
                 continue;
             }
             let (kind, _) = fs::classify_name(&name, &ext, false);
+            match kind {
+                "image" => counts.image += 1,
+                "video" => counts.video += 1,
+                "audio" => counts.audio += 1,
+                _ => {}
+            }
             if !wanted.contains(&kind) {
                 continue;
             }
 
             let meta = entry.metadata().ok();
-            let tags = if kind == "audio" {
-                crate::core::audio_tags::read_tags(&path)
-            } else {
-                Default::default()
-            };
-            let subtitle = if kind == "video" {
-                find_subtitle(&path)
-            } else {
-                None
-            };
-            // ThumbHash 在目录走完后统一从 SQLite 批量取（v2.8.2），首次浏览回退纯色占位
-            let is_image = kind == "image";
-            let has_hash_slot = is_image && hash_candidates.len() < HASH_LIMIT;
-            out.push(MediaItem {
+            out.push(RawMedia {
                 name,
-                path: fs::normalize_display(&path),
+                display: fs::normalize_display(&path),
+                folder: fs::normalize_display(&dir),
+                path,
                 size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                modified: meta
+                mtime: meta
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs()),
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
                 kind,
                 ext,
-                folder: fs::normalize_display(&dir),
-                title: tags.title,
-                artist: tags.artist,
-                album: tags.album,
-                cover: tags.has_cover,
-                hash: None,
-                color: None,
-                subtitle,
             });
-            if has_hash_slot {
-                hash_candidates.push((out.len() - 1, path));
-            }
         }
     }
 
+    (out, scanned, counts)
+}
+
+/// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash。
+fn build_items(raw: &[RawMedia], auth: &crate::core::auth::AuthStore) -> Vec<MediaItem> {
+    let mut items: Vec<MediaItem> = Vec::with_capacity(raw.len());
+    let mut hash_slots: Vec<(usize, &Path)> = Vec::new();
+
+    for entry in raw {
+        let tags = if entry.kind == "audio" {
+            crate::core::audio_tags::read_tags(&entry.path)
+        } else {
+            Default::default()
+        };
+        let subtitle = if entry.kind == "video" {
+            find_subtitle(&entry.path)
+        } else {
+            None
+        };
+        if entry.kind == "image" {
+            hash_slots.push((items.len(), entry.path.as_path()));
+        }
+        items.push(MediaItem {
+            name: entry.name.clone(),
+            path: entry.display.clone(),
+            size: entry.size,
+            modified: (entry.mtime > 0).then_some(entry.mtime),
+            kind: entry.kind,
+            ext: entry.ext.clone(),
+            folder: entry.folder.clone(),
+            title: tags.title,
+            artist: tags.artist,
+            album: tags.album,
+            cover: tags.has_cover,
+            hash: None,
+            color: None,
+            subtitle,
+        });
+    }
+
     // 批量取 ThumbHash：一次连接逐键查 SQLite（v2.8.2 起只存库，不落旁路文件）
-    if !hash_candidates.is_empty() {
-        let keys: Vec<String> = hash_candidates
+    if !hash_slots.is_empty() {
+        let keys: Vec<String> = hash_slots
             .iter()
             .map(|(_, path)| crate::core::thumbnail::Thumbnailer::hash_key(path))
             .collect();
         let hits = auth.thumb_hashes_get_many(&keys);
-        for ((index, _), key) in hash_candidates.iter().zip(keys.iter()) {
+        for ((index, _), key) in hash_slots.iter().zip(keys.iter()) {
             if let Some(hash) = hits.get(key)
-                && let Some(item) = out.get_mut(*index)
+                && let Some(item) = items.get_mut(*index)
             {
                 item.hash = Some(hash.clone());
                 item.color = average_color(hash);
@@ -496,37 +658,37 @@ fn scan(
         }
     }
 
-    // 新的在前
-    out.sort_by_key(|item| std::cmp::Reverse(item.modified));
-    (out, scanned, truncated)
+    items
 }
 
 // ---------------------------------------------------------------------------
 // 照片库相册视图（设计文档 3.4.3）
 // ---------------------------------------------------------------------------
 
-/// 单个相册最多扫多少个目录项（防止一本相册把请求拖死）
-const ALBUM_SCAN_LIMIT: usize = 20_000;
+/// 相册扫描结果：只留卡片必需的字段，封面 ThumbHash 推迟到分页切片之后。
+struct RawAlbum {
+    name: String,
+    /// 展示路径（同时是游标里的次级排序键）
+    path: String,
+    count: usize,
+    is_root: bool,
+    /// 封面真实路径（算 ThumbHash 用；展示串已换成 `/` 分隔，拿它算 key 会与缩略图不一致）
+    cover_path: Option<PathBuf>,
+    /// 归一化后的 mtime（缺失记 0，降序时沉底）
+    mtime: u64,
+}
 
-fn scan_albums(
-    root: &Path,
-    depth: usize,
-    wanted: &[&str],
-    auth: &crate::core::auth::AuthStore,
-) -> (Vec<Album>, bool) {
-    let mut albums: Vec<Album> = Vec::new();
-    // 与 albums 一一对应的封面真实路径（取 ThumbHash 用；展示串已换成 `/` 分隔，
-    // 拿展示串算 key 会与缩略图生成时的 key 不一致）
-    let mut covers: Vec<Option<PathBuf>> = Vec::new();
-    let mut truncated = false;
-    let mut scanned = 0usize;
+fn scan_albums(root: &Path, depth: usize, wanted: &[&str]) -> Vec<RawAlbum> {
+    let mut albums: Vec<RawAlbum> = Vec::new();
 
     // 与 v2.8 相册视图同一口径（设计文档 3.4.3）：遍历目录树，**每个直接含有
     // 图片的目录**都记一本相册——包括扫描起点（挂载目录）自己；计数只看该目录
     // 第一层，点进相册也只列第一层，卡片上的条数才和看到的一致。
+    //
+    // 没有扫描上限：相册多到几万本也必须能翻到最后一张卡片。
     let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, true)];
 
-    'walk: while let Some((dir, level, is_root)) = stack.pop() {
+    while let Some((dir, level, is_root)) = stack.pop() {
         let Ok(reader) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -535,11 +697,6 @@ fn scan_albums(
         let mut newest: Option<(u64, PathBuf)> = None;
 
         for entry in reader.flatten() {
-            scanned += 1;
-            if scanned > ALBUM_SCAN_LIMIT {
-                truncated = true;
-                break 'walk;
-            }
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -599,54 +756,65 @@ fn scan_albums(
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_else(|| fs::normalize_display(&dir));
-        let (modified, cover_source) = match newest {
+        let (mtime, cover_path) = match newest {
             Some((mtime, path)) => (Some(mtime), Some(path)),
             None => (None, None),
         };
-        albums.push(Album {
+        albums.push(RawAlbum {
             name,
             path: fs::normalize_display(&dir),
             count,
             is_root,
-            cover: cover_source
+            cover_path,
+            mtime: mtime.unwrap_or(0),
+        });
+    }
+
+    albums
+}
+
+/// 给当前页的相册补封面 ThumbHash（一次批量查询，不逐本开连接）。
+fn build_albums(raw: &[RawAlbum], auth: &crate::core::auth::AuthStore) -> Vec<Album> {
+    let mut albums: Vec<Album> = raw
+        .iter()
+        .map(|entry| Album {
+            name: entry.name.clone(),
+            path: entry.path.clone(),
+            count: entry.count,
+            is_root: entry.is_root,
+            cover: entry
+                .cover_path
                 .as_ref()
                 .map(|path| fs::normalize_display(path)),
             cover_hash: None,
             cover_color: None,
-            modified,
-        });
-        covers.push(cover_source);
-    }
+            modified: (entry.mtime > 0).then_some(entry.mtime),
+        })
+        .collect();
 
-    // 封面 ThumbHash 一次性批量取（与媒体列表同一条惰性迁移路径）
-    let lookup: Vec<(usize, PathBuf)> = covers
+    let lookup: Vec<(usize, &PathBuf)> = raw
         .iter()
         .enumerate()
-        .filter_map(|(index, path)| path.as_ref().map(|path| (index, path.clone())))
+        .filter_map(|(index, entry)| entry.cover_path.as_ref().map(|path| (index, path)))
         .collect();
-    if !lookup.is_empty() {
-        let keys: Vec<String> = lookup
-            .iter()
-            .map(|(_, path)| crate::core::thumbnail::Thumbnailer::hash_key(path))
-            .collect();
-        let hits = auth.thumb_hashes_get_many(&keys);
-        for ((index, _), key) in lookup.iter().zip(keys.iter()) {
-            if let Some(hash) = hits.get(key)
-                && let Some(album) = albums.get_mut(*index)
-            {
-                album.cover_hash = Some(hash.clone());
-                album.cover_color = average_color(hash);
-            }
-        }
+    if lookup.is_empty() {
+        return albums;
     }
 
-    // 新的在前；没有 mtime 的沉底
-    albums.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    (albums, truncated)
+    let keys: Vec<String> = lookup
+        .iter()
+        .map(|(_, path)| crate::core::thumbnail::Thumbnailer::hash_key(path))
+        .collect();
+    let hits = auth.thumb_hashes_get_many(&keys);
+    for ((index, _), key) in lookup.iter().zip(keys.iter()) {
+        if let Some(hash) = hits.get(key)
+            && let Some(album) = albums.get_mut(*index)
+        {
+            album.cover_hash = Some(hash.clone());
+            album.cover_color = average_color(hash);
+        }
+    }
+    albums
 }
 
 // ---------------------------------------------------------------------------
@@ -819,5 +987,182 @@ pub async fn clear_cache(State(state): State<AppState>) -> Response {
         }
         Ok(Err(err)) => fs_error(FsError::Io(format!("清理缓存失败：{err}"))),
         Err(err) => fs_error(FsError::Io(format!("清理任务失败：{err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("asmoday-media-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 造文件并给一个可预测的 mtime（秒），方便断言排序
+    fn touch(dir: &Path, name: &str, mtime: u64) {
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    }
+
+    #[test]
+    fn scan_has_no_upper_limit_and_counts_every_kind() {
+        let root = scratch("count");
+        // 5000 张图，远超旧实现的 4000 上限
+        for index in 0..5000u64 {
+            touch(&root, &format!("p{index:05}.jpg"), 1_700_000_000 + index);
+        }
+        touch(&root, "clip.mp4", 1_700_000_000);
+        touch(&root, "song.mp3", 1_700_000_000);
+
+        let (raw, _scanned, counts) = scan_raw(&root, &["image"], 0);
+        assert_eq!(raw.len(), 5000, "旧实现到 4000 就截断，现在必须全都在");
+        // counts 统计全部媒体文件，与 wanted 无关
+        assert_eq!(counts.image, 5000);
+        assert_eq!(counts.video, 1);
+        assert_eq!(counts.audio, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_paging_covers_every_item_exactly_once() {
+        let root = scratch("paging");
+        for index in 0..17u64 {
+            touch(&root, &format!("p{index:02}.jpg"), 1_700_000_000 + index);
+        }
+
+        let (mut raw, _, _) = scan_raw(&root, &["image"], 0);
+        raw.sort_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| a.display.cmp(&b.display))
+        });
+        let expected: Vec<String> = raw.iter().map(|item| item.display.clone()).collect();
+        // 新的在前
+        assert!(expected[0].ends_with("p16.jpg"));
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<MediaCursor> = None;
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 20, "分页没有收敛");
+            let start = page_start(&raw, cursor.as_ref());
+            let end = (start + 5).min(raw.len());
+            for item in &raw[start..end] {
+                seen.push(item.display.clone());
+            }
+            if end >= raw.len() {
+                break;
+            }
+            cursor = Some(MediaCursor {
+                m: raw[end - 1].mtime,
+                p: raw[end - 1].display.clone(),
+            });
+        }
+
+        assert_eq!(seen, expected);
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "翻页出现重复条目");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_with_same_mtime_still_converges() {
+        let root = scratch("same-mtime");
+        // 同一秒内写入的一批文件（真实目录里非常常见），靠路径兜底也必须有确定顺序
+        for index in 0..9u64 {
+            touch(&root, &format!("same{index}.jpg"), 1_700_000_000);
+        }
+        let (mut raw, _, _) = scan_raw(&root, &["image"], 0);
+        raw.sort_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| a.display.cmp(&b.display))
+        });
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<MediaCursor> = None;
+        loop {
+            let start = page_start(&raw, cursor.as_ref());
+            let end = (start + 4).min(raw.len());
+            seen.extend(raw[start..end].iter().map(|item| item.display.clone()));
+            if end >= raw.len() {
+                break;
+            }
+            cursor = Some(MediaCursor {
+                m: raw[end - 1].mtime,
+                p: raw[end - 1].display.clone(),
+            });
+        }
+        assert_eq!(seen.len(), 9, "mtime 相同也不能漏项或死循环");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_decodes_what_encode_produced() {
+        let raw = encode_cursor(1_700_000_123, "D:/media/a.jpg");
+        let cursor = decode_cursor(&raw).expect("游标必须能解回来");
+        assert_eq!(cursor.m, 1_700_000_123);
+        assert_eq!(cursor.p, "D:/media/a.jpg");
+        // 手工改坏的游标当第一页处理，不报错
+        assert!(decode_cursor("not-a-cursor").is_none());
+    }
+
+    #[test]
+    fn albums_are_paged_and_skip_empty_dirs() {
+        let root = scratch("albums");
+        for (index, name) in ["a", "b", "c"].iter().enumerate() {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            touch(&dir, "1.jpg", 1_700_000_000 + index as u64);
+        }
+        // 空目录不是相册
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        // 数据目录（SKIP_DIRS）里的图不算
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        touch(&data, "cache.jpg", 1_700_000_009);
+
+        let mut raw = scan_albums(&root, 3, &["image"]);
+        raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+        assert_eq!(raw.len(), 3, "只该有 a/b/c 三本，空目录与数据目录都不算");
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<MediaCursor> = None;
+        loop {
+            let start = match &cursor {
+                Some(cur) => raw.partition_point(|item| {
+                    item.mtime > cur.m || (item.mtime == cur.m && item.path <= cur.p)
+                }),
+                None => 0,
+            };
+            let end = (start + 2).min(raw.len());
+            seen.extend(raw[start..end].iter().map(|item| item.path.clone()));
+            if end >= raw.len() {
+                break;
+            }
+            cursor = Some(MediaCursor {
+                m: raw[end - 1].mtime,
+                p: raw[end - 1].path.clone(),
+            });
+        }
+        assert_eq!(seen.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
