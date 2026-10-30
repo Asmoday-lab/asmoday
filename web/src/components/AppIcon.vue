@@ -3,7 +3,7 @@
  * 内联 SVG 图标。零外部请求。
  */
 import { computed } from 'vue'
-import { ICONS, type IconName } from './icons'
+import { ICONS, HEAD_SOLID, type IconName } from './icons'
 
 const props = withDefaults(
   defineProps<{
@@ -17,6 +17,10 @@ const props = withDefaults(
 )
 
 const paths = computed(() => ICONS[props.name] ?? [])
+/** 音量类图标：第一段（喇叭体）实心，其余段（声波/叉）描边 */
+const headSolid = computed(() => HEAD_SOLID.has(props.name))
+/** 某一段是否走实心：整体 filled，或该图标的首段实心 */
+const isFilled = (index: number) => props.filled || (headSolid.value && index === 0)
 </script>
 
 <template>
@@ -32,6 +36,12 @@ const paths = computed(() => ICONS[props.name] ?? [])
     aria-hidden="true"
     class="shrink-0"
   >
-    <path v-for="(d, i) in paths" :key="i" :d="d" />
+    <path
+      v-for="(d, i) in paths"
+      :key="i"
+      :d="d"
+      :fill="isFilled(i) ? 'currentColor' : 'none'"
+      :stroke="isFilled(i) ? 'none' : 'currentColor'"
+    />
   </svg>
 </template>

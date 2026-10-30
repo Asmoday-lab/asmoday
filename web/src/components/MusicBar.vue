@@ -76,7 +76,11 @@ const volumeTitle = computed(() =>
   volume.muted ? t('gallery.player.unmute') : t('gallery.player.mute'),
 )
 
-const volumeIcon = computed<IconName>(() => (volume.muted ? 'volumeMute' : 'volume'))
+const volumeIcon = computed<IconName>(() => {
+  // 三档与参考稿 volIcon 一致：静音 / 单弧（<55%）/ 双弧
+  if (volume.muted || volume.sliderValue <= 0) return 'volumeMute'
+  return volume.sliderValue < 0.55 ? 'volumeLow' : 'volume'
+})
 
 /** 播放列表抽屉的贴底距离：极简形态下要落在胶囊上方，别压住唱片 */
 const drawerOffset = computed(() =>
@@ -542,7 +546,7 @@ watch(
                 音量（参考稿 .vol-popup）：声音键 + 上方竖排滑条。
                 桌面上同时保留参考稿那根横向细轨（lg 起），窄屏只有这颗键。
               -->
-              <div class="relative" data-testid="music-volume-wrap" @click.stop>
+              <div class="vol-wrap relative" data-testid="music-volume-wrap" @click.stop>
                 <button
                   class="grid size-[26px] shrink-0 place-items-center rounded-full transition-colors hover:bg-elevated lg:size-6"
                   :class="volume.muted ? 'text-accent' : 'text-muted hover:text-ink'"
@@ -552,28 +556,30 @@ watch(
                 >
                   <AppIcon :name="volumeIcon" :size="15" />
                 </button>
-                <Transition name="fade">
-                  <div
-                    v-if="volOpen"
-                    class="absolute bottom-full left-1/2 mb-1 h-24 w-9 -translate-x-1/2 rounded-[18px] border border-line bg-panel shadow-2xl"
-                    data-testid="music-volume-popup"
-                  >
-                    <div class="grid h-full w-full place-items-center">
-                      <input
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.01"
-                        :value="volume.sliderValue"
-                        :title="t('gallery.player.volume')"
-                        class="music-range is-volume vol-vertical w-[72px]"
-                        :style="{ backgroundImage: volumeBackground }"
-                        data-testid="music-volume-slider"
-                        @input="onVolumeInput"
-                      />
-                    </div>
+                <!--
+                  弹层常驻 DOM（参考稿 .vol-popup-slider 也是靠 opacity 切换）：
+                  点击锁定用 `.is-open`，<lg 且真指针设备上悬停即展开，隐藏时下沉 4px。
+                -->
+                <div
+                  class="vol-popup absolute bottom-full left-1/2 mb-1 h-24 w-9 rounded-[18px] border border-line bg-panel shadow-2xl"
+                  :class="{ 'is-open': volOpen }"
+                  data-testid="music-volume-popup"
+                >
+                  <div class="relative h-full w-full">
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      :value="volume.sliderValue"
+                      :title="t('gallery.player.volume')"
+                      class="music-range is-volume vol-vertical w-[72px]"
+                      :style="{ backgroundImage: volumeBackground }"
+                      data-testid="music-volume-slider"
+                      @input="onVolumeInput"
+                    />
                   </div>
-                </Transition>
+                </div>
               </div>
 
               <!-- 桌面横向音量细轨（参考稿 .vol-horizontal，lg 起才有位置放） -->

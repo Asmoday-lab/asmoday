@@ -338,10 +338,58 @@ body {
   transform: scale(1);
 }
 
-/* 竖排音量条（参考稿 .vol-vertical）：横向 72px 的轨道整体转 -90°，向上为变大 */
+/*
+ * 竖排音量条（参考稿 .vol-vertical）：横向 72px 的轨道整体转 -90°，向上为变大。
+ * **必须绝对定位居中**：滑条盒（72×16）比胶囊内容区（34×94）宽，交给 grid/flex 的
+ * `place-items: center` 时，浏览器按「起始边对齐 + 向右溢出」处理，实测中心右偏 19px，
+ * 滑条整个跑到胶囊外面（v4.5.5 之前的真实缺陷）。
+ */
 .vol-vertical {
-  flex: 0 0 auto;
-  transform: rotate(-90deg);
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) rotate(-90deg);
+}
+
+/*
+ * 音量弹层（参考稿 .vol-popup-slider）：hover 或点击展开，隐藏时下沉 4px。
+ * 4px 间隙用透明桥接块补齐（参考稿的 .vol-popup::before），鼠标从键滑到滑条不闪断。
+ * `visibility` 延迟到淡出结束再置 hidden —— 否则隐藏的滑条还能被 Tab 聚焦。
+ */
+.vol-popup {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(4px);
+  transition:
+    opacity 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+    visibility 0s linear 0.2s;
+}
+.vol-popup::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -6px;
+  height: 8px;
+}
+.vol-popup.is-open {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+  transition-delay: 0s;
+}
+/* 悬停展开只在窄屏 + 真有指针的设备上（≥lg 条内已有横向滑轨，参考稿也是 display:none） */
+@media (hover: hover) and (max-width: 1023.98px) {
+  .vol-wrap:hover .vol-popup {
+    visibility: visible;
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+    transition-delay: 0s;
+  }
 }
 .music-range::-moz-range-track {
   height: 4px;

@@ -108,6 +108,8 @@ export const ICONS = {
   edit: ['M4 20h4L20 8l-4-4L4 16Z', 'm14 6 4 4'],
   image: ['M4 5h16v14H4Z', 'M4 16l4.5-4.5 3 3L15 11l5 5', 'M15.5 9.5h.01'],
   volume: ['M4 9.5h3.2L12 5.5v13L7.2 14.5H4Z', 'M15.4 9.2a4.1 4.1 0 0 1 0 5.6', 'M18 6.6a7.8 7.8 0 0 1 0 10.8'],
+  /** 低音量：只有一道声波（参考稿 volIcon 的三档之一） */
+  volumeLow: ['M4 9.5h3.2L12 5.5v13L7.2 14.5H4Z', 'M15.4 9.2a4.1 4.1 0 0 1 0 5.6'],
   volumeMute: ['M4 9.5h3.2L12 5.5v13L7.2 14.5H4Z', 'm16.2 9.6 4.6 5.4', 'm20.8 9.6-4.6 5.4'],
   list: ['M4 7h11', 'M4 12h11', 'M4 17h7', 'M16.6 6.4v9.2', 'M14.2 18.4a2.4 2.4 0 1 1 0-4.8 2.4 2.4 0 0 1 0 4.8Z'],
   // 隐藏文件开关（设计文档 3.2）
@@ -121,5 +123,11 @@ export const ICONS = {
 } as const
 
 export type IconName = keyof typeof ICONS
+
+/**
+ * 首段路径画实心、其余段描边的图标（参考稿 volIcon 就是这么画音量键的：
+ * 喇叭体 `fill`、声波弧 `stroke`）。AppIcon 会按这个集合逐段决定填充/描边。
+ */
+export const HEAD_SOLID: ReadonlySet<IconName> = new Set<IconName>(['volume', 'volumeLow', 'volumeMute'])
 
 export const isIconName = (name: string): name is IconName => name in ICONS
