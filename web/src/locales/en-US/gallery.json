@@ -11,7 +11,9 @@
     "videoBadge": "Video",
     "rootFolder": "Root",
     "albumEmpty": "No folders with photos yet",
-    "albumEmptyHint": "Photos loose in the root still show up in the timeline"
+    "albumEmptyHint": "Photos loose in the root still show up in the timeline",
+    "albumStale": "Album list did not load",
+    "albumStaleHint": "{count} photos are indexed but no albums came back — usually the scan has not finished; try rescanning"
   },
   "cinema": {
     "title": "Cinema",
@@ -44,6 +46,7 @@
     "rescan": "Rescan",
     "indexed": "Media indexed from mounts",
     "loadFailed": "Failed to load the media index",
+    "retry": "Retry",
     "loadingMore": "Loading more…",
     "allLoaded": "All loaded",
     "loadedOf": "{loaded} of {total} loaded"

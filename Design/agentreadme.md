@@ -1251,6 +1251,11 @@ GWT-PHOTO-13 Given 快速连按翻页  When 旧图 load 晚到  Then 不污染�
 GWT-PHOTO-14 Given 打开预览小图  When 打底图与原始图交替  Then 可见图尺寸全程不变（不得先大后小；两层同为 size-full+object-contain，缩略图 URL 带 r 与 v）
 GWT-PHOTO-15 Given 灯箱  When 连点两次左右箭头  Then 正常翻两页且缩放仍是 100%（dblclick 在控件上不触发缩放）
 GWT-PHOTO-16 Given 灯箱  When 长按 +/−  Then 只放大一档；When 长按 ←/→  Then 每次 ≥110ms 才翻一张
+GWT-PHOTO-17 Given 深链进 /cinema 再点侧边栏「图片库」  Then 相册清单必须出现（切分区要补拉，不能停在「没有找到含图片的文件夹」）
+GWT-PHOTO-18 Given 相册清单接口 500 / 断网  Then 显示错误 + 「重新扫描」，不得显示成空相册；点重试后恢复
+GWT-PHOTO-19 Given 索引里有图（counts.image>0）但相册清单为空  Then 文案是「相册清单没有加载出来」并给重扫入口
+GWT-PHOTO-20 Given 慢网 >180ms  Then 骨架形状与真实卡片一致（4:3 + 两行字 / 方格 / 16:9），内容到达时无跳版，且刷新时不清空旧数据
+GWT-PHOTO-21 Given prefers-reduced-motion  Then 骨架不动画（只留静态底块）
 GWT-THUMB-01 Given 缩略图 URL 带 v=<mtime>  When 服务端指纹与 mtime 一致  Then 回 immutable 长缓存；不带 v 则 private, no-cache + ETag，条件请求回 304
 GWT-THUMB-02 Given 320×213 的原图  When 请求 w=960  Then 返回仍是 320×213（绝不放大），缓存文件名前缀是 v3-<长度>-<mtime>
 GWT-THUMB-03 Given 源文件被改  When 再次请求缩略图  Then 指纹变、落新文件名、旧指纹文件被 prune_stale 删掉（目录不随时间增长）

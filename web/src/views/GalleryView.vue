@@ -31,6 +31,7 @@ import { triggerDownload } from '../lib/download'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
 import { useLongPress } from '../composables/useLongPress'
+import { useDeferredLoading } from '../composables/useDeferredLoading'
 import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
@@ -49,7 +50,12 @@ watch(
   (value) => {
     if (value === 'photos' || value === 'cinema' || value === 'music') {
       tab.value = value
-      // 组件在三个路由间复用，挂载时只 load 过一次：影视库的文件夹卡片按需补拉
+      // 组件在三个路由间复用，onMounted 只跑一次：**每个分区的副列表都要按需补拉**。
+      // 只补影视库曾导致「深链进 /cinema 再切到图片库，相册永远是空的」——这就是
+      // 「相册偶尔不出现」的真因（能否复现只取决于用户先进哪个分区）。
+      if (value === 'photos' && albums.value.length === 0 && !albumsLoading.value) {
+        void loadAlbums()
+      }
       if (value === 'cinema' && cinemaAlbums.value.length === 0 && !cinemaAlbumsLoading.value) {
         void loadCinemaAlbums()
       }
@@ -61,6 +67,8 @@ const items = ref<MediaItem[]>([])
 const root = ref('')
 const loading = ref(true)
 const error = ref('')
+/** 骨架延后 180ms 才出现：快接口直接出内容，不闪一下白块 */
+const loadingSkeleton = useDeferredLoading(loading)
 
 // ---------------- 游标分页（设计文档 3.4） ----------------
 //
@@ -339,6 +347,7 @@ const photoView = ref<PhotoView>(
 const albums = ref<Album[]>([])
 const albumsLoading = ref(false)
 const albumsError = ref('')
+const albumsSkeleton = useDeferredLoading(albumsLoading)
 /** 相册卡片同样分页（一个媒体根下几千本相册是常态） */
 const albumsCursor = ref<string | null>(null)
 const albumsHasMore = ref(false)
@@ -347,13 +356,24 @@ const albumsTotal = ref(0)
 const activeAlbum = ref<Album | null>(null)
 const albumItems = ref<MediaItem[]>([])
 const albumLoading = ref(false)
+const albumError = ref('')
+const albumSkeleton = useDeferredLoading(albumLoading)
 const albumCursor = ref<string | null>(null)
 const albumHasMore = ref(false)
 /** 相册封面加载失败（坏图）时回退纯色，不再重复请求 */
 const albumCoverFailed = ref(new Set<string>())
 
+/**
+ * 正在加载时又来的请求：记下它带没带 refresh，等这一轮结束按原样重跑。
+ * 以前直接丢弃，工具栏「重新扫描」会白点一次（而重扫恰恰是最需要它生效的那次）。
+ */
+let albumsQueued: boolean | null = null
+
 async function loadAlbums(refresh = false) {
-  if (albumsLoading.value) return
+  if (albumsLoading.value) {
+    albumsQueued = refresh
+    return
+  }
   albumsLoading.value = true
   albumsError.value = ''
   try {
@@ -366,6 +386,11 @@ async function loadAlbums(refresh = false) {
     albumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
     albumsLoading.value = false
+    if (albumsQueued !== null) {
+      const next = albumsQueued
+      albumsQueued = null
+      void loadAlbums(next)
+    }
   }
 }
 
@@ -397,7 +422,13 @@ function setPhotoView(view: PhotoView) {
 
 async function openAlbum(album: Album) {
   activeAlbum.value = album
+  await loadAlbumItems(album)
+}
+
+/** 拉册内第一屏（重试按钮也走这里，避免失败只能退出再进） */
+async function loadAlbumItems(album: Album) {
   albumLoading.value = true
+  albumError.value = ''
   albumItems.value = []
   albumCursor.value = null
   albumHasMore.value = false
@@ -409,7 +440,7 @@ async function openAlbum(album: Album) {
     albumCursor.value = result.next_cursor ?? null
     albumHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
-    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+    albumError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
     albumLoading.value = false
   }
@@ -436,6 +467,7 @@ async function loadMoreAlbumItems() {
 function closeAlbum() {
   activeAlbum.value = null
   albumItems.value = []
+  albumError.value = ''
   albumLoading.value = false
   albumCursor.value = null
   albumHasMore.value = false
@@ -451,12 +483,14 @@ function closeAlbum() {
 const cinemaAlbums = ref<Album[]>([])
 const cinemaAlbumsLoading = ref(false)
 const cinemaAlbumsError = ref('')
+const cinemaAlbumsSkeleton = useDeferredLoading(cinemaAlbumsLoading)
 const cinemaAlbumsCursor = ref<string | null>(null)
 const cinemaAlbumsHasMore = ref(false)
 const cinemaAlbumsTotal = ref(0)
 const activeCinemaAlbum = ref<Album | null>(null)
 const cinemaItems = ref<MediaItem[]>([])
 const cinemaLoading = ref(false)
+const cinemaSkeleton = useDeferredLoading(cinemaLoading)
 const cinemaCursor = ref<string | null>(null)
 const cinemaHasMore = ref(false)
 const cinemaCoverFailed = ref(new Set<string>())
@@ -465,8 +499,13 @@ function markCinemaCoverFailed(path: string) {
   cinemaCoverFailed.value = new Set(cinemaCoverFailed.value).add(path)
 }
 
+let cinemaAlbumsQueued: boolean | null = null
+
 async function loadCinemaAlbums(refresh = false) {
-  if (cinemaAlbumsLoading.value) return
+  if (cinemaAlbumsLoading.value) {
+    cinemaAlbumsQueued = refresh
+    return
+  }
   cinemaAlbumsLoading.value = true
   cinemaAlbumsError.value = ''
   try {
@@ -479,6 +518,11 @@ async function loadCinemaAlbums(refresh = false) {
     cinemaAlbumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
     cinemaAlbumsLoading.value = false
+    if (cinemaAlbumsQueued !== null) {
+      const next = cinemaAlbumsQueued
+      cinemaAlbumsQueued = null
+      void loadCinemaAlbums(next)
+    }
   }
 }
 
@@ -936,20 +980,70 @@ useEventListener(window, 'keydown', onKey)
       </div>
     </header>
 
-    <!-- 加载 / 错误 -->
-    <div v-if="loading" class="min-h-0 flex-1 p-4">
-      <div class="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-2">
-        <div v-for="i in 12" :key="i" class="skeleton aspect-square rounded-xl" />
+    <!-- 加载中：骨架形状跟真实内容对齐（相册 4:3 / 照片方块 / 影视 16:9 / 音乐行），
+         内容接上来时不会「跳一下版」；180ms 内出结果则完全不显示骨架 -->
+    <div v-if="loading" class="min-h-0 flex-1 p-2 md:p-3">
+      <div v-if="!loadingSkeleton" class="h-full" />
+      <template v-else-if="tab === 'photos'">
+        <div
+          v-if="photoView === 'albums'"
+          class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
+        >
+          <div v-for="i in 8" :key="i">
+            <div class="skeleton aspect-[4/3] rounded-xl" />
+            <div class="skeleton mt-2 h-3 w-2/3 rounded" />
+            <div class="skeleton mt-1.5 h-2.5 w-1/3 rounded" />
+          </div>
+        </div>
+        <div
+          v-else
+          class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
+        >
+          <div v-for="i in 18" :key="i" class="skeleton aspect-square rounded-lg md:rounded-xl" />
+        </div>
+      </template>
+      <div v-else-if="tab === 'cinema'">
+        <!-- 页面标题也占位：否则卡片先出现、标题后到，整屏会往下跳一下 -->
+        <div class="mb-4 flex items-center justify-between px-2 md:px-3">
+          <div class="skeleton h-6 w-24 rounded-md" />
+          <div class="skeleton h-3 w-16 rounded" />
+        </div>
+        <div
+          class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+        >
+          <div v-for="i in 6" :key="i">
+            <div class="skeleton aspect-video rounded-xl" />
+            <div class="skeleton mt-2 h-3 w-3/4 rounded" />
+            <div class="skeleton mt-1.5 h-2.5 w-1/3 rounded" />
+          </div>
+        </div>
+      </div>
+      <div v-else class="space-y-1">
+        <div v-for="i in 9" :key="i" class="flex items-center gap-3 px-2 py-2">
+          <div class="skeleton size-10 shrink-0 rounded-lg" />
+          <div class="min-w-0 flex-1">
+            <div class="skeleton h-3 rounded" :style="{ width: `${54 + ((i * 11) % 34)}%` }" />
+            <div class="skeleton mt-2 h-2.5 w-1/4 rounded" />
+          </div>
+        </div>
       </div>
     </div>
 
+    <!-- 加载失败不能只报错不给路：重新扫描一次往往就恢复（快照没建好 / 索引重建中） -->
     <div v-else-if="error" class="grid min-h-0 flex-1 place-items-center px-6 text-center">
       <div>
         <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
           <AppIcon name="alert" :size="22" />
         </span>
         <p class="text-sm text-ink">{{ t('gallery.toolbar.loadFailed') }}</p>
-        <p class="mt-1 text-xs text-muted">{{ error }}</p>
+        <p class="mt-1 max-w-xs text-xs text-muted">{{ error }}</p>
+        <button
+          class="mt-4 rounded-md border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+          data-testid="gallery-retry"
+          @click="load({ refresh: true })"
+        >
+          {{ t('gallery.toolbar.rescan') }}
+        </button>
       </div>
     </div>
 
@@ -984,11 +1078,31 @@ useEventListener(window, 'keydown', onKey)
         </header>
 
         <div class="min-h-0 flex-1 overflow-y-auto p-2 md:p-3">
+          <!-- 失败要能看见、能重试：以前只弹个 toast，然后界面显示成「相册是空的」 -->
+          <div v-if="albumError" class="grid h-full place-items-center px-6 text-center">
+            <div>
+              <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+                <AppIcon name="alert" :size="22" />
+              </span>
+              <p class="text-sm text-ink">{{ t('gallery.toolbar.loadFailed') }}</p>
+              <p class="mt-1 max-w-xs text-xs text-muted">{{ albumError }}</p>
+              <button
+                class="mt-4 rounded-md border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+                data-testid="album-retry"
+                @click="activeAlbum && loadAlbumItems(activeAlbum)"
+              >
+                {{ t('gallery.toolbar.retry') }}
+              </button>
+            </div>
+          </div>
           <div
-            v-if="albumLoading"
+            v-else-if="albumLoading"
             class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
           >
-            <div v-for="i in 12" :key="i" class="skeleton aspect-square rounded-lg" />
+            <template v-if="albumSkeleton">
+              <div v-for="i in 12" :key="i" class="skeleton aspect-square rounded-lg md:rounded-xl" />
+            </template>
+            <div v-else class="h-24" />
           </div>
           <div
             v-else-if="albumItems.length === 0"
@@ -998,7 +1112,7 @@ useEventListener(window, 'keydown', onKey)
           </div>
           <div
             v-else
-            class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
+            class="fade-in grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
             data-testid="album-photos"
           >
             <PhotoTile
@@ -1027,36 +1141,62 @@ useEventListener(window, 'keydown', onKey)
 
       <!-- 相册卡片：封面取册内最新一张图，空相册后端已剔除 -->
       <div v-else-if="photoView === 'albums'" class="h-full overflow-y-auto p-2 md:p-3" data-testid="photo-albums">
+        <!-- 首次加载：骨架连「标题 + 副标题」两行一起占位，真卡片接上来高度不跳 -->
         <div
-          v-if="albumsLoading"
+          v-if="albums.length === 0 && albumsSkeleton"
           class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
         >
-          <div v-for="i in 8" :key="i" class="skeleton aspect-[4/3] rounded-xl" />
-        </div>
-
-        <div v-else-if="albumsError" class="grid h-full place-items-center text-center">
-          <div>
-            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-              <AppIcon name="alert" :size="22" />
-            </span>
-            <p class="text-sm text-ink">{{ t('gallery.toolbar.loadFailed') }}</p>
-            <p class="mt-1 text-xs text-muted">{{ albumsError }}</p>
+          <div v-for="i in 8" :key="i">
+            <div class="skeleton aspect-[4/3] rounded-xl" />
+            <div class="skeleton mt-2 h-3 w-2/3 rounded" />
+            <div class="skeleton mt-1.5 h-2.5 w-1/3 rounded" />
           </div>
         </div>
 
-        <div v-else-if="albums.length === 0" class="grid h-full place-items-center text-center">
+        <!-- 骨架还没到（180ms 内）：先留白，别闪一下「还没有相册」的空态 -->
+        <div v-else-if="albums.length === 0 && albumsLoading" class="h-full" />
+
+        <div
+          v-else-if="albums.length === 0"
+          class="grid h-full place-items-center px-6 text-center"
+        >
           <div>
             <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-              <AppIcon name="gallery" :size="22" />
+              <AppIcon :name="albumsError || counts.image > 0 ? 'alert' : 'gallery'" :size="22" />
             </span>
-            <p class="text-sm text-ink">{{ t('gallery.photos.albumEmpty') }}</p>
-            <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.albumEmptyHint') }}</p>
+            <p class="text-sm text-ink">
+              {{
+                albumsError
+                  ? t('gallery.toolbar.loadFailed')
+                  : counts.image > 0
+                    ? t('gallery.photos.albumStale')
+                    : t('gallery.photos.albumEmpty')
+              }}
+            </p>
+            <p class="mt-1 max-w-xs text-xs text-muted">
+              {{
+                albumsError
+                  ? albumsError
+                  : counts.image > 0
+                    ? t('gallery.photos.albumStaleHint', { count: counts.image })
+                    : t('gallery.photos.albumEmptyHint')
+              }}
+            </p>
+            <!-- 明明索引里有图却没有相册 = 清单没拿到，给一个能自己救回来的入口 -->
+            <button
+              v-if="albumsError || counts.image > 0"
+              class="mt-4 rounded-md border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+              data-testid="albums-retry"
+              @click="loadAlbums(true)"
+            >
+              {{ t('gallery.toolbar.rescan') }}
+            </button>
           </div>
         </div>
 
         <div
           v-else
-          class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
+          class="fade-in grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
         >
           <button
             v-for="album in albums"
@@ -1189,14 +1329,20 @@ useEventListener(window, 'keydown', onKey)
             v-if="cinemaLoading"
             class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
           >
-            <div v-for="i in 8" :key="i" class="skeleton aspect-video rounded-xl" />
+            <template v-if="cinemaSkeleton">
+              <div v-for="i in 6" :key="i">
+                <div class="skeleton aspect-video rounded-xl" />
+                <div class="skeleton mt-2 h-3 w-3/4 rounded" />
+              </div>
+            </template>
+            <div v-else class="h-24" />
           </div>
           <div v-else-if="cinemaItems.length === 0" class="grid h-full place-items-center text-center">
             <p class="text-sm text-muted">{{ t('gallery.cinema.empty') }}</p>
           </div>
           <div
             v-else
-            class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+            class="fade-in grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
             data-testid="cinema-videos"
           >
             <VideoCard
@@ -1234,35 +1380,50 @@ useEventListener(window, 'keydown', onKey)
         </div>
 
         <div
-          v-if="cinemaAlbumsLoading"
+          v-if="cinemaAlbums.length === 0 && cinemaAlbumsSkeleton"
           class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
         >
-          <div v-for="i in 8" :key="i" class="skeleton aspect-video rounded-xl" />
-        </div>
-
-        <div v-else-if="cinemaAlbumsError" class="grid h-full place-items-center text-center">
-          <div>
-            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-              <AppIcon name="alert" :size="22" />
-            </span>
-            <p class="text-sm text-ink">{{ t('gallery.toolbar.loadFailed') }}</p>
-            <p class="mt-1 text-xs text-muted">{{ cinemaAlbumsError }}</p>
+          <div v-for="i in 6" :key="i">
+            <div class="skeleton aspect-video rounded-xl" />
+            <div class="skeleton mt-2 h-3 w-3/4 rounded" />
+            <div class="skeleton mt-1.5 h-2.5 w-1/3 rounded" />
           </div>
         </div>
 
-        <div v-else-if="cinemaAlbums.length === 0" class="grid h-full place-items-center text-center">
+        <div v-else-if="cinemaAlbums.length === 0 && cinemaAlbumsLoading" class="h-24" />
+
+        <div
+          v-else-if="cinemaAlbums.length === 0"
+          class="grid h-full place-items-center px-6 text-center"
+        >
           <div>
             <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-              <AppIcon name="video" :size="22" />
+              <AppIcon :name="cinemaAlbumsError ? 'alert' : 'video'" :size="22" />
             </span>
-            <p class="text-sm text-ink">{{ t('gallery.cinema.folderEmpty') }}</p>
-            <p class="mt-1 text-xs text-muted">{{ t('gallery.cinema.folderEmptyHint') }}</p>
+            <p class="text-sm text-ink">
+              {{
+                cinemaAlbumsError
+                  ? t('gallery.toolbar.loadFailed')
+                  : t('gallery.cinema.folderEmpty')
+              }}
+            </p>
+            <p class="mt-1 max-w-xs text-xs text-muted">
+              {{ cinemaAlbumsError || t('gallery.cinema.folderEmptyHint') }}
+            </p>
+            <button
+              v-if="cinemaAlbumsError"
+              class="mt-4 rounded-md border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+              data-testid="cinema-albums-retry"
+              @click="loadCinemaAlbums(true)"
+            >
+              {{ t('gallery.toolbar.retry') }}
+            </button>
           </div>
         </div>
 
         <div
           v-else
-          class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+          class="fade-in grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
         >
           <button
             v-for="album in cinemaAlbums"

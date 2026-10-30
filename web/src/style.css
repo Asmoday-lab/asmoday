@@ -419,24 +419,57 @@ body {
   animation-play-state: running;
 }
 
-/* 骨架屏脉冲 */
+/* 骨架屏：底块 + 一道低对比微光扫过（v4.6.1）
+ *
+ * 旧版用 --border-color 当高光：深色主题下它是 8% 白，扫过去是**一条更暗的带子**，
+ * 看上去像色块在抽搐；浅色主题下又几乎看不见。改成和文字色按比例混出的「比底块亮一档」，
+ * 深浅两个主题都只是柔和的一层浮光。1.9s + 缓入缓出无限循环，比原来 1.4s ease 稳。
+ */
 .skeleton {
-  background: linear-gradient(
-    90deg,
-    var(--bg-elevated) 25%,
-    var(--border-color) 37%,
-    var(--bg-elevated) 63%
+  --skeleton-base: color-mix(in oklab, var(--bg-elevated) 90%, var(--text-main) 10%);
+  --skeleton-glow: color-mix(in oklab, var(--text-main) 7%, transparent);
+  background-color: var(--skeleton-base);
+  background-image: linear-gradient(
+    100deg,
+    transparent 26%,
+    var(--skeleton-glow) 45%,
+    transparent 64%
   );
-  background-size: 400% 100%;
-  animation: skeleton-loading 1.4s ease infinite;
+  background-repeat: no-repeat;
+  background-size: 220% 100%;
+  animation: skeleton-shimmer 2.2s cubic-bezier(0.45, 0, 0.55, 1) infinite;
 }
 
-@keyframes skeleton-loading {
-  0% {
-    background-position: 100% 50%;
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 135% 0;
   }
-  100% {
-    background-position: 0 50%;
+  to {
+    background-position: -35% 0;
+  }
+}
+
+/* 内容接替骨架时淡入，避免「骨架 → 图片」硬切造成的闪动 */
+.fade-in {
+  animation: content-in 0.22s ease-out both;
+}
+
+@keyframes content-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton,
+  .fade-in {
+    animation: none;
+    background-image: none;
   }
 }
 

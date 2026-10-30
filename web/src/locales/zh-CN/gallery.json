@@ -11,7 +11,9 @@
     "videoBadge": "视频",
     "rootFolder": "根目录",
     "albumEmpty": "没有找到含图片的文件夹",
-    "albumEmptyHint": "把图片放进挂载点（含根目录）就会出现在这里"
+    "albumEmptyHint": "把图片放进挂载点（含根目录）就会出现在这里",
+    "albumStale": "相册清单没有加载出来",
+    "albumStaleHint": "已索引 {count} 张图片，但分册清单是空的——通常是扫描还没完成或快照未建立，重新扫描一次即可"
   },
   "cinema": {
     "title": "影视库",
@@ -44,6 +46,7 @@
     "rescan": "重新扫描",
     "indexed": "已索引挂载点媒体",
     "loadFailed": "媒体索引加载失败",
+    "retry": "重试",
     "loadingMore": "正在加载更多…",
     "allLoaded": "已全部加载",
     "loadedOf": "已加载 {loaded} / 共 {total}"
