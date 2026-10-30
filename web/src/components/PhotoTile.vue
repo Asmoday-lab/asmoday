@@ -49,7 +49,7 @@ const placeholder = computed(() => thumbHashToDataUrl(props.item.hash))
     <!-- 视频同样取后端首帧当封面（v2.8），失败才回落图标 -->
     <img
       v-if="!failed"
-      :src="thumbUrl(item.path, width)"
+      :src="thumbUrl(item.path, width, item.modified)"
       class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
       loading="lazy"
       alt=""

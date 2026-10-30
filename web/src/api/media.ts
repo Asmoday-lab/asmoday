@@ -117,14 +117,37 @@ export async function browseAlbums(
   return (await res.json()) as AlbumsResult
 }
 
-/** 缩略图（后端信号量限流，拥塞时返回占位图） */
-export function thumbUrl(path: string, width = 320): string {
-  return withBase(`/api/files/thumb?path=${encodeURIComponent(path)}&w=${width}`)
+/**
+ * 缩略图渲染版本：**生成规则一变就 +1**（与服务端 `Thumbnailer::CACHE_VERSION` 对齐）。
+ *
+ * 它只是 URL 上的盐。浏览器缓存按 URL 认人，光改服务端缓存键没用——旧 URL 仍然
+ * 一分钟命中一次旧字节。改规则时同步改这里，所有缩略图 URL 一起换，旧缓存自然作废。
+ */
+export const THUMB_REV = 'v3'
+
+/**
+ * 缩略图（后端信号量限流，拥塞时返回占位图）。
+ *
+ * `version` 传源文件的 `modified`（秒）。URL 里带它之后，服务端才敢给
+ * `immutable` 长缓存：文件一变 URL 就变，不可能拿到过期图。不传也能用，只是
+ * 每次都要回源校验（304，便宜但多一趟）。
+ */
+export function thumbUrl(path: string, width = 320, version?: number | null): string {
+  const params = new URLSearchParams({ path, w: String(width), r: THUMB_REV })
+  if (version !== undefined && version !== null) params.set('v', String(version))
+  return withBase(`/api/files/thumb?${params.toString()}`)
 }
 
-/** 原图/原视频 */
-export function rawUrl(path: string): string {
-  return withBase(`/api/files/raw?path=${encodeURIComponent(path)}`)
+/** 原图/原视频。`download` 为真时带 attachment，浏览器直接存盘 */
+export function rawUrl(path: string, options: { download?: boolean } = {}): string {
+  const params = new URLSearchParams({ path })
+  if (options.download) params.set('download', '1')
+  return withBase(`/api/files/raw?${params.toString()}`)
+}
+
+/** 目录打包下载（store 模式流式 zip） */
+export function archiveUrl(path: string): string {
+  return withBase(`/api/files/archive?path=${encodeURIComponent(path)}`)
 }
 
 /** 音频内嵌封面（ID3 APIC）；无封面时后端回 404，调用方需做兜底 */

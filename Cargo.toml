@@ -92,6 +92,7 @@ lofty = "0.25.5"
 dav-server = { version = "0.11", default-features = false, features = ["localfs"] }
 # dav-server 的 `DavFile::write_buf` 签名里要写 `Box<dyn bytes::Buf>`（本来就在依赖树里）
 bytes = "1"
+crc32fast = "1"
 
 # 测试专用：把生成的二维码矩阵再解回来，证明「扫出来的就是那条 otpauth 链接」。
 # 只解码不编码（编码仍用上面的 qrcode），且仅在测试构建里链接，不进发布产物。

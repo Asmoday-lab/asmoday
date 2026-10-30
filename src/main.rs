@@ -550,6 +550,7 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/files/text", get(api::files::read_text))
         .route("/api/files/thumb", get(api::media::thumb))
+        .route("/api/files/archive", get(api::files::archive))
         .route("/api/files/upload", axum::routing::put(api::files::upload))
         .route("/api/files/search", get(api::files::search))
         .route("/api/files/subtitle", get(api::files::subtitle))

@@ -55,9 +55,6 @@ const FRESH_WINDOW: Duration = Duration::from_secs(60);
 /// 以为缩略图坏了。真正会反复重绘的是几百兆的影视文件，所以用体积当第二道判据。
 const FRESH_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// 版本戳文件名：内容为 `长度:mtime`，源文件一变缓存即失效。
-const STAMP_FILE: &str = "stamp";
-
 /// 文件是否可能仍在写盘（mtime 极新且体积可观）。
 fn is_fresh_write(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
@@ -182,40 +179,39 @@ impl Thumbnailer {
         Self::digest(path)
     }
 
-    /// 源文件的版本戳：缓存格式版本 + 长度 + mtime 秒。变了就说明源文件被改过、
-    /// 或生成规则换过，缓存作废。
+    /// 源文件的**内容指纹**：`v3-<长度>-<mtime秒>`。既进缓存文件名，也做 HTTP ETag。
     ///
-    /// `v2` 是一次**格式升版**：v4.4.2 之前 `render_thumbnail` 会把小于请求宽度的
-    /// 图放大（300×200 的照片被生成成 960 宽的缩略图），灯箱用 960 缩略图打底时
-    /// 画面先按放大版铺开、原图一到又缩回去，看起来就是「打开预览先大后小」。
-    /// 只改生成代码没用——旧文件 stamp 与源文件仍然吻合，永远命中旧图；加上版本
-    /// 前缀后旧 stamp 对不上，会在同一个文件名上就地重生（不产生孤儿文件）。
-    const CACHE_VERSION: &str = "v2";
+    /// 键里带源文件状态（长度 + mtime）与格式版本，所以不存在「戳与图不一致」的窗口——
+    /// 命中与否只看这个文件在不在。v4.4.2 之前 `render_thumbnail` 会把小于请求宽度的图
+    /// 放大（300×200 生成成 960 宽），灯箱用 960 当打底时画面先按放大版铺开、原图一到
+    /// 又缩回去，就是「打开预览先大后小」；把版本号放进文件名后，旧版文件不再命中，
+    /// 新图换个名字落盘，LRU 顺手把旧版收走（不再有 stamp 文件互相踩的窗口）。
+    const CACHE_VERSION: u8 = 3;
 
-    fn stamp_of(path: &Path) -> String {
+    /// 视频首帧的独立版本号：它不跟随图片的取值范围（截帧比解图贵一个数量级，
+    /// 跟着图片升版会让几千个视频白跑一遍 FFmpeg）。
+    const POSTER_VERSION: u8 = 1;
+
+    pub fn fingerprint(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
-        format!("{}:{len}:{mtime}", Self::CACHE_VERSION)
+        format!("v{}-{len:x}-{mtime:x}", Self::CACHE_VERSION)
     }
 
-    /// 视频首帧的戳：只有源文件的长度 + mtime，不含缓存格式版本（理由见 `video_poster`）。
-    fn poster_stamp_of(path: &Path) -> String {
+    /// 源文件 mtime（秒）。前端把它当作 URL 上的 `v`，服务端据此决定能不能长缓存
+    /// （`v` 与当前 mtime 一致 = 这条 URL 代表的就是这一版字节）。
+    pub fn mtime_secs(path: &Path) -> u64 {
+        Self::source_stamp(path).1
+    }
+
+    fn poster_fingerprint(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
-        format!("{len}:{mtime}")
+        format!("p{}-{len:x}-{mtime:x}", Self::POSTER_VERSION)
     }
 
-    fn read_stamp(dir: &Path) -> Option<String> {
-        std::fs::read_to_string(dir.join(STAMP_FILE))
-            .ok()
-            .map(|text| text.trim().to_string())
-    }
-
-    /// 取某个缓存单元里已生成好的图（stamp 必须与当前源文件一致）。
-    async fn cached(dir: &Path, stamp: &str, width: u32) -> Option<ThumbOutcome> {
-        if Self::read_stamp(dir).as_deref() != Some(stamp) {
-            return None;
-        }
+    /// 取某个缓存单元里已生成好的图（文件名前缀就是当前内容的指纹）。
+    async fn cached(dir: &Path, fp: &str, width: u32) -> Option<ThumbOutcome> {
         for (codec, mime) in [("webp", "image/webp"), ("jpg", "image/jpeg")] {
-            let file = dir.join(format!("{width}-{codec}"));
+            let file = dir.join(format!("{fp}-{width}-{codec}"));
             if let Ok(bytes) = tokio::fs::read(&file).await {
                 // 触碰 mtime，参与 LRU 排序
                 let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
@@ -225,13 +221,10 @@ impl Thumbnailer {
         None
     }
 
-    /// 取缓存单元里的视频首帧（同样先验 stamp）。
-    async fn cached_poster(dir: &Path, stamp: &str, width: u32) -> Option<ThumbOutcome> {
-        if Self::read_stamp(dir).as_deref() != Some(stamp) {
-            return None;
-        }
+    /// 取缓存单元里的视频首帧。
+    async fn cached_poster(dir: &Path, fp: &str, width: u32) -> Option<ThumbOutcome> {
         for format in ffmpeg::POSTER_FORMATS {
-            let file = dir.join(format!("{width}p-{}", format.extension()));
+            let file = dir.join(format!("{fp}-{width}p-{}", format.extension()));
             if let Ok(bytes) = tokio::fs::read(&file).await {
                 let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
                 return Some(ThumbOutcome::Ready(Rendered {
@@ -241,6 +234,26 @@ impl Thumbnailer {
             }
         }
         None
+    }
+
+    /// 删掉同一缓存单元里属于**旧内容**的文件（文件名前缀不是当前指纹）。
+    ///
+    /// 键里带源文件状态后，改一次图会多一份文件；不清理的话目录会随编辑次数线性增长。
+    /// 只动我们自己命名的文件（`v…` / `p…` 且含连字符），`.tmp-` 残片留给清理任务。
+    fn prune_stale(dir: &Path, keep_prefix: &str) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(keep_prefix) || !name.contains('-') {
+                continue;
+            }
+            if !(name.starts_with('v') || name.starts_with('p')) {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 
     /// 取该缓存单元的异步锁（同一源文件串行生成）。
@@ -268,9 +281,9 @@ impl Thumbnailer {
     /// 返回 `(结果, 新鲜 ThumbHash)`：缓存命中时第二个值为 None；
     /// 生成成功时带上 hash 由调用方入库，本模块**不再**写任何 `.th` 文件。
     ///
-    /// 缓存布局对齐 FileBrowser 的 diskcache：`<digest[..2]>/<digest>/<width>-<codec>`，
-    /// 同目录 `stamp` 记源文件的 len+mtime。**同一路径永远落在同一个目录里**，
-    /// 源文件改了就原地覆盖，不会因为 mtime 变化不断堆出新文件。
+    /// 缓存布局：`<digest[..2]>/<digest>/<指纹>-<宽度>-<编码>`，指纹含源文件长度与 mtime，
+    /// 所以**命中只看文件在不在**（没有 stamp 文件，也就没有「戳写了图没写」的窗口）。
+    /// 源文件一变指纹就变，新图换个名字落盘、旧名由 `prune_stale` 收走。
     pub async fn get(
         &self,
         path: &Path,
@@ -279,9 +292,9 @@ impl Thumbnailer {
     ) -> (ThumbOutcome, Option<FreshHash>) {
         let width = width.clamp(64, 1024);
         let dir = self.entry_dir(path);
-        let stamp = Self::stamp_of(path);
+        let fp = Self::fingerprint(path);
 
-        if let Some(outcome) = Self::cached(&dir, &stamp, width).await {
+        if let Some(outcome) = Self::cached(&dir, &fp, width).await {
             return (outcome, None);
         }
 
@@ -291,10 +304,10 @@ impl Thumbnailer {
             return (ThumbOutcome::Placeholder, None);
         }
 
-        // 同一源文件串行：320 / 960 同时请求只解码一次，也不会两份 stamp 互相踩
+        // 同一源文件串行：320 / 960 同时请求只解码一次
         let lock = self.key_lock(&dir);
         let _serial = lock.lock().await;
-        if let Some(outcome) = Self::cached(&dir, &stamp, width).await {
+        if let Some(outcome) = Self::cached(&dir, &fp, width).await {
             return (outcome, None);
         }
 
@@ -306,41 +319,46 @@ impl Thumbnailer {
 
         let source = path.to_path_buf();
         let hash_key = Self::hash_key(&source);
-        let target_dir = dir.clone();
-        let cache_dir = self.cache_dir.clone();
-        let stamp_for_task = stamp.clone();
-        let limit = self.limit_bytes.load(Ordering::Relaxed);
-        let max_age = self.max_age_secs.load(Ordering::Relaxed);
+        let work_dir = dir.clone();
         let caps = Arc::clone(&self.caps);
         let webp_bin = webp_bin.map(Path::to_path_buf);
 
+        // 渲染 + 编码放阻塞线程池；**落盘不在这条链路上**（见下）
         let result = tokio::task::spawn_blocking(move || {
             let (thumb, hash) = render_thumbnail(&source, width)?;
             let (bytes, mime, codec) =
-                encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &target_dir)?;
-            if write_atomic(&target_dir.join(format!("{width}-{codec}")), &bytes).is_err() {
-                return None;
-            }
-            // stamp 最后写：中途失败最多下次重做，不会留下「有戳没图」的死缓存
-            let _ = write_atomic(&target_dir.join(STAMP_FILE), stamp_for_task.as_bytes());
-            let fresh = FreshHash {
-                key: hash_key,
-                value: BASE64.encode(&hash),
-            };
-            let _ = cleanup_cache(&cache_dir, limit, max_age);
-            Some((bytes, mime, fresh))
+                encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &work_dir)?;
+            Some((bytes, mime, codec, hash))
         })
         .await;
 
         drop(permit);
 
-        match result {
-            Ok(Some((bytes, mime, fresh))) => {
-                self.count_generated();
-                (ThumbOutcome::Ready(Rendered { bytes, mime }), Some(fresh))
-            }
-            _ => (ThumbOutcome::Placeholder, None),
-        }
+        let Ok(Some((bytes, mime, codec, hash))) = result else {
+            return (ThumbOutcome::Placeholder, None);
+        };
+        self.count_generated();
+
+        // 字节已经在手上了，客户端不必等磁盘：FileBrowser 的 `createPreview` 也是先回
+        // 响应、再 `go func()` 落缓存。写失败最多下次重做，没有要回滚的状态。
+        let target_dir = dir.clone();
+        let target = target_dir.join(format!("{fp}-{width}-{codec}"));
+        let keep = format!("{fp}-");
+        let cache_dir = self.cache_dir.clone();
+        let limit = self.limit_bytes.load(Ordering::Relaxed);
+        let max_age = self.max_age_secs.load(Ordering::Relaxed);
+        let stored = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = write_atomic(&target, &stored);
+            Self::prune_stale(&target_dir, &keep);
+            let _ = cleanup_cache(&cache_dir, limit, max_age);
+        });
+
+        let fresh = FreshHash {
+            key: hash_key,
+            value: BASE64.encode(&hash),
+        };
+        (ThumbOutcome::Ready(Rendered { bytes, mime }), Some(fresh))
     }
 
     /// 生成计数 + 每 N 次跑一次后台淘汰（避免每次生成都全目录扫一遍）
@@ -382,11 +400,11 @@ impl Thumbnailer {
     pub async fn video_poster(&self, path: &Path, bin: &Path, width: u32) -> ThumbOutcome {
         let width = width.clamp(64, 1024);
         let dir = self.entry_dir(path);
-        // 海报用不带格式版本的戳：视频首帧本来就是「按容器尺寸截」，没有放大失真问题，
-        // 跟着图片一起升版只会让几千个视频白白重跑一遍 FFmpeg
-        let stamp = Self::poster_stamp_of(path);
+        // 海报用独立的版本号：截帧比解图贵一个数量级，不能跟着图片一起升版
+        // （否则几千个视频要白跑一遍 FFmpeg）
+        let fp = Self::poster_fingerprint(path);
 
-        if let Some(outcome) = Self::cached_poster(&dir, &stamp, width).await {
+        if let Some(outcome) = Self::cached_poster(&dir, &fp, width).await {
             return outcome;
         }
 
@@ -398,7 +416,7 @@ impl Thumbnailer {
 
         let lock = self.key_lock(&dir);
         let _serial = lock.lock().await;
-        if let Some(outcome) = Self::cached_poster(&dir, &stamp, width).await {
+        if let Some(outcome) = Self::cached_poster(&dir, &fp, width).await {
             return outcome;
         }
 
@@ -411,7 +429,7 @@ impl Thumbnailer {
         let source = path.to_path_buf();
         let target_dir = dir.clone();
         let cache_dir = self.cache_dir.clone();
-        let stamp_for_task = stamp.clone();
+        let fp_for_task = fp.clone();
         let ffmpeg_bin = bin.to_path_buf();
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
@@ -435,12 +453,14 @@ impl Thumbnailer {
                     let _ = std::fs::remove_file(&tmp);
                     continue;
                 }
-                let final_path = target_dir.join(format!("{width}p-{}", format.extension()));
+                let final_path =
+                    target_dir.join(format!("{fp_for_task}-{width}p-{}", format.extension()));
                 if std::fs::rename(&tmp, &final_path).is_err() {
                     let _ = std::fs::remove_file(&tmp);
                     continue;
                 }
-                let _ = write_atomic(&target_dir.join(STAMP_FILE), stamp_for_task.as_bytes());
+                let keep = format!("{fp_for_task}-");
+                Self::prune_stale(&target_dir, &keep);
                 let _ = cleanup_cache(&cache_dir, limit, max_age);
                 if let Ok(bytes) = std::fs::read(&final_path) {
                     return Some((bytes, format.mime()));
@@ -782,24 +802,26 @@ mod tests {
         let _ = fs::remove_dir_all(&cache);
     }
 
-    /// 缓存戳带**格式版本**：v4.4.2 之前生成的「放大版」缩略图只靠 mtime 永远命中，
-    /// 灯箱拿 960 缩略图打底就会「先大后小」。版本前缀是让老缓存就地重生的唯一开关，
-    /// 删掉它这条回归会立刻变红。
+    /// 缓存键带**格式版本 + 源文件状态**：v4.4.2 之前生成的「放大版」缩略图只靠
+    /// 路径永远命中，灯箱拿 960 缩略图打底就会「先大后小」。把版本写进文件名是让
+    /// 老缓存失效的唯一开关，删掉它这条回归会立刻变红。
     #[test]
-    fn thumbnail_stamp_carries_format_version() {
-        let dir = scratch_dir("thumb-stamp");
+    fn thumbnail_key_carries_format_version() {
+        let dir = scratch_dir("thumb-key");
         let file = dir.join("a.png");
         image::RgbaImage::from_pixel(12, 9, image::Rgba([1, 2, 3, 255]))
             .save(&file)
             .unwrap();
 
-        let stamp = Thumbnailer::stamp_of(&file);
-        assert!(stamp.starts_with("v2:"), "缩略图戳必须带格式版本：{stamp}");
-        // 海报（视频首帧）不跟版本：它没有放大失真问题，跟着升版只是白跑一遍 FFmpeg
+        let key = Thumbnailer::fingerprint(&file);
+        assert!(key.starts_with("v3-"), "缩略图键必须带格式版本：{key}");
+        // 海报（视频首帧）用自己的版本号：跟着图片一起升版只是白跑一遍 FFmpeg
         assert!(
-            !Thumbnailer::poster_stamp_of(&file).starts_with("v2:"),
-            "海报戳不该带缩略图格式版本"
+            Thumbnailer::poster_fingerprint(&file).starts_with("p1-"),
+            "海报键必须用独立版本号"
         );
+        // 内容一变（长度 / mtime 变）键必须跟着变，否则就是「改了不生效」
+        assert_ne!(key, Thumbnailer::fingerprint(&dir.join("missing.png")));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -889,14 +911,13 @@ mod tests {
 
         // 缓存里只允许「扇出目录 / 单元目录 / 无扩展名文件」。
         // 任何带 `.jpg` / `.webp` 的文件都会让它自己被再缩略图一遍 —— 指数增殖的根源。
+        // 落盘在后台线程，先轮询等它稳定。
+        wait_for_files(&cache, 1);
         let files = collect_files(&cache);
         assert!(!files.is_empty(), "缩略图本体应已落盘");
         for file in &files {
             let name = file.file_name().unwrap().to_string_lossy().to_string();
-            assert!(
-                name == STAMP_FILE || !name.contains('.'),
-                "缓存文件名不能带扩展名：{name}"
-            );
+            assert!(!name.contains('.'), "缓存文件名不能带扩展名：{name}");
             assert!(!name.ends_with(".th"), "不应出现 .th 旁路文件：{name}");
         }
         let _ = fs::remove_dir_all(&dir);
@@ -924,12 +945,28 @@ mod tests {
         }
     }
 
+    /// 等后台落盘稳定：缩略图的写盘不在响应链路上，断言前必须轮询。
+    fn wait_for_files(cache: &Path, want: usize) -> usize {
+        for _ in 0..150 {
+            let count = collect_files(cache).len();
+            if count >= want {
+                return count;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        collect_files(cache).len()
+    }
+
     #[test]
     fn cleanup_evicts_whole_units_oldest_first() {
         let cache = scratch_dir("thumb-cleanup");
-        let a = put_unit(&cache, "aa1", &[("320-jpg", 512), (STAMP_FILE, 8)]);
-        let b = put_unit(&cache, "bb2", &[("320-jpg", 512)]);
-        let c = put_unit(&cache, "cc3", &[("320-jpg", 512)]);
+        let a = put_unit(
+            &cache,
+            "aa1",
+            &[("v3-1-1-320-jpg", 512), ("v3-1-1-960-webp", 8)],
+        );
+        let b = put_unit(&cache, "bb2", &[("v3-1-1-320-jpg", 512)]);
+        let c = put_unit(&cache, "cc3", &[("v3-1-1-320-jpg", 512)]);
         backdate(&a, Duration::from_secs(3 * 3600));
         backdate(&b, Duration::from_secs(2 * 3600));
 
@@ -1006,17 +1043,25 @@ mod tests {
             .build()
             .unwrap();
 
-        for _ in 0..3 {
-            let (outcome, _) = rt.block_on(thumbnails.get(&source, 64, None));
-            assert!(matches!(outcome, ThumbOutcome::Ready(_)));
+        // 第一次请求落一个文件；落盘在后台线程（响应不等磁盘），轮询等它稳定
+        let (first, _) = rt.block_on(thumbnails.get(&source, 64, None));
+        assert!(matches!(first, ThumbOutcome::Ready(_)));
+        let after_first = wait_for_files(&cache, 1);
+        assert_eq!(
+            after_first, 1,
+            "一个宽度 = 一个文件（不再有 stamp）：{after_first}"
+        );
+
+        // 再取两次：命中缓存，一个文件都不新增
+        for _ in 0..2 {
+            let _ = rt.block_on(thumbnails.get(&source, 64, None));
         }
-        let after_first = collect_files(&cache).len();
-        assert_eq!(after_first, 2, "一个宽度 = 图 + stamp：{after_first}");
+        assert_eq!(collect_files(&cache).len(), 1, "命中缓存不能再落文件");
 
         // 换宽度：只多一个文件（同一单元目录内）
         let (wide, _) = rt.block_on(thumbnails.get(&source, 96, None));
         assert!(matches!(wide, ThumbOutcome::Ready(_)));
-        assert_eq!(collect_files(&cache).len(), after_first + 1);
+        assert_eq!(wait_for_files(&cache, 2), 2);
 
         // 再取一遍：全部命中，一个文件都不新增
         for _ in 0..3 {

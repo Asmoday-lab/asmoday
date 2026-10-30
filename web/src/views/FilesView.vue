@@ -70,57 +70,9 @@ function openTerminal(entry: EntryInfo) {
   router.push({ path: '/terminal', query: { path: target } })
 }
 
-async function copyPath(entry: EntryInfo) {
-  try {
-    await navigator.clipboard.writeText(entry.path)
-    showToast(t('files.menu.pathCopied'))
-  } catch {
-    showToast(t('common.clipboard.denied'))
-  }
-  menu.value = null
-}
-
-/**
- * 相对挂载点的路径（设计文档 3.2.5）：最长前缀匹配挂载根，POSIX 风格。
- * 例：挂载点「媒体盘」→ `/movies`；挂在根上的条目就是 `/`。
- */
-function relativePathOf(entry: EntryInfo): string {
-  const normalized = entry.path.replace(/\\/g, '/')
-  let matchedPrefix = ''
-  for (const root of roots.value) {
-    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
-    if (
-      prefix &&
-      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
-      prefix.length > matchedPrefix.length
-    ) {
-      matchedPrefix = prefix
-    }
-  }
-  if (!matchedPrefix) return normalized
-  const rest = normalized.slice(matchedPrefix.length).replace(/^\/+/, '')
-  return `/${rest}`
-}
-
-/** 复制相对路径：只暴露挂载点内的位置，不含宿主机目录结构 */
-async function copyRelativePath(entry: EntryInfo) {
-  try {
-    await navigator.clipboard.writeText(relativePathOf(entry))
-    showToast(t('files.menu.pathCopied'))
-  } catch {
-    showToast(t('common.clipboard.denied'))
-  }
-  menu.value = null
-}
-
-/** 复制绝对路径（物理路径）。仅控制台菜单可达——分享访客页没有本菜单（设计文档 3.2.5）。 */
-async function copyAbsolutePath(entry: EntryInfo) {
-  await copyPath(entry)
-}
-
 function downloadEntry(entry: EntryInfo) {
   menu.value = null
-  window.open(filesApi.rawUrl(entry.path), '_blank', 'noopener')
+  triggerDownload(entry)
 }
 
 function menuOpenEntry() {
@@ -184,16 +136,11 @@ const fileMenuItems = computed<ContextMenuItem[]>(() => {
       icon: entry.is_dir ? 'folderOpen' : 'file',
     },
   ]
-  // 极客联动（设计文档 3.2.5）：「在此终端中打开」紧跟「打开」——文件取所在目录，
-  // 想操作路径时一键进终端优先于复制路径。
+  // 极客联动（设计文档 3.2.5）：「在此终端中打开」紧跟「打开」——要路径时直接进终端，
+  // 比复制一串文本有用（v4.4.9 起移除了「复制相对/绝对路径」，只留图床直链）。
   items.push({ id: 'terminal', label: t('files.menu.terminal'), icon: 'terminal' })
-  items.push({ id: 'copyRelativePath', label: t('files.menu.copyRelativePath'), icon: 'fileText' })
-  // 复制绝对路径只在控制台菜单出现：本视图必须登录会话才可达，
-  // 分享访客页（ShareView）没有 ContextMenu，后端 stat 也只对会话返回物理路径。
-  items.push({ id: 'copyAbsolutePath', label: t('files.menu.copyAbsolutePath'), icon: 'link' })
-  if (!entry.is_dir) {
-    items.push({ id: 'download', label: t('files.menu.download'), icon: 'archive' })
-  }
+  // 目录也能下载：后端打包成流式 zip（v4.4.9）
+  items.push({ id: 'download', label: t('files.menu.download'), icon: 'archive' })
   items.push({ id: 'share', label: t('files.menu.share'), icon: 'share' })
   if (entry.kind === 'image' && !entry.is_dir) {
     items.push({ id: 'directLink', label: t('files.menu.directLink'), icon: 'link' })
@@ -242,18 +189,6 @@ function onMenuSelect(id: string) {
     case 'terminal':
       menuOpenTerminal()
       break
-    case 'copyRelativePath': {
-      const relEntry = menu.value?.entry
-      menu.value = null
-      if (relEntry) void copyRelativePath(relEntry)
-      break
-    }
-    case 'copyAbsolutePath': {
-      const absEntry = menu.value?.entry
-      menu.value = null
-      if (absEntry) void copyAbsolutePath(absEntry)
-      break
-    }
     case 'download':
       menuDownload()
       break
@@ -714,13 +649,24 @@ function onPressMove(event: TouchEvent) {
   if (dx > LONG_PRESS_SLOP || dy > LONG_PRESS_SLOP) cancelPress()
 }
 
-// ---- 批量下载（设计文档 3.2.6.6：不做服务端 ZIP，逐个触发浏览器下载） ----
+// ---- 批量下载（设计文档 3.2.6.6：逐个触发浏览器下载，不排队到一条连接上） ----
 const bulkDownloadConfirm = ref<EntryInfo[] | null>(null)
 
+/**
+ * 触发一次下载：目录走流式 zip，文件走 `?download=1`。
+ *
+ * 以前一律 `window.open(raw)`：浏览器会就地渲染，TOML / 日志变成一页乱码，
+ * 目录则直接报「目标是目录」。`download=1` 让后端补 Content-Disposition，
+ * 才是真正可靠的存盘方式。
+ */
 function triggerDownload(entry: EntryInfo) {
+  const url = entry.is_dir
+    ? filesApi.archiveUrl(entry.path)
+    : filesApi.rawUrl(entry.path, { download: true })
   const link = document.createElement('a')
-  link.href = filesApi.rawUrl(entry.path)
+  link.href = url
   link.rel = 'noopener'
+  link.style.display = 'none'
   document.body.appendChild(link)
   link.click()
   link.remove()
@@ -3126,7 +3072,7 @@ onBeforeUnmount(() => {
               >
                 <img
                   v-if="hasThumb(entry) && !thumbFailed.has(entry.path)"
-                  :src="thumbUrl(entry.path, 320)"
+                  :src="thumbUrl(entry.path, 320, entry.modified)"
                   class="size-full object-cover"
                   loading="lazy"
                   alt=""

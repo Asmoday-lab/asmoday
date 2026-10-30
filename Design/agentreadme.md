@@ -1248,9 +1248,16 @@ GWT-PHOTO-10 Given 灯箱视频  When 按 →  Then 快进 5 秒且不切条目�
 GWT-PHOTO-11 Given 灯箱打开  When 点击左右箭头或缩放胶囊  Then 正常生效且灯箱不关（onTap 按 closest('button, a') 豁免 stage 内控件）
 GWT-PHOTO-12 Given 图片模式  When 看底部  Then 缩放胶囊常驻显示百分比，未放大淡显、放大变亮，点击复位
 GWT-PHOTO-13 Given 快速连按翻页  When 旧图 load 晚到  Then 不污染新图 ready，无空白闪帧；打底图与原图均已预载
-GWT-PHOTO-14 Given 打开预览小图  When 打底图与原始图交替  Then 可见图尺寸全程不变（不得先大后小；缩略图戳带 v2 版本）
+GWT-PHOTO-14 Given 打开预览小图  When 打底图与原始图交替  Then 可见图尺寸全程不变（不得先大后小；两层同为 size-full+object-contain，缩略图 URL 带 r 与 v）
 GWT-PHOTO-15 Given 灯箱  When 连点两次左右箭头  Then 正常翻两页且缩放仍是 100%（dblclick 在控件上不触发缩放）
 GWT-PHOTO-16 Given 灯箱  When 长按 +/−  Then 只放大一档；When 长按 ←/→  Then 每次 ≥110ms 才翻一张
+GWT-THUMB-01 Given 缩略图 URL 带 v=<mtime>  When 服务端指纹与 mtime 一致  Then 回 immutable 长缓存；不带 v 则 private, no-cache + ETag，条件请求回 304
+GWT-THUMB-02 Given 320×213 的原图  When 请求 w=960  Then 返回仍是 320×213（绝不放大），缓存文件名前缀是 v3-<长度>-<mtime>
+GWT-THUMB-03 Given 源文件被改  When 再次请求缩略图  Then 指纹变、落新文件名、旧指纹文件被 prune_stale 删掉（目录不随时间增长）
+GWT-DL-01 Given 任意文件  When 请求 raw?download=1  Then Content-Disposition 为 attachment 且含 filename*=UTF-8''…，类型 octet-stream + nosniff
+GWT-DL-02 Given 文本文件  When 请求 raw（不带 download）  Then Content-Type 带 charset=utf-8（不得让浏览器按 GBK 猜成乱码）
+GWT-DL-03 Given 目录  When 请求 archive  Then 返回合法 zip（PK\x03\x04 开头，目录条目以 / 结尾），Windows 资源管理器可直接解压
+GWT-MENU-01 Given 文件或目录  When 右键  Then 有「下载」且没有「复制相对路径/绝对路径」；目录下载走 zip
 ```
 
 #### 依赖红线

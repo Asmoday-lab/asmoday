@@ -21,6 +21,7 @@ import ContextMenu, { type ContextMenuItem } from './ContextMenu.vue'
 import { coverUrl, rawUrl, thumbUrl } from '../api/media'
 import { sharesApi } from '../api/shares'
 import { formatSize, formatTime } from '../lib/format'
+import { triggerDownload } from '../lib/download'
 import { openShare } from '../stores/share'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
@@ -194,11 +195,10 @@ function preloadNeighbors() {
     const image = new Image()
     image.decoding = 'async'
     image.src = rawUrl(entry.path)
-    // 打底用的 960 缩略图是独立 URL（网格里是 320/480），不预载的话翻页瞬间
-    // 连打底都没就绪，整屏黑一下——这就是「预览闪烁」的另一半来源
+    // 打底图与画面用的是同一档（320），翻页瞬间就能铺上，不用等新尺寸的缩略图
     const thumb = new Image()
     thumb.decoding = 'async'
-    thumb.src = thumbUrl(entry.path, 960)
+    thumb.src = thumbUrl(entry.path, 320, entry.modified)
   }
 }
 
@@ -334,8 +334,8 @@ function onImageLoad(event: Event) {
 }
 
 /** 缩略图统一用后端首帧（视频也有），失败时退回类型图标 */
-function thumbOf(path: string, width: number) {
-  return thumbUrl(path, width)
+function thumbOf(entry: { path: string; modified?: number | null }, width: number) {
+  return thumbUrl(entry.path, width, entry.modified)
 }
 
 /** 滚轮在缩略图条上是「横向滚动」，别让浏览器把它当成页面滚动（8.2 滚动体验） */
@@ -382,13 +382,10 @@ watch(
 function download() {
   const current = item.value
   if (!current) return
-  const link = document.createElement('a')
-  link.href = rawUrl(current.path)
-  link.download = current.name
-  link.rel = 'noopener'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
+  // 走 `?download=1`：后端补 Content-Disposition + octet-stream，浏览器直接存盘。
+  // 以前是 `window.open(raw)`，TOML / 日志这类文件会被当成 text/plain 就地渲染，
+  // 而且不带 charset，中文全是乱码。
+  triggerDownload(rawUrl(current.path, { download: true }))
 }
 
 // ---------------- 右键菜单（设计文档 3.2.5：灯箱复用全局 ContextMenu） ----------------
@@ -403,7 +400,7 @@ const menuItems = computed<ContextMenuItem[]>(() => {
   if (!current) return []
   const items: ContextMenuItem[] = [
     { id: 'open', label: t('gallery.viewer.openOriginal'), icon: 'globe' },
-    { id: 'download', label: t('gallery.viewer.original'), icon: 'download' },
+    { id: 'download', label: t('files.preview.download'), icon: 'download' },
     { id: 'share', label: t('files.mediaMenu.share'), icon: 'share' },
   ]
   if (current.kind === 'image') {
@@ -447,12 +444,14 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <!-- Telegram 式观感：背景半透明 + 模糊，隐约透出下面的页面。
+    <!-- Telegram 式观感：背景半透明，隐约透出下面的页面。
+         刻意**不用 backdrop-blur**：那会让浏览器每帧重算整个视口背后的内容，
+         1080p 下翻页明显掉帧，观感上就是「糊一下／闪一下」——比不糊更糟。
          进场用一次性动画淡入；不能包 <Transition>——关闭时 items 已被清空，
          离场帧里 item 是 null，模板里满屏的 item.name 会炸。 -->
     <div
       v-if="isOpen && item"
-      class="fixed inset-0 z-[80] overflow-hidden bg-black/90 select-none backdrop-blur-xl lightbox-in"
+      class="fixed inset-0 z-[80] overflow-hidden bg-black/80 select-none lightbox-in"
       :class="chrome ? '' : 'cursor-none'"
       data-testid="media-lightbox"
       @pointermove.passive="noteActivity"
@@ -479,24 +478,28 @@ onBeforeUnmount(() => {
             :style="zoomStyle"
             data-testid="lightbox-zoom-layer"
           >
-            <!-- 打底层：用缓存过的缩略图占位，原图就绪后**完全淡出**。
-                 `object-scale-down` 而非 `contain`：小图不会被放大成比原图大一圈的
-                 模糊块（contain 会把盒子撑满并放大内容），两者严格重合，撤下时无残影。 -->
+            <!-- 打底层与原图**共用同一个盒子、同一条 object-contain 规则**。
+                 以前打底用 `object-scale-down`（按缩略图自身像素渲染），原图用
+                 `max-w/h-full + contain`（按可用框渲染）——两套布局模型，像素尺寸
+                 一旦不等就必然跳尺寸，用户看到的就是「先大后小」。
+                 现在两层都是 `size-full + object-contain`：几何只由宽高比决定，
+                 缩略图和原图宽高比相同 ⇒ 渲染矩形完全重合，交叉淡入只变清晰度，
+                 不变尺寸（320 缩略图被拉伸到最终框，正是照片应用该有的渐进观感）。 -->
             <img
               v-if="!failed.has(item.path)"
-              :src="thumbUrl(item.path, 960)"
-              class="pointer-events-none absolute inset-0 z-0 m-auto max-h-full max-w-full object-scale-down transition-opacity duration-300"
+              :src="thumbUrl(item.path, 320, item.modified)"
+              class="pointer-events-none absolute inset-0 z-0 size-full object-contain transition-opacity duration-300"
               :class="ready === item.path ? 'opacity-0' : 'opacity-100'"
               aria-hidden="true"
               alt=""
             />
-            <!-- 原图：加载完成后淡入，层级永远高于遮罩与打底层 -->
+            <!-- 原图：加载完成后淡入，层级永远高于打底层 -->
             <img
               v-if="!failed.has(item.path)"
               ref="imgEl"
               :key="item.path"
               :src="rawUrl(item.path)"
-              class="relative z-10 max-h-full max-w-full object-contain transition-opacity duration-300"
+              class="absolute inset-0 z-10 size-full object-contain transition-opacity duration-300"
               :class="ready === item.path ? 'opacity-100' : 'opacity-0'"
               data-testid="lightbox-image"
               alt=""
@@ -516,7 +519,7 @@ onBeforeUnmount(() => {
           <MediaPlayer
             ref="playerRef"
             :src="rawUrl(item.path)"
-            :poster="thumbUrl(item.path, 960)"
+            :poster="thumbUrl(item.path, 480, item.modified)"
             :subtitle="item.subtitle ?? null"
             :autoplay="true"
             fill
@@ -622,7 +625,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="grid size-9 place-items-center rounded-full text-white/75 transition-colors hover:bg-white/15 hover:text-white"
-            :title="t('gallery.viewer.original')"
+            :title="t('files.preview.download')"
             data-testid="lightbox-download"
             @click="download()"
           >
@@ -705,7 +708,7 @@ onBeforeUnmount(() => {
             @click="jumpLightbox(index)"
           >
             <img
-              :src="thumbOf(entry.path, 160)"
+              :src="thumbOf(entry, 160)"
               alt=""
               class="size-full object-cover"
               loading="lazy"

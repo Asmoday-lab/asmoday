@@ -13,6 +13,7 @@ import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import { filesApi, type EntryInfo } from '../api/files'
 import { CSV_MAX_ROWS, parseCsv, type CsvTable } from '../lib/csv'
+import { triggerDownload } from '../lib/download'
 import { formatSize } from '../lib/format'
 
 const props = defineProps<{ entry: EntryInfo }>()
@@ -114,7 +115,8 @@ async function load() {
 }
 
 function download() {
-  window.open(filesApi.rawUrl(props.entry.path), '_blank', 'noopener')
+  // `?download=1` 让后端补 Content-Disposition；直接 open(raw) 会被就地渲染成乱码页
+  triggerDownload(filesApi.rawUrl(props.entry.path, { download: true }))
 }
 
 onMounted(load)

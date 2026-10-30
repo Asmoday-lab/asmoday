@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,6 +31,8 @@ const DEFAULT_DEPTH: usize = 2;
 pub struct ThumbQuery {
     pub path: String,
     pub w: Option<u32>,
+    /// 前端带回来的**内容指纹**（= 文件 `modified`）。对上才允许长缓存，见 `thumb`。
+    pub v: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,8 +230,17 @@ async fn resolve_default(state: &AppState, requested: Option<&str>) -> Result<Pa
     }
 }
 
-/// GET /api/files/thumb?path=…&w=320
-pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery>) -> Response {
+/// GET /api/files/thumb?path=…&w=320&v=<指纹>
+///
+/// `v` 是前端带回来的内容指纹（媒体的 `modified`）。**对上了才给长缓存**：URL 一变
+/// 内容必变，浏览器可以 `immutable` 一年不再回头问；对不上（老书签、内容刚改）
+/// 退回 `no-cache` + ETag 304。这条是「改了缩略图规则但浏览器还抱着旧图」的解药——
+/// 光改服务端缓存键没用，URL 不变浏览器永远不会重新请求。
+pub async fn thumb(
+    State(state): State<AppState>,
+    Query(query): Query<ThumbQuery>,
+    headers: HeaderMap,
+) -> Response {
     let path = match resolve_default(&state, Some(&query.path)).await {
         Ok(path) => path,
         Err(err) => return fs_error(err),
@@ -252,6 +263,38 @@ pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery
     let (kind, _) = fs::classify_name(&name, &ext, false);
 
     let width = query.w.unwrap_or(if kind == "video" { 480 } else { 320 });
+
+    // 内容指纹 → ETag。前端 url 里的 `v` 是源文件的 mtime，**与当前 mtime 一致**说明
+    // 这条链接代表的就是这一版字节，可以放心长缓存；不一致（老链接、文件刚改）就每次
+    // 回源校验，命中只花一次 304。
+    let fingerprint = crate::core::thumbnail::Thumbnailer::fingerprint(&path);
+    let etag = format!("\"{fingerprint}-{width}\"");
+    let mtime = crate::core::thumbnail::Thumbnailer::mtime_secs(&path);
+    let versioned = query
+        .v
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|value| value == mtime);
+    let cache_control = if versioned {
+        "private, max-age=31536000, immutable"
+    } else {
+        "private, no-cache"
+    };
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache_control.to_string()),
+            ],
+            Body::empty(),
+        )
+            .into_response();
+    }
 
     // 一次解析复用：图片缩略图用它编码 WebP（3.4），视频封面用它截首帧
     let ffmpeg_bin = {
@@ -293,8 +336,9 @@ pub async fn thumb(State(state): State<AppState>, Query(query): Query<ThumbQuery
         ThumbOutcome::Ready(rendered) => (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, rendered.mime),
-                (header::CACHE_CONTROL, "private, max-age=86400"),
+                (header::CONTENT_TYPE, rendered.mime.to_string()),
+                (header::CACHE_CONTROL, cache_control.to_string()),
+                (header::ETAG, etag),
             ],
             Body::from(rendered.bytes),
         )

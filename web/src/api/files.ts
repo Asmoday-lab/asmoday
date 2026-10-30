@@ -251,7 +251,11 @@ export const filesApi = {
   },
 
   /** 直接给 <img>/<video> 用；同样走挂载点校验 */
-  rawUrl: (path: string) => `/api/files/raw?path=${encodePath(path)}`,
+  rawUrl: (path: string, options: { download?: boolean } = {}) =>
+    `/api/files/raw?path=${encodePath(path)}${options.download ? '&download=1' : ''}`,
+
+  /** 目录打包下载：后端 store 模式流式 zip（不压缩、不落临时文件） */
+  archiveUrl: (path: string) => `/api/files/archive?path=${encodePath(path)}`,
 
   async readText(path: string): Promise<string> {
     const res = await fetch(filesApi.rawUrl(path))

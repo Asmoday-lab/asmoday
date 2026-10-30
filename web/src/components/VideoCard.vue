@@ -65,7 +65,7 @@ const resumeLabel = computed(() => {
       />
       <img
         v-if="!coverFailed"
-        :src="thumbUrl(video.path, 480)"
+        :src="thumbUrl(video.path, 480, video.modified)"
         class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
         loading="lazy"
         alt=""

@@ -126,6 +126,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "crc32fast",
  "data-encoding",
  "dav-server",
  "dirs",

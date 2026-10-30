@@ -27,6 +27,7 @@ import {
 } from '../api/media'
 import { sharesApi } from '../api/shares'
 import { formatSize } from '../lib/format'
+import { triggerDownload } from '../lib/download'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
 import { player } from '../stores/player'
@@ -141,12 +142,7 @@ function onNativeError() {
 function downloadPlaying() {
   const item = playing.value
   if (!item) return
-  const link = document.createElement('a')
-  link.href = rawUrl(item.path)
-  link.rel = 'noopener'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
+  triggerDownload(rawUrl(item.path, { download: true }))
 }
 
 // 换片时清掉上一条错误提示

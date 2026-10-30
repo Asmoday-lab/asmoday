@@ -8,7 +8,7 @@
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
@@ -46,6 +46,10 @@ pub struct ListQuery {
 #[derive(Debug, Deserialize)]
 pub struct PathQuery {
     pub path: String,
+    /// `?download=1`：响 application/octet-stream + Content-Disposition，强制存盘。
+    /// 其它接口共用这个结构，缺省即「就地展示」。
+    #[serde(default)]
+    pub download: Option<String>,
 }
 
 /// `PUT /api/files/raw` 的保存选项（设计文档 3.2.2.1）。
@@ -228,9 +232,49 @@ pub async fn raw(
         return response;
     }
 
-    let mime = mime_guess::from_path(&path)
+    // mime_guess 对 .toml / .md / .log 一律给 `text/plain`，**不带 charset** ——
+    // 浏览器于是按系统本地编码（中文 Windows 是 GBK）解码，中文全成乱码。
+    // 本项目只产生 UTF-8，文本类统一补上；下载时再整体覆盖成 octet-stream。
+    let mut mime = mime_guess::from_path(&path)
         .first_or_octet_stream()
         .to_string();
+    if mime.starts_with("text/") && !mime.contains("charset") {
+        mime.push_str("; charset=utf-8");
+    }
+
+    // `?download=1`：强制存盘。没有这个头，浏览器会就地渲染（截图里那个乱码 TOML
+    // 页面就是 `window.open(raw)` 的产物），而 `<a download>` 在跨域/重定向下会被忽略。
+    let download = query
+        .download
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
+    let mut extra: Vec<(HeaderName, String)> = Vec::new();
+    if download {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".to_string());
+        // ASCII 兜底给老客户端，filename* 才是中文正确写法（RFC 5987 / 6266）
+        let fallback: String = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        extra.push((
+            header::CONTENT_DISPOSITION,
+            format!(
+                "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
+                encode_rfc5987(&name)
+            ),
+        ));
+        extra.push((header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()));
+        mime = "application/octet-stream".to_string();
+    }
 
     let range_header = headers
         .get(header::RANGE)
@@ -271,12 +315,15 @@ pub async fn raw(
                     format!("bytes {}-{}/{}", range.start, range.end, total),
                 ),
                 (header::CONTENT_LENGTH, range.len().to_string()),
-                (header::CACHE_CONTROL, "no-store".to_string()),
+                // `no-store` 会让原图每次打开都重传一遍（灯箱里就是「闪一下才好」）。
+                // 文件带 ETag，`private, no-cache` 足够安全：每次回源校验，命中走 304。
+                (header::CACHE_CONTROL, "private, no-cache".to_string()),
                 (header::ETAG, etag),
             ];
             if let Some(value) = last_modified {
                 headers_out.push((header::LAST_MODIFIED, value));
             }
+            headers_out.extend(extra.clone());
             for (name, value) in headers_out {
                 if let Ok(parsed) = value.parse() {
                     response.headers_mut().insert(name, parsed);
@@ -295,12 +342,15 @@ pub async fn raw(
                 (header::CONTENT_TYPE, mime),
                 (header::ACCEPT_RANGES, "bytes".to_string()),
                 (header::CONTENT_LENGTH, total.to_string()),
-                (header::CACHE_CONTROL, "no-store".to_string()),
+                // `no-store` 会让原图每次打开都重传一遍（灯箱里就是「闪一下才好」）。
+                // 文件带 ETag，`private, no-cache` 足够安全：每次回源校验，命中走 304。
+                (header::CACHE_CONTROL, "private, no-cache".to_string()),
                 (header::ETAG, etag),
             ];
             if let Some(value) = last_modified {
                 headers_out.push((header::LAST_MODIFIED, value));
             }
+            headers_out.extend(extra);
             for (name, value) in headers_out {
                 if let Ok(parsed) = value.parse() {
                     response.headers_mut().insert(name, parsed);
@@ -309,6 +359,86 @@ pub async fn raw(
             response
         }
     }
+}
+
+/// GET /api/files/archive?path=…：把目录打成 ZIP 流式下发（设计文档 3.2.4）。
+///
+/// store 模式 + 数据描述符：不压缩、不落临时文件、内存恒定，首字节就是第一个
+/// 文件的读延迟。条目在阻塞线程里摊平（walk 是同步 IO），然后交给一条 duplex
+/// 管道边写边发；客户端断开时写端报错退出，任务自然结束。
+pub async fn archive(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    let set = roots_for(&state).await;
+    let path = match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
+        Ok(path) => path,
+        Err(err) => return fs_error(err),
+    };
+    if !path.is_dir() {
+        return fs_error(FsError::BadRequest("目标是文件，直接下载即可".to_string()));
+    }
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+
+    let walked = path.clone();
+    let entries =
+        match tokio::task::spawn_blocking(move || crate::core::archive::plan(&walked)).await {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(err)) => return fs_error(FsError::Io(err.to_string())),
+            Err(err) => return fs_error(FsError::Io(format!("打包失败：{err}"))),
+        };
+
+    // 256 KiB 缓冲：够吞下一条 TCP 窗口，又不至于让慢客户端在服务端囤满内存
+    let (mut writer, reader) = tokio::io::duplex(256 * 1024);
+    tokio::spawn(async move {
+        let _ = crate::core::archive::stream_zip(entries, &mut writer).await;
+    });
+
+    let filename = format!("{name}.zip");
+    let mut response =
+        (StatusCode::OK, Body::from_stream(ReaderStream::new(reader))).into_response();
+    let headers_out = [
+        (header::CONTENT_TYPE, "application/zip".to_string()),
+        (header::CACHE_CONTROL, "no-store".to_string()),
+        (
+            header::CONTENT_DISPOSITION,
+            format!(
+                "attachment; filename=\"archive.zip\"; filename*=UTF-8''{}",
+                encode_rfc5987(&filename)
+            ),
+        ),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+    ];
+    for (key, value) in headers_out {
+        if let Ok(parsed) = value.parse() {
+            response.headers_mut().insert(key, parsed);
+        }
+    }
+    response
+}
+
+/// RFC 5987 的 `filename*` 百分号编码：只有 attr-char 原样保留，其余按字节 %XX。
+///
+/// 中文文件名走 `filename*=UTF-8''…` 才不会变成一串问号；`filename="…"` 那份
+/// 是给不认 RFC 5987 的老客户端的 ASCII 兜底（调用处已把非 ASCII 换成 `_`）。
+fn encode_rfc5987(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() * 3);
+    for &byte in name.as_bytes() {
+        let ch = byte as char;
+        let safe = ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '!' | '#' | '$' | '&' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+            );
+        if safe {
+            out.push(ch);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// GET /api/files/text：编辑器专用的 JSON 读取（设计文档 3.2.2.1）。
