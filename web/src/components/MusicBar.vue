@@ -922,44 +922,62 @@ onBeforeUnmount(() => {
         </div>
 
         <!--
-          唱片本体（参考稿 .record）：48px 黑胶 —— 深色同心纹路 + conic 高光，
-          中心标贴换成封面（保留信息量），正中一枚小轴孔；播放时整盘旋转。
-          纹路用「极淡的一圈亮边压暗底」而不是两种实色交替：实色条纹在 48px 上会
-          按像素格量化，靠近边缘时横向条带会拼出直边，看起来就不像一个圆（v4.6.9），
-          再配 `overflow-hidden` 与 1px 描边把轮廓钉死；高光的 conic 首尾取同一个值，
-          否则 0deg 处会留一道竖直接缝，正圆上多一条直线。
+          唱片本体（参考稿 .record）：64px 胶囊里嵌 48px 黑胶 —— 深色同心纹路 + 一圈柔光，
+          中心标贴换成封面（保留信息量），正中一枚小轴孔；播放时纹路随盘点转动。
+          三条硬约束（v4.6.10，为了「看起来是正圆」）：
+          1. **圆形轮廓由不旋转的外层决定**：外层给底色 + `ring-inset` 1px 描边，只有里层
+             纹路在转，且四周内缩 1px。以前整块连描边一起转，圆边每秒被重采样一次，
+             再叠上被 inline `box-shadow` 顶掉的 `ring-1`，轮廓就只剩渐变条纹的锯齿。
+          2. **描边必须走 Tailwind 的 `ring-inset`**：内联 `style="box-shadow: …"` 会把
+             Tailwind 拼在同一属性里的 ring 整条覆盖掉，等于没有描边。
+          3. **纹路用 SVG 正圆**，不用 `repeating-radial-gradient`：后者在 48px 上按像素格
+             量化，靠边的条带相位随角度变化，圆边被啃出缺口，看着右侧比左侧宽一圈。
         -->
         <button
           type="button"
-          class="absolute right-2 top-2 grid size-12 place-items-center rounded-full transition-transform duration-200 hover:scale-105 active:scale-95"
+          class="absolute left-1/2 top-1/2 grid size-12 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full transition-transform duration-200 hover:scale-105 active:scale-95"
           :title="t('gallery.player.discHint')"
           @click="onDiscClick"
         >
           <span
-            class="music-disc relative block size-12 overflow-hidden rounded-full bg-[#0d0d13] ring-1 ring-white/15"
-            :class="{ 'is-playing': player.state.playing }"
-            style="box-shadow: 0 5px 14px rgba(0, 0, 0, 0.45)"
+            class="relative block size-12 overflow-hidden rounded-full bg-[#0d0d13] shadow-[0_4px_12px_rgba(0,0,0,0.42)] ring-1 ring-inset ring-white/15"
           >
+            <!-- 盘面柔光：不随盘转，像固定的顶光 -->
             <span
               class="absolute inset-0 rounded-full"
-              style="background: repeating-radial-gradient(circle at 50%, rgba(255, 255, 255, 0.07) 0 1px, rgba(255, 255, 255, 0) 1px 3.2px)"
+              style="background: radial-gradient(circle at 32% 24%, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0) 52%)"
             />
+            <!-- 纹路层：唯一参与旋转的一层，四周内缩 1px 让外缘永远由外层描边兜底 -->
             <span
-              class="absolute inset-0 rounded-full"
-              style="background: conic-gradient(from 0deg, rgba(255, 255, 255, 0.1), transparent 25%, transparent 75%, rgba(255, 255, 255, 0.1))"
-            />
-            <span
-              class="absolute inset-[30%] overflow-hidden rounded-full bg-accent ring-1 ring-black/50"
+              class="music-grooves absolute inset-px block rounded-full"
+              :class="{ 'is-playing': player.state.playing }"
             >
-              <img
-                v-if="showCover"
-                :src="coverUrl(currentTrack.path)"
-                alt=""
-                class="size-full object-cover"
-                @error="coverFailed = true"
-              />
+              <svg viewBox="0 0 46 46" class="absolute inset-0 size-full" aria-hidden="true">
+                <g fill="none" stroke="#ffffff" stroke-opacity="0.13" stroke-width="0.7">
+                  <circle cx="23" cy="23" r="21.4" />
+                  <circle cx="23" cy="23" r="20.2" />
+                  <circle cx="23" cy="23" r="19" />
+                  <circle cx="23" cy="23" r="17.8" />
+                  <circle cx="23" cy="23" r="16.6" />
+                  <circle cx="23" cy="23" r="15.4" />
+                  <circle cx="23" cy="23" r="14.2" />
+                  <circle cx="23" cy="23" r="13" />
+                  <circle cx="23" cy="23" r="11.9" />
+                </g>
+              </svg>
+              <span
+                class="absolute inset-[30%] overflow-hidden rounded-full bg-accent ring-1 ring-black/50"
+              >
+                <img
+                  v-if="showCover"
+                  :src="coverUrl(currentTrack.path)"
+                  alt=""
+                  class="size-full object-cover"
+                  @error="coverFailed = true"
+                />
+              </span>
+              <span class="absolute inset-[46%] rounded-full bg-[#0d0d13]" />
             </span>
-            <span class="absolute inset-[46%] rounded-full bg-[#0d0d13]" />
           </span>
         </button>
       </div>

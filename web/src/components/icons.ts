@@ -57,8 +57,6 @@ export const ICONS = {
   copy: ['M9 9h10v12H9Z', 'M15 9V3H5v12h4'],
   alert: ['M12 3 2.5 20h19Z', 'M12 9v5', 'M12 17h.01'],
   lock: ['M6 11h12v9H6Z', 'M9 11V8a3 3 0 0 1 6 0v3'],
-  /** 开锁：锁体同 lock，锁梁向右上敞开（对应「锁定常驻」的未锁状态） */
-  unlock: ['M6 11h12v9H6Z', 'M9 11V8a3 3 0 0 1 5.6-1.5'],
   play: ['M8 5.5v13l11-6.5Z'],
   pause: ['M8 5.5h3v13H8Z', 'M13 5.5h3v13h-3Z'],
   prev: ['M6 5.5v13', 'M18 5.5 9 12l9 6.5Z'],

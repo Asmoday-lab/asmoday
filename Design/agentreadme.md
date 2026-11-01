@@ -1275,20 +1275,20 @@ GWT-BAR-02 Given 正在播放且有同目录 .lrc  When 播放进度推进  Then
 GWT-BAR-03 Given 播放条为 classic  When 点右工具区极简按钮（圆盘图标）  Then 切换为右下角 64px 胶囊（内含 48px 黑胶唱片）；展开后**双击唱片**回到 classic；两种形态刷新后保持
 GWT-BAR-04 Given 桌面 1440px  When 量 classic 条  Then 整条 **864×101**（`lg:w-[60%]`、`lg:min-w-[820px]`、内边距 14/24），播放键 44×44、上一首/下一首 36×36、模式/歌单/极简三个 32×32 且都带描边、声音键 24×24 + 横向音量轨 64×16，都不被 flex 压窄；封面是 accent 底 + 8px 白点；切歌与播放是实心图形；内联歌词区宽 > 150px
 GWT-BAR-05 Given 播放条任意形态  When 看顶行  Then 有贯穿整条的 4px 进度条与两端 34px 定宽时间；点击 60% 处 currentTime 跳到 60% 附近（命中区 16px 高）；空轨用 `--range-track`，深色底上可见
-GWT-BAR-06 Given 极简形态  When 未 hover  Then 是 64px 胶囊 + 48px 黑胶唱片（同心纹路 + 中心封面标贴 + 轴孔），播放中旋转（animation-play-state=running）；hover 展开 340px；双击唱片回到 classic
-GWT-BAR-07 Given classic 条  When 未 hover  Then 条内没有关闭按钮，条外右上方有**两个**窗口键（锁定常驻 24×24 + 关闭 24×24，`-top-3.5 right-3/5`）；hover 整条后两个键 opacity=1
+GWT-BAR-06 Given 极简形态  When 未 hover  Then 是 64px 胶囊 + 48px 黑胶唱片（同心纹路 + 中心封面标贴 + 轴孔）；**只有纹路层旋转**（`.music-grooves`，animation-play-state=running），外轮廓层不转；hover 展开 340px；双击唱片回到 classic
+GWT-BAR-07 Given classic 条  When 未 hover  Then 条内没有关闭按钮，条外右上方只有**一个**窗口键（关闭 24×24，`-top-3.5 right-3/5`）；hover 整条后它 opacity=1（v4.6.9 删掉「锁定常驻」，它是无效功能）
 GWT-BAR-08 Given 触屏（hover:none）且为极简形态  When 点唱片展开后又想关掉  Then 胶囊外右上方的关闭键 opacity=1（不依赖 hover），点击后播放条消失
 GWT-BAR-09 Given 歌词面板或播放列表展开  When 量两者底边  Then 底边都在播放条顶边之上（桌面让位 130px、`<lg` 84px；极简形态 96px，落在胶囊上方），不压住进度行
 GWT-BAR-10 Given 极简面板展开  When 数里面的按钮  Then 依次是 音量 24×24 / 模式 24 / 上一首 24 / 播放 28 / 下一首 24 / 歌单 24（与参考稿逐项对齐，只多一个歌单），**没有还原键**；点音量键 title 在「静音 / 取消静音」间切换，点模式键循环 列表循环 → 单曲循环 → 随机
 GWT-BAR-11 Given 极简面板  When 点一次唱片（等待 >240ms）  Then 播放/暂停切换；在 240ms 内连点两次  Then 还原为 classic（触屏双击同样生效，不依赖 dblclick 事件）
-GWT-BAR-12 Given 移动端 390px  When 看 classic 条  Then 曲目区三行（歌名 12 / 歌手 10 / 歌词 10，无歌词写「无歌词」），控件依次是 声音键 26 / 模式 26 / 上一首 26 / 播放 32 / 下一首 26 / 歌单 26 / 极简 28，无横向溢出（整条 390×80），关闭与锁定键浮在条外右上角
+GWT-BAR-12 Given 移动端 390px  When 看 classic 条  Then 曲目区三行（歌名 12 / 歌手 10 / 歌词 10，无歌词写「无歌词」），控件依次是 声音键 26 / 模式 26 / 上一首 26 / 播放 32 / 下一首 26 / 歌单 26 / 极简 28，无横向溢出（整条 390×80），关闭键浮在条外右上角（只有一个）
 GWT-BAR-13 Given `<lg`（如 838px）或触屏  When 点声音键  Then 播放条上方弹出 **36×96** 的竖排音量胶囊（`.vol-vertical` 旋转 -90°），胶囊底边距声音键 **4px**、72px 滑条**绝对定位居中**（`dxCenter=dyCenter=0`，可视底端到键顶 16px，左右各留 10px 不出胶囊），拖动写进 `asm_volume`；点弹层外收起；**lg+ 点声音键只切静音、不弹层**（条内已有横向滑轨）
 GWT-BAR-16 Given `<lg` 且设备有指针（`hover:hover`）  When 鼠标划过声音键  Then 弹层自动展开（opacity 0→1、下沉 4px 上浮，0.2s）；移到 4px 间隙或滑条上仍保持展开（透明桥接块）；移开收起；点击声音键则 `.is-open` 锁定展开，鼠标移开不收起，点外部才收起；隐藏态 `visibility:hidden` 且不接收指针、不被 Tab 聚焦
 GWT-BAR-17 Given 音量  When 依次取 0 / 40% / 80%  Then 声音键图标依次是 静音（实心喇叭 + 叉）/ 单弧（<55%）/ 双弧；喇叭体是 `fill`、声波弧是 `stroke`（`AppIcon` 的 `HEAD_SOLID`）
 GWT-BAR-18 Given 极简形态且面板已展开  When 点音量键  Then 同时静音/取消静音，并在键的正上方弹出 36×96 的竖排音量胶囊（`data-testid="music-mini-volume-popup"`，底边距键 4px、72px 滑条居中 `dxCenter=dyCenter=0`、不被胶囊裁切），拖动写进 `asm_volume`；有指针设备悬停即展开、移开 140ms 收起；点面板/弹层外收起
 GWT-BAR-19 Given 极简形态  When 用鼠标划过 64px 胶囊  Then 展开成 340px（`miniExpanded` 状态驱动，不能只靠 `group-hover`，否则宽度会被 `w-16` 盖掉），移开后回到 64px
 GWT-NAV-01 Given 移动端（<md）抽屉打开  When 点任一导航项  Then 抽屉在路由切换完成后收起，页面**真的换到目标页**（不得因 `history.back()` 把导航回滚）；点当前页的项则直接收起抽屉；按系统返回只收抽屉、不离开当前页
-GWT-BAR-14 Given 点条外右上角的锁定键  When 再看关闭键  Then 锁定态下关闭键 `disabled` 且 opacity≈0.4、点击不会关掉播放条；再点锁定键解锁后关闭键恢复可用；锁定状态刷新后保持
+GWT-BAR-14 Given 点条外右上角的关闭键  Then 播放条立刻收起、队列清空、`<audio>` 卸载；条外不再有第二个窗口键（锁定键已于 v4.6.9 删除，`asmoday.player.pinned` 也不再写 localStorage）
 GWT-BAR-15 Given 768~1023 宽度（如 838）  When 看 classic 条  Then 整条铺满底部（838×72、`border-t`、不浮起），曲目区两行（歌名 + 歌手）、内联歌词区可见且有竖线、控件含声音键；页面无横向溢出
 ```
 
@@ -1621,7 +1621,9 @@ GWT-UX-46 Given 桌面端（≥lg）正在播放  When 进入系统终端或文�
 GWT-UX-47 Given 桌面端正在播放  When 终端有内容  Then 终端最后一行落在播放条上方、不被遮挡；切到极简形态时不预留整块高度（不出现空白带），黑胶只压住右下角
 GWT-UX-48 Given 文件管理正在播放  When 滚动到最后一页  Then 最后一行仍能滚到播放条上方，不会被悬浮卡片压住
 GWT-UX-49 Given 桌面端经典播放条  Then 条外只有「关闭」一个窗口键；点它立即收起播放条并清空队列（不再有锁定键与置灰态）
-GWT-UX-50 Given 极简形态的黑胶唱片  Then 外轮廓是正圆（`overflow-hidden` + 1px 描边），同心纹路平滑无直边、无 conic 接缝，播放时旋转不影响圆形
+GWT-UX-50 Given 极简形态的黑胶唱片  Then 外轮廓是正圆：48×48 的静态外层给底色 + `ring-1 ring-inset`，纹路层 `inset-px` 内缩且**只有它**旋转，任意播放相位下沿圆心量 360 个方向的半径，最大值与最小值相差 < 1px（4 倍像素密度下实测 95.65±0.65px）
+GWT-UX-52 Given 64px 胶囊  Then 48px 唱片四边留白都是 8px（`disc.left-capsule.left = capsule.right-disc.right = 8`），不出现一侧 7px、一侧 9px 的偏心
+GWT-UX-53 Given 极简形态的黑胶唱片  Then 纹路是 SVG `circle` 正圆（不用 `repeating-radial-gradient`：它在 48px 上按像素格量化，靠边条带相位随角度变化会把圆边啃出缺口），1x 屏上也不出现条纹错乱
 GWT-UX-51 Given 窄屏（<lg）经典播放条  Then 它是铺满底部的 dock，正文仍为其预留高度，内容不被压住
 ```
 #### GWT 验收（日志时间口径）

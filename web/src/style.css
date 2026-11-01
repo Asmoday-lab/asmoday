@@ -426,17 +426,19 @@ body {
   box-shadow: 0 6px 18px -4px color-mix(in oklab, var(--accent) 62%, transparent);
 }
 
-/* 极简模式的黑胶唱片：只在播放时转 */
+/* 极简模式的黑胶唱片：只在播放时转。
+ * 只管纹路层（.music-grooves），圆形外轮廓在不旋转的外层上 —— 整块转会让圆边
+ * 每秒被重采样一次，边缘发虚、左右不对称（v4.6.10）。 */
 @keyframes music-spin {
   to {
     transform: rotate(360deg);
   }
 }
-.music-disc {
+.music-grooves {
   animation: music-spin 9s linear infinite;
   animation-play-state: paused;
 }
-.music-disc.is-playing {
+.music-grooves.is-playing {
   animation-play-state: running;
 }
 
