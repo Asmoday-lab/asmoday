@@ -37,7 +37,8 @@
     "columnIndex": "#",
     "columnTitle": "标题",
     "columnSize": "大小",
-    "columnFavorite": "收藏"
+    "columnFavorite": "收藏",
+    "folderHint": "右键可对该文件夹做改名 / 移动 / 复制 / 删除"
   },
   "toolbar": {
     "favorites": "收藏",
@@ -108,5 +109,8 @@
     "modified": "修改时间",
     "infoPending": "正在读取媒体信息…",
     "zoomReset": "恢复原始大小（双击或按 0）"
+  },
+  "folder": {
+    "rootLocked": "库根目录不能改名、移动或删除（它就是这个挂载点本身）"
   }
 }

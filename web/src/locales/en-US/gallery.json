@@ -37,7 +37,8 @@
     "columnIndex": "#",
     "columnTitle": "Title",
     "columnSize": "Size",
-    "columnFavorite": "Favorite"
+    "columnFavorite": "Favorite",
+    "folderHint": "Right-click this folder to rename / move / copy / delete it"
   },
   "toolbar": {
     "favorites": "Favorites",
@@ -108,5 +109,8 @@
     "modified": "Modified",
     "infoPending": "Reading media info…",
     "zoomReset": "Reset zoom (double-click or press 0)"
+  },
+  "folder": {
+    "rootLocked": "The library root cannot be renamed, moved or deleted — it is the mount point itself"
   }
 }

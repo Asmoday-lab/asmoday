@@ -21,6 +21,7 @@ import { useMediaQuery } from '@vueuse/core'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
+import FileOpsDialogs, { type FileOpDone } from '../components/FileOpsDialogs.vue'
 import FilePreviewPane from '../components/FilePreviewPane.vue'
 import VirtualGrid from '../components/VirtualGrid.vue'
 import VirtualList from '../components/VirtualList.vue'
@@ -31,14 +32,12 @@ import {
   summarizeResults,
   type EntryInfo,
   type EolType,
-  type FileStat,
   type Listing,
   type MountPoint,
-  type OnConflict,
   type SearchHit,
   type TextEncoding,
 } from '../api/files'
-import { localizedCode, messageFromBody } from '../lib/errors'
+import { messageFromBody } from '../lib/errors'
 import { triggerDownload } from '../lib/download'
 import { sharesApi } from '../api/shares'
 import { THUMB_WIDTH, thumbUrl } from '../api/media'
@@ -60,6 +59,12 @@ const router = useRouter()
 
 /** 右键菜单目标（定位与视口夹取由全局 ContextMenu 组件负责） */
 const menu = ref<{ x: number; y: number; entry: EntryInfo } | null>(null)
+
+/**
+ * 变更类弹窗（重命名 / 移动复制 / 删除 / 属性）：**文件管理与媒体库共用同一个组件**。
+ * 这里只负责把「点的是谁」翻译成组件的方法调用，操作完成后由 `onOpsDone` 刷新列表。
+ */
+const ops = ref<InstanceType<typeof FileOpsDialogs> | null>(null)
 
 function openMenu(event: MouseEvent, entry: EntryInfo) {
   menu.value = { x: event.clientX, y: event.clientY, entry }
@@ -266,14 +271,7 @@ async function submitCreate() {
   }
 }
 
-const renameDialog = ref<{
-  entry: EntryInfo
-  name: string
-  busy: boolean
-  error: string
-} | null>(null)
-
-/** 弹窗弹出后把焦点送进输入框并全选原名（F2 / 新建之后可以直接敲字） */
+/** 弹窗弹出后把焦点送进输入框并全选原名（新建之后可以直接敲字） */
 async function focusFieldLater(selector: string) {
   await nextTick()
   const field = document.querySelector<HTMLInputElement>(selector)
@@ -285,295 +283,34 @@ async function focusFieldLater(selector: string) {
 function openRenameDialog(entry?: EntryInfo) {
   const target = entry ?? menu.value?.entry
   menu.value = null
-  if (!target) return
-  renameDialog.value = { entry: target, name: target.name, busy: false, error: '' }
-  void focusFieldLater('[data-testid="rename-name"]')
+  if (target) ops.value?.openRename(target)
 }
 
-async function submitRename() {
-  const dialog = renameDialog.value
-  if (!dialog || dialog.busy) return
-  const name = dialog.name.trim()
-  if (!name || name === dialog.entry.name) {
-    renameDialog.value = null
-    return
-  }
-  dialog.busy = true
-  dialog.error = ''
-  try {
-    const result = await filesApi.rename(dialog.entry.path, name)
-    if (editor.value?.path === dialog.entry.path) {
-      editor.value.path = result.new_path
-      editor.value.name = name
+/** 变更成功后的统一收尾：编辑器指向的文件被改/被删要跟着走，多选退出，列表重拉 */
+async function onOpsDone(payload: FileOpDone) {
+  if (payload.kind === 'delete') {
+    for (const path of payload.paths) {
+      if (editor.value?.path === path) forceCloseEditor()
+      if (selected.value === path) selected.value = null
     }
-    renameDialog.value = null
-    showToast(t('files.rename.done'))
-    await open(currentPath.value)
-  } catch (err) {
-    dialog.error = describe(err).message
-  } finally {
-    dialog.busy = false
   }
+  if (payload.kind === 'rename' && payload.newPath && editor.value) {
+    if (editor.value.path === payload.paths[0]) {
+      editor.value.path = payload.newPath
+      editor.value.name = payload.newPath.replace(/^.*\//, '')
+    }
+  }
+  exitSelect()
+  await open(currentPath.value)
 }
 
 type TransferMode = 'copy' | 'move'
-
-/** 冲突策略按固定顺序展示：overwrite 风险最高放最上面但不预选（设计文档 3.2.6.2） */
-const CONFLICT_OPTIONS: OnConflict[] = ['overwrite', 'rename', 'skip']
-
-const transferDialog = ref<{
-  mode: TransferMode
-  targets: EntryInfo[]
-  dest: string
-  busy: boolean
-  error: string
-} | null>(null)
-
-/** 冲突策略：默认「未选择」，强制用户明确表态（设计文档 3.2.6.2） */
-const conflictChoice = ref<OnConflict | 'ask'>('ask')
 
 /** `dest` 省略时默认当前目录（剪贴板粘贴 / 拖拽到文件夹都会显式传目标） */
 function openTransferDialog(mode: TransferMode, targets?: EntryInfo[], dest?: string) {
   const list = targets ?? (menu.value ? [menu.value.entry] : [])
   menu.value = null
-  if (!list.length) return
-  conflictChoice.value = 'ask'
-  transferDialog.value = {
-    mode,
-    targets: list,
-    // 默认目标 = 当前目录（用户改路径比从零输入快）
-    dest: dest ?? currentPath.value,
-    busy: false,
-    error: '',
-  }
-  // 目录浏览器从当前目录开始逛，比手填绝对路径友好（v3.5.5）
-  transferPicker.value = {
-    path: currentPath.value,
-    dirs: [],
-    loading: true,
-    error: '',
-    manual: false,
-  }
-  void browsePicker(currentPath.value)
-}
-
-// ---------------- 目标目录浏览器（v3.5.5：点选代替手填绝对路径） ----------------
-const transferPicker = ref<{
-  path: string
-  dirs: { name: string; path: string }[]
-  loading: boolean
-  error: string
-  manual: boolean
-} | null>(null)
-
-/** 挂载点内相对展示：「挂载点名/子路径」；不在任何挂载点时隐藏盘符兜底 */
-function displayPath(path: string): string {
-  const normalized = path.replace(/\\/g, '/')
-  const mount = mountForPath(path)
-  if (mount) {
-    const prefix = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
-    const rest = normalized.slice(prefix.length).replace(/^\/+/, '')
-    return rest ? `${mount.name}/${rest}` : mount.name
-  }
-  const parts = normalized
-    .split('/')
-    .filter(Boolean)
-    .filter((part) => !/^[a-zA-Z]:$/.test(part))
-  return parts.join('/') || path
-}
-
-/** 浏览器面包屑：挂载点名 + 相对段，点击逐级跳转 */
-const pickerCrumbs = computed(() => {
-  const picker = transferPicker.value
-  if (!picker) return [] as { label: string; path: string }[]
-  const normalized = picker.path.replace(/\\/g, '/')
-  const mount = mountForPath(picker.path)
-  const result: { label: string; path: string }[] = []
-  if (mount) {
-    const prefix = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
-    result.push({ label: mount.name, path: mount.path })
-    let acc = prefix
-    for (const part of normalized.slice(prefix.length).split('/').filter(Boolean)) {
-      acc = `${acc}/${part}`
-      result.push({ label: part, path: acc })
-    }
-    return result
-  }
-  const parts = normalized.split('/').filter(Boolean)
-  let acc = ''
-  for (const part of parts) {
-    acc = acc ? `${acc}/${part}` : part.endsWith(':') ? `${part}/` : part
-    result.push({ label: part, path: acc })
-  }
-  return result
-})
-
-/** 浏览目标目录：只列子目录，选中即「当前所在」 */
-async function browsePicker(path: string) {
-  const picker = transferPicker.value
-  if (!picker) return
-  picker.loading = true
-  picker.error = ''
-  try {
-    const data = await filesApi.list(path, 1, false, 'name', 'asc')
-    picker.path = data.path
-    picker.dirs = data.entries
-      .filter((entry) => entry.is_dir)
-      .map((entry) => ({ name: entry.name, path: entry.path }))
-    if (transferDialog.value) transferDialog.value.dest = data.path
-  } catch (err) {
-    picker.error = describe(err).message
-  } finally {
-    picker.loading = false
-  }
-}
-
-async function submitTransfer() {
-  const dialog = transferDialog.value
-  if (!dialog || dialog.busy) return
-  const dest = dialog.dest.trim()
-  if (!dest) {
-    dialog.error = t('files.transfer.noTarget')
-    return
-  }
-  if (conflictChoice.value === 'ask') {
-    dialog.error = t('files.transfer.conflictRequired')
-    return
-  }
-  dialog.busy = true
-  dialog.error = ''
-  try {
-    const call = dialog.mode === 'copy' ? filesApi.copy : filesApi.move
-    const paths = dialog.targets.map((entry) => entry.path)
-    const response = await call(paths, dest, conflictChoice.value)
-    const summary = summarizeResults(response)
-    transferDialog.value = null
-    exitSelect()
-    showTransferResult(dialog.mode, summary, displayPath(dest), dest, conflictChoice.value)
-    await open(currentPath.value)
-  } catch (err) {
-    dialog.error = describe(err).message
-  } finally {
-    dialog.busy = false
-  }
-}
-
-interface TransferFailure {
-  path: string
-  source?: string
-  error_code?: string
-  message?: string
-}
-
-interface TransferSummary {
-  ok: number
-  failed: number
-  skipped: number
-  failures: TransferFailure[]
-}
-
-const resultDialog = ref<
-  ({ mode: TransferMode; dest?: string; destAbs?: string; conflict: OnConflict } & TransferSummary) | null
->(null)
-
-function showTransferResult(
-  mode: TransferMode,
-  summary: TransferSummary,
-  dest: string | undefined,
-  destAbs: string | undefined,
-  conflict: OnConflict,
-) {
-  if (summary.failed === 0) {
-    showToast(t('files.transfer.done'))
-    return
-  }
-  // 失败时带上目标目录：权限类错误（如目录拒绝写入）需要一眼定位是哪个目录；
-  // conflict 也要带上——重试必须沿用同一套冲突策略，否则「跳过」会变成「覆盖」
-  resultDialog.value = { mode, ...summary, dest, destAbs, conflict }
-}
-
-/**
- * 这些错误码来自**外部状态**，立刻重试必然再次失败（设计文档 8.5 第 7 条）。
- * `E_SOURCE_DELETE_FAILED` 更特殊：数据其实已经写到目标了，重试等于复制第二份。
- */
-const RETRY_BLOCKED_CODES = new Set([
-  'E_BUSY',
-  'E_CONFLICT',
-  'E_DIR_CONFLICT',
-  'E_SOURCE_DELETE_FAILED',
-  'E_READONLY',
-  'E_FORBIDDEN',
-])
-
-function canRetry(item: TransferFailure): boolean {
-  return !RETRY_BLOCKED_CODES.has(item.error_code ?? '')
-}
-
-/** 阻塞项不是给个「重试」就完事，必须告诉用户到底要动哪里 */
-function blockedHint(item: TransferFailure): string {
-  switch (item.error_code) {
-    case 'E_BUSY':
-      return t('files.result.hintBusy')
-    case 'E_CONFLICT':
-    case 'E_DIR_CONFLICT':
-      return t('files.result.hintConflict')
-    case 'E_SOURCE_DELETE_FAILED':
-      return t('files.result.hintSourceLeft')
-    case 'E_READONLY':
-    case 'E_FORBIDDEN':
-      return t('files.result.hintReadonly')
-    default:
-      return ''
-  }
-}
-
-const retrying = ref(false)
-
-/** 只重试「可能自己好起来」的失败项（网络抖动、单点权限等） */
-async function retryFailures() {
-  const dialog = resultDialog.value
-  if (!dialog || retrying.value) return
-  const targets = dialog.failures.filter(canRetry)
-  if (!targets.length || !dialog.destAbs) return
-  retrying.value = true
-  try {
-    const call = dialog.mode === 'copy' ? filesApi.copy : filesApi.move
-    const response = await call(
-      targets.map((item) => item.path),
-      dialog.destAbs,
-      dialog.conflict,
-    )
-    const summary = summarizeResults(response)
-    // 阻塞项没参与重试，必须原样留在列表里，否则用户会以为它们成功了
-    const blocked = dialog.failures.filter((item) => !canRetry(item))
-    const merged: TransferSummary = {
-      ok: summary.ok,
-      failed: summary.failed + blocked.length,
-      skipped: summary.skipped,
-      failures: [...summary.failures, ...blocked],
-    }
-    resultDialog.value = merged.failed
-      ? {
-          mode: dialog.mode,
-          dest: dialog.dest,
-          destAbs: dialog.destAbs,
-          conflict: dialog.conflict,
-          ...merged,
-        }
-      : null
-    if (!merged.failed) showToast(t('files.transfer.done'))
-    await open(currentPath.value)
-  } catch (err) {
-    showToast(describe(err).message)
-  } finally {
-    retrying.value = false
-  }
-}
-
-function failureText(item: { error_code?: string; message?: string }) {
-  // 后端 message 是中文且指向具体原因（如「文件正被其他程序占用」），
-  // 比通用错误码文案更有用；只有 message 缺失时才退回错误码翻译。
-  return item.message?.trim() || localizedCode(item.error_code) || t('common.state.unknownError')
+  if (list.length) ops.value?.openTransfer(mode, list, dest ?? currentPath.value)
 }
 
 // ---------------- 多选（设计文档 3.2.6.6 / 8.6） ----------------
@@ -689,148 +426,20 @@ function confirmBulkDownload() {
   if (targets.length) runBulkDownload(targets)
 }
 
-// ---------------- 删除（设计文档 3.2.6.5） ----------------
-const deleteTargets = ref<EntryInfo[]>([])
-const deleteBusy = ref(false)
-const deleteError = ref('')
-/** 删除目录时必须输入目录名：防误触，不是安全边界 */
-const deleteConfirmName = ref('')
-/** 删除前统计（项数 / 总大小），null = 统计中 */
-const deleteSurvey = ref<{ items: number; bytes: number; truncated: boolean } | null>(null)
+// ---------------- 删除 / 属性（弹窗实现在 components/FileOpsDialogs.vue） ----------------
 
-/** 只有「单选一个目录」才要求输入名字；批量走 60 秒一次性令牌 */
-const deleteNeedsName = computed(
-  () => deleteTargets.value.length === 1 && deleteTargets.value[0].is_dir,
-)
-const deleteTitle = computed(() => {
-  if (deleteTargets.value.length > 1) return t('files.delete.titleBatch')
-  return t(deleteTargets.value[0]?.is_dir ? 'files.delete.titleDir' : 'files.delete.titleFile')
-})
-
-const deleteNameMatches = computed(() => {
-  if (!deleteNeedsName.value) return true
-  const target = deleteTargets.value[0]
-  if (!target) return false
-  return deleteConfirmName.value.trim() === target.name.trim()
-})
-
-/** 删除统计请求序号（同 statDialog：不能用数组身份比较） */
-let deleteRequestSeq = 0
-
+/** `targets` 省略时取右键菜单选中的那条（快捷键 / 多选操作栏都显式传） */
 function openDeleteDialog(targets?: EntryInfo[]) {
   const list = targets ?? (menu.value ? [menu.value.entry] : [])
   menu.value = null
-  if (!list.length) return
-  const seq = ++deleteRequestSeq
-  deleteTargets.value = list
-  deleteConfirmName.value = ''
-  deleteError.value = ''
-  deleteSurvey.value = null
-  void (async () => {
-    try {
-      const survey = await filesApi.measure(list.map((entry) => entry.path))
-      if (seq === deleteRequestSeq && deleteTargets.value.length) deleteSurvey.value = survey
-    } catch {
-      if (seq === deleteRequestSeq && deleteTargets.value.length) {
-        deleteSurvey.value = { items: list.length, bytes: 0, truncated: false }
-      }
-    }
-  })()
+  ops.value?.openDelete(list)
 }
-
-async function confirmDelete() {
-  const targets = deleteTargets.value
-  if (!targets.length || deleteBusy.value) return
-  if (!deleteNameMatches.value) {
-    deleteError.value = t('errors.E_NAME_MISMATCH')
-    return
-  }
-  deleteBusy.value = true
-  deleteError.value = ''
-  try {
-    const paths = targets.map((entry) => entry.path)
-    const confirmName = deleteNeedsName.value ? targets[0].name : undefined
-    await filesApi.remove(paths, confirmName)
-    deleteTargets.value = []
-    for (const entry of targets) {
-      if (editor.value?.path === entry.path) forceCloseEditor()
-      if (selected.value === entry.path) selected.value = null
-    }
-    exitSelect()
-    showToast(t(targets.length > 1 ? 'files.delete.doneBatch' : targets[0].is_dir ? 'files.delete.doneDir' : 'files.delete.doneFile'))
-    await open(currentPath.value)
-  } catch (err) {
-    deleteError.value = describe(err).message
-  } finally {
-    deleteBusy.value = false
-  }
-}
-
-// ---------------- 属性（设计文档 3.2 右键菜单 / 3.2.6.8 只读 stat） ----------------
-const statDialog = ref<{
-  entry: EntryInfo
-  data: FileStat | null
-  busy: boolean
-  error: string
-} | null>(null)
-
-/** 属性请求序号：ref.value 是深响应 proxy，与原始对象恒不相等，只能用序号判定「仍是这次打开」 */
-let statRequestSeq = 0
 
 function openStatDialog() {
   const entry = menu.value?.entry
   menu.value = null
-  if (!entry) return
-  const seq = ++statRequestSeq
-  statDialog.value = { entry, data: null, busy: true, error: '' }
-  void (async () => {
-    try {
-      const data = await filesApi.stat(entry.path)
-      if (seq === statRequestSeq && statDialog.value) {
-        statDialog.value = { ...statDialog.value, data, busy: false }
-      }
-    } catch (err) {
-      if (seq === statRequestSeq && statDialog.value) {
-        statDialog.value = { ...statDialog.value, busy: false, error: describe(err).message }
-      }
-    }
-  })()
+  if (entry) ops.value?.openStat(entry)
 }
-
-/** 权限位显示成 `0644`：只用来给用户看，不参与任何判定 */
-function formatMode(mode: number | null | undefined) {
-  if (mode === null || mode === undefined) return '—'
-  return `0${(mode & 0o7777).toString(8).padStart(3, '0')}`
-}
-
-/**
- * 属性页的「所在目录」（v2.9）：只显示挂载点内的相对路径，
- * 不再展示真实路径 —— 既和顶部的完整路径重复，又暴露服务端盘符。
- */
-const statRelativeDir = computed(() => {
-  const raw = statDialog.value?.data?.path ?? statDialog.value?.entry.path ?? ''
-  if (!raw) return '/'
-  const dir = raw.replace(/[\\/][^\\/]*$/, '') || '/'
-  const normalized = dir.replace(/\\/g, '/')
-  let matchedPrefix = ''
-  for (const root of roots.value) {
-    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
-    if (
-      prefix &&
-      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
-      prefix.length > matchedPrefix.length
-    ) {
-      matchedPrefix = prefix
-    }
-  }
-  if (matchedPrefix) {
-    const rest = normalized.slice(matchedPrefix.length).replace(/^\/+/, '')
-    return rest ? `/${rest}` : '/'
-  }
-  // 兜底：不在任何挂载点下（理论上不会发生），按段展示但隐藏盘符
-  const parts = normalized.split('/').filter(Boolean).filter((part) => !/^[a-zA-Z]:$/.test(part))
-  return parts.length ? `/${parts.join('/')}` : '/'
-})
 
 const roots = ref<MountPoint[]>([])
 const rootsImplicit = ref(false)
@@ -2018,13 +1627,10 @@ useScrollLock(
       shareTarget.value ||
         editor.value ||
         preview.value ||
-        deleteTargets.value.length ||
         createDialog.value ||
-        renameDialog.value ||
-        transferDialog.value ||
-        resultDialog.value ||
-        statDialog.value ||
-        bulkDownloadConfirm.value,
+        bulkDownloadConfirm.value ||
+        // 变更弹窗（重命名/移动复制/删除/属性）在 FileOpsDialogs 里，问它有没有开着
+        ops.value?.isOpen,
     ),
   ),
 )
@@ -2094,13 +1700,9 @@ function typingInField(target: EventTarget | null): boolean {
 function anyOverlayOpen(): boolean {
   return Boolean(
     menu.value ||
-      renameDialog.value ||
       createDialog.value ||
-      transferDialog.value ||
-      deleteTargets.value.length ||
-      resultDialog.value ||
-      statDialog.value ||
       bulkDownloadConfirm.value ||
+      ops.value?.isOpen ||
       closePrompt.value ||
       preview.value ||
       editor.value,
@@ -2117,28 +1719,10 @@ function closeTopLayer(): boolean {
     menu.value = null
     return true
   }
-  if (deleteTargets.value.length) {
-    deleteTargets.value = []
-    return true
-  }
-  if (renameDialog.value) {
-    renameDialog.value = null
-    return true
-  }
+  // 变更弹窗自己按「结果 → 删除 → 重命名 → 移动复制 → 属性」的顺序关
+  if (ops.value?.closeAll()) return true
   if (createDialog.value) {
     createDialog.value = null
-    return true
-  }
-  if (transferDialog.value) {
-    transferDialog.value = null
-    return true
-  }
-  if (resultDialog.value) {
-    resultDialog.value = null
-    return true
-  }
-  if (statDialog.value) {
-    statDialog.value = null
     return true
   }
   if (bulkDownloadConfirm.value) {
@@ -2287,7 +1871,7 @@ async function runTransfer(mode: TransferMode, targets: EntryInfo[], dest: strin
     }
     exitSelect()
     if (summary.failed) {
-      showTransferResult(mode, summary, displayPath(dest), dest, 'skip')
+      ops.value?.showResult(mode, summary, dest, 'skip')
     } else {
       showToast(t(mode === 'copy' ? 'files.keys.copiedDone' : 'files.keys.movedDone', { count: summary.ok }))
     }
@@ -3474,95 +3058,14 @@ onBeforeUnmount(() => {
       @close="menu = null"
     />
 
-    <!-- 删除确认 -->
-    <div
-      v-if="deleteTargets.length"
-      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
-      @click.self="deleteTargets = []"
-    >
-      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <p class="text-sm font-medium text-ink">{{ deleteTitle }}</p>
-        <p
-          v-if="deleteTargets.length === 1"
-          class="mt-2 break-all text-[12px] text-muted"
-        >
-          {{ deleteTargets[0].name }}
-        </p>
-        <ul v-else class="mt-2 max-h-32 space-y-0.5 overflow-y-auto">
-          <li
-            v-for="entry in deleteTargets"
-            :key="entry.path"
-            class="truncate text-[12px] text-muted"
-          >
-            {{ entry.name }}
-          </li>
-        </ul>
-
-        <!-- 删除前统计（设计文档 3.2.6.5） -->
-        <p class="mt-2 text-[12px] text-muted">
-          <template v-if="!deleteSurvey">{{ t('files.delete.measuring') }}</template>
-          <template v-else-if="deleteSurvey.truncated">
-            {{ t('files.delete.summaryMore', { count: deleteSurvey.items }) }}
-          </template>
-          <template v-else>
-            {{
-              t('files.delete.summary', {
-                count: deleteSurvey.items,
-                size: formatSize(deleteSurvey.bytes),
-              })
-            }}
-          </template>
-        </p>
-        <p
-          v-if="deleteSurvey?.truncated || (deleteSurvey?.items ?? 0) > 1000"
-          class="mt-1 text-[12px] fg-warn"
-        >
-          {{ t('files.delete.large') }}
-        </p>
-
-        <p class="mt-3 text-xs leading-relaxed fg-danger">
-          {{
-            t(
-              deleteNeedsName
-                ? 'files.delete.warningDir'
-                : deleteTargets.length > 1
-                  ? 'files.delete.warningDir'
-                  : 'files.delete.warningFile',
-            )
-          }}
-        </p>
-        <!-- 删除单个目录必须输入目录名（设计文档 3.2.6.5：防误触，不是安全边界） -->
-        <label v-if="deleteNeedsName" class="mt-3 block text-[12px] text-muted">
-          {{ t('files.delete.confirmNameLabel') }}
-          <input
-            v-model="deleteConfirmName"
-            type="text"
-            :placeholder="deleteTargets[0].name"
-            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-            data-testid="delete-confirm-name"
-            @keydown.enter="confirmDelete"
-            @keydown.esc="deleteTargets = []"
-          />
-          <span class="mt-1 block text-[11px] text-muted">{{ t('files.delete.confirmNameHint') }}</span>
-        </label>
-        <p v-if="deleteError" class="mt-3 text-xs fg-danger">{{ deleteError }}</p>
-        <div class="mt-5 flex justify-end gap-2">
-          <button
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-            @click="deleteTargets = []"
-          >
-            {{ t('common.action.cancel') }}
-          </button>
-          <button
-            class="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-            :disabled="deleteBusy || !deleteNameMatches"
-            @click="confirmDelete"
-          >
-            {{ deleteBusy ? t('common.action.deleting') : t('files.delete.confirm') }}
-          </button>
-        </div>
-      </div>
-    </div>
+    <!-- 变更弹窗（重命名 / 移动复制 / 删除 / 属性）：与媒体库共用同一个实现 -->
+    <FileOpsDialogs
+      ref="ops"
+      :start-dir="currentPath"
+      :roots="roots"
+      @done="onOpsDone"
+      @toast="showToast"
+    />
 
     <!-- 多选下载确认（设计文档 3.2.6.6：> 10 个先提示会被浏览器拦截） -->
     <div
@@ -3636,369 +3139,6 @@ onBeforeUnmount(() => {
             @click="submitCreate"
           >
             {{ t('files.create.submit') }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 重命名（设计文档 3.2.6.1） -->
-    <div
-      v-if="renameDialog"
-      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
-      @click.self="renameDialog = null"
-    >
-      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <p class="text-sm font-medium text-ink">{{ t('files.rename.title') }}</p>
-        <p class="mt-0.5 break-all text-[12px] text-muted">{{ renameDialog.entry.name }}</p>
-        <label class="mt-4 block text-[12px] text-muted">
-          {{ t('files.rename.label') }}
-          <input
-            v-model="renameDialog.name"
-            type="text"
-            class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-            data-testid="rename-name"
-            autofocus
-            @keydown.enter="submitRename"
-            @keydown.esc="renameDialog = null"
-          />
-        </label>
-        <p v-if="renameDialog.error" class="mt-3 text-xs fg-danger">{{ renameDialog.error }}</p>
-        <div class="mt-5 flex justify-end gap-2">
-          <button
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-            @click="renameDialog = null"
-          >
-            {{ t('common.action.cancel') }}
-          </button>
-          <button
-            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-            :disabled="renameDialog.busy"
-            @click="submitRename"
-          >
-            {{ t('files.rename.submit') }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 移动 / 复制（设计文档 3.2.6.2：冲突必须由用户解析成具体策略） -->
-    <div
-      v-if="transferDialog"
-      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
-      @click.self="transferDialog = null"
-    >
-      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <p class="text-sm font-medium text-ink">
-          {{
-            t(
-              transferDialog.mode === 'move'
-                ? 'files.transfer.titleMove'
-                : 'files.transfer.titleCopy',
-            )
-          }}
-        </p>
-        <p class="mt-0.5 text-[12px] text-muted">
-          {{
-            transferDialog.targets.length === 1
-              ? displayPath(transferDialog.targets[0].path)
-              : t('files.select.count', { count: transferDialog.targets.length })
-          }}
-        </p>
-
-        <label class="mt-4 block text-[12px] text-muted">
-          {{ t('files.transfer.destination') }}
-          <!-- 目录浏览器（v3.5.5）：点选进入代替手填绝对路径；当前所在目录即目标 -->
-          <template v-if="transferPicker && !transferPicker.manual">
-            <nav
-              v-if="pickerCrumbs.length"
-              class="mt-1 flex flex-wrap items-center gap-x-0.5 gap-y-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[12px]"
-              data-testid="transfer-picker-crumb"
-            >
-              <template v-for="(crumb, index) in pickerCrumbs" :key="crumb.path">
-                <span v-if="index > 0" class="text-muted opacity-50">/</span>
-                <button
-                  class="max-w-[160px] truncate rounded px-1 transition-colors hover:text-ink"
-                  :class="index === pickerCrumbs.length - 1 ? 'font-medium text-accent' : 'text-muted'"
-                  :title="crumb.label"
-                  @click="browsePicker(crumb.path)"
-                >
-                  {{ crumb.label }}
-                </button>
-              </template>
-            </nav>
-            <div class="mt-1 max-h-40 overflow-y-auto rounded-lg border border-line bg-elevated">
-              <button
-                v-for="dir in transferPicker.dirs"
-                :key="dir.path"
-                type="button"
-                class="flex w-full items-center gap-2 px-3 py-1.5 text-[12px] text-ink transition-colors hover:bg-panel"
-                @click="browsePicker(dir.path)"
-              >
-                <AppIcon name="folder" :size="14" class="shrink-0 text-muted" />
-                <span class="truncate">{{ dir.name }}</span>
-                <AppIcon name="chevronRight" :size="11" class="ml-auto shrink-0 text-muted opacity-50" />
-              </button>
-              <p
-                v-if="!transferPicker.loading && !transferPicker.dirs.length"
-                class="px-3 py-2 text-[11px] text-muted"
-              >
-                {{ t('files.transfer.emptyDir') }}
-              </p>
-              <p v-if="transferPicker.loading" class="px-3 py-2 text-[11px] text-muted">
-                {{ t('common.action.loading') }}
-              </p>
-              <p v-if="transferPicker.error" class="px-3 py-2 text-[11px] fg-danger">
-                {{ transferPicker.error }}
-              </p>
-            </div>
-            <button
-              type="button"
-              class="mt-1 text-[11px] text-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
-              @click="transferPicker.manual = true"
-            >
-              {{ t('files.transfer.manualInput') }}
-            </button>
-          </template>
-          <template v-else>
-            <input
-              v-model="transferDialog.dest"
-              type="text"
-              class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-[12px] text-ink outline-none focus:border-accent"
-              data-testid="transfer-dest"
-              @keydown.enter="submitTransfer"
-              @keydown.esc="transferDialog = null"
-            />
-            <button
-              v-if="transferPicker?.manual"
-              type="button"
-              class="mt-1 block text-[11px] text-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
-              @click="transferPicker.manual = false; browsePicker(transferPicker.path)"
-            >
-              {{ t('files.transfer.backToBrowse') }}
-            </button>
-          </template>
-          <span class="mt-1 block text-[11px] text-muted">
-            {{ t('files.transfer.destinationHint') }}
-          </span>
-        </label>
-
-        <p class="mt-4 text-[12px] text-muted">{{ t('files.transfer.conflict') }}</p>
-        <div class="mt-1.5 space-y-1">
-          <label
-            v-for="option in CONFLICT_OPTIONS"
-            :key="option"
-            class="flex cursor-pointer items-center gap-2 rounded-lg border border-line px-3 py-1.5 text-xs text-ink"
-            :class="conflictChoice === option ? 'border-accent/60 bg-accent-soft' : ''"
-          >
-            <input
-              v-model="conflictChoice"
-              type="radio"
-              :value="option"
-              class="accent-[var(--accent)]"
-              :data-testid="`conflict-${option}`"
-            />
-            {{
-              t(
-                option === 'overwrite'
-                  ? 'files.transfer.overwrite'
-                  : option === 'rename'
-                    ? 'files.transfer.renamePolicy'
-                    : 'files.transfer.skip',
-              )
-            }}
-          </label>
-        </div>
-
-        <p v-if="transferDialog.error" class="mt-3 text-xs fg-danger">
-          {{ transferDialog.error }}
-        </p>
-        <div class="mt-5 flex justify-end gap-2">
-          <button
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-            @click="transferDialog = null"
-          >
-            {{ t('common.action.cancel') }}
-          </button>
-          <button
-            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-            :disabled="transferDialog.busy"
-            @click="submitTransfer"
-          >
-            {{ transferDialog.busy ? t('common.action.loading') : t('files.transfer.submit') }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 批量操作进行中：同步请求，只给不确定进度 + 遮罩，不伪造百分比（设计文档 8.5 第 2 条） -->
-    <div
-      v-if="transferDialog?.busy"
-      class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4"
-    >
-      <div class="rounded-xl border border-line bg-panel px-6 py-5 text-center shadow-xl">
-        <div
-          class="mx-auto size-6 animate-spin rounded-full border-2 border-line border-t-accent"
-        />
-        <p class="mt-3 text-xs text-ink">
-          {{ t('files.transfer.busy', { count: transferDialog.targets.length }) }}
-        </p>
-      </div>
-    </div>
-
-    <!-- 批量结果汇总（设计文档 6.2：逐项展示后端中文 message，缺 message 才退回 error_code 翻译） -->
-    <div
-      v-if="resultDialog"
-      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
-      @click.self="resultDialog = null"
-    >
-      <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <p class="text-sm font-medium text-ink">{{ t('files.result.title') }}</p>
-        <p class="mt-2 text-xs text-muted">
-          {{
-            t('files.result.summary', {
-              ok: resultDialog.ok,
-              failed: resultDialog.failed,
-              skipped: resultDialog.skipped,
-            })
-          }}
-        </p>
-        <p v-if="resultDialog.dest" class="mt-1 break-all text-[11px] text-muted">
-          {{ t('files.result.targetDir') }}：{{ resultDialog.dest }}
-        </p>
-        <template v-if="resultDialog.failures.length">
-          <p class="mt-4 text-[12px] font-medium text-muted">{{ t('files.result.failures') }}</p>
-          <ul class="mt-1.5 max-h-48 space-y-1 overflow-y-auto">
-            <li
-              v-for="item in resultDialog.failures"
-              :key="item.path"
-              class="rounded-lg border border-line bg-elevated px-2.5 py-1.5"
-            >
-              <p class="break-all text-[12px] text-ink">{{ displayPath(item.source ?? item.path) }}</p>
-              <p class="mt-0.5 text-[11px] fg-danger">{{ failureText(item) }}</p>
-              <!-- 阻塞项只给指引，不给「重试」：立刻重试必然再失败（设计文档 8.5 第 7 条） -->
-              <p v-if="blockedHint(item)" class="mt-0.5 text-[11px] text-muted">
-                {{ blockedHint(item) }}
-              </p>
-            </li>
-          </ul>
-        </template>
-        <div class="mt-5 flex justify-end gap-2">
-          <!-- 只有全部是阻塞项时才给「忽略并继续」，否则用户会连能重试的一起丢掉 -->
-          <button
-            v-if="!resultDialog.failures.some(canRetry)"
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
-            @click="resultDialog = null"
-          >
-            {{ t('files.result.ignore') }}
-          </button>
-          <button
-            v-else
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink"
-            :disabled="retrying"
-            @click="retryFailures"
-          >
-            {{ retrying ? t('common.action.loading') : t('files.result.retry') }}
-          </button>
-          <button
-            class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
-            @click="resultDialog = null"
-          >
-            {{ t('common.action.close') }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 属性（设计文档 3.2 右键菜单 / 6.2 stat） -->
-    <div
-      v-if="statDialog"
-      class="fixed inset-0 z-50 grid place-items-center modal-overlay bg-black/50 p-4"
-      @click.self="statDialog = null"
-    >
-      <div class="w-full max-w-md modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
-        <p class="text-sm font-medium text-ink">{{ t('files.stat.title') }}</p>
-        <!-- 只显示文件名：完整路径（含盘符）不给属性页（v2.9） -->
-        <p class="mt-0.5 truncate text-[12px] text-muted">{{ statDialog.entry.name }}</p>
-
-        <p v-if="statDialog.busy" class="mt-4 text-xs text-muted">
-          {{ t('common.action.loading') }}
-        </p>
-        <p v-else-if="statDialog.error" class="mt-4 text-xs fg-danger">{{ statDialog.error }}</p>
-        <dl v-else-if="statDialog.data" class="mt-4 space-y-1.5 text-[12px]">
-          <div class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.size') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-ink">
-              <template v-if="statDialog.data.is_dir">—</template>
-              <template v-else>
-                {{ formatSize(statDialog.data.size) }}
-                <!-- 精确字节数用浅色小字附带，方便对账 / 校验哈希（v2.9） -->
-                <span class="ml-1 text-[11px] text-muted">
-                  {{ t('files.stat.bytes', { count: statDialog.data.size.toLocaleString() }) }}
-                </span>
-              </template>
-            </dd>
-          </div>
-          <!-- 分辨率只有媒体才有，其余类型不占位（v2.9） -->
-          <div
-            v-if="statDialog.data.width && statDialog.data.height"
-            class="flex gap-3"
-          >
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.resolution') }}</dt>
-            <dd class="min-w-0 flex-1 text-ink">
-              {{ statDialog.data.width }} × {{ statDialog.data.height }}
-            </dd>
-          </div>
-          <div class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.mime') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.mime }}</dd>
-          </div>
-          <div class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.modified') }}</dt>
-            <dd class="min-w-0 flex-1 text-ink">{{ formatTime(statDialog.data.mtime) }}</dd>
-          </div>
-          <!-- Windows 拿不到权限/所有者/inode：整行隐藏，绝不画「—」占位（v2.9） -->
-          <div
-            v-if="statDialog.data.mode !== null && statDialog.data.mode !== undefined"
-            class="flex gap-3"
-          >
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.mode') }}</dt>
-            <dd class="min-w-0 flex-1 text-ink">{{ formatMode(statDialog.data.mode) }}</dd>
-          </div>
-          <div v-if="statDialog.data.owner" class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.owner') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-ink">{{ statDialog.data.owner }}</dd>
-          </div>
-          <div
-            v-if="statDialog.data.inode !== null && statDialog.data.inode !== undefined"
-            class="flex gap-3"
-          >
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.inode') }}</dt>
-            <dd class="min-w-0 flex-1 text-ink">{{ statDialog.data.inode }}</dd>
-          </div>
-          <div class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.directory') }}</dt>
-            <dd class="min-w-0 flex-1 break-all text-ink" :title="statRelativeDir">
-              {{ statRelativeDir }}
-            </dd>
-          </div>
-          <div v-if="statDialog.data.is_symlink" class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.symlink') }}</dt>
-            <dd class="min-w-0 flex-1 break-all fg-warn">
-              {{ statDialog.data.symlink_target ?? '—' }}
-            </dd>
-          </div>
-          <div v-if="statDialog.data.readonly" class="flex gap-3">
-            <dt class="w-20 shrink-0 text-muted">{{ t('files.stat.readonly') }}</dt>
-            <dd class="min-w-0 flex-1 text-ink">{{ t('files.readonly.badge') }}</dd>
-          </div>
-        </dl>
-
-        <div class="mt-5 flex justify-end">
-          <button
-            class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-            @click="statDialog = null"
-          >
-            {{ t('common.action.close') }}
           </button>
         </div>
       </div>

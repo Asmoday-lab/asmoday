@@ -11,6 +11,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
+import FileOpsDialogs, { type FileOpDone } from '../components/FileOpsDialogs.vue'
 import PhotoTile from '../components/PhotoTile.vue'
 import VideoCard from '../components/VideoCard.vue'
 import {
@@ -26,6 +27,7 @@ import {
   type KindCounts,
   type MediaItem,
 } from '../api/media'
+import { filesApi, type MountPoint } from '../api/files'
 import { sharesApi } from '../api/shares'
 import { formatSize } from '../lib/format'
 import { triggerDownload } from '../lib/download'
@@ -674,8 +676,47 @@ function openViewer(list: MediaItem[], index: number) {
 // ---------------- 媒体库右键菜单（设计文档 3.2.5 / 8.4.13） ----------------
 //
 // 相册时间线、影视海报墙、音乐列表都复用全局 ContextMenu —— 媒体库不允许
-// 变成「只能看不能操作」的死水，下载 / 分享 / 复制直链 / 收藏必须在原地可达。
+// 变成「只能看不能操作」的死水。除了播放/下载/分享，**文件管理的整套变更动作
+// （重命名 / 移动 / 复制 / 删除 / 属性）也必须原地可达**：弹窗来自
+// components/FileOpsDialogs.vue，与文件管理是同一份实现，口径不会分叉。
 const mediaMenu = ref<{ x: number; y: number; item: MediaItem; context: MediaTab } | null>(null)
+
+/** 变更弹窗（与文件管理共用） */
+const ops = ref<InstanceType<typeof FileOpsDialogs> | null>(null)
+
+/**
+ * 挂载点清单：媒体接口不返回 readonly，只能从挂载点配置反推。
+ * 取「最长前缀命中」，避免 `/mnt/a` 与 `/mnt/ab` 互相误判。
+ */
+const mounts = ref<MountPoint[]>([])
+
+function mountForPath(path: string): MountPoint | null {
+  const normalized = path.replace(/\\/g, '/')
+  let matched: MountPoint | null = null
+  let matchedLength = -1
+  for (const mount of mounts.value) {
+    const prefix = mount.path.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (
+      prefix &&
+      normalized.toLowerCase().startsWith(prefix.toLowerCase()) &&
+      prefix.length > matchedLength
+    ) {
+      matched = mount
+      matchedLength = prefix.length
+    }
+  }
+  return matched
+}
+
+/** 只读挂载点：变更项统一置灰并带原因（设计文档 3.2.6） */
+function readonlyAt(path: string): boolean {
+  return mountForPath(path)?.readonly ?? false
+}
+
+/** 变更弹窗的默认目标目录：当前打开的册，否则库根 */
+const opsStartDir = computed(
+  () => activeAlbum.value?.path ?? activeCinemaAlbum.value?.path ?? root.value,
+)
 
 function openMediaMenu(event: MouseEvent, item: MediaItem, context: MediaTab) {
   mediaMenu.value = { x: event.clientX, y: event.clientY, item, context }
@@ -701,10 +742,17 @@ function playTrackAt(track: MediaItem) {
   player.play(audios.value, audioRowIndex.value.get(track.path) ?? 0)
 }
 
+/** 媒体条目 → 变更弹窗的作用对象（媒体库里的条目一律是文件） */
+function mediaTarget(item: MediaItem) {
+  return { name: item.name, path: item.path, is_dir: false }
+}
+
 const mediaMenuItems = computed<ContextMenuItem[]>(() => {
   const current = mediaMenu.value
   if (!current) return []
   const item = current.item
+  const hint = t('files.readonly.tooltip')
+  const readonly = readonlyAt(item.path)
   const items: ContextMenuItem[] = []
   items.push({
     id: 'open',
@@ -722,6 +770,38 @@ const mediaMenuItems = computed<ContextMenuItem[]>(() => {
     label: isFavorite(item.path) ? t('gallery.favorite.remove') : t('gallery.favorite.add'),
     icon: 'heart',
     divider: true,
+  })
+  // 下面是文件操作：与文件管理同一套弹窗、同一套置灰口径
+  items.push({
+    id: 'rename',
+    label: t('files.menu.rename'),
+    icon: 'edit',
+    divider: true,
+    disabled: readonly,
+    hint,
+  })
+  items.push({
+    id: 'move',
+    label: t('files.menu.moveTo'),
+    icon: 'arrowRight',
+    disabled: readonly,
+    hint,
+  })
+  items.push({
+    id: 'copy',
+    label: t('files.menu.copyTo'),
+    icon: 'gallery',
+    disabled: readonly,
+    hint,
+  })
+  items.push({ id: 'properties', label: t('files.menu.properties'), icon: 'chip', divider: true })
+  items.push({
+    id: 'delete',
+    label: t('files.menu.delete'),
+    icon: 'trash',
+    danger: true,
+    disabled: readonly,
+    hint,
   })
   return items
 })
@@ -757,9 +837,187 @@ async function onMediaMenuSelect(id: string) {
     case 'favorite':
       await toggleFavorite(item)
       break
+    case 'rename':
+      ops.value?.openRename(mediaTarget(item))
+      break
+    case 'move':
+      ops.value?.openTransfer('move', [mediaTarget(item)])
+      break
+    case 'copy':
+      ops.value?.openTransfer('copy', [mediaTarget(item)])
+      break
+    case 'properties':
+      ops.value?.openStat(mediaTarget(item))
+      break
+    case 'delete':
+      ops.value?.openDelete([mediaTarget(item)])
+      break
     default:
       break
   }
+}
+
+// ---------------- 文件夹右键菜单（相册 / 影视文件夹 / 音乐分区标题） ----------------
+//
+// 媒体库里的相册就是目录：改名、移动到别的挂载点、删掉空册，都必须能在这里做，
+// 否则用户只能切回文件管理重走一遍路径。
+const folderMenu = ref<{ x: number; y: number; album: Album; context: MediaTab } | null>(null)
+
+function openFolderMenu(event: MouseEvent, album: Album, context: MediaTab) {
+  folderMenu.value = { x: event.clientX, y: event.clientY, album, context }
+}
+
+/** 卡片长按 = 同一个菜单（触屏没有右键） */
+const folderPress = useLongPress<{ album: Album; context: MediaTab }>(({ album, context }) => {
+  folderMenu.value = { x: 0, y: 0, album, context }
+})
+
+/** 相册卡片单击：长按已经弹过菜单就不再进册 */
+function openAlbumCard(album: Album) {
+  if (folderPress.takeFired()) return
+  void openAlbum(album)
+}
+
+function openCinemaCard(album: Album) {
+  if (folderPress.takeFired()) return
+  void openCinemaAlbum(album)
+}
+
+/** 音乐库按文件夹分区时，分区标题就是那个目录 */
+function openMusicGroupMenu(event: MouseEvent, group: FolderGroup) {
+  if (group.key === '/') return
+  folderMenu.value = {
+    x: event.clientX,
+    y: event.clientY,
+    album: {
+      name: group.label,
+      path: group.key,
+      count: group.items.length,
+      is_root: false,
+      cover: null,
+      cover_hash: null,
+      cover_color: null,
+      modified: null,
+    },
+    context: 'music',
+  }
+}
+
+/** 目录 → 变更弹窗的作用对象 */
+function folderTarget(album: Album) {
+  return { name: album.name, path: album.path, is_dir: true }
+}
+
+const folderMenuItems = computed<ContextMenuItem[]>(() => {
+  const current = folderMenu.value
+  if (!current) return []
+  const album = current.album
+  // 库根 = 挂载点本身：改名/移动/删除都会把整个库挪走，一律不给（不是权限问题）
+  const locked = album.is_root
+  const readonly = readonlyAt(album.path)
+  const hint = locked ? t('gallery.folder.rootLocked') : t('files.readonly.tooltip')
+  const blocked = locked || readonly
+  const items: ContextMenuItem[] = []
+  if (current.context !== 'music') {
+    // 「打开」永远可用：库根也只是一个目录，进得去
+    items.push({ id: 'open', label: t('files.menu.openDir'), icon: 'folderOpen' })
+  }
+  items.push({ id: 'download', label: t('files.menu.download'), icon: 'archive' })
+  items.push({
+    id: 'rename',
+    label: t('files.menu.rename'),
+    icon: 'edit',
+    divider: true,
+    disabled: blocked,
+    hint,
+  })
+  items.push({
+    id: 'move',
+    label: t('files.menu.moveTo'),
+    icon: 'arrowRight',
+    disabled: blocked,
+    hint,
+  })
+  items.push({
+    id: 'copy',
+    label: t('files.menu.copyTo'),
+    icon: 'gallery',
+    disabled: locked,
+    hint: locked ? t('gallery.folder.rootLocked') : t('files.readonly.tooltip'),
+  })
+  items.push({ id: 'properties', label: t('files.menu.properties'), icon: 'chip', divider: true })
+  items.push({
+    id: 'delete',
+    label: t('files.menu.delete'),
+    icon: 'trash',
+    danger: true,
+    disabled: blocked,
+    hint,
+  })
+  return items
+})
+
+function onFolderMenuSelect(id: string) {
+  const current = folderMenu.value
+  folderMenu.value = null
+  if (!current) return
+  const album = current.album
+  switch (id) {
+    case 'open':
+      if (current.context === 'photos') void openAlbum(album)
+      else if (current.context === 'cinema') void openCinemaAlbum(album)
+      break
+    case 'download':
+      triggerDownload(filesApi.archiveUrl(album.path))
+      break
+    case 'rename':
+      ops.value?.openRename(folderTarget(album))
+      break
+    case 'move':
+      ops.value?.openTransfer('move', [folderTarget(album)])
+      break
+    case 'copy':
+      ops.value?.openTransfer('copy', [folderTarget(album)])
+      break
+    case 'properties':
+      ops.value?.openStat(folderTarget(album))
+      break
+    case 'delete':
+      ops.value?.openDelete([folderTarget(album)])
+      break
+    default:
+      break
+  }
+}
+
+/**
+ * 变更完成后的刷新：**留在原地**。
+ * 册内改名/删除只重拉册内一屏，不把用户踢回相册墙（那等于把上下文弄丢了）。
+ */
+async function refreshAfterOps() {
+  if (tab.value === 'photos') {
+    if (photoView.value === 'albums' && activeAlbum.value) {
+      await loadAlbumItems(activeAlbum.value)
+      void loadAlbums()
+    } else {
+      await load()
+    }
+    return
+  }
+  if (tab.value === 'cinema') {
+    if (activeCinemaAlbum.value) {
+      await openCinemaAlbum(activeCinemaAlbum.value)
+      void loadCinemaAlbums()
+    } else {
+      await load()
+    }
+    return
+  }
+  await load()
+}
+
+async function onOpsDone(_payload: FileOpDone) {
+  await refreshAfterOps()
 }
 
 /** 图床直链：永久、无口令的 raw 分享地址（与文件管理里的同名动作一致） */
@@ -782,6 +1040,8 @@ function onKey(event: KeyboardEvent) {
     if (event.key === 'Escape') playing.value = null
     return
   }
+  // 菜单与变更弹窗自己收 Esc：这一下只该关最上面那层，不能顺手把相册也退了
+  if (event.key === 'Escape' && (mediaMenu.value || folderMenu.value || ops.value?.isOpen)) return
   // 相册详情里按 Esc 退回相册列表（对齐 v2.9）；灯箱会先消费掉 Esc 并 preventDefault，
   // 这里判 defaultPrevented，避免一次 Esc 连退两层
   if (event.key === 'Escape' && !event.defaultPrevented && activeAlbum.value) {
@@ -900,6 +1160,11 @@ onMounted(() => {
   observeSentinel(sentinel.value)
   void load()
   void loadLibraryState()
+  // 挂载点清单只为「只读挂载点要把变更项置灰」服务，拉失败不影响浏览
+  void filesApi
+    .mounts()
+    .then((data) => (mounts.value = data.mounts))
+    .catch(() => {})
 })
 
 // 切换视图会换掉 sentinel 元素（v-if 分支互斥），这里跟着重新 observe
@@ -1206,7 +1471,12 @@ useEventListener(window, 'keydown', onKey)
             class="group text-left"
             :data-album="album.name"
             :title="albumLabel(album)"
-            @click="openAlbum(album)"
+            @click="openAlbumCard(album)"
+            @contextmenu.prevent="openFolderMenu($event, album, 'photos')"
+            @touchstart.passive="folderPress.start($event, { album, context: 'photos' })"
+            @touchmove.passive="folderPress.move"
+            @touchend="folderPress.cancel"
+            @touchcancel="folderPress.cancel"
           >
             <div
               class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line"
@@ -1433,7 +1703,12 @@ useEventListener(window, 'keydown', onKey)
             class="group text-left"
             :data-cinema-album="album.name"
             :title="cinemaAlbumLabel(album)"
-            @click="openCinemaAlbum(album)"
+            @click="openCinemaCard(album)"
+            @contextmenu.prevent="openFolderMenu($event, album, 'cinema')"
+            @touchstart.passive="folderPress.start($event, { album, context: 'cinema' })"
+            @touchmove.passive="folderPress.move"
+            @touchend="folderPress.cancel"
+            @touchcancel="folderPress.cancel"
           >
             <div
               class="relative aspect-video overflow-hidden rounded-xl border border-line"
@@ -1545,7 +1820,12 @@ useEventListener(window, 'keydown', onKey)
             <template v-for="group in audioGroups" :key="group.key">
               <!-- 分组标题：多个文件夹时按文件夹分区（v3.5.5） -->
               <tr v-if="audioGroups.length > 1">
-                <td colspan="4" class="border-b border-line/60 px-2 pb-1.5 pt-4 md:px-3">
+                <td
+                  colspan="4"
+                  class="border-b border-line/60 px-2 pb-1.5 pt-4 md:px-3"
+                  :title="t('gallery.music.folderHint')"
+                  @contextmenu.prevent="openMusicGroupMenu($event, group)"
+                >
                   <span class="text-sm font-semibold text-ink">{{ group.label }}</span>
                   <span class="ml-2 text-xs text-muted">{{ group.items.length }}</span>
                 </td>
@@ -1689,6 +1969,26 @@ useEventListener(window, 'keydown', onKey)
       :title="mediaMenu?.item.name"
       @select="onMediaMenuSelect"
       @close="mediaMenu = null"
+    />
+
+    <!-- 文件夹右键菜单：相册 / 影视文件夹 / 音乐分区标题（同一个 ContextMenu 组件） -->
+    <ContextMenu
+      :open="!!folderMenu"
+      :x="folderMenu?.x ?? 0"
+      :y="folderMenu?.y ?? 0"
+      :items="folderMenuItems"
+      :title="folderMenu ? folderMenu.album.name : undefined"
+      @select="onFolderMenuSelect"
+      @close="folderMenu = null"
+    />
+
+    <!-- 变更弹窗（重命名 / 移动复制 / 删除 / 属性）：与文件管理共用同一个实现 -->
+    <FileOpsDialogs
+      ref="ops"
+      :start-dir="opsStartDir"
+      :roots="mounts"
+      @done="onOpsDone"
+      @toast="showToast"
     />
 
     <!-- 轻提示（坏文件 / 不支持格式） -->

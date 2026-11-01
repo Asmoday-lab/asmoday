@@ -1598,6 +1598,20 @@ GWT-UX-23 Given 多挂载点根目录  When 点「返回上级」  Then 回到�
 GWT-UX-24 Given 路径条  Then 当前目录是 span（不可点，点它只是原地刷新）、祖先段可点回退、分隔符是 `/`；顶栏不再出现「Home > 文件管理」
 GWT-UX-25 Given 1024px 窗口  Then 路径完整显示（搜索框 160px、排序只留图标），导航区宽度 ≥ 260px、动作区 ≤ 480px
 GWT-UX-26 Given 390px 窄屏  Then 导航在上、动作在下（两行不重叠），动作行内「新建/上传」带文字且不横向溢出（scrollWidth == 390）
+GWT-UX-27 Given 照片库相册卡片 / 影视文件夹卡片 / 音乐库分区标题  When 右键（触屏长按）  Then 菜单含打开目录、下载、重命名、移动到、复制到、属性、删除；长按后不会顺带进册
+GWT-UX-28 Given 媒体库里的一张照片/一个视频/一首歌  Then 右键菜单在原有播放/下载/分享/收藏之外，必须含重命名…/移动到…/复制到…/属性/删除…
+GWT-UX-29 Given 库根（is_root，即挂载点本身）  Then 打开与复制可用；重命名/移动/删除置灰并给出「库根不能改」的原因
+GWT-UX-30 Given 只读挂载点  Then 媒体库菜单里的重命名/移动/复制/删除全部置灰，提示「该挂载点为只读，变更操作已禁用」
+GWT-UX-31 Given 在册内改名或删除一项  When 操作完成  Then 停留在该册并重拉册内一屏（不回到相册墙），相册清单数量同步
+GWT-UX-32 Given 任一变更弹窗打开  When 按 Esc  Then 只关掉最上面那层（相册不会被一起退掉），再按一次才退层
+```
+
+#### GWT 验收（日志时间口径）
+
+```gwt
+GWT-LOG-01 Given [log] format = "text"（默认）  When 任意一行写入控制台或 data/logs/asmoday.log  Then 行首是服务器本地时间 `YYYY-MM-DD HH:MM:SS`（跟随操作系统时区，不是 UTC，可对照 `date` 验证）
+GWT-LOG-02 Given [log] format = "json"  Then 每行 `ts` 是带时区偏移的 RFC 3339（如 `2026-11-01T20:49:35+08:00`），机器解析不丢时区
+GWT-LOG-03 Given 同一个事件  Then 控制台、主文件、错误文件三处用的是同一时刻同一时区口径（不会出现一处 UTC 一处本地）
 ```
 
 ---

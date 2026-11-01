@@ -11,7 +11,9 @@
 //! - 只有 `DEBUG` 级别的日志才附带源代码 `文件名:行号`（`log_debug!` 宏展开），
 //!   INFO 及以上不掺开发期信息。
 //! - `format = "text"`（默认，人读）| `"json"`（机器解析，每行一个 JSON 对象）。
-//! - 文件日志强制 UTC（RFC 3339）且无颜色代码；控制台用本地时间、TTY 下带颜色。
+//! - 时间一律用**服务器本地时间**（即操作系统时区，不是 UTC）：文本形如
+//!   `2026-10-17 09:38:58`，控制台与文件同构；JSON 的 `ts` 用带偏移的 RFC 3339
+//!   （`2026-10-17T09:38:58+08:00`），机器解析不会丢时区。文件日志无颜色代码。
 //! - 轮转：单文件 10 MiB × 5 备份，两个文件 sink 各自独立轮转。
 //! - **消息一律英文**：跨平台无乱码、便于检索；用户数据（路径/文件名）原样保留。
 //!
@@ -269,7 +271,7 @@ fn render_console_text(
     format!("{ts} [{tag}] [{pid}] {module}: {message}{suffix}\n")
 }
 
-/// 文件文本行（UTC RFC 3339，无颜色）
+/// 文件文本行（服务器本地时间，无颜色）
 fn render_file_text(
     level: Level,
     module: &str,
@@ -285,7 +287,7 @@ fn render_file_text(
     )
 }
 
-/// JSON 行（结构化输出；ts 由调用方决定本地 / UTC 口径）
+/// JSON 行（结构化输出；`ts` 是带偏移的本地时间，机器解析不丢时区）
 fn render_json(
     level: Level,
     module: &str,
@@ -314,14 +316,19 @@ fn emit(level: Level, module: &str, source: Option<&str>, message: &str) {
     let now = SystemTime::now();
     let settings = settings();
     let color = COLOR.load(Ordering::Relaxed) && !settings.json;
+    // 三个通道共用同一时刻、同一时区口径：文本 `2026-10-17 09:38:58`（服务器本地时间），
+    // JSON 用带偏移的 RFC 3339 —— 机器解析仍然知道这是哪个时区。
+    let offset = local_offset();
+    let text_ts = format_local(now, offset);
+    let json_ts = iso8601_local(now, offset);
+    let ts = |json: bool| if json { &json_ts } else { &text_ts };
 
     // 控制台：本地时间；WARN/ERROR 走 stderr
     if passes(level, settings.console) {
-        let ts = format_local(now, local_offset());
         let line = if settings.json {
-            render_json(level, module, message, source, &ts, pid)
+            render_json(level, module, message, source, ts(true), pid)
         } else {
-            render_console_text(level, module, message, source, &ts, pid, color)
+            render_console_text(level, module, message, source, ts(false), pid, color)
         };
         if level >= Level::Warn {
             eprint!("{line}");
@@ -330,24 +337,22 @@ fn emit(level: Level, module: &str, source: Option<&str>, message: &str) {
         }
     }
 
-    // 主文件：UTC、无颜色
+    // 主文件：本地时间、无颜色
     if passes(level, settings.file) {
-        let ts = iso8601_millis(now);
         let line = if settings.json {
-            render_json(level, module, message, source, &ts, pid)
+            render_json(level, module, message, source, ts(true), pid)
         } else {
-            render_file_text(level, module, message, source, &ts, pid)
+            render_file_text(level, module, message, source, ts(false), pid)
         };
         write_to(&MAIN_SINK, &line);
     }
 
     // 错误文件：只收 ERROR
     if level == Level::Error {
-        let ts = iso8601_millis(now);
         let line = if settings.json {
-            render_json(level, module, message, source, &ts, pid)
+            render_json(level, module, message, source, ts(true), pid)
         } else {
-            render_file_text(level, module, message, source, &ts, pid)
+            render_file_text(level, module, message, source, ts(false), pid)
         };
         write_to(&ERROR_SINK, &line);
     }
@@ -399,29 +404,33 @@ pub fn error(module: &str, message: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// 时间格式化（不引时间库：只需要到毫秒的 UTC / 本地时间两种形态）
+// 时间格式化（不引时间库：只需要「服务器本地时间」的两种写法）
 // ---------------------------------------------------------------------------
 
-/// 当前时刻的拆分：UTC 秒 + 毫秒
-fn split_now(now: SystemTime) -> (i64, u32) {
+/// 当前时刻的 UTC 秒
+fn unix_secs(now: SystemTime) -> i64 {
     match now.duration_since(UNIX_EPOCH) {
-        Ok(delta) => (delta.as_secs() as i64, delta.subsec_millis()),
-        Err(_) => (0, 0),
+        Ok(delta) => delta.as_secs() as i64,
+        Err(_) => 0,
     }
 }
 
-/// RFC 3339 UTC，带毫秒：`2026-10-27T15:04:05.123Z`
-fn iso8601_millis(now: SystemTime) -> String {
-    let (secs, millis) = split_now(now);
-    let (year, month, day, hour, minute, second) = civil(secs);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+/// 服务器本地时间（人读，与控制台/文件行首一致）：`2026-10-17 09:38:58`
+fn format_local(now: SystemTime, offset_secs: i64) -> String {
+    let (year, month, day, hour, minute, second) = civil(unix_secs(now) + offset_secs);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
 }
 
-/// 服务器本地时间：`2026-10-27 23:04:05.123`
-fn format_local(now: SystemTime, offset_secs: i64) -> String {
-    let (secs, millis) = split_now(now);
-    let (year, month, day, hour, minute, second) = civil(secs + offset_secs);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}")
+/// 服务器本地时间 + 时区偏移（JSON 用，机器解析不丢时区）：
+/// `2026-10-17T09:38:58+08:00`
+fn iso8601_local(now: SystemTime, offset_secs: i64) -> String {
+    let (year, month, day, hour, minute, second) = civil(unix_secs(now) + offset_secs);
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.unsigned_abs();
+    let (off_h, off_m) = (abs / 3600, (abs % 3600) / 60);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{sign}{off_h:02}:{off_m:02}"
+    )
 }
 
 /// Unix 秒 → (年, 月, 日, 时, 分, 秒)，UTC 口径
@@ -453,7 +462,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// 本地时区偏移探测。探不到就按 UTC 输出——只影响控制台可读性，不影响正确性。
+/// 本地时区偏移探测。探不到就按 UTC 输出——只影响日志可读性，不影响正确性。
 #[cfg(unix)]
 mod tz {
     #[repr(C)]
@@ -605,16 +614,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn iso8601_epoch() {
-        assert_eq!(iso8601_millis(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
-    }
-
-    #[test]
-    fn iso8601_leap_day() {
-        // 2024-02-29T12:34:56Z
+    fn iso8601_local_keeps_offset() {
+        // 偏移 0 = UTC，用 `+00:00` 而不是 `Z`：形状统一，机器解析不会因时区写法分叉
+        assert_eq!(iso8601_local(UNIX_EPOCH, 0), "1970-01-01T00:00:00+00:00");
+        // 2024-02-29T12:34:56Z + 08:00 = 本地 20:34:56
         assert_eq!(
-            iso8601_millis(UNIX_EPOCH + std::time::Duration::from_millis(1_709_210_096_789)),
-            "2024-02-29T12:34:56.789Z"
+            iso8601_local(
+                UNIX_EPOCH + std::time::Duration::from_secs(1_709_210_096),
+                8 * 3600
+            ),
+            "2024-02-29T20:34:56+08:00"
+        );
+        // 跨年 + 负偏移：1970-01-01T00:00:00Z - 05:00 = 1969-12-31 19:00:00
+        assert_eq!(
+            iso8601_local(UNIX_EPOCH, -5 * 3600),
+            "1969-12-31T19:00:00-05:00"
         );
     }
 
@@ -622,7 +636,7 @@ mod tests {
     fn local_format_applies_offset() {
         // UTC 00:00 + 8h = 本地 08:00
         let text = format_local(UNIX_EPOCH, 8 * 3600);
-        assert_eq!(text, "1970-01-01 08:00:00.000");
+        assert_eq!(text, "1970-01-01 08:00:00");
     }
 
     #[test]
@@ -656,13 +670,13 @@ mod tests {
             "core::fs_ops",
             "copy done",
             None,
-            "2026-10-28 23:00:00.000",
+            "2026-10-28 23:00:00",
             42,
             false,
         );
         assert_eq!(
             plain,
-            "2026-10-28 23:00:00.000 [INFO] [42] core::fs_ops: copy done\n"
+            "2026-10-28 23:00:00 [INFO] [42] core::fs_ops: copy done\n"
         );
 
         let colored = render_console_text(Level::Error, "a::b", "boom", None, "t", 1, true);
@@ -684,18 +698,18 @@ mod tests {
     }
 
     #[test]
-    fn file_text_is_color_free_and_utc() {
+    fn file_text_is_color_free_and_local() {
         let line = render_file_text(
             Level::Warn,
             "core::config",
             "watching config file",
             None,
-            "2026-10-28T15:00:00.000Z",
+            "2026-10-28 23:00:00",
             7,
         );
         assert_eq!(
             line,
-            "2026-10-28T15:00:00.000Z [WARN] [7] core::config: watching config file\n"
+            "2026-10-28 23:00:00 [WARN] [7] core::config: watching config file\n"
         );
         assert!(!line.contains('\x1b'), "文件日志不得包含颜色代码");
     }
@@ -707,7 +721,7 @@ mod tests {
             "core::config",
             "listening on 0.0.0.0:4242",
             None,
-            "2026-10-28T15:00:00.000Z",
+            "2026-10-28T15:00:00+08:00",
             9,
         );
         let value: serde_json::Value = serde_json::from_str(plain.trim()).unwrap();
