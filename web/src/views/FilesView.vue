@@ -1540,6 +1540,23 @@ async function goHome() {
   if (route.name !== 'files') void router.replace({ name: 'files' })
 }
 
+/**
+ * 「返回上级」：目录内取父目录；已在挂载点根且是多挂载点模式时回卡片页。
+ * 单挂载点模式下根目录没有上一级（文档 3.2.1：单挂载点跳过卡片页），按钮置灰。
+ */
+const canGoUp = computed(() => crumbs.value.length >= 2 || !singleMount.value)
+
+async function goUp() {
+  const list = crumbs.value
+  if (list.length >= 2) {
+    if (editor.value && !(await closeEditor())) return
+    void open(list[list.length - 2].path)
+    return
+  }
+  if (singleMount.value) return
+  await goHome()
+}
+
 async function open(
   path: string,
   pageNo = 1,
@@ -2770,228 +2787,266 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else>
-      <!-- 工具栏 -->
-            <!--
-              窄屏把面包屑折到第二行：一行里塞「操作 + 路径」的结果是路径被压成几个像素，
-              手机上等于无法回退（设计文档 8.6）。宽屏仍然是单行。
-            -->
+            <!-- 工具栏（设计文档 8.6）
+              分成互不重叠的两区：左边「导航」（返回上级 + 路径），右边「动作」（新建 / 上传 /
+              刷新 + 搜索 / 排序 / 视图）。以前全部挤在一行、路径紧贴上传按钮，点路径回退时手
+              一滑就点到上传；现在中间留弹性空隙 + 竖分隔线，窄屏直接拆两行（导航在上、动作
+              在下），触屏也不会跨区误触。 -->
             <header
-              class="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-panel px-2 py-1.5 md:h-11 md:flex-nowrap md:px-3 md:py-0"
+              class="flex shrink-0 flex-col border-b border-line bg-panel md:h-11 md:flex-row md:items-center md:px-3"
             >
-        <button
-          class="touch-target grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
-          :title="t('files.toolbar.refresh')"
-          data-testid="toolbar-refresh"
-          @click="open(currentPath)"
-        >
-          <AppIcon name="refresh" :size="15" />
-        </button>
+              <!-- 导航区：只放导航，点击目标不再和动作按钮相邻 -->
+              <nav
+                class="order-1 flex min-w-0 items-center gap-1 px-1.5 py-1 md:flex-1 md:px-0 md:py-0 md:pr-3"
+                data-testid="breadcrumb"
+              >
+                <button
+                  class="touch-target grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                  :title="t('files.toolbar.up')"
+                  :disabled="!canGoUp"
+                  data-testid="toolbar-up"
+                  @click="goUp"
+                >
+                  <AppIcon name="arrowLeft" :size="15" />
+                </button>
+                <span class="h-4 w-px shrink-0 bg-line" aria-hidden="true" />
 
-        <!-- 新建（设计文档 3.2 工具栏 / 3.2.6.1） -->
-        <div class="relative shrink-0">
-          <button
-            class="touch-chip flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
-            :disabled="readonly"
-            :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
-            data-testid="new-entry"
-            :aria-expanded="newMenuOpen"
-            @click="newMenuOpen = !newMenuOpen"
-          >
-            <AppIcon name="plus" :size="13" />
-            <span class="hidden sm:inline">{{ t('files.toolbar.new') }}</span>
-          </button>
-          <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
-          <div
-            v-if="newMenuOpen"
-            class="absolute left-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
-          >
-            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
-              <AppIcon name="folder" :size="14" />
-              {{ t('files.toolbar.newFolder') }}
-            </button>
-            <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
-              <AppIcon name="file" :size="14" />
-              {{ t('files.toolbar.newFile') }}
-            </button>
-          </div>
-        </div>
+                <!-- 路径用「/」分段而不是 chevron：与顶栏「页面 > 子页」的层级箭头区分开，
+                     一眼能看出这里是文件路径，不是又一套面包屑 -->
+                <div class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[13px]">
+                  <button
+                    class="grid size-6 shrink-0 place-items-center rounded text-muted transition-colors hover:bg-elevated hover:text-ink"
+                    :title="t('files.toolbar.home')"
+                    data-testid="breadcrumb-home"
+                    @click="goHome"
+                  >
+                    <AppIcon name="home" :size="13" />
+                  </button>
+                  <span class="shrink-0 px-0.5 text-[11px] text-muted opacity-50" aria-hidden="true">/</span>
+                  <template v-for="(crumb, index) in crumbs" :key="crumb.path">
+                    <span
+                      v-if="index > 0"
+                      class="shrink-0 px-0.5 text-[11px] text-muted opacity-50"
+                      aria-hidden="true"
+                      >/</span
+                    >
+                    <!-- 当前目录不可点：以前点它等于原地刷新一次，是最常见的误触 -->
+                    <span
+                      v-if="index === crumbs.length - 1"
+                      class="max-w-[200px] shrink-0 truncate rounded px-1.5 py-1 font-medium text-ink"
+                      :title="crumb.label"
+                      data-testid="breadcrumb-current"
+                      >{{ crumb.label }}</span
+                    >
+                    <button
+                      v-else
+                      class="max-w-[160px] shrink-0 truncate rounded px-1.5 py-1 text-muted transition-colors hover:bg-elevated hover:text-ink"
+                      :title="crumb.label"
+                      @click="open(crumb.path)"
+                    >
+                      {{ crumb.label }}
+                    </button>
+                  </template>
+                </div>
 
-        <button
-          class="touch-chip flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-          :disabled="readonly"
-          :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
-          @click="pickFiles"
-        >
-          <AppIcon name="upload" :size="13" />
-          <span class="hidden sm:inline">{{ t('files.toolbar.upload') }}</span>
-        </button>
-        <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
+                <!-- 只读挂载点：全部变更入口置灰并带 Tooltip（设计文档 8.4 第 7 条） -->
+                <span
+                  v-if="readonly"
+                  class="hidden shrink-0 items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted sm:flex"
+                  :title="t('files.readonly.tooltip')"
+                  data-testid="readonly-badge"
+                >
+                  <AppIcon name="lock" :size="10" />
+                  {{ t('files.readonly.badge') }}
+                </span>
+              </nav>
 
-        <nav
-          class="order-last flex w-full min-w-0 items-center gap-0.5 overflow-x-auto border-t border-line/50 pt-1 text-[13px] md:order-none md:w-auto md:flex-1 md:border-0 md:pt-0"
-          data-testid="breadcrumb"
-        >
-          <button
-            class="shrink-0 rounded px-1.5 py-1 text-muted transition-colors hover:bg-elevated hover:text-ink"
-            :title="t('files.toolbar.home')"
-            @click="goHome"
-          >
-            <AppIcon name="home" :size="12" />
-          </button>
-          <AppIcon name="chevronRight" :size="11" class="shrink-0 text-muted opacity-50" />
-          <template v-for="(crumb, index) in crumbs" :key="crumb.path">
-            <AppIcon
-              v-if="index > 0"
-              name="chevronRight"
-              :size="11"
-              class="shrink-0 text-muted opacity-50"
-            />
-            <button
-              class="max-w-[160px] shrink-0 truncate rounded px-1.5 py-1 transition-colors hover:bg-elevated"
-              :class="index === crumbs.length - 1 ? 'text-ink' : 'text-muted'"
-              :title="crumb.label"
-              @click="open(crumb.path)"
-            >
-              {{ crumb.label }}
-            </button>
-          </template>
-        </nav>
+              <!-- 动作区：与导航之间隔着竖线与 12px 空白，手滑也点不到 -->
+              <div
+                class="order-2 flex w-full items-center gap-3 overflow-x-auto border-t border-line/60 px-1.5 py-1.5 md:w-auto md:shrink-0 md:gap-4 md:border-t-0 md:border-l md:border-line md:py-0 md:pl-3"
+              >
+                <!-- 目录动作：新建（3.2 工具栏 / 3.2.6.1）、上传、刷新 -->
+                <div class="flex shrink-0 items-center gap-2">
+                  <div class="relative shrink-0">
+                    <button
+                      class="touch-chip flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
+                      :disabled="readonly"
+                      :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
+                      data-testid="new-entry"
+                      :aria-expanded="newMenuOpen"
+                      @click="newMenuOpen = !newMenuOpen"
+                    >
+                      <AppIcon name="plus" :size="13" />
+                      <span class="inline">{{ t('files.toolbar.new') }}</span>
+                    </button>
+                    <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
+                    <div
+                      v-if="newMenuOpen"
+                      class="absolute left-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+                    >
+                      <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
+                        <AppIcon name="folder" :size="14" />
+                        {{ t('files.toolbar.newFolder') }}
+                      </button>
+                      <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
+                        <AppIcon name="file" :size="14" />
+                        {{ t('files.toolbar.newFile') }}
+                      </button>
+                    </div>
+                  </div>
 
-        <!-- 只读挂载点：全部变更入口置灰并带 Tooltip（设计文档 8.4 第 7 条） -->
-        <span
-          v-if="readonly"
-          class="hidden shrink-0 items-center gap-1 rounded bg-elevated px-1.5 py-0.5 text-[11px] text-muted sm:flex"
-          :title="t('files.readonly.tooltip')"
-          data-testid="readonly-badge"
-        >
-          <AppIcon name="lock" :size="10" />
-          {{ t('files.readonly.badge') }}
-        </span>
+                  <button
+                    class="touch-chip flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+                    :disabled="readonly"
+                    :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
+                    data-testid="toolbar-upload"
+                    @click="pickFiles"
+                  >
+                    <AppIcon name="upload" :size="13" />
+                    <span class="inline">{{ t('files.toolbar.upload') }}</span>
+                  </button>
+                  <input ref="fileInput" type="file" multiple class="hidden" @change="onFilesPicked" />
+                </div>
 
-        <div class="relative hidden w-44 shrink-0 sm:block md:w-60">
-          <span class="absolute left-2 top-1/2 -translate-y-1/2 text-muted">
-            <AppIcon name="search" :size="13" />
-          </span>
-          <input
-            v-model="searchTerm"
-            :placeholder="
-              searching
-                ? t('files.toolbar.searching')
-                : recursiveSearch
-                  ? t('files.toolbar.searchPlaceholderDeep')
-                  : t('files.toolbar.searchPlaceholder')
-            "
-            class="w-full rounded-full border border-line bg-elevated py-1 pl-7 text-[12px] text-ink outline-none focus:border-accent"
-            :class="searchTerm ? 'pr-12' : 'pr-7'"
-            @input="scheduleSearch"
-            @keydown.esc="clearSearch"
-          />
-          <!-- 搜索范围开关：贴在输入框里，不额外占工具栏宽度 -->
-          <button
-            v-if="searchTerm"
-            class="absolute right-6 top-1/2 -translate-y-1/2 transition-colors"
-            :class="recursiveSearch ? 'text-accent' : 'text-muted hover:text-ink'"
-            :title="
-              recursiveSearch
-                ? t('files.toolbar.searchScopeAll')
-                : t('files.toolbar.searchScopeDir')
-            "
-            :aria-pressed="recursiveSearch"
-            data-testid="search-scope"
-            @click="toggleRecursiveSearch"
-          >
-            <AppIcon :name="recursiveSearch ? 'folderOpen' : 'folder'" :size="12" />
-          </button>
-          <button
-            v-if="searchTerm"
-            class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
-            :title="t('files.toolbar.clearSearch')"
-            @click="clearSearch"
-          >
-            <AppIcon name="close" :size="12" />
-          </button>
-        </div>
+                <!-- 视图控制：刷新 / 搜索 / 排序 / 隐藏文件 / 网格列表（都不改目录内容，与主操作分开） -->
+                <div class="ml-auto flex shrink-0 items-center gap-1">
+                  <button
+                    class="touch-target grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
+                    :title="t('files.toolbar.refresh')"
+                    data-testid="toolbar-refresh"
+                    @click="open(currentPath)"
+                  >
+                    <AppIcon name="refresh" :size="15" />
+                  </button>
 
-        <!-- 窄屏没有常驻搜索框：一个按钮展开第二行，手机也能搜（设计文档 8.6） -->
-        <button
-          class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors hover:bg-elevated sm:hidden"
-          :class="mobileSearchOpen ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
-          :title="t('files.toolbar.search')"
-          data-testid="mobile-search-toggle"
-          :aria-expanded="mobileSearchOpen"
-          @click="toggleMobileSearch"
-        >
-          <AppIcon name="search" :size="15" />
-        </button>
+                  <div class="relative hidden w-44 shrink-0 sm:block md:w-40 xl:w-60">
+                    <span class="absolute left-2 top-1/2 -translate-y-1/2 text-muted">
+                      <AppIcon name="search" :size="13" />
+                    </span>
+                    <input
+                      v-model="searchTerm"
+                      :placeholder="
+                        searching
+                          ? t('files.toolbar.searching')
+                          : recursiveSearch
+                            ? t('files.toolbar.searchPlaceholderDeep')
+                            : t('files.toolbar.searchPlaceholder')
+                      "
+                      class="w-full rounded-full border border-line bg-elevated py-1 pl-7 text-[12px] text-ink outline-none focus:border-accent"
+                      :class="searchTerm ? 'pr-12' : 'pr-7'"
+                      @input="scheduleSearch"
+                      @keydown.esc="clearSearch"
+                    />
+                    <!-- 搜索范围开关：贴在输入框里，不额外占工具栏宽度 -->
+                    <button
+                      v-if="searchTerm"
+                      class="absolute right-6 top-1/2 -translate-y-1/2 transition-colors"
+                      :class="recursiveSearch ? 'text-accent' : 'text-muted hover:text-ink'"
+                      :title="
+                        recursiveSearch
+                          ? t('files.toolbar.searchScopeAll')
+                          : t('files.toolbar.searchScopeDir')
+                      "
+                      :aria-pressed="recursiveSearch"
+                      data-testid="search-scope"
+                      @click="toggleRecursiveSearch"
+                    >
+                      <AppIcon :name="recursiveSearch ? 'folderOpen' : 'folder'" :size="12" />
+                    </button>
+                    <button
+                      v-if="searchTerm"
+                      class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
+                      :title="t('files.toolbar.clearSearch')"
+                      @click="clearSearch"
+                    >
+                      <AppIcon name="close" :size="12" />
+                    </button>
+                  </div>
 
-        <!-- 排序（设计文档 v2.7.0 3.2.1：名称/修改时间/大小 + 升降序，状态持久化） -->
-        <div class="relative shrink-0">
-          <button
-            class="touch-chip flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
-            :title="t('files.sort.label')"
-            data-testid="sort-menu"
-            :aria-expanded="sortMenuOpen"
-            @click="sortMenuOpen = !sortMenuOpen"
-          >
-            <AppIcon name="sort" :size="13" />
-            <span class="hidden md:inline">{{ sortLabel }}</span>
-          </button>
-          <div v-if="sortMenuOpen" class="fixed inset-0 z-40" @click="sortMenuOpen = false" />
-          <div
-            v-if="sortMenuOpen"
-            class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
-          >
-            <button
-              v-for="option in SORT_OPTIONS"
-              :key="option.key"
-              class="menu-item"
-              :data-sort="option.key"
-              @click="applySort(option.key)"
-            >
-              <AppIcon
-                name="check"
-                :size="14"
-                :class="sortKey === option.key ? 'text-accent' : 'opacity-0'"
-              />
-              {{ t(`files.sort.${option.key}`) }}
-              <span
-                v-if="sortKey === option.key"
-                class="ml-auto text-[11px] text-muted"
-              >{{ sortDir === 'asc' ? '↑' : '↓' }}</span>
-            </button>
-          </div>
-        </div>
+                  <!-- 窄屏没有常驻搜索框：一个按钮展开第二行，手机也能搜（设计文档 8.6） -->
+                  <button
+                    class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors hover:bg-elevated sm:hidden"
+                    :class="mobileSearchOpen ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
+                    :title="t('files.toolbar.search')"
+                    data-testid="mobile-search-toggle"
+                    :aria-expanded="mobileSearchOpen"
+                    @click="toggleMobileSearch"
+                  >
+                    <AppIcon name="search" :size="15" />
+                  </button>
 
-        <button
-          class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors"
-          :class="showHidden ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-elevated hover:text-ink'"
-          :title="showHidden ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden')"
-          data-testid="toggle-hidden"
-          :aria-pressed="showHidden"
-          @click="toggleHidden"
-        >
-          <AppIcon :name="showHidden ? 'eye' : 'eyeOff'" :size="15" />
-        </button>
+                  <!-- 排序（设计文档 v2.7.0 3.2.1：名称/修改时间/大小 + 升降序，状态持久化） -->
+                  <div class="relative shrink-0">
+                    <button
+                      class="touch-chip flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
+                      :title="t('files.sort.label')"
+                      data-testid="sort-menu"
+                      :aria-expanded="sortMenuOpen"
+                      @click="sortMenuOpen = !sortMenuOpen"
+                    >
+                      <AppIcon name="sort" :size="13" />
+                      <span class="hidden xl:inline">{{ sortLabel }}</span>
+                    </button>
+                    <div v-if="sortMenuOpen" class="fixed inset-0 z-40" @click="sortMenuOpen = false" />
+                    <div
+                      v-if="sortMenuOpen"
+                      class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+                    >
+                      <button
+                        v-for="option in SORT_OPTIONS"
+                        :key="option.key"
+                        class="menu-item"
+                        :data-sort="option.key"
+                        @click="applySort(option.key)"
+                      >
+                        <AppIcon
+                          name="check"
+                          :size="14"
+                          :class="sortKey === option.key ? 'text-accent' : 'opacity-0'"
+                        />
+                        {{ t(`files.sort.${option.key}`) }}
+                        <span
+                          v-if="sortKey === option.key"
+                          class="ml-auto text-[11px] text-muted"
+                        >{{ sortDir === 'asc' ? '↑' : '↓' }}</span>
+                      </button>
+                    </div>
+                  </div>
 
-        <div class="flex shrink-0 items-center rounded-md border border-line p-0.5">
-          <button
-            class="grid size-6 place-items-center rounded transition-colors"
-            :class="viewMode === 'grid' ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
-            :title="t('files.toolbar.grid')"
-            @click="setView('grid')"
-          >
-            <AppIcon name="grid" :size="13" />
-          </button>
-          <button
-            class="grid size-6 place-items-center rounded transition-colors"
-            :class="viewMode === 'list' ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
-            :title="t('files.toolbar.list')"
-            @click="setView('list')"
-          >
-            <AppIcon name="rows" :size="13" />
-          </button>
-        </div>
-      </header>
+                  <button
+                    class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors"
+                    :class="showHidden ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-elevated hover:text-ink'"
+                    :title="showHidden ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden')"
+                    data-testid="toggle-hidden"
+                    :aria-pressed="showHidden"
+                    @click="toggleHidden"
+                  >
+                    <AppIcon :name="showHidden ? 'eye' : 'eyeOff'" :size="15" />
+                  </button>
+
+                  <div class="flex shrink-0 items-center rounded-md border border-line p-0.5">
+                    <button
+                      class="grid size-6 place-items-center rounded transition-colors"
+                      :class="viewMode === 'grid' ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
+                      :title="t('files.toolbar.grid')"
+                      data-testid="view-grid"
+                      @click="setView('grid')"
+                    >
+                      <AppIcon name="grid" :size="13" />
+                    </button>
+                    <button
+                      class="grid size-6 place-items-center rounded transition-colors"
+                      :class="viewMode === 'list' ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'"
+                      :title="t('files.toolbar.list')"
+                      data-testid="view-list"
+                      @click="setView('list')"
+                    >
+                      <AppIcon name="rows" :size="13" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </header>
 
       <!-- 窄屏搜索行：与工具栏分两行，输入框才够宽（不抢面包屑的位置） -->
       <div

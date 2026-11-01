@@ -18,6 +18,7 @@
   },
   "toolbar": {
     "refresh": "Refresh",
+    "up": "Go to parent folder",
     "home": "Back to mounts",
     "searchPlaceholder": "Search this folder…",
     "search": "Search",

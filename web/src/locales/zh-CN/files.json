@@ -18,6 +18,7 @@
   },
   "toolbar": {
     "refresh": "刷新",
+    "up": "返回上一级",
     "home": "返回挂载点列表",
     "searchPlaceholder": "搜索当前目录…",
     "search": "搜索",

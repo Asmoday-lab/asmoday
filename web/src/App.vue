@@ -136,9 +136,13 @@ async function logout() {
         </button>
 
         <div class="min-w-0 flex-1">
+          <!-- 自带路径条的页面（文件管理）不再挂「Home > 页面名」：两条 A > B 叠在一起时
+               用户分不清该点哪个（设计文档 8.6），这里只留页面名当标题 -->
           <div class="hidden items-center gap-1.5 text-sm text-muted md:flex">
-            <RouterLink to="/" class="cursor-pointer transition-colors hover:text-ink">Home</RouterLink>
-            <AppIcon name="chevronRight" :size="10" />
+            <template v-if="!route.meta.hideCrumb">
+              <RouterLink to="/" class="cursor-pointer transition-colors hover:text-ink">Home</RouterLink>
+              <AppIcon name="chevronRight" :size="10" />
+            </template>
             <span class="capitalize text-ink">{{ t(String(route.meta.title)) }}</span>
           </div>
           <p class="truncate text-base font-bold capitalize text-ink md:hidden">

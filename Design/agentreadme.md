@@ -1593,6 +1593,11 @@ GWT-UX-18 Given 任意密码框（初始化/登录/强制改密/设置/分享提
 GWT-UX-19 Given 密码框已聚焦  When 点「显示密码」  Then type 在 password/text 间切换、图标与 aria-label 同步，input 不失焦（移动端小键盘不收起）
 GWT-UX-20 Given 浏览器自带的 reveal（Edge `::-ms-reveal` / Chromium 装饰按钮）  Then 一律隐藏，页面上只有自建的那一个眼睛（不会出现双图标）
 GWT-UX-21 Given 密码框在 <form> 内  When 点「显示密码」  Then 不触发提交（按钮必须 type="button"）
+GWT-UX-22 Given 文件页任意目录  Then 工具栏左区只有「返回上级 + 路径」、右区是动作按钮，两区之间有竖分隔线且路径与上传不相邻（gap ≥ 12px）
+GWT-UX-23 Given 多挂载点根目录  When 点「返回上级」  Then 回到挂载点卡片页；单挂载点根目录时该按钮 disabled
+GWT-UX-24 Given 路径条  Then 当前目录是 span（不可点，点它只是原地刷新）、祖先段可点回退、分隔符是 `/`；顶栏不再出现「Home > 文件管理」
+GWT-UX-25 Given 1024px 窗口  Then 路径完整显示（搜索框 160px、排序只留图标），导航区宽度 ≥ 260px、动作区 ≤ 480px
+GWT-UX-26 Given 390px 窄屏  Then 导航在上、动作在下（两行不重叠），动作行内「新建/上传」带文字且不横向溢出（scrollWidth == 390）
 ```
 
 ---

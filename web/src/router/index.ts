@@ -16,6 +16,13 @@ declare module 'vue-router' {
     public?: boolean
     /** GalleryView 复用时的媒体分区 */
     mediaTab?: 'photos' | 'cinema' | 'music'
+    /**
+     * 顶栏不渲染「Home > 页面名」的层级前缀。
+     *
+     * 文件管理自己有一条完整的路径条；两个 `A > B` 叠在一起（Home > 文件管理 / 🏠 > home > storage）
+     * 会让用户分不清哪个能点、点哪个（设计文档 8.6）。这类「自带路径」的页面只保留页面名。
+     */
+    hideCrumb?: boolean
   }
 }
 
@@ -42,14 +49,24 @@ const routes: RouteRecordRaw[] = [
     path: '/files',
     name: 'files',
     component: () => import('../views/FilesView.vue'),
-    meta: { title: 'common.nav.files', icon: 'folder', subtitle: 'common.subtitle.files' },
+    meta: {
+      title: 'common.nav.files',
+      icon: 'folder',
+      subtitle: 'common.subtitle.files',
+      hideCrumb: true,
+    },
   },
   {
     // 单挂载点必须 router.replace 到这里（设计文档 3.2.1），深链接形如 /files/<id>/a/b
     path: '/files/:mountId/:pathMatch(.*)*',
     name: 'files-mount',
     component: () => import('../views/FilesView.vue'),
-    meta: { title: 'common.nav.files', icon: 'folder', subtitle: 'common.subtitle.files' },
+    meta: {
+      title: 'common.nav.files',
+      icon: 'folder',
+      subtitle: 'common.subtitle.files',
+      hideCrumb: true,
+    },
   },
   {
     path: '/photos',
