@@ -32,8 +32,6 @@ export const usePlayerStore = defineStore('player', () => {
   const mode = useStorage<PlayMode>('asmoday.player.mode', 'loop')
   const currentTime = ref(0)
   const duration = ref(0)
-  /** 展开歌词面板 */
-  const expanded = ref(false)
   const lyrics = ref<LyricLine[] | null>(null)
   const lyricError = ref('')
   /** 播放条形态跨会话保留（v4.4.12） */
@@ -128,7 +126,6 @@ export const usePlayerStore = defineStore('player', () => {
     duration.value = 0
     lyrics.value = null
     lyricError.value = ''
-    expanded.value = false
   }
 
   function setMode(value: PlayMode) {
@@ -138,18 +135,6 @@ export const usePlayerStore = defineStore('player', () => {
 
   function setBarStyle(value: BarStyle) {
     barStyle.value = value
-    // 换形态时收起浮层面板，避免旧位置的歌词/列表悬空
-    expanded.value = false
-  }
-
-  function seek(time: number) {
-    currentTime.value = time
-    return time
-  }
-
-  function stop() {
-    playing.value = false
-    expanded.value = false
   }
 
   /** 是否正在播放某个路径（播放列表高亮用） */
@@ -164,7 +149,6 @@ export const usePlayerStore = defineStore('player', () => {
     mode,
     currentTime,
     duration,
-    expanded,
     lyrics,
     lyricError,
     barStyle,
@@ -177,8 +161,6 @@ export const usePlayerStore = defineStore('player', () => {
     clearQueue,
     setMode,
     setBarStyle,
-    seek,
-    stop,
     isCurrent,
   }
 })
@@ -204,8 +186,6 @@ export const player = {
   clearQueue: store.clearQueue,
   setMode: store.setMode,
   setBarStyle: store.setBarStyle,
-  seek: store.seek,
-  stop: store.stop,
   isCurrent: store.isCurrent,
 }
 

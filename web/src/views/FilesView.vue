@@ -42,6 +42,8 @@ import { triggerDownload } from '../lib/download'
 import { sharesApi } from '../api/shares'
 import { THUMB_WIDTH, thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
+import { playerClearance } from '../lib/player-layout'
+import { currentTrack, player } from '../stores/player'
 import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
@@ -659,6 +661,15 @@ const newMenuOpen = ref(false)
 const currentPath = ref('')
 const listing = ref<Listing | null>(null)
 const loading = ref(true)
+/**
+ * 播放条让位（v4.6.9）：文件管理是满高应用面，桌面端播放条浮在内容之上，
+ * 布局层不再整块预留高度（否则底栏离开窗口底边）。这里给滚动区补等同的底部空间，
+ * 最后一行才能滚到播放条上方（详见 lib/player-layout.ts）。
+ */
+const clearance = computed(() =>
+  currentTrack.value ? playerClearance(player.state.barStyle) : '',
+)
+
 /**
  * 骨架延后 180ms 再出现（v4.6.8）：目录扫描常常 100ms 内就回来，立刻画骨架只会
  * 「闪一下又换回真内容」；配上会话缓存，重新进入同一个目录时连骨架都不会出现。
@@ -3010,6 +3021,7 @@ onBeforeUnmount(() => {
           :min-width="132"
           :gap="8"
           :ratio="1.42"
+          :class="clearance"
           @bottom="loadMore"
         >
           <template #default="{ item: entry }">
@@ -3123,7 +3135,12 @@ onBeforeUnmount(() => {
               t('files.header.time')
             }}</span>
           </div>
-          <VirtualList :items="displayEntries" :row-height="48" @bottom="loadMore">
+          <VirtualList
+            :items="displayEntries"
+            :row-height="48"
+            :class="clearance"
+            @bottom="loadMore"
+          >
           <template #default="{ item: entry }">
             <div
               class="entry-tile flex h-full cursor-default items-center gap-2 border-t border-line/60 px-3 text-[13px] transition-colors hover:bg-elevated/60"

@@ -17,6 +17,11 @@ declare module 'vue-router' {
     /** GalleryView 复用时的媒体分区 */
     mediaTab?: 'photos' | 'cinema' | 'music'
     /**
+     * 满高应用面（终端 / 文件管理）：内容自己 `h-full` 且自带底部状态条。
+     * 布局据此判断播放条要不要预留高度 —— 这类页面不能被整块顶起来，否则底栏会离开窗口底边。
+     */
+    fullHeight?: boolean
+    /**
      * 顶栏不渲染「Home > 页面名」的层级前缀。
      *
      * 文件管理自己有一条完整的路径条；两个 `A > B` 叠在一起（Home > 文件管理 / 🏠 > home > storage）
@@ -54,6 +59,7 @@ const routes: RouteRecordRaw[] = [
       icon: 'folder',
       subtitle: 'common.subtitle.files',
       hideCrumb: true,
+      fullHeight: true,
     },
   },
   {
@@ -66,6 +72,7 @@ const routes: RouteRecordRaw[] = [
       icon: 'folder',
       subtitle: 'common.subtitle.files',
       hideCrumb: true,
+      fullHeight: true,
     },
   },
   {
@@ -91,7 +98,12 @@ const routes: RouteRecordRaw[] = [
     path: '/terminal',
     name: 'terminal',
     component: () => import('../views/TerminalView.vue'),
-    meta: { title: 'common.nav.terminal', icon: 'terminal', subtitle: 'common.subtitle.terminal' },
+    meta: {
+      title: 'common.nav.terminal',
+      icon: 'terminal',
+      subtitle: 'common.subtitle.terminal',
+      fullHeight: true,
+    },
   },
   {
     path: '/shares',

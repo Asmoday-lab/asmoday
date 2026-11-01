@@ -104,6 +104,31 @@ async function logout() {
     await router.replace('/login')
   }
 }
+
+/**
+ * 满高应用面（终端 / 文件管理）：自带底部状态条，靠 `h-full` 吃满剩余高度。
+ * 它们和普通文档页的区别在于「底部那条状态条必须贴住窗口底边」，
+ * 见下面的 playerSpace。
+ */
+const fullHeightSurface = computed(() => route.meta.fullHeight === true)
+
+/**
+ * 播放条占位（v4.6.9）。
+ *
+ * 只有「铺满底部的经典条」在窄屏才真的需要内容让出高度 —— 它是 dock，不让位就压住内容。
+ * lg 起经典条变成居中悬浮卡片、极简形态一直是右下角角标，两者都浮在内容之上：
+ * 此时再按整条高度预留，终端/文件管理会被整块顶起来（底栏离开窗口底边），
+ * 这就是用户反馈的「底部信息上浮」。所以满高应用面在 lg 断点一律不预留，
+ * 普通文档页仍然保留 —— 否则滚动到末尾时最后一行会被悬浮卡片压住。
+ */
+const playerSpace = computed(() => {
+  if (!currentTrack.value) return ''
+  const docked = player.state.barStyle === 'classic'
+  if (fullHeightSurface.value) {
+    return docked ? 'pb-[calc(5rem+env(safe-area-inset-bottom,0px))] lg:pb-0' : 'pb-24 lg:pb-0'
+  }
+  return docked ? 'pb-[calc(5rem+env(safe-area-inset-bottom,0px))] lg:pb-[132px]' : 'pb-24'
+})
 </script>
 
 <template>
@@ -205,17 +230,7 @@ async function logout() {
         </div>
       </header>
 
-      <div
-        id="app-scroll"
-        class="min-h-0 flex-1 overflow-y-auto"
-        :class="
-          currentTrack
-            ? player.state.barStyle === 'minimal'
-              ? 'pb-24'
-              : 'pb-[calc(5rem+env(safe-area-inset-bottom,0px))] lg:pb-[132px]'
-            : ''
-        "
-      >
+      <div id="app-scroll" class="min-h-0 flex-1 overflow-y-auto" :class="playerSpace">
         <!-- 一次性密码会话：后端只放行改密接口，这里也别把主界面挂起来，
              否则底层页面会连着发一堆 403 请求，弹一堆错误 toast -->
         <RouterView v-if="!mustChangePassword" v-slot="{ Component }">

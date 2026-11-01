@@ -10,9 +10,11 @@
  * - 播放键 44px、accent 底 + 柔和外发光，前后切歌 36px；
  * - 模式键改成描边胶囊，非列表循环时高亮；
  * - 极简形态改为右下角黑胶唱片：播放时旋转，hover 展开成胶囊面板。
+ *
+ * 播放条是**浮层**：它不参与布局（`#app-scroll` 的让位只在窄屏经典条下生效，见 App.vue
+ * 的 playerSpace），所以这里所有形态都用 fixed 定位，关掉就彻底从视觉上消失。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useStorage } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
@@ -59,8 +61,6 @@ function onMiniPointerOut(event: MouseEvent) {
   miniHover.value = false
   scheduleMiniVolClose()
 }
-/** 锁定常驻：锁上后关闭键置灰，避免误关（参考稿的 .window-btn.pinned） */
-const pinned = useStorage('asmoday.player.pinned', false)
 const lyricBox = ref<HTMLElement | null>(null)
 const seeking = ref(false)
 /** 内嵌封面加载失败时退回图标占位（老文件常常标注了 APIC 但数据是坏的） */
@@ -124,7 +124,6 @@ function cycleMode() {
 }
 
 function closePlayer() {
-  if (pinned.value) return // 锁定常驻时关闭键不可用，先解锁
   listOpen.value = false
   expanded.value = false
   miniOpen.value = false
@@ -351,10 +350,6 @@ function onSeekCommit() {
   seeking.value = false
 }
 
-function onError() {
-  player.state.lyricError = ''
-}
-
 /** 当前应高亮的歌词行 */
 const activeLyric = computed(() => {
   const lines = player.state.lyrics
@@ -570,35 +565,16 @@ onBeforeUnmount(() => {
         data-testid="music-bar"
       >
         <!--
-          右上角外侧窗口键（参考稿 .window-ctrl，**两个键**）：锁定常驻 / 关闭。
-          浮在条外 -14px，hover 整条、键盘聚焦或触屏（无 hover）时常显。
-          锁定后关闭键置灰不可点，避免误关；条内不再挤这两个灰按钮。
+          右上角外侧窗口键（参考稿 .window-ctrl，只留关闭）：浮在条外 -14px，
+          hover 整条、键盘聚焦或触屏（无 hover）时常显。
+          锁常驻是无效功能（条本来就是常驻浮层，锁上只是让关闭键失灵），已删除。
         -->
         <div
           class="absolute -top-3.5 right-3 z-20 flex gap-1.5 opacity-0 transition-opacity duration-200 group-hover/bar:opacity-100 focus-within:opacity-100 lg:right-5 [@media(hover:none)]:opacity-100"
         >
           <button
-            class="grid size-6 place-items-center rounded-full border bg-panel shadow-sm transition-all hover:scale-110"
-            :class="
-              pinned
-                ? 'border-accent bg-accent/10 text-accent'
-                : 'border-line text-muted hover:border-transparent hover:bg-accent hover:text-white'
-            "
-            :title="pinned ? t('gallery.player.unpin') : t('gallery.player.pin')"
-            data-testid="music-bar-pin"
-            @click="pinned = !pinned"
-          >
-            <AppIcon :name="pinned ? 'lock' : 'unlock'" :size="12" />
-          </button>
-          <button
-            class="grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all"
-            :class="
-              pinned
-                ? 'cursor-not-allowed opacity-40'
-                : 'hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white'
-            "
-            :title="pinned ? t('gallery.player.pinnedHint') : t('gallery.player.close')"
-            :disabled="pinned"
+            class="grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white"
+            :title="t('gallery.player.close')"
             data-testid="music-bar-close"
             @click="closePlayer"
           >
@@ -821,14 +797,9 @@ onBeforeUnmount(() => {
       @mouseout="onMiniPointerOut"
     >
       <button
-        class="pointer-events-auto absolute -top-3.5 right-2 z-20 grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
-        :class="
-          pinned
-            ? 'cursor-not-allowed opacity-40'
-            : ['hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white', miniExpanded ? 'opacity-100' : 'opacity-0']
-        "
-        :title="pinned ? t('gallery.player.pinnedHint') : t('gallery.player.close')"
-        :disabled="pinned"
+        class="pointer-events-auto absolute -top-3.5 right-2 z-20 grid size-6 place-items-center rounded-full border border-line bg-panel text-muted shadow-sm transition-all hover:scale-110 hover:border-transparent hover:bg-red-500/85 hover:text-white focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+        :class="miniExpanded ? 'opacity-100' : 'opacity-0'"
+        :title="t('gallery.player.close')"
         data-testid="music-bar-close"
         @click="closePlayer"
       >
@@ -953,6 +924,10 @@ onBeforeUnmount(() => {
         <!--
           唱片本体（参考稿 .record）：48px 黑胶 —— 深色同心纹路 + conic 高光，
           中心标贴换成封面（保留信息量），正中一枚小轴孔；播放时整盘旋转。
+          纹路用「极淡的一圈亮边压暗底」而不是两种实色交替：实色条纹在 48px 上会
+          按像素格量化，靠近边缘时横向条带会拼出直边，看起来就不像一个圆（v4.6.9），
+          再配 `overflow-hidden` 与 1px 描边把轮廓钉死；高光的 conic 首尾取同一个值，
+          否则 0deg 处会留一道竖直接缝，正圆上多一条直线。
         -->
         <button
           type="button"
@@ -961,17 +936,17 @@ onBeforeUnmount(() => {
           @click="onDiscClick"
         >
           <span
-            class="music-disc relative block size-12 rounded-full"
+            class="music-disc relative block size-12 overflow-hidden rounded-full bg-[#0d0d13] ring-1 ring-white/15"
             :class="{ 'is-playing': player.state.playing }"
-            style="box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07), 0 5px 14px rgba(0, 0, 0, 0.45)"
+            style="box-shadow: 0 5px 14px rgba(0, 0, 0, 0.45)"
           >
             <span
               class="absolute inset-0 rounded-full"
-              style="background: repeating-radial-gradient(circle at 50%, #2a2a34 0 1.5px, #14141a 1.5px 3px)"
+              style="background: repeating-radial-gradient(circle at 50%, rgba(255, 255, 255, 0.07) 0 1px, rgba(255, 255, 255, 0) 1px 3.2px)"
             />
             <span
               class="absolute inset-0 rounded-full"
-              style="background: conic-gradient(from 0deg, rgba(255, 255, 255, 0.14), transparent 22%, transparent 78%, rgba(255, 255, 255, 0.06))"
+              style="background: conic-gradient(from 0deg, rgba(255, 255, 255, 0.1), transparent 25%, transparent 75%, rgba(255, 255, 255, 0.1))"
             />
             <span
               class="absolute inset-[30%] overflow-hidden rounded-full bg-accent ring-1 ring-black/50"
@@ -984,7 +959,7 @@ onBeforeUnmount(() => {
                 @error="coverFailed = true"
               />
             </span>
-            <span class="absolute inset-[46%] rounded-full bg-[#0b0b12]" />
+            <span class="absolute inset-[46%] rounded-full bg-[#0d0d13]" />
           </span>
         </button>
       </div>
@@ -1001,6 +976,5 @@ onBeforeUnmount(() => {
     @timeupdate="onTimeUpdate"
     @loadedmetadata="onLoaded"
     @ended="onEnded"
-    @error="onError"
   />
 </template>

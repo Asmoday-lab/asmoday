@@ -14,6 +14,8 @@ import TerminalPane from '../components/TerminalPane.vue'
 import { listTerminalSessions, killTerminalSession, type TerminalSession } from '../api/terminal'
 import { useKeyboardInset } from '../composables/useKeyboardInset'
 import { useTerminalStore, saveSafeModeDefault, type TerminalStatus } from '../stores/terminal'
+import { currentTrack, player } from '../stores/player'
+import { playerClearance } from '../lib/player-layout'
 
 // Pinia store 直接解构会丢响应性：状态用 storeToRefs 转回 ref（保持 .value 用法），
 // 方法本身已绑定 store，可以正常解构。
@@ -36,6 +38,14 @@ const shell = ref<HTMLElement | null>(null)
 const keyboardInset = useKeyboardInset(shell)
 const shellStyle = computed(() =>
   keyboardInset.value > 0 ? { paddingBottom: `${keyboardInset.value}px` } : undefined,
+)
+
+/**
+ * 播放条让位（v4.6.9）：桌面端播放条是浮层，不占布局；让位的责任交给终端区自己，
+ * 底部的状态条才能一直贴在窗口底边（详见 lib/player-layout.ts）。
+ */
+const clearance = computed(() =>
+  currentTrack.value ? playerClearance(player.state.barStyle) : '',
 )
 
 const panes = new Map<string, InstanceType<typeof TerminalPane>>()
@@ -370,6 +380,7 @@ const statusTone: Record<TerminalStatus, string> = {
         v-show="tab.id === activeId"
         :key="tab.id"
         class="absolute inset-0 p-2 md:p-3"
+        :class="clearance"
       >
         <!-- 浅色主题下的「画中画」缓冲：主区域浅色，终端壳圆角 + 阴影（8.4.4 第 2 条） -->
         <div
