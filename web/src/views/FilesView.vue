@@ -71,10 +71,55 @@ function openMenu(event: MouseEvent, entry: EntryInfo) {
   selected.value = entry.path
 }
 
+/**
+ * 空白处右键菜单（设计文档 3.2.5）：作用对象是**当前目录**，不是某个条目。
+ *
+ * 「在哪儿点就往哪儿建」——新建/上传/粘贴/开终端放在这里比回工具栏找按钮自然得多。
+ * 条目自己的右键由 `openMenu` 收，两边靠 `[data-entry]` 区分：条目的 handler 没有
+ * `stopPropagation`，冒泡到容器时这一下必须认出来并放行，否则会弹出两层菜单。
+ */
+const blankMenu = ref<{ x: number; y: number } | null>(null)
+
+function openBlankMenu(event: MouseEvent) {
+  const el = event.target as HTMLElement | null
+  if (el?.closest('[data-entry]')) return
+  // 不清高亮会让人以为「接下来操作的是那一行」
+  selected.value = null
+  blankMenu.value = { x: event.clientX, y: event.clientY }
+}
+
+/** 手机端底部面板的标题：说清「这些新东西建在哪个目录里」 */
+const blankTitle = computed(() => {
+  const path = currentPath.value.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (!path) return undefined
+  // 挂载点根用配置里的名字（用户认的是「Media」，不是路径末段的 media）
+  const mount = mountForPath(path)
+  if (mount && mount.path.replace(/\\/g, '/').replace(/\/+$/, '') === path) return mount.name
+  return path.split('/').pop() || path
+})
+
+/**
+ * 跳到系统终端并带上目录（条目右键与空白右键共用）。
+ *
+ * 顺序很关键：**先导航、后关菜单**。关菜单会让 useBackClose 的 `disarm()` 用 `history.back()`
+ * 退掉浮层哨兵；若此时目标页还在加载（终端是懒加载 chunk），这条 back 会把 in-flight 的
+ * 导航取消掉（vue-router 回 `NavigationFailure=cancelled`），表现就是「点了没反应、URL 原地不动」。
+ * 等导航落地再关：那时历史里已不是哨兵记录，`disarm()` 会自己放弃退栈。
+ *
+ * 失败也不能静默：`void router.push()` 的 rejection 谁都不看，这里兜一条 toast 把原因说出来。
+ */
+function openTerminalAt(path: string) {
+  void router
+    .push({ path: '/terminal', query: { path } })
+    .catch((err: unknown) => showToast(err instanceof Error ? err.message : String(err)))
+    .finally(() => {
+      menu.value = null
+      blankMenu.value = null
+    })
+}
+
 function openTerminal(entry: EntryInfo) {
-  const target = entry.is_dir ? entry.path : entry.path.replace(/\/[^/]*$/, '')
-  menu.value = null
-  router.push({ path: '/terminal', query: { path: target } })
+  openTerminalAt(entry.is_dir ? entry.path : entry.path.replace(/\/[^/]*$/, ''))
 }
 
 /** 下载一个条目：目录走流式 zip，文件走 `?download=1`（服务端补 attachment） */
@@ -92,9 +137,9 @@ function menuOpenEntry() {
   if (entry) void activate(entry)
 }
 
+/** 关菜单的动作由 openTerminalAt 在导航落地后统一做（见那里的注释） */
 function menuOpenTerminal() {
   const entry = menu.value?.entry
-  menu.value = null
   if (entry) openTerminal(entry)
 }
 
@@ -226,6 +271,105 @@ function onMenuSelect(id: string) {
       break
     default:
       menu.value = null
+  }
+}
+
+/**
+ * 空白处（当前目录）的右键菜单。
+ *
+ * 只读挂载点：新建/上传/粘贴一律置灰并带原因——和工具栏同一条红线，不靠后端 403 兜。
+ * 粘贴只在内部剪贴板非空时出现（没东西可粘就别摆一个永远点不动的项）。
+ */
+const blankMenuItems = computed<ContextMenuItem[]>(() => {
+  if (!blankMenu.value) return []
+  const hint = t('files.readonly.tooltip')
+  const clip = clipboard.value
+  const items: ContextMenuItem[] = [
+    {
+      id: 'newDir',
+      label: t('files.blankMenu.newDir'),
+      icon: 'folder',
+      disabled: readonly.value,
+      hint,
+    },
+    {
+      id: 'newFile',
+      label: t('files.blankMenu.newFile'),
+      icon: 'file',
+      disabled: readonly.value,
+      hint,
+    },
+    {
+      id: 'upload',
+      label: t('files.blankMenu.upload'),
+      icon: 'upload',
+      disabled: readonly.value,
+      hint,
+    },
+  ]
+  if (clip) {
+    items.push({
+      id: 'paste',
+      label: t('files.blankMenu.paste', { count: clip.entries.length }),
+      icon: 'copy',
+      divider: true,
+      disabled: readonly.value,
+      hint,
+    })
+  }
+  // 终端永远可用：只读挂载点进去也只能看，但「看」本身就是需求
+  items.push({
+    id: 'terminal',
+    label: t('files.menu.terminal'),
+    icon: 'terminal',
+    divider: true,
+  })
+  items.push({ id: 'refresh', label: t('files.toolbar.refresh'), icon: 'refresh' })
+  items.push({
+    id: 'hidden',
+    label: showHidden.value ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden'),
+    icon: showHidden.value ? 'eyeOff' : 'eye',
+    divider: true,
+  })
+  if (displayEntries.value.length) {
+    items.push({ id: 'selectAll', label: t('files.select.all'), icon: 'check' })
+  }
+  return items
+})
+
+function onBlankMenuSelect(id: string) {
+  // 终端例外：它要等导航落地再关菜单，提前关会把这次导航自己取消掉
+  if (id !== 'terminal') blankMenu.value = null
+  switch (id) {
+    case 'newDir':
+      openCreateDialog('dir')
+      break
+    case 'newFile':
+      openCreateDialog('file')
+      break
+    case 'upload':
+      pickFiles()
+      break
+    case 'paste': {
+      const clip = clipboard.value
+      if (clip) void runTransfer(clip.mode, clip.entries, currentPath.value)
+      break
+    }
+    case 'terminal':
+      openTerminalAt(currentPath.value)
+      break
+    case 'refresh':
+      void open(currentPath.value)
+      break
+    case 'hidden':
+      void toggleHidden()
+      break
+    case 'selectAll':
+      selectMode.value = true
+      selection.value = displayEntries.value.map((entry) => entry.path)
+      break
+    default:
+      break
   }
 }
 
@@ -1700,6 +1844,7 @@ function typingInField(target: EventTarget | null): boolean {
 function anyOverlayOpen(): boolean {
   return Boolean(
     menu.value ||
+      blankMenu.value ||
       createDialog.value ||
       bulkDownloadConfirm.value ||
       ops.value?.isOpen ||
@@ -1717,6 +1862,10 @@ function closeTopLayer(): boolean {
   }
   if (menu.value) {
     menu.value = null
+    return true
+  }
+  if (blankMenu.value) {
+    blankMenu.value = null
     return true
   }
   // 变更弹窗自己按「结果 → 删除 → 重命名 → 移动复制 → 属性」的顺序关
@@ -2689,6 +2838,7 @@ onBeforeUnmount(() => {
         class="relative min-h-0 flex-1 overflow-y-auto"
         :class="selectMode ? 'pb-32 sm:pb-20' : ''"
         data-testid="entry-scroll"
+        @contextmenu.prevent="openBlankMenu"
       >
         <div v-if="loading" class="p-3">
           <div class="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2">
@@ -3056,6 +3206,17 @@ onBeforeUnmount(() => {
       :title="menu?.entry.name"
       @select="onMenuSelect"
       @close="menu = null"
+    />
+
+    <!-- 空白处右键：作用对象是当前目录（新建在哪儿点就在哪儿建） -->
+    <ContextMenu
+      :open="!!blankMenu"
+      :x="blankMenu?.x ?? 0"
+      :y="blankMenu?.y ?? 0"
+      :items="blankMenuItems"
+      :title="blankTitle"
+      @select="onBlankMenuSelect"
+      @close="blankMenu = null"
     />
 
     <!-- 变更弹窗（重命名 / 移动复制 / 删除 / 属性）：与媒体库共用同一个实现 -->

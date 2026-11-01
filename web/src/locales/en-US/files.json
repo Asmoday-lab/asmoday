@@ -42,7 +42,7 @@
     "failed": "Cannot open this folder",
     "backToRoots": "Back to mounts",
     "empty": "This folder is empty",
-    "emptyHint": "Drop files here, or use the Upload button",
+    "emptyHint": "Drop files here or use Upload — right-click the empty area to create a folder, a file, or open a terminal",
     "noResults": "No matching files",
     "noResultsHint": "Try another keyword, or press Esc to clear the search",
     "total": "{count} items",
@@ -94,6 +94,12 @@
     "moveTo": "Move to…",
     "more": "More actions",
     "properties": "Properties"
+  },
+  "blankMenu": {
+    "newDir": "New folder…",
+    "newFile": "New file…",
+    "upload": "Upload files…",
+    "paste": "Paste {count} item(s)"
   },
   "delete": {
     "titleDir": "Delete folder",
@@ -224,7 +230,8 @@
     "delete": "Delete",
     "downloadConfirm": "Pack {count} items into one ZIP",
     "downloadHint": "Folders are packed with everything inside; large selections take a while before the first byte",
-    "toggle": "Select this item"
+    "toggle": "Select this item",
+    "all": "Select all"
   },
   "sort": {
     "label": "Sort",

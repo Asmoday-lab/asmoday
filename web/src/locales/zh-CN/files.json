@@ -42,7 +42,7 @@
     "failed": "无法打开该目录",
     "backToRoots": "回到挂载点列表",
     "empty": "此目录为空",
-    "emptyHint": "把文件拖进来，或点击右上角「上传」",
+    "emptyHint": "把文件拖进来，或用右上角「上传」；在空白处右键可以新建文件夹、文件或打开终端",
     "noResults": "没有匹配的文件",
     "noResultsHint": "换个关键词，或按 Esc 清除搜索",
     "total": "共 {count} 项",
@@ -94,6 +94,12 @@
     "moveTo": "移动到…",
     "more": "更多操作",
     "properties": "属性"
+  },
+  "blankMenu": {
+    "newDir": "新建文件夹…",
+    "newFile": "新建文件…",
+    "upload": "上传文件…",
+    "paste": "粘贴 {count} 项"
   },
   "delete": {
     "titleDir": "删除目录",
@@ -224,7 +230,8 @@
     "delete": "删除",
     "downloadConfirm": "将 {count} 项打包成 ZIP 下载",
     "downloadHint": "目录会连同其中的文件一起打进包里，体积较大时首字节要等一会儿",
-    "toggle": "选择此项"
+    "toggle": "选择此项",
+    "all": "全选"
   },
   "sort": {
     "label": "排序",
