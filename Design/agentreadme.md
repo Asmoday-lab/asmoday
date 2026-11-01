@@ -1589,6 +1589,10 @@ GWT-UX-14 Given 窄屏多选  When 操作栏出现  Then 两行：已选 N 项 +
 GWT-UX-15 Given 触屏  When 渲染工具栏/操作栏  Then 可点区 ≥36px（touch-target/touch-chip）
 GWT-UX-16 Given 触屏长按照片/音乐行 500ms  Then 弹出底部动作面板，且不打开大图、不开始播放、面板不被补发的 click 关掉
 GWT-UX-17 Given 触屏短按照片  Then 正常打开大图（长按的 click 拦截不能误伤普通点击）
+GWT-UX-18 Given 任意密码框（初始化/登录/强制改密/设置/分享提取）  When 未聚焦、为空、失焦  Then 右侧「显示密码」按钮始终可见（40×40）且可点
+GWT-UX-19 Given 密码框已聚焦  When 点「显示密码」  Then type 在 password/text 间切换、图标与 aria-label 同步，input 不失焦（移动端小键盘不收起）
+GWT-UX-20 Given 浏览器自带的 reveal（Edge `::-ms-reveal` / Chromium 装饰按钮）  Then 一律隐藏，页面上只有自建的那一个眼睛（不会出现双图标）
+GWT-UX-21 Given 密码框在 <form> 内  When 点「显示密码」  Then 不触发提交（按钮必须 type="button"）
 ```
 
 ---

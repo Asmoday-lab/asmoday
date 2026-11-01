@@ -13,6 +13,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import { onBeforeRouteLeave } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import AppIcon from '../components/AppIcon.vue'
+import PasswordInput from '../components/PasswordInput.vue'
 import type { IconName } from '../components/icons'
 import { authApi } from '../api/auth'
 import { cacheApi, type CacheStats } from '../api/media'
@@ -902,21 +903,18 @@ onBeforeUnmount(() => {
           <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.security.hint') }}</p>
         </div>
         <div class="grid gap-3 md:grid-cols-3">
-          <input
+          <PasswordInput
             v-model="currentPassword"
-            type="password"
             :placeholder="t('settings.security.current')"
             class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
-          <input
+          <PasswordInput
             v-model="nextPassword"
-            type="password"
             :placeholder="t('settings.security.next')"
             class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
-          <input
+          <PasswordInput
             v-model="confirmPassword"
-            type="password"
             :placeholder="t('settings.security.confirm')"
             class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
@@ -976,9 +974,8 @@ onBeforeUnmount(() => {
         <template v-else>
           <p class="mb-2 text-[12px] text-muted">{{ t('settings.security.recoveryHint') }}</p>
           <div class="flex flex-wrap items-center gap-2">
-            <input
+            <PasswordInput
               v-model="disablePassword"
-              type="password"
               :placeholder="t('settings.security.totpDisablePlaceholder')"
               class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
             />

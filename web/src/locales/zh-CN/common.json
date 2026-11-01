@@ -58,6 +58,10 @@
     "notLoggedIn": "未登录",
     "label": "账号"
   },
+  "password": {
+    "show": "显示密码",
+    "hide": "隐藏密码"
+  },
   "language": {
     "label": "语言",
     "zh-CN": "简体中文",

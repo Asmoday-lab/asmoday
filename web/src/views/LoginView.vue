@@ -6,6 +6,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
+import PasswordInput from '../components/PasswordInput.vue'
 import { authApi } from '../api/auth'
 import { useTheme } from '../composables/useTheme'
 import { SUPPORTED_LOCALES, type Locale } from '../locales'
@@ -138,9 +139,8 @@ function changeLocale(event: Event) {
 
         <label class="block">
           <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
-          <input
+          <PasswordInput
             v-model="password"
-            type="password"
             :autocomplete="isSetup ? 'new-password' : 'current-password'"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             :placeholder="isSetup ? t('auth.login.passwordPlaceholder') : '••••••••'"
@@ -155,9 +155,8 @@ function changeLocale(event: Event) {
 
         <label v-if="isSetup" class="block">
           <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.confirmPassword') }}</span>
-          <input
+          <PasswordInput
             v-model="confirm"
-            type="password"
             autocomplete="new-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             :placeholder="t('auth.login.confirmPlaceholder')"

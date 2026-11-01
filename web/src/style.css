@@ -167,6 +167,27 @@ body,
   font-display: swap;
 }
 
+/* ============================================================
+   关掉浏览器自带的「显示密码」眼睛
+   Edge 的 `::-ms-reveal`、Chromium 内置的装饰按钮都只在**聚焦且非空**时出现，
+   失焦即消失，位置还会被 input 的 padding-right 裁掉 — 用户点它之前先得猜它在不在。
+   统一改成 PasswordInput.vue 里的常驻按钮（始终可见、始终可点）。
+   ============================================================ */
+input[type='password']::-ms-reveal,
+input[type='password']::-ms-clear {
+  display: none;
+}
+input::-webkit-textfield-decoration-container {
+  display: none;
+}
+
+/* 自建眼睛按钮占位：用未分层规则压过 Tailwind 的 px-*（utilities 在 @layer 里）。
+   写成 `.pw-field input` 而不是给 input 加 pr-10，是因为各页面传进来的 class
+   里已经带了 px-3 / px-2，两个 padding-right 谁赢取决于生成顺序，不可靠。 */
+.pw-field input {
+  padding-right: 2.5rem;
+}
+
 body {
   margin: 0;
   background-color: var(--bg-base);

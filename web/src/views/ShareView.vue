@@ -7,6 +7,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
+import PasswordInput from '../components/PasswordInput.vue'
 import { sharesApi, type PublicShareInfo, type ShareEntry } from '../api/shares'
 import { ApiError } from '../lib/errors'
 
@@ -157,13 +158,14 @@ onMounted(() => void boot())
           class="mx-auto mt-4 flex max-w-xs items-center gap-2"
           @submit.prevent="boot(password)"
         >
-          <input
-            v-model="password"
-            type="password"
-            :placeholder="t('shares.public.passwordPlaceholder')"
-            autofocus
-            class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-3 py-2 text-xs outline-none focus:border-accent"
-          />
+          <div class="min-w-0 flex-1">
+            <PasswordInput
+              v-model="password"
+              :placeholder="t('shares.public.passwordPlaceholder')"
+              autofocus
+              class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs outline-none focus:border-accent"
+            />
+          </div>
           <button
             type="submit"
             class="shrink-0 rounded-lg bg-accent px-3 py-2 text-xs font-medium text-white hover:opacity-90"

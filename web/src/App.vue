@@ -11,6 +11,7 @@ import AppIcon from './components/AppIcon.vue'
 import AppSidebar from './components/AppSidebar.vue'
 import MediaLightbox from './components/MediaLightbox.vue'
 import MusicBar from './components/MusicBar.vue'
+import PasswordInput from './components/PasswordInput.vue'
 import ShareDialog from './components/ShareDialog.vue'
 import { currentTrack, player } from './stores/player'
 import { authApi } from './api/auth'
@@ -240,23 +241,20 @@ async function logout() {
         <p class="mt-1 text-xs text-muted">{{ t('auth.forceChange.desc') }}</p>
 
         <div class="mt-4 space-y-2">
-          <input
+          <PasswordInput
             v-model="passwordForm.current"
-            type="password"
             :placeholder="t('auth.forceChange.current')"
             autocomplete="current-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
           />
-          <input
+          <PasswordInput
             v-model="passwordForm.next"
-            type="password"
             :placeholder="t('auth.forceChange.next')"
             autocomplete="new-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
           />
-          <input
+          <PasswordInput
             v-model="passwordForm.confirm"
-            type="password"
             :placeholder="t('auth.forceChange.confirm')"
             autocomplete="new-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"

@@ -58,6 +58,10 @@
     "notLoggedIn": "Not signed in",
     "label": "Account"
   },
+  "password": {
+    "show": "Show password",
+    "hide": "Hide password"
+  },
   "language": {
     "label": "Language",
     "zh-CN": "简体中文",
