@@ -11,7 +11,7 @@
  * - 模式键改成描边胶囊，非列表循环时高亮；
  * - 极简形态改为右下角黑胶唱片：播放时旋转，hover 展开成胶囊面板。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useStorage } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
@@ -325,7 +325,19 @@ function onLoaded() {
 
 function onEnded() {
   if (player.state.mode === 'one') return // loop 属性会自动重放
+  const before = player.state.index
   player.next(false)
+  // 队列里只有这一首：next() 的目标还是自己，path 没变 → 换曲 watcher 不会触发，
+  // 音频停在 ended 状态，界面却还是「播放中」。这里必须自己从头再来一遍。
+  if (player.state.index === before) restartTrack()
+}
+
+/** 原地重播当前曲（队列只剩一首时，列表循环 / 随机都该继续放下去） */
+function restartTrack() {
+  const element = audio.value
+  player.state.currentTime = 0
+  if (element) element.currentTime = 0
+  void syncPlayback()
 }
 
 function onSeekInput(event: Event) {
@@ -365,11 +377,67 @@ watch(activeLyric, () => {
   }
 })
 
+/**
+ * 播放驱动的**唯一**入口（v4.6.8）。
+ *
+ * 以前是「watch(playing) → play()」加「watch(path) → play()」两处各写一遍，且把
+ * play() 的失败一律当成「放不了」写回 `playing = false`。换曲时 `<audio :src>` 的
+ * 更新发生在渲染阶段，而 pre 阶段调用的 play() 打在**旧源**上，紧接着被新源的
+ * load 打断并抛 AbortError —— 于是新歌刚换上来就被记成「播放失败」：
+ * 界面停在暂停键、声音没了，看起来就是「列表循环 / 随机 / 单曲循环都不生效」，
+ * 必须手动点一次悬浮控件的播放键才继续。现在只把 AbortError（换源打断）当成
+ * 「不是失败」：新的源会自己再走一遍 syncPlayback。编码不支持 / 自动播放被拦
+ * 这类真失败照旧把状态改回暂停 —— 让界面和「没有声音」保持一致。
+ */
+let playSeq = 0
+
+async function syncPlayback() {
+  const element = audio.value
+  if (!element) return
+  if (!player.state.playing) {
+    element.pause()
+    return
+  }
+  const seq = ++playSeq
+  try {
+    await element.play()
+  } catch (err) {
+    // 这次尝试已经被更晚的一次操作取代（换曲 / 暂停 / 再次播放）：结果没有意义
+    if (seq !== playSeq) return
+    const name = err instanceof DOMException ? err.name : ''
+    // 换源打断：新音源会自己再走一遍 syncPlayback，这次结果不算失败
+    if (name === 'AbortError') return
+    player.state.playing = false
+  }
+}
+
+watch(
+  () => player.state.playing,
+  () => {
+    void syncPlayback()
+  },
+)
+
+// 换曲：先复位进度与歌词，等 `<audio>` 的 src 真正写进 DOM 之后再播。
+// 不等这一帧，play() 就会打在上一首的音源上（见 syncPlayback 注释）。
+watch(
+  () => currentTrack.value?.path,
+  () => {
+    player.state.currentTime = 0
+    player.state.duration = 0
+    coverFailed.value = false
+    void nextTick().then(syncPlayback)
+  },
+)
+
 // 音量绑定：换元素（首次渲染/切歌重建）时重新挂，卸载时解绑
 let detachVolume: (() => void) | null = null
 watch(audio, (element) => {
   detachVolume?.()
   detachVolume = element ? bindVolume(element) : null
+  // 播放条刚挂上音频元素（首次出条 / 换形态重建）时，把「该播还是该停」补齐：
+  // 这一帧之前 play() 都没有落脚点，watcher 那两次调用会被空元素直接返回
+  if (element) void syncPlayback()
 })
 
 // 在别处（视频播放器、设置）调过音量时，音乐条这边也要跟上
@@ -389,28 +457,6 @@ onBeforeUnmount(() => {
   if (miniVolRaf !== null) window.cancelAnimationFrame(miniVolRaf)
   if (miniVolLeaveTimer !== null) window.clearTimeout(miniVolLeaveTimer)
 })
-
-watch(
-  () => player.state.playing,
-  (playing) => {
-    const element = audio.value
-    if (!element) return
-    if (playing) void element.play().catch(() => (player.state.playing = false))
-    else element.pause()
-  },
-)
-
-// 换曲时 <audio :src> 变化后若处于播放态需要显式 play
-watch(
-  () => currentTrack.value?.path,
-  () => {
-    player.state.currentTime = 0
-    player.state.duration = 0
-    coverFailed.value = false
-    const element = audio.value
-    if (element && player.state.playing) void element.play().catch(() => (player.state.playing = false))
-  },
-)
 </script>
 
 <template>
@@ -951,7 +997,6 @@ watch(
     data-testid="music-bar-audio"
     :src="rawUrl(currentTrack.path)"
     :loop="player.state.mode === 'one'"
-    :autoplay="player.state.playing"
     preload="metadata"
     @timeupdate="onTimeUpdate"
     @loadedmetadata="onLoaded"

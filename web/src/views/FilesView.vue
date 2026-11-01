@@ -46,6 +46,8 @@ import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
 import { useKeyboardInset } from '../composables/useKeyboardInset'
+import { useDeferredLoading } from '../composables/useDeferredLoading'
+import { readCache, writeCache } from '../lib/view-cache'
 import { openLightbox, type LightboxItem } from '../stores/lightbox'
 import { openShare, shareTarget } from '../stores/share'
 
@@ -657,6 +659,13 @@ const newMenuOpen = ref(false)
 const currentPath = ref('')
 const listing = ref<Listing | null>(null)
 const loading = ref(true)
+/**
+ * 骨架延后 180ms 再出现（v4.6.8）：目录扫描常常 100ms 内就回来，立刻画骨架只会
+ * 「闪一下又换回真内容」；配上会话缓存，重新进入同一个目录时连骨架都不会出现。
+ */
+const loadingSkeleton = useDeferredLoading(loading)
+/** 静默刷新中：列表照旧在屏幕上，只有刷新键转过来说明「正在重新读目录」 */
+const refreshing = ref(false)
 const loadingMore = ref(false)
 const error = ref<{ status: number; message: string } | null>(null)
 const selected = ref<string | null>(null)
@@ -1184,12 +1193,100 @@ function describe(err: unknown): { status: number; message: string } {
   return { status: 0, message: err instanceof Error ? err.message : t('common.state.unknownError') }
 }
 
+// ---------------- 会话缓存：进目录先把上一帧贴出来（v4.6.8） ----------------
+//
+// 每次进入页面照旧全量重新拉取（设计文档 3.2.1：禁止拿旧数据当答案），缓存只负责
+// 「第一帧画什么」—— 没有它，任何一次进入都要先闪一下骨架屏。键里带上排序与隐藏
+// 文件开关，换了口径就当成另一个列表，绝不拿排序不符的旧内容冒充。
+interface FilesSnapshot {
+  listing: Listing
+  page: number
+  nextCursor: string | null
+}
+
+interface RootsSnapshot {
+  mounts: MountPoint[]
+  implicit: boolean
+}
+
+const ROOTS_SNAPSHOT_KEY = 'files:roots'
+
+function snapshotKey(mountId: string, segments: string[]): string {
+  const flags = `${sortKey.value}${sortDir.value}${showHidden.value ? 'h' : '-'}`
+  return `files:${mountId}/${segments.join('/')}|${flags}`
+}
+
+/** 当前 URL 里的挂载点与目录段 */
+function routeTarget(): { mountId: string; segments: string[] } {
+  const mountId = typeof route.params.mountId === 'string' ? route.params.mountId : ''
+  const raw = route.params.pathMatch
+  const segments = (Array.isArray(raw) ? raw : raw ? [raw] : []).map(String)
+  return { mountId, segments }
+}
+
+/** 绝对路径对应的缓存键：走「挂载点 → 路由段」，与 URL 完全同一套换算 */
+function pathSnapshotKey(path: string): string {
+  const mount = mountForPath(path)
+  if (!mount) return ''
+  const target = routeFor(mount, path)
+  return snapshotKey(mount.id, (target.params.pathMatch ?? []).map(String))
+}
+
+/** 挂载点清单：面包屑要靠它把绝对路径映射成「根名 + 相对段」，必须跟列表一起贴 */
+function seedRoots() {
+  const snapshot = readCache<RootsSnapshot>(ROOTS_SNAPSHOT_KEY)
+  if (!snapshot) return
+  roots.value = snapshot.mounts
+  rootsImplicit.value = snapshot.implicit
+}
+
+/** 把上一帧目录贴回屏幕；没有缓存就返回 false，调用方照旧进骨架态 */
+function seedListing(mountId: string, segments: string[]): boolean {
+  if (!mountId) return false
+  const snapshot = readCache<FilesSnapshot>(snapshotKey(mountId, segments))
+  if (!snapshot) return false
+  listing.value = snapshot.listing
+  currentPath.value = snapshot.listing.path
+  page.value = snapshot.page
+  nextCursor.value = snapshot.nextCursor
+  loading.value = false
+  return true
+}
+
+function saveListing(data: Listing) {
+  const key = pathSnapshotKey(data.path)
+  if (!key) return
+  writeCache(key, {
+    listing: data,
+    page: data.page,
+    nextCursor: data.next_cursor ?? null,
+  } satisfies FilesSnapshot)
+}
+
 /** 重新加载挂载点，并按 URL 落到对应目录（设计文档 3.2.1 路由强制规范） */
 async function boot() {
-  loading.value = true
+  // 上一帧先贴出来（v4.6.8）：重新进入同一个目录时不该先闪一下骨架屏，
+  // 面包屑也不该「先只显示末段、再跳成完整路径」，所以挂载点清单一起贴。
+  seedRoots()
+  const routeLoc = routeTarget()
+  // 单挂载点：URL 只是 /files 时必然被 replace 到该挂载点根。与其先画卡片页、
+  // 再盖一层跳转遮罩、再等目录接口，不如现在就把那个目录的上一帧贴出来。
+  const cachedOnline = roots.value.filter((mount) => mount.online)
+  const landing = routeLoc.mountId
+    ? routeLoc
+    : cachedOnline.length === 1
+      ? { mountId: cachedOnline[0].id, segments: [] as string[] }
+      : null
+  const seeded = landing ? seedListing(landing.mountId, landing.segments) : roots.value.length > 0
+  loading.value = !seeded
+  refreshing.value = seeded
   error.value = null
-  currentPath.value = ''
-  listing.value = null
+  // 单挂载点从卡片页直达目录时，面包屑/只读判定都要有挂载点，先补上
+  if (!routeLoc.mountId && cachedOnline.length === 1 && seeded) activeMount.value = cachedOnline[0]
+  if (!seeded) {
+    currentPath.value = ''
+    listing.value = null
+  }
   selected.value = null
   clearSearch()
   preview.value = null
@@ -1198,6 +1295,7 @@ async function boot() {
     const data = await filesApi.mounts()
     roots.value = data.mounts
     rootsImplicit.value = data.implicit
+    writeCache(ROOTS_SNAPSHOT_KEY, { mounts: data.mounts, implicit: data.implicit } satisfies RootsSnapshot)
 
     // 一、URL 里已带 mountId（单挂载点跳转后的稳定形态 / 直接粘贴深链接）
     const requestedId = typeof route.params.mountId === 'string' ? route.params.mountId : ''
@@ -1234,7 +1332,8 @@ async function boot() {
     } else if (online.length === 1) {
       // 单挂载点：必须 router.replace 到 /files/:mountId/，跳过卡片页直达根目录。
       // 严禁「原地打开不改 URL」——那样刷新会回到卡片页，深链接也无从分享。
-      redirecting.value = true
+      // 已经贴好该目录的上一帧时不再盖遮罩：那层 blur 本身就是一次闪烁（v4.6.8）
+      redirecting.value = !seeded
       try {
         activeMount.value = online[0]
         await router.replace(routeFor(online[0], online[0].path))
@@ -1248,6 +1347,7 @@ async function boot() {
     error.value = describe(err)
   } finally {
     loading.value = false
+    refreshing.value = false
   }
 }
 
@@ -1315,7 +1415,11 @@ async function open(
   pageNo = 1,
   options: { sync?: boolean; push?: boolean } = {},
 ): Promise<boolean> {
-  loading.value = true
+  // 屏幕上已经是这个目录（会话缓存贴回来的上一帧 / 操作完成后的原地刷新）：
+  // 这次只做静默刷新，绝不回到骨架态 —— 否则每次进目录、每次删完文件都要闪一下
+  const silent = pageNo === 1 && listing.value?.path === path
+  if (silent) refreshing.value = true
+  else loading.value = true
   error.value = null
   selected.value = null
   preview.value = null
@@ -1337,6 +1441,7 @@ async function open(
     currentPath.value = data.path
     page.value = data.page
     nextCursor.value = data.next_cursor ?? null
+    saveListing(data)
     if (options.sync !== false) syncUrl(data.path, options.push ? 'push' : 'replace')
     return true
   } catch (err) {
@@ -1345,12 +1450,19 @@ async function open(
     // 读不到目录时先确认挂载点还在（设计文档 3.2.8）：配置热重载删掉/掉线了，
     // 必须回卡片页并说明，不能把用户留在「目标不存在」的报错页
     if (!(await ensureMountAlive())) return false
-    error.value = describe(err)
+    const described = describe(err)
+    // 静默刷新失败：旧内容还在屏幕上，只轻提示，不要把整页换成错误页
+    if (silent) {
+      showToast(described.message)
+      return false
+    }
+    error.value = described
     return false
   } finally {
     if (inflight === controller) {
       inflight = null
       loading.value = false
+      refreshing.value = false
     }
   }
 }
@@ -2444,9 +2556,10 @@ onBeforeUnmount(() => {
           <button
             class="ml-auto grid size-7 place-items-center rounded-md text-muted transition-colors hover:bg-elevated hover:text-ink"
             :title="t('files.roots.refresh')"
+            data-testid="roots-refresh"
             @click="boot"
           >
-            <AppIcon name="refresh" :size="15" />
+            <AppIcon name="refresh" :size="15" :class="refreshing ? 'animate-spin' : ''" />
           </button>
         </header>
 
@@ -2455,7 +2568,10 @@ onBeforeUnmount(() => {
             v-if="loading"
             class="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(200px,1fr))]"
           >
-            <div v-for="i in 4" :key="i" class="skeleton h-24 rounded-xl" />
+            <div v-if="!loadingSkeleton" class="col-span-full h-24" />
+            <template v-else>
+              <div v-for="i in 4" :key="i" class="skeleton h-24 rounded-xl" />
+            </template>
           </div>
 
           <div v-else-if="error" class="grid h-full place-items-center py-10 text-center">
@@ -2649,7 +2765,8 @@ onBeforeUnmount(() => {
                     data-testid="toolbar-refresh"
                     @click="open(currentPath)"
                   >
-                    <AppIcon name="refresh" :size="15" />
+                    <!-- 静默刷新不再有骨架屏，刷新键转起来是唯一的「正在读目录」反馈 -->
+                    <AppIcon name="refresh" :size="15" :class="refreshing ? 'animate-spin' : ''" />
                   </button>
 
                   <div class="relative hidden w-44 shrink-0 sm:block md:w-40 xl:w-60">
@@ -2841,7 +2958,9 @@ onBeforeUnmount(() => {
         @contextmenu.prevent="openBlankMenu"
       >
         <div v-if="loading" class="p-3">
-          <div class="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2">
+          <!-- 180ms 内就回来的目录不画骨架：直接留白，避免「闪一下灰块又换成真内容」 -->
+          <div v-if="!loadingSkeleton" class="h-full" />
+          <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2">
             <div v-for="i in 12" :key="i" class="flex flex-col items-center gap-2 p-3">
               <div class="skeleton size-12 rounded-lg" />
               <div class="skeleton h-2.5 w-3/4 rounded" />

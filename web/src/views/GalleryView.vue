@@ -39,6 +39,7 @@ import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
+import { readCache, writeCache } from '../lib/view-cache'
 
 const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
 const { t } = useI18n()
@@ -56,12 +57,11 @@ watch(
       // 组件在三个路由间复用，onMounted 只跑一次：**每个分区的副列表都要按需补拉**。
       // 只补影视库曾导致「深链进 /cinema 再切到图片库，相册永远是空的」——这就是
       // 「相册偶尔不出现」的真因（能否复现只取决于用户先进哪个分区）。
-      if (value === 'photos' && albums.value.length === 0 && !albumsLoading.value) {
-        void loadAlbums()
-      }
-      if (value === 'cinema' && cinemaAlbums.value.length === 0 && !cinemaAlbumsLoading.value) {
-        void loadCinemaAlbums()
-      }
+      //
+      // v4.6.8：从「空才拉」改成「切过来就拉」。会话缓存会把上一次的相册卡片先贴出来，
+      // 若仍按「空才拉」判断，缓存一贴就再也不会刷新了（后端读快照，代价是毫秒级）。
+      if (value === 'photos' && !albumsLoading.value) void loadAlbums()
+      if (value === 'cinema' && !cinemaAlbumsLoading.value) void loadCinemaAlbums()
     }
   },
 )
@@ -72,6 +72,16 @@ const loading = ref(true)
 const error = ref('')
 /** 骨架延后 180ms 才出现：快接口直接出内容，不闪一下白块 */
 const loadingSkeleton = useDeferredLoading(loading)
+/**
+ * 后台静默刷新中（v4.6.8）：屏幕上已经有上一帧的列表，这次请求只用来覆盖它，
+ * 不能再把整页切回骨架态 —— 那正是「每次进页面都先闪一下骨架图」的来源。
+ */
+const refreshing = ref(false)
+/**
+ * 屏幕上是否已经有一份可用列表（会话缓存贴出来的，或上一次真拉到的）。
+ * 空库也算「已知结果」—— 空态页不该先闪一次骨架再变成空态。
+ */
+const hasContent = ref(false)
 
 // ---------------- 游标分页（设计文档 3.4） ----------------
 //
@@ -385,6 +395,7 @@ async function loadAlbums(refresh = false) {
     albumsTotal.value = result.total
     albumsCursor.value = result.next_cursor ?? null
     albumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+    saveAlbumsSnapshot()
   } catch (err) {
     albumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
@@ -408,6 +419,7 @@ async function loadMoreAlbums() {
     albumsTotal.value = result.total
     albumsCursor.value = result.next_cursor ?? null
     albumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+    saveAlbumsSnapshot()
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
   } finally {
@@ -517,6 +529,7 @@ async function loadCinemaAlbums(refresh = false) {
     cinemaAlbumsTotal.value = result.total
     cinemaAlbumsCursor.value = result.next_cursor ?? null
     cinemaAlbumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+    saveCinemaAlbumsSnapshot()
   } catch (err) {
     cinemaAlbumsError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
@@ -543,6 +556,7 @@ async function loadMoreCinemaAlbums() {
     cinemaAlbumsTotal.value = result.total
     cinemaAlbumsCursor.value = result.next_cursor ?? null
     cinemaAlbumsHasMore.value = result.has_more && Boolean(result.next_cursor)
+    saveCinemaAlbumsSnapshot()
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
   } finally {
@@ -736,9 +750,19 @@ function openPhotoTile(list: MediaItem[], index: number) {
   openViewer(list, index)
 }
 
-/** 音乐行单击：同上 */
+/**
+ * 音乐行单击：同上。
+ *
+ * 已经在放的那一首再点一次 = 暂停 / 继续（v4.6.8）。以前不管点什么都走
+ * `player.play()`，它只会把 `playing` 置成 true —— 于是正在放的那行点下去毫无反应，
+ * 想暂停只能去摸底部的悬浮播放条。
+ */
 function playTrackAt(track: MediaItem) {
   if (press.takeFired()) return
+  if (player.isCurrent(track.path)) {
+    player.toggle()
+    return
+  }
   player.play(audios.value, audioRowIndex.value.get(track.path) ?? 0)
 }
 
@@ -1055,9 +1079,14 @@ function onKey(event: KeyboardEvent) {
 /**
  * 首屏加载。`refresh` 只由工具栏的「重新扫描」按钮传 true：
  * 后端其余时候都读目录快照（毫秒级），只有用户明确要求时才整树重扫。
+ *
+ * 屏幕上已经有内容（会话缓存贴回来的上一帧，或上一次的列表）时走**静默刷新**：
+ * 不再进骨架态，失败也只轻提示，不把整页换成错误页（v4.6.8）。
  */
 async function load(options: { refresh?: boolean } = {}) {
-  loading.value = true
+  const silent = hasContent.value
+  if (silent) refreshing.value = true
+  else loading.value = true
   error.value = ''
   try {
     const result = await browseMedia(undefined, 'media', 2, {
@@ -1072,6 +1101,8 @@ async function load(options: { refresh?: boolean } = {}) {
     counts.value = result.counts
     nextCursor.value = result.next_cursor ?? null
     hasMore.value = result.has_more && Boolean(result.next_cursor)
+    hasContent.value = true
+    saveMediaSnapshot()
     // 照片库同时刷新相册清单（后端会剔除空相册）
     if (tab.value === 'photos') {
       closeAlbum()
@@ -1083,9 +1114,13 @@ async function load(options: { refresh?: boolean } = {}) {
       void loadCinemaAlbums(options.refresh)
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
+    const message = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
+    // 有旧内容就只提示：让用户继续看已经加载好的部分，别把屏幕清空
+    if (silent) showToast(message)
+    else error.value = message
   } finally {
     loading.value = false
+    refreshing.value = false
   }
 }
 
@@ -1100,6 +1135,7 @@ async function loadMoreMedia() {
     counts.value = result.counts
     nextCursor.value = result.next_cursor ?? null
     hasMore.value = result.has_more && Boolean(result.next_cursor)
+    saveMediaSnapshot()
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
   } finally {
@@ -1135,6 +1171,95 @@ function observeSentinel(el: HTMLElement | null) {
   if (el) observer?.observe(el)
 }
 
+// ---------------- 会话缓存：进页面先把上一帧贴出来（v4.6.8） ----------------
+//
+// 媒体库一次进入要同时拉「媒体列表 + 相册卡片」两条流，任何一条慢都会让首屏先闪
+// 一下骨架。这里把两条流最后一次成功的结果记在内存里，下次进页面直接贴出来，
+// 同时照旧重新拉取覆盖 —— 缓存只决定第一帧画什么（见 lib/view-cache.ts）。
+interface MediaSnapshot {
+  items: MediaItem[]
+  root: string
+  total: number
+  counts: KindCounts
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+interface AlbumsSnapshot {
+  items: Album[]
+  total: number
+  cursor: string | null
+  hasMore: boolean
+}
+
+const MEDIA_SNAPSHOT_KEY = 'gallery:media'
+const ALBUMS_SNAPSHOT_KEY = 'gallery:albums:image'
+const CINEMA_ALBUMS_SNAPSHOT_KEY = 'gallery:albums:video'
+
+function saveMediaSnapshot() {
+  writeCache(MEDIA_SNAPSHOT_KEY, {
+    items: items.value,
+    root: root.value,
+    total: total.value,
+    counts: counts.value,
+    nextCursor: nextCursor.value,
+    hasMore: hasMore.value,
+  } satisfies MediaSnapshot)
+}
+
+function saveAlbumsSnapshot() {
+  writeCache(ALBUMS_SNAPSHOT_KEY, {
+    items: albums.value,
+    total: albumsTotal.value,
+    cursor: albumsCursor.value,
+    hasMore: albumsHasMore.value,
+  } satisfies AlbumsSnapshot)
+}
+
+function saveCinemaAlbumsSnapshot() {
+  writeCache(CINEMA_ALBUMS_SNAPSHOT_KEY, {
+    items: cinemaAlbums.value,
+    total: cinemaAlbumsTotal.value,
+    cursor: cinemaAlbumsCursor.value,
+    hasMore: cinemaAlbumsHasMore.value,
+  } satisfies AlbumsSnapshot)
+}
+
+/** 有上一帧就贴上去并返回 true；此时 `loading` 保持 false，骨架整屏不出现 */
+function seedFromCache(): boolean {
+  const media = readCache<MediaSnapshot>(MEDIA_SNAPSHOT_KEY)
+  const photos = readCache<AlbumsSnapshot>(ALBUMS_SNAPSHOT_KEY)
+  const cinema = readCache<AlbumsSnapshot>(CINEMA_ALBUMS_SNAPSHOT_KEY)
+  if (!media && !photos && !cinema) return false
+
+  if (media) {
+    items.value = media.items
+    loadedPaths.clear()
+    for (const item of media.items) loadedPaths.add(item.path)
+    root.value = media.root
+    total.value = media.total
+    counts.value = media.counts
+    nextCursor.value = media.nextCursor
+    hasMore.value = media.hasMore
+  }
+  if (photos) {
+    albums.value = photos.items
+    albumsTotal.value = photos.total
+    albumsCursor.value = photos.cursor
+    albumsHasMore.value = photos.hasMore
+  }
+  if (cinema) {
+    cinemaAlbums.value = cinema.items
+    cinemaAlbumsTotal.value = cinema.total
+    cinemaAlbumsCursor.value = cinema.cursor
+    cinemaAlbumsHasMore.value = cinema.hasMore
+  }
+  // 有内容就不该再进骨架态；列表为空也算「已知结果」，照样直接画（空态页不是骨架）
+  hasContent.value = true
+  loading.value = false
+  return true
+}
+
 async function loadLibraryState() {
   try {
     const [favPaths, history] = await Promise.all([libraryApi.favorites(), libraryApi.history()])
@@ -1158,6 +1283,8 @@ onMounted(() => {
     { rootMargin: '800px 0px' },
   )
   observeSentinel(sentinel.value)
+  // 先把上一次的画出来（有就完全不出现骨架），再照旧全量拉一次覆盖
+  seedFromCache()
   void load()
   void loadLibraryState()
   // 挂载点清单只为「只读挂载点要把变更项置灰」服务，拉失败不影响浏览
@@ -1239,9 +1366,11 @@ useEventListener(window, 'keydown', onKey)
         <button
           class="grid size-7 place-items-center rounded-md transition-colors hover:bg-elevated hover:text-ink"
           :title="t('gallery.toolbar.rescan')"
+          data-testid="gallery-rescan"
           @click="load({ refresh: true })"
         >
-          <AppIcon name="refresh" :size="14" />
+          <!-- 后台刷新不再有骨架屏可看，图标转起来才是「正在扫」的唯一反馈 -->
+          <AppIcon name="refresh" :size="14" :class="refreshing ? 'animate-spin' : ''" />
         </button>
       </div>
     </header>
