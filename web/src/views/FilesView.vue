@@ -41,7 +41,7 @@ import {
 import { localizedCode, messageFromBody } from '../lib/errors'
 import { triggerDownload } from '../lib/download'
 import { sharesApi } from '../api/shares'
-import { thumbUrl } from '../api/media'
+import { THUMB_WIDTH, thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
 import { useTheme } from '../composables/useTheme'
 import { useScrollLock } from '../composables/useScrollLock'
@@ -3167,7 +3167,7 @@ onBeforeUnmount(() => {
               >
                 <img
                   v-if="hasThumb(entry) && !thumbFailed.has(entry.path)"
-                  :src="thumbUrl(entry.path, 320, entry.modified)"
+                  :src="thumbUrl(entry.path, THUMB_WIDTH.tile, entry.modified)"
                   class="size-full object-cover"
                   loading="lazy"
                   alt=""

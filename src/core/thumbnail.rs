@@ -1,7 +1,8 @@
 //! 缩略图生成（设计文档 3.4）。
 //!
 //! - 并发上限 2（信号量），拿不到就回占位图，绝不让数千张图一起解码把 CPU 打满；
-//! - 结果落磁盘缓存，键 = 路径 + 修改时间 + 大小 + 宽度（源文件 mtime 变了自动失效）；
+//! - 结果落磁盘缓存，键 = 路径 + 修改时间 + 大小 + 有效宽度（源文件 mtime 变了自动失效；
+//!   有效宽度 = min(请求宽度, 源图长边)，小图的各档位请求因此归并成同一份字节）；
 //! - 容量上限与过期天数来自 `config.toml` 的 `[media]`，按 LRU + 过期天数淘汰；
 //! - 生成时顺带算一枚 ThumbHash（约 25 字节），供前端做「主色调模糊占位」防抖动；
 //!   **v2.8.2 起存 SQLite `thumb_hashes` 表**，不再落盘旁路文件 —— 几十万张图的
@@ -54,6 +55,12 @@ const FRESH_WINDOW: Duration = Duration::from_secs(60);
 /// 刚上传的照片写盘是毫秒级，如果按 mtime 一刀切，用户上传完会先看到一堆占位图，
 /// 以为缩略图坏了。真正会反复重绘的是几百兆的影视文件，所以用体积当第二道判据。
 const FRESH_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `.tmp-` 残片超过这个年龄才算「死了」（进程被强杀留下的那半张图）。
+///
+/// 并发生成中的临时文件绝不能删：删了之后 rename 找不到源文件，那次落盘白做。
+/// 一次缩略图生成是毫秒到秒级，10 分钟足够宽松。
+const TEMP_STALE_AFTER: Duration = Duration::from_secs(600);
 
 /// 文件是否可能仍在写盘（mtime 极新且体积可观）。
 fn is_fresh_write(path: &Path) -> bool {
@@ -157,8 +164,14 @@ impl Thumbnailer {
     /// `C:/x/y.jpg`（接口入参）或 `\\?\C://x//y.jpg`（canonicalize 结果）出现，
     /// 不归一化就会算出两个键、缓存和 ThumbHash 全都对不上。
     fn digest(path: &Path) -> String {
+        let display = crate::core::fs::normalize_display(path);
+        // Windows 文件系统大小写不敏感：同一个文件可能以 `C:/Photos/A.JPG`（接口入参）
+        // 和 `c:/photos/a.jpg`（系统回读）两种形态出现，不归一就会算出两个单元目录。
+        // 口径与 `path_guard::find_by_path_text` 的 `to_lowercase` 保持一致。
+        #[cfg(windows)]
+        let display = display.to_lowercase();
         let mut hasher = Sha1::new();
-        hasher.update(crate::core::fs::normalize_display(path).as_bytes());
+        hasher.update(display.as_bytes());
         format!("{:x}", hasher.finalize())
     }
 
@@ -179,14 +192,17 @@ impl Thumbnailer {
         Self::digest(path)
     }
 
-    /// 源文件的**内容指纹**：`v3-<长度>-<mtime秒>`。既进缓存文件名，也做 HTTP ETag。
+    /// 源文件的**内容指纹**：`v4-<长度>-<mtime秒>`。既进缓存文件名，也做 HTTP ETag。
     ///
     /// 键里带源文件状态（长度 + mtime）与格式版本，所以不存在「戳与图不一致」的窗口——
     /// 命中与否只看这个文件在不在。v4.4.2 之前 `render_thumbnail` 会把小于请求宽度的图
     /// 放大（300×200 生成成 960 宽），灯箱用 960 当打底时画面先按放大版铺开、原图一到
     /// 又缩回去，就是「打开预览先大后小」；把版本号放进文件名后，旧版文件不再命中，
     /// 新图换个名字落盘，LRU 顺手把旧版收走（不再有 stamp 文件互相踩的窗口）。
-    const CACHE_VERSION: u8 = 3;
+    ///
+    /// v4.6.3：文件名改用**有效宽度**（见 `effective_width`）。小图在 160/320/400 各存了
+    /// 一份字节完全相同的副本，升版让这些重复副本一次性失效，由 LRU 收走。
+    const CACHE_VERSION: u8 = 4;
 
     /// 视频首帧的独立版本号：它不跟随图片的取值范围（截帧比解图贵一个数量级，
     /// 跟着图片升版会让几千个视频白跑一遍 FFmpeg）。
@@ -201,6 +217,22 @@ impl Thumbnailer {
     /// （`v` 与当前 mtime 一致 = 这条 URL 代表的就是这一版字节）。
     pub fn mtime_secs(path: &Path) -> u64 {
         Self::source_stamp(path).1
+    }
+
+    /// 有效宽度：请求宽度与源图长边取小 —— 小图不放大，不同档位因此撞到同一个值。
+    ///
+    /// `render_thumbnail` 从 v4.4.2 起就不放大了，但文件名一直按**请求**宽度取：
+    /// 一张 200×150 的图在 160 / 320 / 400 三档各存一份**字节完全相同**的副本。
+    /// 用有效宽度入键后小图只留一份（编码是确定性的，同样的位图编出同样的字节）。
+    /// 只读图片文件头，不整图解码。
+    ///
+    /// 读不到尺寸（视频、损坏文件、无权限）时原样返回请求宽度 —— 视频首帧不走这里，
+    /// 它的宽度由 FFmpeg 的缩放决定，不做归并。
+    pub fn effective_width(path: &Path, width: u32) -> u32 {
+        let bound = width.clamp(64, 1024);
+        image::image_dimensions(path)
+            .map(|(w, h)| bound.min(w.max(h)))
+            .unwrap_or(bound)
     }
 
     fn poster_fingerprint(path: &Path) -> String {
@@ -239,13 +271,21 @@ impl Thumbnailer {
     /// 删掉同一缓存单元里属于**旧内容**的文件（文件名前缀不是当前指纹）。
     ///
     /// 键里带源文件状态后，改一次图会多一份文件；不清理的话目录会随编辑次数线性增长。
-    /// 只动我们自己命名的文件（`v…` / `p…` 且含连字符），`.tmp-` 残片留给清理任务。
+    /// 只动我们自己命名的文件（`v…` / `p…` 且含连字符），外加超龄的 `.tmp-` 残片
+    /// （进程被强杀时留下的那半张图）。当前正在写的那份临时文件不到 10 分钟，不会误删。
     fn prune_stale(dir: &Path, keep_prefix: &str) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
+        let now = SystemTime::now();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".tmp-") {
+                if temp_is_stale(&entry, now) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                continue;
+            }
             if name.starts_with(keep_prefix) || !name.contains('-') {
                 continue;
             }
@@ -281,7 +321,7 @@ impl Thumbnailer {
     /// 返回 `(结果, 新鲜 ThumbHash)`：缓存命中时第二个值为 None；
     /// 生成成功时带上 hash 由调用方入库，本模块**不再**写任何 `.th` 文件。
     ///
-    /// 缓存布局：`<digest[..2]>/<digest>/<指纹>-<宽度>-<编码>`，指纹含源文件长度与 mtime，
+    /// 缓存布局：`<digest[..2]>/<digest>/<指纹>-<有效宽度>-<编码>`，指纹含源文件长度与 mtime，
     /// 所以**命中只看文件在不在**（没有 stamp 文件，也就没有「戳写了图没写」的窗口）。
     /// 源文件一变指纹就变，新图换个名字落盘、旧名由 `prune_stale` 收走。
     pub async fn get(
@@ -290,7 +330,9 @@ impl Thumbnailer {
         width: u32,
         webp_bin: Option<&Path>,
     ) -> (ThumbOutcome, Option<FreshHash>) {
-        let width = width.clamp(64, 1024);
+        // 按**有效宽度**入键：比请求宽度小的图不再按 160/320/400 各存一份
+        // 字节完全相同的副本（渲染本身早就不放大，浪费的只是这些重复文件）。
+        let width = Self::effective_width(path, width);
         let dir = self.entry_dir(path);
         let fp = Self::fingerprint(path);
 
@@ -580,6 +622,108 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// `.tmp-` 文件是否已经没人管（超过 `TEMP_STALE_AFTER` 没被改写）。
+fn temp_is_stale(entry: &std::fs::DirEntry, now: SystemTime) -> bool {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= TEMP_STALE_AFTER)
+}
+
+/// 从缓存文件名里剥出指纹：`v4-<len>-<mtime>` / `p1-<len>-<mtime>`。
+///
+/// 缓存名固定是 `{指纹}-{宽度}-{编码}`（海报是 `{指纹}-{宽度}p-{扩展名}`），
+/// 去掉末尾两段就是指纹。认不出来的一律返回 `None`（旧扁平布局、外来文件），
+/// 调用方对这类文件保持不动。
+fn fingerprint_of(name: &str) -> Option<String> {
+    let mut tail = name.rsplitn(3, '-');
+    let codec = tail.next()?;
+    if !matches!(codec, "webp" | "jpg" | "png") {
+        return None;
+    }
+    let width = tail.next()?;
+    let digits = width.strip_suffix('p').unwrap_or(width);
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let fingerprint = tail.next()?;
+    let mut seg = fingerprint.split('-');
+    let version = seg.next()?;
+    let len = seg.next()?;
+    let mtime = seg.next()?;
+    if seg.next().is_some() {
+        return None;
+    }
+    let version_ok = matches!(version.as_bytes().first(), Some(b'v' | b'p'))
+        && version[1..].chars().all(|ch| ch.is_ascii_digit());
+    let is_hex = |text: &str| !text.is_empty() && text.chars().all(|ch| ch.is_ascii_hexdigit());
+    if !version_ok || !is_hex(len) || !is_hex(mtime) {
+        return None;
+    }
+    Some(fingerprint.to_string())
+}
+
+/// 扫一遍缓存单元：收走超龄 `.tmp-` 残片，只留下**最新指纹组**的文件，返回释放字节。
+///
+/// 为什么需要这一步：命中缓存会 touch 文件 mtime 参与 LRU，所以活跃单元里的旧副本
+/// **永远不会**被容量淘汰 —— 于是「升级换了键格式（v3→v4）」或「改图后没赶上
+/// `prune_stale`」留下的旧组会长期赖在磁盘上，用户看到的就是「thumbnails 里一堆
+/// 重复图」。这里按指纹分组、只保留最新那组，存量一次性收干净。
+///
+/// 认不出指纹的文件（旧扁平布局、外来文件）不参与分组，也不删除。
+fn sweep_unit(dir: &Path, now: SystemTime) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut freed = 0;
+    let mut newest: HashMap<String, SystemTime> = HashMap::new();
+    let mut files: Vec<(PathBuf, u64, Option<String>)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(".tmp-") {
+            // 正在写的那份（新鲜的）绝不能动：删了 rename 找不到源文件，那次落盘白做
+            if temp_is_stale(&entry, now) && std::fs::remove_file(entry.path()).is_ok() {
+                freed += meta.len();
+            }
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        let group = fingerprint_of(&name);
+        if let Some(group) = &group {
+            let slot = newest.entry(group.clone()).or_insert(modified);
+            if modified > *slot {
+                *slot = modified;
+            }
+        }
+        files.push((entry.path(), meta.len(), group));
+    }
+    // 只有一组（或认不出来）：没有可归并的旧副本
+    if newest.len() < 2 {
+        return freed;
+    }
+    let keep = newest
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(group, _)| group);
+    for (path, len, group) in files {
+        if group.is_none() || group == keep {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            freed += len;
+        }
+    }
+    freed
+}
+
 /// FFmpeg 能力探测结果缓存：同一路径只探测一次，换路径（改配置）才重探。
 fn capabilities(cache: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>, bin: &Path) -> Capabilities {
     let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
@@ -671,6 +815,10 @@ pub fn cleanup_cache(dir: &Path, limit: u64, max_age_secs: u64) -> std::io::Resu
                 let _ = std::fs::remove_file(&unit_path);
                 continue;
             }
+            // 单元目录里的 `.tmp-` 残片（强杀留下的半张图）与**旧指纹组**：
+            // 以前只在整单元被淘汰时顺带删，可命中缓存会把 mtime 顶新、
+            // 活跃单元的旧副本永远等不到淘汰 —— 清理任务路过时先收掉。
+            removed += sweep_unit(&unit_path, now);
             let (_, bytes, newest) = unit_stats(&unit_path);
             let expired = max_age_secs > 0
                 && now
@@ -802,6 +950,23 @@ mod tests {
         let _ = fs::remove_dir_all(&cache);
     }
 
+    /// Windows 文件系统大小写不敏感：同一个文件以不同大小写形态进来必须落到同一个单元。
+    ///
+    /// `path_guard::find_by_path_text` 早就按 `to_lowercase` 比对了，这里口径要一致，
+    /// 否则同一张图会各存一份缓存、ThumbHash 也记两行。
+    #[cfg(windows)]
+    #[test]
+    fn entry_dir_ignores_path_case_on_windows() {
+        let cache = scratch_dir("thumb-case");
+        let thumbnails = Thumbnailer::new(cache.clone());
+        assert_eq!(
+            thumbnails.entry_dir(Path::new("C:/Photos/A.JPG")),
+            thumbnails.entry_dir(Path::new("c:/photos/a.jpg")),
+            "大小写不同也是同一个文件，必须落到同一个单元目录"
+        );
+        let _ = fs::remove_dir_all(&cache);
+    }
+
     /// 缓存键带**格式版本 + 源文件状态**：v4.4.2 之前生成的「放大版」缩略图只靠
     /// 路径永远命中，灯箱拿 960 缩略图打底就会「先大后小」。把版本写进文件名是让
     /// 老缓存失效的唯一开关，删掉它这条回归会立刻变红。
@@ -814,7 +979,7 @@ mod tests {
             .unwrap();
 
         let key = Thumbnailer::fingerprint(&file);
-        assert!(key.starts_with("v3-"), "缩略图键必须带格式版本：{key}");
+        assert!(key.starts_with("v4-"), "缩略图键必须带格式版本：{key}");
         // 海报（视频首帧）用自己的版本号：跟着图片一起升版只是白跑一遍 FFmpeg
         assert!(
             Thumbnailer::poster_fingerprint(&file).starts_with("p1-"),
@@ -945,6 +1110,15 @@ mod tests {
         }
     }
 
+    fn set_mtime(path: &Path, when: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     /// 等后台落盘稳定：缩略图的写盘不在响应链路上，断言前必须轮询。
     fn wait_for_files(cache: &Path, want: usize) -> usize {
         for _ in 0..150 {
@@ -955,6 +1129,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         collect_files(cache).len()
+    }
+
+    /// 等后台落盘彻底停下（连续两次采样数量一致），再返回最终文件列表。
+    ///
+    /// `wait_for_files` 只保证「至少 N 个」，多档位请求可能还在后面补文件，
+    /// 所以断言「不该多出文件」时必须再确认一次计数不再变化。
+    fn settle_files(cache: &Path) -> Vec<PathBuf> {
+        let mut last = collect_files(cache).len();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = collect_files(cache).len();
+            if now == last {
+                break;
+            }
+            last = now;
+        }
+        collect_files(cache)
     }
 
     #[test]
@@ -999,6 +1190,75 @@ mod tests {
         let _ = fs::remove_dir_all(&cache);
     }
 
+    /// 文件名 → 指纹：只认 `{指纹}-{宽度}[p]-{编码}`，别把旧布局或外来文件误判成一组。
+    #[test]
+    fn fingerprint_parses_cache_names() {
+        assert_eq!(
+            fingerprint_of("v4-1f-5a-400-webp").as_deref(),
+            Some("v4-1f-5a")
+        );
+        assert_eq!(fingerprint_of("p1-2-3-400p-jpg").as_deref(), Some("p1-2-3"));
+        for bad in [
+            "0123456789abcdef-320.webp",
+            "v4-1f-5a-400-webp.bak",
+            "v4-1f-400-webp",
+            "320-jpg",
+            ".tmp-1-2-3.webp",
+            "v4-zz-5a-400-webp",
+        ] {
+            assert_eq!(fingerprint_of(bad), None, "不该被识别成缓存文件：{bad}");
+        }
+    }
+
+    /// 升级换了键格式后，活跃单元里的旧组不会随 LRU 淘汰（命中缓存会把 mtime 顶新），
+    /// 清理任务必须按「最新指纹组」把存量重复一次性收走。
+    #[test]
+    fn cleanup_drops_stale_fingerprint_groups() {
+        let cache = scratch_dir("thumb-groups");
+        let unit = put_unit(&cache, "bb8", &[("v4-1-1-400-jpg", 120)]);
+        let old = unit.join("v3-9-9-400-jpg");
+        fs::write(&old, vec![0u8; 100]).unwrap();
+        set_mtime(&old, SystemTime::now() - Duration::from_secs(3600));
+
+        let freed = cleanup_cache(&cache, 10 * 1024 * 1024, 0).unwrap();
+        assert_eq!(freed, 100, "只该释放旧组");
+        assert!(!old.exists(), "旧指纹组必须收走");
+        assert!(
+            unit.join("v4-1-1-400-jpg").exists(),
+            "最新组要留着（同一张图的多个宽度同生共死）"
+        );
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 单元目录里的 `.tmp-` 残片必须被清理任务收走。
+    ///
+    /// 旧实现只扫顶层与 bucket 层，单元里的残片要等「整个单元被 LRU 淘汰」才顺带删，
+    /// 期间还被 `unit_stats` 算进用量。但正在写的那份（新鲜的）绝不能动 ——
+    /// 删了 rename 就找不到源文件，那次落盘白做。
+    #[test]
+    fn cleanup_sweeps_stale_temp_files_in_unit() {
+        let cache = scratch_dir("thumb-tmp");
+        let unit = put_unit(&cache, "aa7", &[("v4-1-1-320-jpg", 100)]);
+        let stale = unit.join(".tmp-1-2-3.webp");
+        fs::write(&stale, vec![0u8; 64]).unwrap();
+        let handle = fs::File::options().write(true).open(&stale).unwrap();
+        handle
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)),
+            )
+            .unwrap();
+        drop(handle);
+        let live = unit.join(".tmp-4-5-6.webp");
+        fs::write(&live, vec![0u8; 32]).unwrap();
+
+        let removed = cleanup_cache(&cache, 10 * 1024 * 1024, 0).unwrap();
+        assert_eq!(removed, 64, "只该释放超龄残片的字节");
+        assert!(!stale.exists(), "超龄残片必须收走");
+        assert!(live.exists(), "正在写的临时文件不能删");
+        assert!(unit.exists(), "单元还在用，不能整目录删");
+        let _ = fs::remove_dir_all(&cache);
+    }
+
     #[test]
     fn cleanup_purges_legacy_flat_layout() {
         // 旧版把 `<hash>-320.webp` 直接摊在顶层：升级后必须一次清掉，
@@ -1025,12 +1285,13 @@ mod tests {
     }
 
     /// 回归（指数增殖）：同一张图反复请求（含多个宽度）后，
-    /// 缓存文件数必须只随「宽度种类」增长，绝不随请求次数增长。
+    /// 缓存文件数必须只随「有效宽度种类」增长，绝不随请求次数增长。
     #[test]
     fn repeated_requests_do_not_grow_cache() {
         let dir = scratch_dir("thumb-repeat");
         let source = dir.join("a.png");
-        let mut image = image::RgbaImage::new(40, 30);
+        // 源图必须比两档请求都大，否则「有效宽度归并」会把它们合成一份（见上一条测试）
+        let mut image = image::RgbaImage::new(400, 300);
         for pixel in image.pixels_mut() {
             *pixel = image::Rgba([10, 20, 200, 255]);
         }
@@ -1072,6 +1333,56 @@ mod tests {
             collect_files(&cache).len(),
             after_first + 1,
             "命中缓存不能再落任何文件"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 小图的各档位请求必须归并成**一份**文件。
+    ///
+    /// 40×30 的图在 64 / 96 / 160 / 320 / 400 各档下有效宽度都是 40，编码又是确定性的
+    /// ——升级前会落五份字节完全相同的副本，这是「thumbnails 里一堆重复图」的主因。
+    #[test]
+    fn small_source_collapses_width_tiers() {
+        let dir = scratch_dir("thumb-collapse");
+        let source = dir.join("small.png");
+        image::RgbaImage::from_pixel(40, 30, image::Rgba([9, 9, 9, 255]))
+            .save(&source)
+            .unwrap();
+        for width in [64, 96, 160, 320, 400] {
+            assert_eq!(
+                Thumbnailer::effective_width(&source, width),
+                40,
+                "有效宽度 = min(请求宽度, 源图长边)：w={width}"
+            );
+        }
+
+        let cache = scratch_dir("thumb-collapse-cache");
+        let thumbnails = Thumbnailer::new(cache.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for width in [64u32, 96, 160, 320, 400] {
+            let (outcome, _) = rt.block_on(thumbnails.get(&source, width, None));
+            assert!(matches!(outcome, ThumbOutcome::Ready(_)), "w={width}");
+        }
+        wait_for_files(&cache, 1);
+        let files = settle_files(&cache);
+        assert_eq!(files.len(), 1, "小图的所有档位必须归并成一份：{files:?}");
+
+        // 大图仍按请求宽度分档，别把有用的小尺寸也归并掉
+        let big = dir.join("big.png");
+        image::RgbaImage::from_pixel(1200, 800, image::Rgba([1, 2, 3, 255]))
+            .save(&big)
+            .unwrap();
+        assert_eq!(Thumbnailer::effective_width(&big, 320), 320);
+        assert_eq!(Thumbnailer::effective_width(&big, 400), 400);
+        assert_eq!(
+            Thumbnailer::effective_width(&big, 4096),
+            1024,
+            "上限仍是 1024"
         );
 
         let _ = fs::remove_dir_all(&dir);

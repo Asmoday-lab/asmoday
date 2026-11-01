@@ -20,6 +20,7 @@ import {
   libraryApi,
   placeholderColor,
   rawUrl,
+  THUMB_WIDTH,
   thumbUrl,
   type Album,
   type KindCounts,
@@ -1221,7 +1222,7 @@ useEventListener(window, 'keydown', onKey)
               />
               <img
                 v-if="album.cover && !albumCoverFailed.has(album.path)"
-                :src="thumbUrl(album.cover, 480)"
+                :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
                 class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                 loading="lazy"
                 alt=""
@@ -1447,7 +1448,7 @@ useEventListener(window, 'keydown', onKey)
               />
               <img
                 v-if="album.cover && !cinemaCoverFailed.has(album.path)"
-                :src="thumbUrl(album.cover, 480)"
+                :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
                 class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                 loading="lazy"
                 alt=""

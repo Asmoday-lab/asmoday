@@ -1257,8 +1257,12 @@ GWT-PHOTO-19 Given 索引里有图（counts.image>0）但相册清单为空  The
 GWT-PHOTO-20 Given 慢网 >180ms  Then 骨架形状与真实卡片一致（4:3 + 两行字 / 方格 / 16:9），内容到达时无跳版，且刷新时不清空旧数据
 GWT-PHOTO-21 Given prefers-reduced-motion  Then 骨架不动画（只留静态底块）
 GWT-THUMB-01 Given 缩略图 URL 带 v=<mtime>  When 服务端指纹与 mtime 一致  Then 回 immutable 长缓存；不带 v 则 private, no-cache + ETag，条件请求回 304
-GWT-THUMB-02 Given 320×213 的原图  When 请求 w=960  Then 返回仍是 320×213（绝不放大），缓存文件名前缀是 v3-<长度>-<mtime>
+GWT-THUMB-02 Given 320×213 的原图  When 请求 w=960  Then 返回仍是 320×213（绝不放大），缓存文件名前缀是 v4-<长度>-<mtime>
 GWT-THUMB-03 Given 源文件被改  When 再次请求缩略图  Then 指纹变、落新文件名、旧指纹文件被 prune_stale 删掉（目录不随时间增长）
+GWT-THUMB-04 Given 200×150 的原图  When 依次请求 w=160 / 320 / 400  Then 只落**1 个**缓存文件（三者有效宽度都是 150），且 ETag 相同
+GWT-THUMB-05 Given 单元目录里同时存在 v3-… 与 v4-… 两组指纹  When 跑一次清理  Then 旧组被删、最新组保留（按组回收，不整单元删）
+GWT-THUMB-06 Given 单元目录里有 1 小时前的 .tmp-*.webp 与刚写的 .tmp-*.webp  When 清理  Then 只删前者（正在写的不能动）
+GWT-THUMB-07 Given 同一张图分别以 C:/Photos/A.JPG 与 c:/photos/a.jpg 请求（Windows）  Then 落在同一个缓存单元目录
 GWT-DL-01 Given 任意文件  When 请求 raw?download=1  Then Content-Disposition 为 attachment 且含 filename*=UTF-8''…，类型 octet-stream + nosniff
 GWT-DL-02 Given 文本文件  When 请求 raw（不带 download）  Then Content-Type 带 charset=utf-8（不得让浏览器按 GBK 猜成乱码）
 GWT-DL-03 Given 目录  When 请求 archive  Then 返回合法 zip（PK\x03\x04 开头，目录条目以 / 结尾），Windows 资源管理器可直接解压

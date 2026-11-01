@@ -12,7 +12,7 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import type { MediaItem } from '../api/media'
-import { placeholderFor, thumbUrl } from '../api/media'
+import { placeholderFor, THUMB_WIDTH, thumbUrl } from '../api/media'
 import { formatSize } from '../lib/format'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
 
@@ -65,7 +65,7 @@ const resumeLabel = computed(() => {
       />
       <img
         v-if="!coverFailed"
-        :src="thumbUrl(video.path, 480, video.modified)"
+        :src="thumbUrl(video.path, THUMB_WIDTH.tile, video.modified)"
         class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
         loading="lazy"
         alt=""

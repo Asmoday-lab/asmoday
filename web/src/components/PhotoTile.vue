@@ -8,7 +8,7 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
-import { placeholderFor, thumbUrl, type MediaItem } from '../api/media'
+import { placeholderFor, THUMB_WIDTH, thumbUrl, type MediaItem } from '../api/media'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
 
 const props = withDefaults(
@@ -17,7 +17,7 @@ const props = withDefaults(
     /** 请求的缩略图宽度 */
     width?: number
   }>(),
-  { width: 400 },
+  { width: THUMB_WIDTH.tile },
 )
 
 const { t } = useI18n()

@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::AppState;
 use crate::core::ffmpeg;
 use crate::core::fs::{self, FsError};
-use crate::core::thumbnail::{PLACEHOLDER_SVG, ThumbOutcome};
+use crate::core::thumbnail::{PLACEHOLDER_SVG, ThumbOutcome, Thumbnailer};
 
 /// 单页条目数（游标分页，设计文档 3.4）：只影响「一次返回多少条」，
 /// 不再有「扫到上限就截断、后面的永远看不到」这回事。
@@ -263,12 +263,19 @@ pub async fn thumb(
     let (kind, _) = fs::classify_name(&name, &ext, false);
 
     let width = query.w.unwrap_or(if kind == "video" { 480 } else { 320 });
+    // 图片的实体宽度 = min(请求宽度, 源图长边)：小图不放大，所以不同档位请求
+    // 拿到的是同一份字节，ETag 也必须跟着落在同一个宽度上（否则同一实体两个 ETag）。
+    let effective = if kind == "image" {
+        Thumbnailer::effective_width(&path, width)
+    } else {
+        width
+    };
 
     // 内容指纹 → ETag。前端 url 里的 `v` 是源文件的 mtime，**与当前 mtime 一致**说明
     // 这条链接代表的就是这一版字节，可以放心长缓存；不一致（老链接、文件刚改）就每次
     // 回源校验，命中只花一次 304。
     let fingerprint = crate::core::thumbnail::Thumbnailer::fingerprint(&path);
-    let etag = format!("\"{fingerprint}-{width}\"");
+    let etag = format!("\"{fingerprint}-{effective}\"");
     let mtime = crate::core::thumbnail::Thumbnailer::mtime_secs(&path);
     let versioned = query
         .v

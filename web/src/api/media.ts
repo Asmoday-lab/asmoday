@@ -123,7 +123,21 @@ export async function browseAlbums(
  * 它只是 URL 上的盐。浏览器缓存按 URL 认人，光改服务端缓存键没用——旧 URL 仍然
  * 一分钟命中一次旧字节。改规则时同步改这里，所有缩略图 URL 一起换，旧缓存自然作废。
  */
-export const THUMB_REV = 'v3'
+export const THUMB_REV = 'v4'
+
+/**
+ * 缩略图宽度档位：**全站只留两档**，别让同一张图在缓存里存成三四份。
+ *
+ * 服务端还会按「请求宽度与源图长边取小」再归并一次（小图不会放大），所以小图
+ * 本来就是一份；这里收敛档位是为了大图也别按 320 / 400 / 480 各存一份 ——
+ * 一档 400 足够覆盖瓦片、灯箱打底、卡片封面与文件网格。
+ */
+export const THUMB_WIDTH = {
+  /** 灯箱底部缩略条：只用来认位置，160 够 */
+  strip: 160,
+  /** 瓦片 / 灯箱打底 / 卡片封面 / 文件网格 */
+  tile: 400,
+} as const
 
 /**
  * 缩略图（后端信号量限流，拥塞时返回占位图）。
@@ -132,7 +146,11 @@ export const THUMB_REV = 'v3'
  * `immutable` 长缓存：文件一变 URL 就变，不可能拿到过期图。不传也能用，只是
  * 每次都要回源校验（304，便宜但多一趟）。
  */
-export function thumbUrl(path: string, width = 320, version?: number | null): string {
+export function thumbUrl(
+  path: string,
+  width: number = THUMB_WIDTH.tile,
+  version?: number | null,
+): string {
   const params = new URLSearchParams({ path, w: String(width), r: THUMB_REV })
   if (version !== undefined && version !== null) params.set('v', String(version))
   return withBase(`/api/files/thumb?${params.toString()}`)

@@ -18,7 +18,7 @@ import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, watch }
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from './ContextMenu.vue'
-import { coverUrl, rawUrl, thumbUrl } from '../api/media'
+import { coverUrl, rawUrl, THUMB_WIDTH, thumbUrl } from '../api/media'
 import { sharesApi } from '../api/shares'
 import { formatSize, formatTime } from '../lib/format'
 import { triggerDownload } from '../lib/download'
@@ -195,10 +195,10 @@ function preloadNeighbors() {
     const image = new Image()
     image.decoding = 'async'
     image.src = rawUrl(entry.path)
-    // 打底图与画面用的是同一档（320），翻页瞬间就能铺上，不用等新尺寸的缩略图
+    // 打底图与画面用的是同一档（tile），翻页瞬间就能铺上，不用等新尺寸的缩略图
     const thumb = new Image()
     thumb.decoding = 'async'
-    thumb.src = thumbUrl(entry.path, 320, entry.modified)
+    thumb.src = thumbUrl(entry.path, THUMB_WIDTH.tile, entry.modified)
   }
 }
 
@@ -487,7 +487,7 @@ onBeforeUnmount(() => {
                  不变尺寸（320 缩略图被拉伸到最终框，正是照片应用该有的渐进观感）。 -->
             <img
               v-if="!failed.has(item.path)"
-              :src="thumbUrl(item.path, 320, item.modified)"
+              :src="thumbUrl(item.path, THUMB_WIDTH.tile, item.modified)"
               class="pointer-events-none absolute inset-0 z-0 size-full object-contain transition-opacity duration-300"
               :class="ready === item.path ? 'opacity-0' : 'opacity-100'"
               aria-hidden="true"
@@ -519,7 +519,7 @@ onBeforeUnmount(() => {
           <MediaPlayer
             ref="playerRef"
             :src="rawUrl(item.path)"
-            :poster="thumbUrl(item.path, 480, item.modified)"
+            :poster="thumbUrl(item.path, THUMB_WIDTH.tile, item.modified)"
             :subtitle="item.subtitle ?? null"
             :autoplay="true"
             fill
@@ -708,7 +708,7 @@ onBeforeUnmount(() => {
             @click="jumpLightbox(index)"
           >
             <img
-              :src="thumbOf(entry, 160)"
+              :src="thumbOf(entry, THUMB_WIDTH.strip)"
               alt=""
               class="size-full object-cover"
               loading="lazy"
