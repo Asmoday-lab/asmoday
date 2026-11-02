@@ -1417,6 +1417,8 @@ GWT-TERM-06 Given 网络断  When 3 分钟后  Then PTY 销毁
 GWT-TERM-07 Given Windows  When openpty  Then 立即写 ESC[1;1R，无死锁
 GWT-TERM-08 Given 用户在终端执行 `history`  When 命令  Then 不写入宿主机 shell 历史
 GWT-TERM-09 Given PowerShell  When 启动  Then `-NoProfile` 可选，纯净模式可用
+GWT-TERM-10 Given 活动会话面板  When 强制关闭某条会话  Then 占用它的标签一并关闭，且 5 秒内不再自动新建等价 PTY
+GWT-TERM-11 Given 两个独立浏览器窗口各开终端  When 任一窗口执行命令或新建标签  Then 另一边画面与 session_id 不变，且所有会话尺寸不被压到 20×5
 ```
 
 #### 依赖红线
@@ -1629,9 +1631,10 @@ GWT-UX-51 Given 窄屏（<lg）经典播放条  Then 它是铺满底部的 dock�
 #### GWT 验收（日志时间口径）
 
 ```gwt
-GWT-LOG-01 Given [log] format = "text"（默认）  When 任意一行写入控制台或 data/logs/asmoday.log  Then 行首是服务器本地时间 `YYYY-MM-DD HH:MM:SS`（跟随操作系统时区，不是 UTC，可对照 `date` 验证）
+GWT-LOG-01 Given [log] format = "text"（默认）  When 任意一行写入控制台或 data/logs/asmoday.log  Then 行首是 `[YYYY-MM-DD HH:MM:SS ±HH:MM]`（服务器本地时间 + 时区偏移，可对照 `date '+%F %T %z'` 验证）
 GWT-LOG-02 Given [log] format = "json"  Then 每行 `ts` 是带时区偏移的 RFC 3339（如 `2026-11-01T20:49:35+08:00`），机器解析不丢时区
 GWT-LOG-03 Given 同一个事件  Then 控制台、主文件、错误文件三处用的是同一时刻同一时区口径（不会出现一处 UTC 一处本地）
+GWT-LOG-04 Given 没有 tzdata 的环境（Android / 静态 musl）  When 启动  Then 偏移由 `date +%z` 兜底，日志时间与系统时间一致；探到的来源写在 DEBUG 的 `log timezone` 行
 ```
 
 ---

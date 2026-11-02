@@ -109,7 +109,14 @@ function openSessions() {
   return refreshSessions()
 }
 
-/** 强制关闭一条会话：若它正被某个标签复用，顺手清掉 sessionId 让该标签按需重开 */
+/**
+ * 强制关闭一条会话：占着它的标签一并关掉。
+ *
+ * 只清 `sessionId` 是假关闭——服务端只是杀掉了 shell 进程，标签的 WebSocket
+ * 还挂在那个已死的 PTY 上（广播发送端随会话对象存活，不会给客户端一个 close）。
+ * 用户下次敲键写入失败，客户端就按退避重连，用同一 cwd 新建一条等价 PTY：
+ * 名额没释放，行为也和「强制结束」相反。所以连标签一起收掉。
+ */
 async function closeSession(session: TerminalSession) {
   try {
     await killTerminalSession(session.id)
@@ -117,8 +124,10 @@ async function closeSession(session: TerminalSession) {
     showToast(err instanceof Error ? err.message : String(err))
     return
   }
-  const owner = tabs.value.find((tab) => tab.sessionId === session.id)
-  if (owner) updateTab(owner.id, { sessionId: null, status: 'closed' })
+  // 正常情况下一个会话只挂一个标签；用 filter 兜住同一 id 被多个标签引用的情况
+  for (const owner of tabs.value.filter((tab) => tab.sessionId === session.id)) {
+    closeTab(owner.id)
+  }
   showToast(t('terminal.sessions.closed'))
   await refreshSessions()
 }

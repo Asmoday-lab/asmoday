@@ -12,8 +12,10 @@
 //!   INFO 及以上不掺开发期信息。
 //! - `format = "text"`（默认，人读）| `"json"`（机器解析，每行一个 JSON 对象）。
 //! - 时间一律用**服务器本地时间**（即操作系统时区，不是 UTC）：文本形如
-//!   `2026-10-17 09:38:58`，控制台与文件同构；JSON 的 `ts` 用带偏移的 RFC 3339
-//!   （`2026-10-17T09:38:58+08:00`），机器解析不会丢时区。文件日志无颜色代码。
+//!   `[2026-10-17 09:38:58 +08:00]`，控制台与文件同构；JSON 的 `ts` 用带偏移的
+//!   RFC 3339（`2026-10-17T09:38:58+08:00`），机器解析不会丢时区。文件日志无颜色代码。
+//!   时区偏移先问 libc；libc 给 0 时再用 `date +%z` 复核（Android / 静态 musl
+//!   没有 tzdata，`localtime_r` 会静默回 GMT+0，日志会整体偏几小时）。
 //! - 轮转：单文件 10 MiB × 5 备份，两个文件 sink 各自独立轮转。
 //! - **消息一律英文**：跨平台无乱码、便于检索；用户数据（路径/文件名）原样保留。
 //!
@@ -120,8 +122,8 @@ static MAIN_SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 static ERROR_SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 /// 控制台颜色开关：TTY 且非 JSON 输出时才着色。初始化时探测一次。
 static COLOR: AtomicBool = AtomicBool::new(false);
-/// 服务器本地时区相对 UTC 的偏移（秒），探测失败按 0 处理（即按 UTC 输出）
-static LOCAL_OFFSET: OnceLock<i64> = OnceLock::new();
+/// 服务器本地时区偏移（秒）+ 探测来源（秒）
+static LOCAL_OFFSET: OnceLock<(i64, &'static str)> = OnceLock::new();
 
 fn settings() -> Settings {
     SETTINGS
@@ -131,12 +133,16 @@ fn settings() -> Settings {
         .unwrap_or_default()
 }
 
-/// 本地时区偏移（秒，惰性探测一次）。
+/// 本地时区偏移与探测来源（惰性探测一次）。
 ///
 /// 惰性而不是只在 `init` 里算：`--check-config` 这类不碰数据目录的命令也要打日志，
 /// 否则控制台时间会莫名其妙变成 UTC。
+fn local_zone() -> (i64, &'static str) {
+    *LOCAL_OFFSET.get_or_init(tz::detect)
+}
+
 fn local_offset() -> i64 {
-    *LOCAL_OFFSET.get_or_init(|| tz::local_offset_secs().unwrap_or(0))
+    local_zone().0
 }
 
 /// 应用 `[log]` 配置（启动与热更新共用）。解析失败的字段保持默认值
@@ -177,6 +183,15 @@ pub fn init(data_dir: &Path) {
     enable_windows_vt();
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     COLOR.store(tty, Ordering::Relaxed);
+
+    // 时区探错会让整份日志的时间对不上系统时间，留一条可核对的记录：
+    // 出现「日志比系统时间早/晚几小时」时，先看这行的 source 是 libc 还是 date
+    let (offset, source) = local_zone();
+    debug(
+        module_path!(),
+        concat!(file!(), ":", line!()),
+        &format!("log timezone: {} (source: {source})", offset_label(offset)),
+    );
 }
 
 /// Windows 经典 conhost 默认关闭 ANSI 转义，需显式打开
@@ -415,21 +430,32 @@ fn unix_secs(now: SystemTime) -> i64 {
     }
 }
 
-/// 服务器本地时间（人读，与控制台/文件行首一致）：`2026-10-17 09:38:58`
+/// 偏移的显示形式：`+08:00` / `-05:30` / `+00:00`（文本与 JSON 共用一套算法）
+fn offset_label(offset_secs: i64) -> String {
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.unsigned_abs();
+    format!("{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60)
+}
+
+/// 服务器本地时间（人读，与控制台/文件行首一致）：`[2026-10-17 09:38:58 +08:00]`
+///
+/// 时区必须写进文本行：跨时区排障时，光看 `09:38:58` 无法判断这是哪台机器的几点，
+/// 对不上系统时间时也无从判断是「时区没探到」还是「进程时间错了」。
 fn format_local(now: SystemTime, offset_secs: i64) -> String {
     let (year, month, day, hour, minute, second) = civil(unix_secs(now) + offset_secs);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    format!(
+        "[{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {}]",
+        offset_label(offset_secs)
+    )
 }
 
 /// 服务器本地时间 + 时区偏移（JSON 用，机器解析不丢时区）：
 /// `2026-10-17T09:38:58+08:00`
 fn iso8601_local(now: SystemTime, offset_secs: i64) -> String {
     let (year, month, day, hour, minute, second) = civil(unix_secs(now) + offset_secs);
-    let sign = if offset_secs < 0 { '-' } else { '+' };
-    let abs = offset_secs.unsigned_abs();
-    let (off_h, off_m) = (abs / 3600, (abs % 3600) / 60);
     format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{sign}{off_h:02}:{off_m:02}"
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{}",
+        offset_label(offset_secs)
     )
 }
 
@@ -462,7 +488,35 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// 本地时区偏移探测。探不到就按 UTC 输出——只影响日志可读性，不影响正确性。
+/// `+0800` / `-05:30` / `+08:00` → 秒。解析失败返回 `None`（不猜）。
+///
+/// 只有 unix 的 `date +%z` 兜底会用到；Windows 上留着是给单测。
+#[cfg(any(unix, test))]
+fn parse_numeric_offset(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    let (sign, rest) = match raw.as_bytes().first()? {
+        b'+' => (1, &raw[1..]),
+        b'-' => (-1, &raw[1..]),
+        _ => return None,
+    };
+    let digits: String = rest.chars().filter(|c| *c != ':').collect();
+    if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i64 = digits[..2].parse().ok()?;
+    let minutes: i64 = digits[2..].parse().ok()?;
+    if hours > 14 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+/// 本地时区偏移探测 + 来源标记（来源只用于 DEBUG 日志，现场判断为什么是 UTC）。
+///
+/// 只靠 libc 不够：Android / 静态 musl 这类环境里没有 tzdata（`/etc/localtime`
+/// 与 `/usr/share/zoneinfo` 都不在），`localtime_r` 会安安静静回 GMT+0，日志
+/// 就整体偏 8 小时。所以 libc 给出 0 时再用 `date +%z` 复核一次——它走的是
+/// 系统自带的时间源（Android 上是 `persist.sys.timezone`），一定与本机时钟一致。
 #[cfg(unix)]
 mod tz {
     #[repr(C)]
@@ -486,7 +540,8 @@ mod tz {
         fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
     }
 
-    pub fn local_offset_secs() -> Option<i64> {
+    /// libc 的本地偏移（依赖 tzdata；Android / 静态 musl 上常常拿不到，于是回 0）
+    fn libc_offset() -> Option<i64> {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -498,6 +553,53 @@ mod tz {
                 return None;
             }
             Some(out.tm_gmtoff)
+        }
+    }
+
+    /// `date +%z`：不依赖 tzdata，读的是系统自己的时区源。
+    ///
+    /// 两轮：先按进程环境（尊重 `TZ`）；全是 0 时再清掉 `TZ` 问一次系统默认时区——
+    /// `TZ` 指向本机不存在的 zoneinfo（Termux 常见）时，第一轮只会静默回 +0000。
+    fn date_offset() -> Option<i64> {
+        // Android 的 date 在 /system/bin，精简容器可能只在 /bin，PATH 兜不住时逐个试
+        let mut zero: Option<i64> = None;
+        for clear_tz in [false, true] {
+            for program in ["date", "/system/bin/date", "/bin/date"] {
+                let mut command = std::process::Command::new(program);
+                command.arg("+%z");
+                if clear_tz {
+                    command.env_remove("TZ");
+                }
+                let Ok(output) = command.output() else {
+                    continue;
+                };
+                if !output.status.success() {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&output.stdout);
+                if let Some(offset) = super::parse_numeric_offset(&text) {
+                    if offset != 0 {
+                        return Some(offset);
+                    }
+                    zero = Some(0);
+                }
+            }
+        }
+        zero
+    }
+
+    pub fn detect() -> (i64, &'static str) {
+        match libc_offset() {
+            // libc 说 0：可能真是 UTC，也可能只是没 tzdata。用 date 复核一次
+            Some(0) => match date_offset() {
+                Some(0) | None => (0, "utc"),
+                Some(offset) => (offset, "date"),
+            },
+            Some(offset) => (offset, "libc"),
+            None => match date_offset() {
+                Some(offset) => (offset, "date"),
+                None => (0, "unknown"),
+            },
         }
     }
 }
@@ -540,8 +642,8 @@ mod tz {
         d + (153 * m2 + 2) / 5 + 365 * y2 + y2 / 4 - y2 / 100 + y2 / 400 - 32_045
     }
 
-    pub fn local_offset_secs() -> Option<i64> {
-        unsafe {
+    pub fn detect() -> (i64, &'static str) {
+        let offset = unsafe {
             let mut utc = SystemTime::default();
             let mut local = SystemTime::default();
             GetSystemTime(&mut utc);
@@ -553,14 +655,15 @@ mod tz {
             } else {
                 None
             }
-        }
+        };
+        (offset.unwrap_or(0), "system")
     }
 }
 
 #[cfg(not(any(unix, windows)))]
 mod tz {
-    pub fn local_offset_secs() -> Option<i64> {
-        None
+    pub fn detect() -> (i64, &'static str) {
+        (0, "unknown")
     }
 }
 
@@ -634,9 +737,33 @@ mod tests {
 
     #[test]
     fn local_format_applies_offset() {
-        // UTC 00:00 + 8h = 本地 08:00
+        // UTC 00:00 + 8h = 本地 08:00，且行首必须带时区，否则对不上系统时间时无从判断
         let text = format_local(UNIX_EPOCH, 8 * 3600);
-        assert_eq!(text, "1970-01-01 08:00:00");
+        assert_eq!(text, "[1970-01-01 08:00:00 +08:00]");
+        // 半小时时区 + 负偏移都要能正确进位
+        assert_eq!(
+            format_local(UNIX_EPOCH, 5 * 3600 + 1800),
+            "[1970-01-01 05:30:00 +05:30]"
+        );
+        assert_eq!(
+            format_local(UNIX_EPOCH, -(3 * 3600 + 1800)),
+            "[1969-12-31 20:30:00 -03:30]"
+        );
+    }
+
+    #[test]
+    fn numeric_offset_parsing() {
+        // `date +%z` 给的是 +0800；手写配置/日志里也可能是 +08:00
+        assert_eq!(parse_numeric_offset("+0800"), Some(8 * 3600));
+        assert_eq!(parse_numeric_offset("+08:00"), Some(8 * 3600));
+        assert_eq!(parse_numeric_offset("-0530"), Some(-(5 * 3600 + 1800)));
+        assert_eq!(parse_numeric_offset("+0000"), Some(0));
+        // 非法值一律不猜，宁可回 UTC 也不要凭空造一个偏移
+        assert_eq!(parse_numeric_offset("0800"), None);
+        assert_eq!(parse_numeric_offset("+8"), None);
+        assert_eq!(parse_numeric_offset("+2500"), None);
+        assert_eq!(parse_numeric_offset("+0860"), None);
+        assert_eq!(parse_numeric_offset(""), None);
     }
 
     #[test]

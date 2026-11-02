@@ -144,9 +144,22 @@ function autoFocus() {
   focusTerminal()
 }
 
-/** 重新适配容器尺寸（ResizeObserver 与 visualViewport 共用） */
+/** 容器是否真的有布局尺寸：隐藏标签（v-show=false）的盒子是 0×0 */
+function hasLayout(): boolean {
+  const box = host.value?.getBoundingClientRect()
+  return !!box && box.width > 0 && box.height > 0
+}
+
+/**
+ * 重新适配容器尺寸（ResizeObserver 与 visualViewport 共用）。
+ *
+ * 只有「活动且真的有尺寸」时才 fit。非活动标签被 v-show 隐藏成 0×0，
+ * 此时 fit 会算出 2 列 1 行这样的垃圾值（后端再钳到 20×5），把别的标签
+ * 的 PTY 一起压扁——切回来时 shell 按 20 列重画提示符，看起来就像
+ * 「终端被重置」了。窗口尺寸变化由 active 的 watcher 在切回来时补做。
+ */
 function refit() {
-  if (!fit || !term) return
+  if (!fit || !term || !props.active || !hasLayout()) return
   try {
     fit.fit()
   } catch {
@@ -480,15 +493,13 @@ onMounted(() => {
 
   // nextTick 确保 host 已完成布局再 fit：挂载瞬间容器尺寸可能是 0，
   // 提前 fit 会算出错误的 cols/rows，PTY 与画布列数错位（色块换行错乱）。
+  // 非活动标签（页面重进时一次挂载多个）没有布局，交给 refit 直接跳过，
+  // 等切换过去时再由 active watcher 补做。
   void nextTick(() => {
     requestAnimationFrame(() => {
-      try {
-        fit?.fit()
-      } catch {
-        /* 容器尚未布局 */
-      }
-      sendResize()
-      autoFocus()
+      refit()
+      // 焦点只能给活动标签：否则后挂载的隐藏标签会把焦点从正在看的终端抢走
+      if (props.active) autoFocus()
     })
   })
 
@@ -547,13 +558,9 @@ watch(
   () => props.active,
   (active) => {
     if (!active) return
+    // 隐藏期间可能被窗口缩放/软键盘改过尺寸，切回来这一次 fit 才是权威值
     requestAnimationFrame(() => {
-      try {
-        fit?.fit()
-      } catch {
-        /* ignore */
-      }
-      sendResize()
+      refit()
       autoFocus()
     })
   },
