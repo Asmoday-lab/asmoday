@@ -283,6 +283,12 @@ async fn open_frame(
         }
         path
     };
+    // 游标是客户端输入，不是凭证：`rel` 里带 `..`、绝对路径或 Windows 盘符
+    // （`C:` / UNC）都会让 `push` 整体替换前缀而逃出搜索根。拼完做一次词法
+    // 归属断言——逃出就按「这一层已失效」处理（与目录被删同口径），绝不去读。
+    if !abs.starts_with(root) {
+        return Err(FsError::Forbidden("搜索游标指向搜索根之外".to_string()));
+    }
 
     let entries = match (cache, stamp_of_dir(&abs).await) {
         (Some(cache), Some((key, stamp))) => match cache.load(&key, stamp) {
@@ -620,5 +626,49 @@ mod tests {
         let decoded = decode_cursor(&encoded);
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[1].next, "a&b=c.png");
+    }
+
+    /// 游标是客户端输入：`..` / 盘符 / UNC 必须逃不出搜索根（安全红线）
+    #[tokio::test]
+    async fn cursor_cannot_escape_the_search_root() {
+        let root = tree("cursor-guard");
+        let outside = scratch("cursor-guard-outside");
+        touch(&outside.join("secret-report.txt"));
+
+        let encode = |dir: &str| {
+            let frames = vec![CursorFrame {
+                dir: dir.to_string(),
+                next: String::new(),
+            }];
+            let json = serde_json::to_vec(&frames).unwrap();
+            data_encoding::BASE64URL_NOPAD.encode(&json)
+        };
+
+        for dir in ["..", "../..", "sub/../../..", "C:", "\\\\evil\\share"] {
+            let page = run(
+                &root,
+                &SearchOptions::new("report"),
+                Some(&encode(dir)),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                page.hits.iter().all(|hit| !hit.abs.starts_with(&outside)),
+                "cursor {dir:?} 逃出了搜索根：{:?}",
+                page.hits
+            );
+        }
+
+        // 合法游标（搜索根内的子目录）不受影响，仍能续页
+        let page = run(
+            &root,
+            &SearchOptions::new("report"),
+            Some(&encode("sub")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(page.hits.iter().any(|hit| hit.rel == "sub/report-draft.md"));
     }
 }

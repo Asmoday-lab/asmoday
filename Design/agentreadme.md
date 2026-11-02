@@ -1637,6 +1637,16 @@ GWT-LOG-03 Given 同一个事件  Then 控制台、主文件、错误文件三�
 GWT-LOG-04 Given 没有 tzdata 的环境（Android / 静态 musl）  When 启动  Then 偏移由 `date +%z` 兜底，日志时间与系统时间一致；探到的来源写在 DEBUG 的 `log timezone` 行
 ```
 
+#### GWT 验收（安全收紧，v4.6.13）
+
+```gwt
+GWT-SEC-01 Given 手工构造的搜索游标（dir 段含 `..` / 盘符 / UNC）  When GET /api/files/search?recursive=true&cursor=…  Then 逃出的层按「已失效」放弃，响应不含挂载点之外的路径；合法游标续页不受影响
+GWT-SEC-02 Given 挂载点内一个指向外部的软链接  When touch / 上传 / WebDAV PUT 到该链接路径  Then 无论 follow_symlinks 取值一律 403 SymlinkEscape；follow_symlinks=true 的「读」行为不变
+GWT-SEC-03 Given 已登录但 15 分钟内未验证过密码  When GET /api/system/backup（或 POST 未验证）  Then 403 REVERIFY_REQUIRED；POST /api/auth/verify-password 通过后 15 分钟内下载免再次输入；终端与日常接口不受影响
+GWT-SEC-04 Given 挂载点内一个 .html 文件被分享并直开  Then 响应强制 attachment + nosniff；.svg 内联时带 CSP sandbox，<img> 场景不受影响；所有文件内联响应带 nosniff
+GWT-SEC-05 Given 跨站页面对 /proxy/{id} 发起 WebSocket 握手  Then 握手被 403 拒绝（与 /api/terminal/ws 同口径）；同源与非浏览器客户端放行
+```
+
 ---
 
 ## 4. Agent 执行协议

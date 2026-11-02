@@ -249,6 +249,14 @@ pub async fn raw(
         .as_deref()
         .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
     let mut extra: Vec<(HeaderName, String)> = Vec::new();
+    // 内联出口防 XSS（安全审查 2026-11-02）：nosniff 一律带上；HTML 能以本站
+    // origin 执行脚本，强制走 attachment。SVG 相册灯箱要当原图内联（<img> 里
+    // 不执行脚本），直开文档时靠响应级 CSP `sandbox` 关掉脚本与表单。
+    let download = download || mime.starts_with("text/html");
+    extra.push((header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()));
+    if !download && mime == "image/svg+xml" {
+        extra.push((header::CONTENT_SECURITY_POLICY, "sandbox".to_string()));
+    }
     if download {
         let name = path
             .file_name()
@@ -825,15 +833,11 @@ pub async fn upload(
         }
     }
 
-    // 文件名只允许单层：拒绝分隔符与上跳
+    // 文件名统一走 path_guard::validate_name：单层校验之外还拒 Windows
+    // 保留设备名（CON/NUL/COM1…）、尾随点/空格与控制字符（安全审查 2026-11-02）
     let name = query.name.trim();
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.contains('\0')
-    {
-        return fail(StatusCode::BAD_REQUEST, "Invalid file name");
+    if let Err(err) = crate::core::path_guard::validate_name(name) {
+        return fail(StatusCode::BAD_REQUEST, err.message());
     }
 
     let roots = roots_for(&state).await;

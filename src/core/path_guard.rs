@@ -424,7 +424,7 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
         ));
     }
     let target = parent_canon.join(name);
-    ensure_child_link_safe(&target, root, mount.info.follow_symlinks)?;
+    ensure_child_link_safe(&target, root)?;
     Ok(target)
 }
 
@@ -433,13 +433,9 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
 /// `resolve_child` 只 canonicalize 了父目录，名字本身不碰磁盘。父目录在挂载点内、
 /// 名字恰好是一个指向外面的链接（尤其是**悬空**链接，`canonicalize` 会直接
 /// ENOENT 被当成「新建」）时，`touch` / 上传 / 覆盖写会顺着链接落到挂载点外。
-/// 这一条与 `follow_symlinks` 无关：配置放开的是「读链接」，不是「借链接写到外面」——
-/// 关闭时必须拒，打开时按链接目标是否仍在本挂载点内判定。
-fn ensure_child_link_safe(
-    target: &Path,
-    root: &Path,
-    follow_symlinks: bool,
-) -> Result<(), FsError> {
+/// 这一条与 `follow_symlinks` 无关：配置放开的是「读链接」，不是「借链接写到外面」
+/// —— 无论配置如何，链接目标不在本挂载点内一律拒绝写入。
+fn ensure_child_link_safe(target: &Path, root: &Path) -> Result<(), FsError> {
     let Ok(meta) = std::fs::symlink_metadata(target) else {
         // 不存在：正常新建，没有链接可跟
         return Ok(());
@@ -453,10 +449,10 @@ fn ensure_child_link_safe(
             "该路径属于应用数据目录，不对外开放".to_string(),
         ));
     }
+    // `follow_symlinks` 只放开「读链接」，不放行「借链接写到外面」：
+    // 最后一段是软链接时，写入一律要求链接目标仍在本挂载点内，
+    // 否则 touch / 上传 / WebDAV PUT 会顺着指向外部的链接落盘越界。
     if lexical_inside(&resolved, root) {
-        return Ok(());
-    }
-    if follow_symlinks {
         return Ok(());
     }
     Err(FsError::SymlinkEscape(
@@ -1036,9 +1032,14 @@ mod symlink_escape_tests {
 
         // 普通新名字不受影响
         assert!(resolve_child(&strict, &root_raw, "fresh.txt").is_ok());
-        // 放宽模式维持既有口径：链接可跟随
+        // 放宽模式同样拒绝：follow_symlinks 放开的是「读链接」，
+        // 不放行「借链接写到外面」（安全审查 2026-11-02 收紧）
         let open = mount_at(&root, true);
-        assert!(resolve_child(&open, &root_raw, "link").is_ok());
+        let err = resolve_child(&open, &root_raw, "link").unwrap_err();
+        assert!(
+            matches!(err, FsError::SymlinkEscape(_)),
+            "放宽模式也必须拒绝借逃逸链接写入，实得 {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

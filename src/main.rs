@@ -324,7 +324,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     // `/asmoday/api/...` 全部落到静态回落（回 `{"error":"接口不存在"}`）。
     let mut app = Router::new().fallback_service(tower::Layer::layer(
         &middleware::from_fn_with_state(state.clone(), api::prefix::apply),
-        build_router(state.clone()),
+        build_router(state.clone()).await,
     ));
     // 子路径部署：整站挂到 base_url 下，根路径跳转到前缀（设计文档 3.1 / 4.2）
     if !base_url.is_empty() {
@@ -498,7 +498,7 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/auth/me", get(api::auth::me))
         .route("/api/system/health", get(api::system::health))
         // 数据库热备下载（设计文档 4.1）：高敏，需近期验证过密码
-        .route("/api/system/backup", get(api::system::backup))
+        .route("/api/system/backup", post(api::system::backup))
         .route("/api/system/ffmpeg-status", get(api::system::ffmpeg_status))
         .route(
             "/api/system/cleanup/thumbnails",
@@ -522,6 +522,10 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/system/test-ffmpeg", post(api::system::test_ffmpeg))
         .route("/api/auth/password", post(api::auth::change_password))
+        .route(
+            "/api/auth/verify-password",
+            post(api::auth::reverify_password),
+        )
         .route("/api/auth/totp/setup", get(api::auth::totp_setup))
         .route("/api/auth/totp/enable", post(api::auth::totp_enable))
         .route("/api/auth/totp/disable", post(api::auth::totp_disable))
@@ -602,7 +606,18 @@ fn dav_routes() -> Router<AppState> {
         .nest("/dav", Router::new().fallback(any(api::webdav::handle)))
 }
 
-fn build_router(state: AppState) -> Router {
+async fn build_router(state: AppState) -> Router {
+    // 请求体上限跟 `[media].upload_max_size_mb` 对齐（安全审查 2026-11-02）：
+    // 「0 = 不限制」不再被写死的 64 MiB 卡住；未配置时维持 64 MiB。
+    // 上传是流式落盘的，放大上限不会放大内存占用。
+    let upload_limit_mb = state.config.read().await.media.upload_max_size_mb;
+    let body_limit: usize = if upload_limit_mb == 0 {
+        4 * 1024 * 1024 * 1024
+    } else {
+        upload_limit_mb
+            .saturating_mul(1024 * 1024)
+            .min(usize::MAX as u64) as usize
+    };
     let protected = protected_routes().route_layer(middleware::from_fn_with_state(
         state.clone(),
         api::auth::require_auth,
@@ -613,7 +628,7 @@ fn build_router(state: AppState) -> Router {
         // WebDAV 自带 Basic 认证，不经 Cookie 中间件
         .merge(dav_routes())
         // 上传/代理大文件：放宽请求体上限
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(body_limit))
         .fallback(api::static_files::serve)
         // HTTP 访问日志（设计文档 3.7：独立 api_level 通道，只记方法/路径/状态码/耗时/IP）
         .layer(middleware::from_fn_with_state(

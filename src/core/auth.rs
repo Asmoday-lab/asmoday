@@ -860,6 +860,39 @@ impl AuthStore {
         Ok(())
     }
 
+    /// 高敏操作的「近期密码验证」窗口（当前仅备份下载使用）。
+    ///
+    /// 有意**不做** v4.4.1 那种全局闸门——那版 5 分钟弹一次密码，太扰人，已删。
+    /// 这里只在用户主动请求高敏操作时要求确认一次，窗口内免重复输入。
+    pub const SENSITIVE_VERIFY_TTL: i64 = 15 * 60;
+
+    /// 记录一次密码验证（复用 v4.4.1 遗留的 `sessions.verified_at` 列）。
+    pub fn mark_session_verified(&self, token: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE sessions SET verified_at = ?1 WHERE token = ?2",
+            params![now_secs(), token],
+        )
+        .map_err(|e| format!("更新验证时间失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 当前会话是否在 `SENSITIVE_VERIFY_TTL` 窗口内验证过密码。
+    pub fn session_verified_recently(&self, token: &str) -> bool {
+        let Ok(conn) = self.connect() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT verified_at FROM sessions WHERE token = ?1",
+            params![token],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|verified_at| {
+            verified_at > 0 && now_secs() - verified_at <= Self::SENSITIVE_VERIFY_TTL
+        })
+        .unwrap_or(false)
+    }
+
     pub fn purge_expired(&self) -> Result<usize, String> {
         let conn = self.connect()?;
         conn.execute(

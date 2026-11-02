@@ -227,6 +227,15 @@ async fn dispatch(
 
     // ---- WebSocket 透传 ----
     if is_websocket(&headers) {
+        // CSWSH 防线（与 terminal 同口径）：握手是 GET，鉴权中间件的同源校验
+        // 对 GET 不生效；配置了 inject_headers 免登录的服务，跨站页面一句
+        // `new WebSocket(...)` 就能无凭证直连。
+        if !crate::api::auth::ws_origin_allowed(&headers) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "Cross-site WebSocket handshake rejected",
+            );
+        }
         let Some(upgrade) = ws.0 else {
             return error_response(StatusCode::BAD_REQUEST, "WebSocket 升级请求缺少必要头部");
         };

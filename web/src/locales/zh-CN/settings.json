@@ -124,7 +124,12 @@
     "backupNow": "下载备份",
     "backupBusy": "正在打包…",
     "backupDone": "备份已开始下载",
-    "backupFailed": "备份失败"
+    "backupFailed": "备份失败",
+    "verifyPlaceholder": "输入当前密码以继续",
+    "verifyConfirm": "确认并下载",
+    "verifyBusy": "验证中…",
+    "verifyHint": "下载数据库备份前需确认一次密码；15 分钟内免重复输入。",
+    "verifyFailed": "密码验证失败"
   },
   "advanced": {
     "form": "可视化表单",

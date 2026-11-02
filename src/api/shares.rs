@@ -673,21 +673,31 @@ async fn stream_file(target: PathBuf, headers: &HeaderMap, as_attachment: bool) 
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
-    let disposition = if as_attachment {
+    // 内联出口防 XSS（安全审查 2026-11-02）：nosniff 一律带上；HTML 能以本站
+    // origin 执行脚本，强制走 attachment。SVG 保持内联（<img> 里不执行脚本），
+    // 直开文档时靠响应级 CSP `sandbox` 关掉脚本与表单。
+    let mut disposition = if as_attachment {
         "attachment"
     } else {
         "inline"
     };
+    if disposition == "inline" && mime.starts_with("text/html") {
+        disposition = "attachment";
+    }
 
     let mut headers_out: Vec<(&'static str, String)> = vec![
-        ("content-type", mime),
+        ("content-type", mime.clone()),
         ("accept-ranges", "bytes".to_string()),
         ("cache-control", "no-store".to_string()),
         (
             "content-disposition",
             format!("{disposition}; filename*=UTF-8''{}", percent_encode(&name)),
         ),
+        ("x-content-type-options", "nosniff".to_string()),
     ];
+    if disposition == "inline" && mime == "image/svg+xml" {
+        headers_out.push(("content-security-policy", "sandbox".to_string()));
+    }
 
     let range_header = headers
         .get(header::RANGE)

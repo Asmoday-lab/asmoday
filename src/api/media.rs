@@ -1109,7 +1109,8 @@ pub async fn cache_stats(State(state): State<AppState>) -> Response {
         "bytes": bytes,
         "limit_mb": config.media.thumb_cache_max_size_mb,
         "max_age_days": config.media.thumb_cache_max_age_days,
-        "dir": fs::normalize_display(state.thumbnails.cache_dir()),
+        // 不回显缓存目录的物理路径（安全审查 2026-11-02）：UI 用不到，
+        // 泄露服务器目录结构没有收益
     }))
     .into_response()
 }

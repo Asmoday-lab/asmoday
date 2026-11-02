@@ -330,33 +330,68 @@ function formatExpiry(value: number | null) {
 
 // ---------------- 安全：数据库热备份 ----------------
 const backupBusy = ref(false)
+// 高敏确认（仅备份）：后端要求 15 分钟内验证过密码，403 时展开密码行。
+// 不是全局闸门——只在下载备份这一次操作上要求。
+const backupVerifyVisible = ref(false)
+const backupVerifyBusy = ref(false)
+const backupPassword = ref('')
+
+/** 把备份响应体落成下载文件；文件名优先用后端 Content-Disposition。 */
+async function saveBackupBlob(res: Response) {
+  const blob = await res.blob()
+  const disposition = res.headers.get('content-disposition') ?? ''
+  const matched = /filename="([^"]+)"/.exec(disposition)
+  const name = matched?.[1] || `asmoday-backup-${Date.now()}.db`
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = name
+  document.body.append(link)
+  link.click()
+  link.remove()
+  // 立刻回收：blob URL 不释放会一直占着这份内存
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  showToast(t('settings.security.backupDone'))
+}
 
 /** 下载一份 SQLite 热备份（后端 `VACUUM INTO`，服务运行中也能备）。 */
 async function downloadBackup() {
   if (backupBusy.value) return
   backupBusy.value = true
   try {
-    const res = await fetch('/api/system/backup')
+    const res = await fetch('/api/system/backup', { method: 'POST' })
+    if (res.status === 403) {
+      // REVERIFY_REQUIRED：展开密码确认行，验证通过后 15 分钟内免重复输入
+      backupVerifyVisible.value = true
+      return
+    }
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
-    const blob = await res.blob()
-    // 文件名优先用后端给的 Content-Disposition（带 UTC 时间戳），拿不到再兜底
-    const disposition = res.headers.get('content-disposition') ?? ''
-    const matched = /filename="([^"]+)"/.exec(disposition)
-    const name = matched?.[1] || `asmoday-backup-${Date.now()}.db`
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = name
-    document.body.append(link)
-    link.click()
-    link.remove()
-    // 立刻回收：blob URL 不释放会一直占着这份内存
-    window.setTimeout(() => URL.revokeObjectURL(url), 0)
-    showToast(t('settings.security.backupDone'))
+    await saveBackupBlob(res)
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('settings.security.backupFailed'))
   } finally {
     backupBusy.value = false
+  }
+}
+
+/** 确认密码并继续下载备份 */
+async function confirmBackupVerify() {
+  if (backupVerifyBusy.value || !backupPassword.value) return
+  backupVerifyBusy.value = true
+  try {
+    const res = await fetch('/api/auth/verify-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: backupPassword.value }),
+    })
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    backupPassword.value = ''
+    backupVerifyVisible.value = false
+    await downloadBackup()
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('settings.security.verifyFailed'))
+  } finally {
+    backupVerifyBusy.value = false
   }
 }
 
@@ -1197,6 +1232,29 @@ onBeforeUnmount(() => {
             <AppIcon name="download" :size="13" />
             {{ backupBusy ? t('settings.security.backupBusy') : t('settings.security.backupNow') }}
           </button>
+        </div>
+
+        <!-- 高敏确认（仅备份）：需要时展开，15 分钟内免重复输入 -->
+        <div
+          v-if="backupVerifyVisible"
+          class="mt-3 flex flex-wrap items-center gap-2"
+        >
+          <PasswordInput
+            v-model="backupPassword"
+            :placeholder="t('settings.security.verifyPlaceholder')"
+            class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+            data-testid="backup-verify-password"
+            @keyup.enter="confirmBackupVerify"
+          />
+          <button
+            class="rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+            :disabled="backupVerifyBusy || !backupPassword"
+            data-testid="backup-verify-confirm"
+            @click="confirmBackupVerify"
+          >
+            {{ backupVerifyBusy ? t('settings.security.verifyBusy') : t('settings.security.verifyConfirm') }}
+          </button>
+          <span class="text-[12px] text-muted">{{ t('settings.security.verifyHint') }}</span>
         </div>
       </div>
 

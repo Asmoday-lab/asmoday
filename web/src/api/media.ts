@@ -257,7 +257,6 @@ export interface CacheStats {
   bytes: number
   limit_mb: number
   max_age_days: number
-  dir: string
 }
 
 export const cacheApi = {

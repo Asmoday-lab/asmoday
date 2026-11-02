@@ -124,7 +124,12 @@
     "backupNow": "Download backup",
     "backupBusy": "Packing…",
     "backupDone": "Backup download started",
-    "backupFailed": "Backup failed"
+    "backupFailed": "Backup failed",
+    "verifyPlaceholder": "Enter your current password to continue",
+    "verifyConfirm": "Confirm and download",
+    "verifyBusy": "Verifying…",
+    "verifyHint": "Downloading a database backup requires a one-time password check; valid for 15 minutes.",
+    "verifyFailed": "Password verification failed"
   },
   "advanced": {
     "form": "Form",

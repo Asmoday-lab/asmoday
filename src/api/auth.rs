@@ -48,7 +48,9 @@ where
 // Cookie 工具
 // ---------------------------------------------------------------------------
 
-fn cookie_token(headers: &HeaderMap) -> Option<String> {
+/// Cookie 里的会话 token。备份等高敏操作要凭它查近期密码验证时间戳，
+/// 所以开放给兄弟模块（`pub(crate)`）。
+pub(crate) fn cookie_token(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
         let part = part.trim();
@@ -603,6 +605,11 @@ pub struct PasswordRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct VerifyPasswordRequest {
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TotpEnableRequest {
     pub code: String,
 }
@@ -824,8 +831,19 @@ pub async fn login(
 pub async fn logout(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    request: Request,
 ) -> Response {
+    // logout 是公开 POST，不吃鉴权中间件的同源校验：跨站页面可以零交互
+    // 把管理员登出（滋扰级 CSRF）。浏览器请求必带 Origin/Referer，这里
+    // 用同一套判定挡掉跨站；非浏览器客户端两者都缺，照常放行。
+    if !origin_matches_host(request.headers(), request.method()) {
+        return json_error_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Cross-site logout rejected",
+        );
+    }
+    let headers = request.headers().clone();
     if let Some(token) = cookie_token(&headers) {
         let _ = state.auth.delete_session(&token);
     }
@@ -897,6 +915,71 @@ pub async fn change_password(
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
+}
+
+/// POST /api/auth/verify-password（受保护）：高敏操作前的密码确认。
+///
+/// 范围有意收得很窄：**当前只有备份下载**会检查验证时间戳（`core::auth`
+/// 的 `SENSITIVE_VERIFY_TTL`，15 分钟）。v4.4.1 曾做过 5 分钟一次的全局
+/// 二次验证闸门，因为太扰人被整体移除——这里不在终端、文件等日常路径
+/// 上加任何验证，只在用户主动请求高敏操作时要求确认一次。
+/// 防爆破与登录共用同一限流池（同 IP 连续错 5 次封 15 分钟）。
+pub async fn reverify_password(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    auth_user: AuthUser,
+    Json(body): Json<VerifyPasswordRequest>,
+) -> Response {
+    let ip = client_ip(&state, &headers, Some(peer)).await;
+    let keys = [ip.clone(), format!("verify|{ip}")];
+    for key in &keys {
+        if let Err(remaining) = state.login_guard.check(key) {
+            return json_error_code(
+                StatusCode::TOO_MANY_REQUESTS,
+                "AUTH_RATE_LIMITED",
+                format!("Too many attempts, retry in {remaining}s"),
+            );
+        }
+    }
+
+    let found = match state.auth.find_user(&auth_user.username) {
+        Ok(found) => found,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let Some((_, hash, _)) = found else {
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_USER_MISSING",
+            "User not found",
+        );
+    };
+    if !verify_password(&hash, &body.password) {
+        record_login_failure(&state.login_guard, &keys);
+        return json_error_code(
+            StatusCode::BAD_REQUEST,
+            "PASSWORD_WRONG",
+            "Current password is incorrect",
+        );
+    }
+    clear_login_failures(&state.login_guard, &keys);
+
+    let Some(token) = cookie_token(&headers) else {
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_REQUIRED",
+            "No session cookie",
+        );
+    };
+    if let Err(err) = state.auth.mark_session_verified(&token) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    Json(json!({
+        "status": "ok",
+        "verified_until": crate::core::auth::now_secs()
+            + crate::core::auth::AuthStore::SENSITIVE_VERIFY_TTL,
+    }))
+    .into_response()
 }
 
 /// GET /api/auth/totp/setup（受保护）：生成密钥、otpauth 链接与二维码

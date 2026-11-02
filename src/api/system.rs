@@ -190,11 +190,32 @@ pub async fn cleanup_parts(State(state): State<AppState>) -> Response {
     }
 }
 
-/// GET /api/system/backup：下载一份数据库热备份（设计文档 4.1）
+/// POST /api/system/backup：下载一份数据库热备份（设计文档 4.1）
 ///
 /// 备份里是密码哈希、TOTP 密钥与会话，属于高敏操作，所以：
+/// - **只接受 POST**：GET 会被一次顶级导航 CSRF 拉走（SameSite=Lax 允许
+///   顶级导航携带 Cookie），改 POST 后有写方法同源校验兜底；
+/// - 要求 **15 分钟内验证过密码**（`POST /api/auth/verify-password`），
+///   没验证过回 403 `REVERIFY_REQUIRED`，前端弹密码框。这是单次操作的
+///   确认，不是全局闸门——终端与日常操作不受影响；
 /// - 响应 `no-store` + `attachment`，绝不能被缓存或内联渲染。
-pub async fn backup(State(state): State<AppState>) -> Response {
+pub async fn backup(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    let verified = crate::api::auth::cookie_token(&headers)
+        .map(|token| state.auth.session_verified_recently(&token))
+        .unwrap_or(false);
+    if !verified {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": {
+                    "code": "REVERIFY_REQUIRED",
+                    "message": "Password verification required before downloading a backup",
+                }
+            })),
+        )
+            .into_response();
+    }
+
     let stamp = crate::core::auth::now_secs();
     let temp = state
         .data_dir
