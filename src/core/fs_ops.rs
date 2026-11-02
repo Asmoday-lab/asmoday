@@ -426,13 +426,13 @@ impl NameBook {
 }
 
 /// 冲突决策结果
-enum Placement {
+pub(crate) enum Placement {
     /// 用这个名字落盘；`overwrite=true` 时才允许替换已存在的同名文件
     Use(String, bool),
     Skip,
 }
 
-fn resolve_placement(
+pub(crate) fn resolve_placement(
     book: &mut NameBook,
     name: &str,
     is_dir_src: bool,

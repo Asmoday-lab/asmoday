@@ -17,6 +17,7 @@ pub mod static_files;
 pub mod system;
 pub mod terminal;
 pub mod tokens;
+pub mod upload_tus;
 pub mod webdav;
 
 /// 宽松布尔查询参数：接受 `1/0`、`true/false`、`yes/no`、`on/off`。

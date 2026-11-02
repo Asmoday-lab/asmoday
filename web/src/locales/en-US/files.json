@@ -140,7 +140,9 @@
     "failed": "Failed",
     "done": "Done",
     "error": "Upload failed",
-    "network": "Network error"
+    "network": "Network error",
+    "retry": "Retry",
+    "resume": "Resuming from last offset"
   },
   "language": {
     "plain": "Plain text"

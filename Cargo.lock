@@ -134,6 +134,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "http-body",
+ "http-body-util",
  "httpdate",
  "image",
  "lofty",

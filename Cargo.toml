@@ -80,6 +80,7 @@ tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"
 # 实现自定义判定必须能写出这个 trait 路径（本来就在依赖树里）。
 # 注意 crate 名带连字符、lib 名是 http_body
 http-body = "1"
+http-body-util = "0.1"
 # 音频标签（ID3v2 / FLAC / Ogg / MP4 / WAV / AIFF / APE / WavPack）。
 # 自己写 ID3v2 只能覆盖 MP3，FLAC 与 M4A 直接没标签（音乐库整页空白）。
 lofty = "0.25.5"

@@ -140,7 +140,9 @@
     "failed": "失败",
     "done": "完成",
     "error": "上传失败",
-    "network": "网络错误"
+    "network": "网络错误",
+    "retry": "重试",
+    "resume": "将从断点续传"
   },
   "language": {
     "plain": "纯文本"

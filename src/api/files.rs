@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::AppState;
 use crate::core::config::Config;
 use crate::core::fs::{self, FsError, RootSet};
+use crate::core::fs_ops;
 use crate::core::path_guard;
 
 /// 编辑器单次保存上限（8 MiB）
@@ -101,10 +102,63 @@ fn fail_code(status: StatusCode, code: &str, message: impl Into<String>) -> Resp
 /// 目录快照以「目录 mtime」为失效依据，而**覆盖写既有文件不会推进目录 mtime**
 /// （名字集合没变），只有创建 / 删除 / 改名才会。所以这一类写必须自己补一刀，
 /// 否则媒体库里那张图的体积与时间会一直是旧的、排序也停在老位置。
-fn forget_parent_snapshot(state: &AppState, path: &std::path::Path) {
+pub(crate) fn forget_parent_snapshot(state: &AppState, path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         state.dir_cache.forget(&fs::normalize_display(parent));
     }
+}
+
+/// 解析并校验一个「可写入的上传目标目录」，整包 PUT 与 tus init 共用（安全审查
+/// 2026-11-02 时两处口径已对齐；只读检查为 v4.6.14 补齐——此前整包上传漏了它）。
+///
+/// 校验链：路径解析 → 是目录 → 只读 → 剩余空间 → 授权根包含性。
+pub(crate) async fn resolve_upload_dir(
+    state: &AppState,
+    dir: &str,
+    needed_bytes: u64,
+) -> Result<PathBuf, Response> {
+    let roots = roots_for(state).await;
+    let resolved = match fs::resolve_existing(dir, &roots.allowed, roots.follow_symlinks) {
+        Ok(path) => path,
+        Err(err) => return Err(fs_error(err)),
+    };
+    if !resolved.is_dir() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Upload target is not a directory",
+        ));
+    }
+
+    // 只读挂载点拒绝写入（与 files_mutate 的 mount.ensure_writable 同口径）
+    let mounts = mounts_for(state).await;
+    if mounts.is_readonly(&resolved) {
+        return Err(fs_error(FsError::Readonly(fs::normalize_display(
+            &resolved,
+        ))));
+    }
+
+    // 上传前检查目标挂载点剩余空间（设计文档 3.2.3）
+    if let Err(err) = fs_ops::ensure_space(&resolved, needed_bytes) {
+        return Err(fs_error(err));
+    }
+
+    // 二次确认：拼接后的真实路径仍在授权根内。
+    // 允许「经由挂载点内软链接」逃逸时（`[system].follow_symlinks`）不算越权——
+    // 与 `resolve_existing` 口径一致，否则链接目录里上传会被这一道单独拦掉。
+    if let Ok(canonical_parent) = std::fs::canonicalize(&resolved)
+        && !roots
+            .allowed
+            .iter()
+            .any(|root| canonical_parent.starts_with(root))
+        && !(roots.follow_symlinks && path_guard::escaped_via_symlink(&resolved, &roots.allowed))
+    {
+        return Err(fail_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Upload target is outside the allowed roots",
+        ));
+    }
+    Ok(resolved)
 }
 
 pub async fn roots(State(state): State<AppState>) -> Response {
@@ -125,7 +179,14 @@ pub async fn roots(State(state): State<AppState>) -> Response {
 pub async fn mounts(State(state): State<AppState>) -> Response {
     let set = mounts_for(&state).await;
     let items: Vec<_> = set.mounts.iter().map(|m| m.info.clone()).collect();
-    Json(json!({ "mounts": items, "implicit": set.implicit })).into_response()
+    // 分片大小随挂载点清单下发：文件页据此决定整包 PUT 还是 tus 分块（3.2.3.1）
+    let chunk_size_mb = state.config.read().await.media.upload_chunk_size_mb;
+    Json(json!({
+        "mounts": items,
+        "implicit": set.implicit,
+        "upload_chunk_size_mb": chunk_size_mb,
+    }))
+    .into_response()
 }
 
 /// GET /api/files/list
@@ -840,14 +901,11 @@ pub async fn upload(
         return fail(StatusCode::BAD_REQUEST, err.message());
     }
 
-    let roots = roots_for(&state).await;
-    let dir = match fs::resolve_existing(&query.dir, &roots.allowed, roots.follow_symlinks) {
+    // 路径 / 只读 / 剩余空间 / 授权根：与 tus 分块上传共用同一套校验
+    let dir = match resolve_upload_dir(&state, &query.dir, body.len() as u64).await {
         Ok(path) => path,
-        Err(err) => return fs_error(err),
+        Err(resp) => return resp,
     };
-    if !dir.is_dir() {
-        return fail(StatusCode::BAD_REQUEST, "Upload target is not a directory");
-    }
 
     let target = dir.join(name);
     if target.exists() && !query.overwrite {
@@ -855,28 +913,6 @@ pub async fn upload(
             StatusCode::CONFLICT,
             "E_CONFLICT",
             format!("File already exists: {name}"),
-        );
-    }
-
-    // 上传前检查目标挂载点剩余空间（设计文档 3.2.3）
-    if let Err(err) = crate::core::fs_ops::ensure_space(&dir, body.len() as u64) {
-        return fs_error(err);
-    }
-
-    // 二次确认：拼接后的真实路径仍在授权根内。
-    // 允许「经由挂载点内软链接」逃逸时（`[system].follow_symlinks`）不算越权——
-    // 与 `resolve_existing` 口径一致，否则链接目录里上传会被这一道单独拦掉。
-    if let Ok(canonical_parent) = std::fs::canonicalize(&dir)
-        && !roots
-            .allowed
-            .iter()
-            .any(|root| canonical_parent.starts_with(root))
-        && !(roots.follow_symlinks && path_guard::escaped_via_symlink(&dir, &roots.allowed))
-    {
-        return fail_code(
-            StatusCode::FORBIDDEN,
-            "E_FORBIDDEN",
-            "Upload target is outside the allowed roots",
         );
     }
 

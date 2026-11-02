@@ -1637,6 +1637,15 @@ GWT-LOG-03 Given 同一个事件  Then 控制台、主文件、错误文件三�
 GWT-LOG-04 Given 没有 tzdata 的环境（Android / 静态 musl）  When 启动  Then 偏移由 `date +%z` 兜底，日志时间与系统时间一致；探到的来源写在 DEBUG 的 `log timezone` 行
 ```
 
+#### GWT 验收（tus 分块上传，v4.6.14）
+
+```
+GWT-UP-01 Given 一个大于 upload_chunk_size_mb 的文件  When 前端上传  Then 走 tus：POST 建会话（201+Location）→ 逐片 PATCH（每片 204 + upload-offset 递增）→ 收满自动落位，临时目录清空，内容与源文件逐字节一致
+GWT-UP-02 Given 传到一半断开  When 重新上传同一文件（或点「重试」）  Then 先 HEAD 问服务端偏移，从断点继续 PATCH，不重传已落盘字节；服务重启后（会话丢失）HEAD 404，客户端从头 init
+GWT-UP-03 Given 会话声明 Upload-Length = N  When PATCH 累计超过 N  Then 400 并销毁会话与临时文件；When 上传同名文件  Then conflict=fail 得 409 E_CONFLICT / overwrite 覆盖 / rename 落 `名称 (n).扩展名`
+GWT-UP-04 Given 只读挂载点  When PUT /api/files/upload 或 POST /api/files/upload/tus  Then 403 E_READONLY（v4.6.14 堵住整包上传的只读缺口）
+```
+
 #### GWT 验收（安全收紧，v4.6.13）
 
 ```gwt

@@ -65,5 +65,6 @@
   "E_INTERNAL": "Internal server error",
   "E_INIT_REQUIRED": "The instance is not initialized yet",
   "SHARE_RATE_LIMITED": "Too many password attempts, please retry later",
-  "E_TOO_MANY_REQUESTS": "Too many attempts, please try again later"
+  "E_TOO_MANY_REQUESTS": "Too many attempts, please try again later",
+  "E_OFFSET_MISMATCH": "Resume offset mismatch, please upload again"
 }

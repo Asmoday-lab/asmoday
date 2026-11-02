@@ -83,6 +83,9 @@ thumb_cache_max_age_days = 90
 ffmpeg_path = ""
 # 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束。
 upload_max_size_mb = 0
+# 分块上传片大小（MiB）。超过该大小的文件走 tus 分块上传（断点续传），
+# 不超过则整包 PUT。0 = 关闭分块，一律整包（设计文档 3.2.3.1）。
+upload_chunk_size_mb = 10
 
 # 终端 PTY 拉起覆盖（设计文档 3.3.5）。两项都留空/缺省时走自动探测：
 # Windows pwsh → powershell；类 Unix $SHELL → zsh → bash → sh。
@@ -216,6 +219,8 @@ pub struct MediaConfig {
     pub ffmpeg_path: String,
     /// 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束（设计文档 3.2.3）
     pub upload_max_size_mb: u64,
+    /// 分块上传片大小（MiB），0 = 关闭分块（设计文档 3.2.3.1）
+    pub upload_chunk_size_mb: u64,
 }
 
 impl Default for MediaConfig {
@@ -225,6 +230,7 @@ impl Default for MediaConfig {
             thumb_cache_max_age_days: 90,
             ffmpeg_path: String::new(),
             upload_max_size_mb: 0,
+            upload_chunk_size_mb: 10,
         }
     }
 }

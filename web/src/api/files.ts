@@ -4,7 +4,8 @@
  * 变更类接口（设计文档 6.2）统一返回逐项结果 + summary，前端按 `summary` 汇总，
  * 按 `error_code` 逐项翻译，绝不把后端的英文 message 直接甩给用户。
  */
-import { ApiError, readApiError } from '../lib/errors'
+import { ApiError, messageFromBody, readApiError } from '../lib/errors'
+import type { ApiErrorBody } from '../lib/errors'
 
 export { ApiError }
 
@@ -199,7 +200,10 @@ const encodePath = (path: string) => encodeURIComponent(path)
 
 export const filesApi = {
   /** 挂载点清单：每次进入文件管理都要重新拉，禁止缓存（设计文档 3.2.1） */
-  mounts: () => getJson<{ mounts: MountPoint[]; implicit: boolean }>('/api/files/mounts'),
+  mounts: () =>
+    getJson<{ mounts: MountPoint[]; implicit: boolean; upload_chunk_size_mb?: number }>(
+      '/api/files/mounts',
+    ),
 
   roots: () => getJson<RootsResponse>('/api/files/roots'),
 
@@ -390,4 +394,76 @@ export function summarizeResults(response: BatchResponse) {
     firstError: failed[0]?.error_code ?? null,
     failures: failed,
   }
+}
+
+// ---------------------------------------------------------------------------
+// tus 1.0.0 子集：分块上传与断点续传（设计文档 3.2.3.1）
+//
+// 偏移的权威在服务端临时文件：任何一次失败后都先 `offset()` 问服务端，
+// 从真实落盘进度接着传，绝不信任本地计数。
+// ---------------------------------------------------------------------------
+
+export type TusConflict = 'fail' | 'overwrite' | 'rename'
+
+/** 分片上传进度：`loaded` 是当前分片内已发出的字节 */
+export type TusChunkProgress = (loaded: number, chunkTotal: number) => void
+
+export const tusApi = {
+  /** 建会话：返回相对会话地址（`/api/files/upload/tus/<id>`，放 localStorage 里当续传凭证） */
+  async init(
+    dir: string,
+    name: string,
+    size: number,
+    conflict: TusConflict = 'fail',
+  ): Promise<string> {
+    const res = await fetch(
+      `/api/files/upload/tus?dir=${encodePath(dir)}&name=${encodePath(name)}&conflict=${conflict}`,
+      { method: 'POST', headers: { 'Upload-Length': String(size) } },
+    )
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    const location = res.headers.get('location')
+    if (!location) throw new Error('tus: missing Location header')
+    return location
+  },
+
+  /** 查服务端已收偏移。会话已失效时抛 ApiError(404)，调用方应重新 init */
+  async offset(url: string): Promise<number> {
+    const res = await fetch(url, { method: 'HEAD' })
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    return Number(res.headers.get('upload-offset') ?? '0')
+  },
+
+  /** 追加分片（XHR：需要逐片进度与稳定的状态码读取） */
+  patch(url: string, blob: Blob, offset: number, onprogress?: TusChunkProgress): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('PATCH', url)
+      xhr.setRequestHeader('Content-Type', 'application/offset+octet-stream')
+      xhr.setRequestHeader('Upload-Offset', String(offset))
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onprogress?.(event.loaded, event.total)
+      }
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve()
+          return
+        }
+        let message = `HTTP ${xhr.status}`
+        try {
+          const body = JSON.parse(xhr.responseText) as ApiErrorBody
+          message = messageFromBody(body, xhr.status)
+        } catch {
+          /* 非 JSON */
+        }
+        reject(new Error(message))
+      }
+      xhr.onerror = () => reject(new Error('tus: network error'))
+      xhr.send(blob)
+    })
+  },
+
+  /** 取消会话并清理服务端临时文件（尽力而为，失败不抛） */
+  async cancel(url: string): Promise<void> {
+    await fetch(url, { method: 'DELETE' }).catch(() => {})
+  },
 }

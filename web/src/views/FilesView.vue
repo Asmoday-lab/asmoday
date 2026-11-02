@@ -30,6 +30,7 @@ import {
   ApiError,
   filesApi,
   summarizeResults,
+  tusApi,
   type EntryInfo,
   type EolType,
   type Listing,
@@ -898,9 +899,16 @@ interface UploadTask {
   progress: number
   status: 'uploading' | 'done' | 'error'
   error?: string
+  /** 原始文件与目标目录：错误后「重试」要用（用户可能已切走目录） */
+  file?: File
+  dir?: string
+  /** 是否被本任务取消（组件卸载等），避免重试复活已取消的传输 */
+  cancelled?: boolean
 }
 
 const uploads = ref<UploadTask[]>([])
+/** tus 分片大小（MiB，0 = 关闭分块）。跟挂载点清单一起下发（3.2.3.1） */
+const uploadChunkMb = ref(0)
 const dragging = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 let uploadSeq = 0
@@ -939,6 +947,8 @@ async function uploadFiles(files: File[]) {
       name: file.name,
       progress: 0,
       status: 'uploading',
+      file,
+      dir,
     }
     uploads.value.push(task)
     try {
@@ -956,7 +966,65 @@ async function uploadFiles(files: File[]) {
   }, 4000)
 }
 
+/** 错误任务的重试入口：文件对象还挂在任务上，直接重跑（分块自动续传） */
+async function retryTask(task: UploadTask) {
+  if (!task.file || !task.dir || task.status === 'uploading') return
+  task.status = 'uploading'
+  task.error = undefined
+  try {
+    await uploadOne(task.file, task.dir, task)
+    task.status = 'done'
+    task.progress = 100
+    await open(task.dir)
+  } catch (err) {
+    task.status = 'error'
+    task.error = err instanceof Error ? err.message : t('files.upload.error')
+  }
+}
+
+// ---------------- tus 分块上传与断点续传（设计文档 3.2.3.1） ----------------
+
+/** tus 续传凭证：同一文件（目录+名字+大小+mtime 全一致）断线/刷新后接着传 */
+function tusResumeKey(dir: string, file: File): string {
+  return `asmoday.tus.${[dir, file.name, file.size, file.lastModified]
+    .map((part) => encodeURIComponent(String(part)))
+    .join('|')}`
+}
+
+function readTusSession(dir: string, file: File): string | null {
+  try {
+    return localStorage.getItem(tusResumeKey(dir, file))
+  } catch {
+    return null
+  }
+}
+
+function saveTusSession(dir: string, file: File, url: string) {
+  try {
+    localStorage.setItem(tusResumeKey(dir, file), url)
+  } catch {
+    /* 隐私模式等 localStorage 不可用：只损失续传能力，不影响上传 */
+  }
+}
+
+function clearTusSession(dir: string, file: File) {
+  try {
+    localStorage.removeItem(tusResumeKey(dir, file))
+  } catch {
+    /* ignore */
+  }
+}
+
 function uploadOne(file: File, dir: string, task: UploadTask): Promise<void> {
+  const chunkMb = uploadChunkMb.value
+  if (chunkMb > 0 && file.size > chunkMb * 1024 * 1024) {
+    return uploadChunked(file, dir, task)
+  }
+  return uploadDirect(file, dir, task)
+}
+
+/** 整包 PUT：小文件走这条，一次请求完事（比建会话少两趟往返） */
+function uploadDirect(file: File, dir: string, task: UploadTask): Promise<void> {
   return new Promise((resolve, reject) => {
     const url = `/api/files/upload?dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`
     const xhr = new XMLHttpRequest()
@@ -986,6 +1054,54 @@ function uploadOne(file: File, dir: string, task: UploadTask): Promise<void> {
     xhr.onerror = () => reject(new Error(t('files.upload.network')))
     xhr.send(file)
   })
+}
+
+/**
+ * tus 分块上传：逐片 PATCH，断点续传。
+ *
+ * 偏移的权威在服务端临时文件——每次（重）进入都先 HEAD 问真实进度，
+ * 本地只保存会话地址当凭证；分片失败保留会话，重试时从服务端断点接着传。
+ */
+async function uploadChunked(file: File, dir: string, task: UploadTask): Promise<void> {
+  const chunkSize = Math.max(1, uploadChunkMb.value) * 1024 * 1024
+  let sessionUrl = readTusSession(dir, file)
+  let offset = 0
+
+  if (sessionUrl) {
+    try {
+      offset = await tusApi.offset(sessionUrl)
+      // 上次最后一个分片已落盘但响应没回来：服务端已落位，直接当成功
+      if (offset >= file.size) {
+        clearTusSession(dir, file)
+        return
+      }
+    } catch {
+      // 会话失效（服务重启 / TTL 过期 / 手动清理）：从头再来
+      sessionUrl = null
+      offset = 0
+    }
+  }
+  if (!sessionUrl) {
+    sessionUrl = await tusApi.init(dir, file.name, file.size)
+    saveTusSession(dir, file, sessionUrl)
+    offset = 0
+  }
+
+  while (offset < file.size) {
+    const end = Math.min(offset + chunkSize, file.size)
+    try {
+      await tusApi.patch(sessionUrl, file.slice(offset, end), offset, (loaded) => {
+        task.progress = Math.min(99, Math.round(((offset + loaded) / file.size) * 100))
+      })
+    } catch (err) {
+      // 会话已保留：点「重试」或重新拖入同一文件都会从断点续传
+      throw new Error(
+        `${err instanceof Error && err.message ? err.message : t('files.upload.network')}（${t('files.upload.resume')}）`,
+      )
+    }
+    offset = end
+  }
+  clearTusSession(dir, file)
 }
 
 const displayEntries = computed(() => searchResults.value ?? entries.value)
@@ -1218,6 +1334,8 @@ interface FilesSnapshot {
 interface RootsSnapshot {
   mounts: MountPoint[]
   implicit: boolean
+  /** 分片大小（MiB，0 = 全部整包）。快照里缺字段按 0 处理，等活数据到达再修正 */
+  uploadChunkSizeMb?: number
 }
 
 const ROOTS_SNAPSHOT_KEY = 'files:roots'
@@ -1249,6 +1367,7 @@ function seedRoots() {
   if (!snapshot) return
   roots.value = snapshot.mounts
   rootsImplicit.value = snapshot.implicit
+  uploadChunkMb.value = snapshot.uploadChunkSizeMb ?? 0
 }
 
 /** 把上一帧目录贴回屏幕；没有缓存就返回 false，调用方照旧进骨架态 */
@@ -1306,7 +1425,12 @@ async function boot() {
     const data = await filesApi.mounts()
     roots.value = data.mounts
     rootsImplicit.value = data.implicit
-    writeCache(ROOTS_SNAPSHOT_KEY, { mounts: data.mounts, implicit: data.implicit } satisfies RootsSnapshot)
+    uploadChunkMb.value = data.upload_chunk_size_mb ?? 0
+    writeCache(ROOTS_SNAPSHOT_KEY, {
+      mounts: data.mounts,
+      implicit: data.implicit,
+      uploadChunkSizeMb: data.upload_chunk_size_mb ?? 0,
+    } satisfies RootsSnapshot)
 
     // 一、URL 里已带 mountId（单挂载点跳转后的稳定形态 / 直接粘贴深链接）
     const requestedId = typeof route.params.mountId === 'string' ? route.params.mountId : ''
@@ -3463,6 +3587,13 @@ onBeforeUnmount(() => {
       <div v-for="task in uploads" :key="task.id" class="space-y-1">
         <div class="flex items-center gap-2 text-[12px]">
           <span class="min-w-0 flex-1 truncate text-ink">{{ task.name }}</span>
+          <button
+            v-if="task.status === 'error' && task.file"
+            class="shrink-0 text-accent hover:underline"
+            @click="retryTask(task)"
+          >
+            {{ t('files.upload.retry') }}
+          </button>
           <span
             :class="task.status === 'error' ? 'fg-danger' : 'text-muted'"
             :title="task.error ?? ''"

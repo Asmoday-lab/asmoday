@@ -73,6 +73,8 @@ pub struct AppState {
     pub dav: Arc<api::webdav::DavCache>,
     /// 批量删除的一次性令牌
     pub delete_tickets: Arc<api::files_mutate::DeleteTickets>,
+    /// tus 分块上传会话表（设计文档 3.2.3.1）
+    pub tus: Arc<api::upload_tus::TusStore>,
     /// 哈希并发槽位（上限 2，设计文档 6.2）
     pub hash_slots: Arc<tokio::sync::Semaphore>,
     /// 进程启动时刻（`/api/system/health` 的 uptime）
@@ -303,6 +305,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         path_locks: Arc::new(core::locks::PathLocks::new()),
         dav: Arc::new(api::webdav::DavCache::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
+        tus: Arc::new(api::upload_tus::TusStore::new(data_dir.join("uploads_tmp"))),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         started,
         rebuild: Arc::new(api::system::RebuildState::default()),
@@ -556,6 +559,17 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/files/thumb", get(api::media::thumb))
         .route("/api/files/archive", get(api::files::archive))
         .route("/api/files/upload", axum::routing::put(api::files::upload))
+        // tus 1.0.0 子集：分块上传与断点续传（设计文档 3.2.3.1）
+        .route(
+            "/api/files/upload/tus",
+            axum::routing::post(api::upload_tus::tus_init),
+        )
+        .route(
+            "/api/files/upload/tus/{id}",
+            axum::routing::head(api::upload_tus::tus_head)
+                .patch(api::upload_tus::tus_patch)
+                .delete(api::upload_tus::tus_delete),
+        )
         .route("/api/files/search", get(api::files::search))
         .route("/api/files/subtitle", get(api::files::subtitle))
         .route("/api/media/browse", get(api::media::browse))

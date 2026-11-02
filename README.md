@@ -21,7 +21,7 @@ It is built for the "own machine + browser" setup: a NAS, a Raspberry Pi, a mini
 
 ## Features
 
-- 📂 **File management** — multiple mounts (individually read-only), grid and list views, drag-and-drop upload, batch copy/move/delete, whole-folder ZIP download, recursive search.
+- 📂 **File management** — multiple mounts (individually read-only), grid and list views, drag-and-drop upload (large files are chunked with resumable transfers), batch copy/move/delete, whole-folder ZIP download, recursive search.
 - ✏️ **Built-in editor** — CodeMirror 6 with syntax highlighting, Markdown preview, read-only CSV and PDF previews; line endings (LF / CRLF) and encoding are written back unchanged.
 - 🖥️ **Web terminal** — a real PTY via `portable-pty`, multiple tabs, sessions that survive disconnects, an on-screen key bar on phones, and "Open terminal here" from the file manager.
 - 🖼️ **Photo library** — albums and timeline, virtual scrolling, ThumbHash placeholders, slideshow and favorites.
@@ -114,7 +114,7 @@ Configuration is TOML. Resolution order: `-c` flag → `ASMODAY_CONFIG_PATH` →
 | `[server]` | Listen address and port, TLS, proxy compatibility, batch limits |
 | `[auth]` | Local login switch, proxy trust (SSO) |
 | `[system]` | Mounts (`[[system.mounts]]`), symlink policy |
-| `[media]` | Thumbnail cache size and age, FFmpeg path, upload size limit |
+| `[media]` | Thumbnail cache size and age, FFmpeg path, upload size limit, upload chunk size |
 | `[terminal]` | Custom shell and args, idle keep-alive, concurrent sessions |
 | `[log]` | Console and file levels, access log, text or JSON output |
 | `[[services]]` | External services on the home page and their proxy options |
