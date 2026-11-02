@@ -124,7 +124,7 @@ jobs:
           DIR="${APP_NAME}-${{ matrix.target }}"
           mkdir -p "$DIR"
           cp "target/${{ matrix.target }}/release/${APP_NAME}" "$DIR/"
-          cp README.md "$DIR/" 2>/dev/null || true
+          cp README.md README.zh.md LICENSE "$DIR/"
           tar czf "${DIR}.tar.gz" "$DIR"
 
       - name: Prepare artifact (Windows)
@@ -134,7 +134,7 @@ jobs:
           $DIR = "${env:APP_NAME}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $DIR
           Copy-Item "target/${{ matrix.target }}/release/${env:APP_NAME}.exe" -Destination $DIR
-          Copy-Item "README.md" -Destination $DIR -ErrorAction SilentlyContinue
+          Copy-Item README.md, README.zh.md, LICENSE -Destination $DIR
           Compress-Archive -Path $DIR -DestinationPath "$DIR.zip"
 
       - name: Upload artifact
