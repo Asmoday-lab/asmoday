@@ -24,19 +24,24 @@ const totp = ref('')
 const showTotp = ref(false)
 const error = ref('')
 const submitting = ref(false)
+// 用户点过一次提交后，校验提示对「空值」也生效（否则空表单提交毫无反馈）
+const submitAttempted = ref(false)
 
 const isSetup = computed(() => !authApi.initialized.value)
 
-// 内联校验提示：只在用户已输入内容且不满足规则时出现，避免一进页面就满屏红字
-const usernameShort = computed(
-  () => username.value.trim().length > 0 && username.value.trim().length < 2,
+// 内联校验提示：已输入但不满足规则时即时出现；空值提示只在尝试提交后出现，避免一进页面就满屏红字
+const usernameShort = computed(() => {
+  const u = username.value.trim()
+  return u.length < 2 && (u.length > 0 || submitAttempted.value)
+})
+const passwordShort = computed(
+  () => password.value.length < 8 && (password.value.length > 0 || submitAttempted.value),
 )
-const passwordShort = computed(() => password.value.length > 0 && password.value.length < 8)
 const passwordDigits = computed(
   () => password.value.length >= 8 && /^\d+$/.test(password.value),
 )
 const confirmMismatch = computed(
-  () => confirm.value.length > 0 && password.value !== confirm.value,
+  () => confirm.value !== password.value && (confirm.value.length > 0 || submitAttempted.value),
 )
 
 const canSubmit = computed(() => {
@@ -53,8 +58,14 @@ const canSubmit = computed(() => {
 })
 
 async function submit() {
-  if (!canSubmit.value) return
+  if (submitting.value) return
+  submitAttempted.value = true
   error.value = ''
+  if (!canSubmit.value) {
+    // 登录模式没有内联规则可提示，空表单给一句明确反馈
+    if (!isSetup.value) error.value = t('auth.login.required')
+    return
+  }
   submitting.value = true
   try {
     if (isSetup.value) {
@@ -195,7 +206,7 @@ function changeLocale(event: Event) {
 
         <button
           type="submit"
-          :disabled="!canSubmit"
+          :disabled="submitting"
           class="w-full rounded-lg bg-accent py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
         >
           {{ submitting ? t('auth.login.submitting') : isSetup ? t('auth.login.submitSetup') : t('auth.login.submit') }}

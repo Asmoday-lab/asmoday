@@ -39,8 +39,10 @@ function onInput(event: Event) {
       class="w-full"
       @input="onInput"
     />
+    <!-- tabindex=-1：不参与 Tab 焦点链，Tab 应在输入框之间直接跳转 -->
     <button
       type="button"
+      tabindex="-1"
       class="absolute inset-y-0 right-0 grid w-10 place-items-center rounded-r-lg text-muted transition-colors hover:text-ink focus-visible:text-ink focus-visible:outline-none"
       :aria-label="reveal ? t('common.password.hide') : t('common.password.show')"
       :aria-pressed="reveal"
