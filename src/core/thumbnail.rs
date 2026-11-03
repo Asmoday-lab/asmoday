@@ -238,7 +238,12 @@ impl Thumbnailer {
     ///
     /// v4.6.3：文件名改用**有效宽度**（见 `effective_width`）。小图在 160/320/400 各存了
     /// 一份字节完全相同的副本，升版让这些重复副本一次性失效，由 LRU 收走。
-    const CACHE_VERSION: u8 = 4;
+    /// 缓存格式版本：**任何改变渲染结果的改动都必须 +1**，否则老图永远命中旧缓存。
+    ///
+    /// v5（v4.9.11）：缩放从 `imageops::thumbnail`（标量 box filter）换成
+    /// fast_image_resize 的 Lanczos3。文件名不变的话，用户之前看过的图会一直
+    /// 停在旧算法的模糊版本，等于这次优化白做。
+    const CACHE_VERSION: u8 = 5;
 
     /// 视频首帧的独立版本号：它不跟随图片的取值范围（截帧比解图贵一个数量级，
     /// 跟着图片升版会让几千个视频白跑一遍 FFmpeg）。
@@ -1196,7 +1201,12 @@ mod tests {
             .unwrap();
 
         let key = Thumbnailer::fingerprint(&file);
-        assert!(key.starts_with("v4-"), "缩略图键必须带格式版本：{key}");
+        // 断言「带当前版本号」而不是钉死某个数字：渲染结果一变就得升版本，
+        // 硬编码的话每次升版都要改测试，改着改着就会有人顺手把断言删掉。
+        assert!(
+            key.starts_with(&format!("v{}-", Thumbnailer::CACHE_VERSION)),
+            "缩略图键必须带格式版本：{key}"
+        );
         // 海报（视频首帧）用自己的版本号：跟着图片一起升版只是白跑一遍 FFmpeg
         assert!(
             Thumbnailer::poster_fingerprint(&file).starts_with("p1-"),
