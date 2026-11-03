@@ -75,6 +75,10 @@ watch(
       // 若仍按「空才拉」判断，缓存一贴就再也不会刷新了（后端读快照，代价是毫秒级）。
       if (value === 'photos' && !albumsLoading.value) void loadAlbums()
       if (value === 'cinema' && !cinemaAlbumsLoading.value) void loadCinemaAlbums()
+      // 三个分区各是一条独立的流（image+video / video / audio，v4.9.1）：
+      // 切过去发现 items 还是上一区的，就得换过来，否则音乐库会拿全库混排的
+      // 前 120 条去过滤音频，看起来就是「96 首只显示 1 首」
+      if (streamKind.value !== loadedKind.value) void load()
     }
   },
 )
@@ -236,6 +240,20 @@ function onPlayEnded(path: string) {
 function resumeAt(path: string): number {
   return progressMap.value.get(path) ?? 0
 }
+
+/**
+ * 当前分区该拉哪一类（v4.9.1）。
+ *
+ * 以前三个分区共用一条 `kind=media` 的流、在前端按 kind 过滤。全库 21898 条里只有
+ * 96 首音频（0.44%），每页 120 条平均命中半首歌 —— 音乐库标着「96 首曲目」，
+ * 列表只出 1 首，剩下的要翻近 200 页才凑得齐，实际表现就是「一直正在加载更多」。
+ * 索引本来就能按 kind 过滤，直接每类各拉一条才是对的。
+ */
+const streamKind = computed<'media' | 'video' | 'audio'>(() =>
+  tab.value === 'cinema' ? 'video' : tab.value === 'music' ? 'audio' : 'media',
+)
+/** `items` 目前装的是哪条流；与 `streamKind` 不一致说明还没换过来 */
+const loadedKind = ref<'media' | 'video' | 'audio' | null>(null)
 
 /** 照片分区只含图片与视频（音频归音乐库，否则时间线里会出现点不开的黑块） */
 const photoItems = computed(() =>
@@ -713,6 +731,7 @@ const albumGridEl = ref<HTMLElement | null>(null)
 const cinemaGridEl = ref<HTMLElement | null>(null)
 
 const timelineFlip = useFlip(timelineEl)
+const cinemaFlowFlip = useFlip(cinemaAllEl)
 const photoFolderFlip = useFlip(photoAlbumsEl)
 const cinemaFolderFlip = useFlip(cinemaAlbumsEl)
 const albumGridFlip = useFlip(albumGridEl)
@@ -1523,7 +1542,9 @@ function onKey(event: KeyboardEvent) {
  * 不再进骨架态，失败也只轻提示，不把整页换成错误页（v4.6.8）。
  */
 async function load(options: { refresh?: boolean } = {}) {
-  const silent = hasContent.value
+  const kind = streamKind.value
+  // 换了分区就是换了一条数据流：静默刷新的前提是「屏幕上这堆东西本来就是这条流的」
+  const silent = hasContent.value && loadedKind.value === kind
   if (silent) refreshing.value = true
   else loading.value = true
   error.value = ''
@@ -1533,16 +1554,19 @@ async function load(options: { refresh?: boolean } = {}) {
   if (tab.value === 'photos') void loadAlbums(options.refresh)
   if (tab.value === 'cinema') void loadCinemaAlbums(options.refresh)
   try {
-    const result = await browseMedia(undefined, 'media', 2, {
+    const result = await browseMedia(undefined, kind, 2, {
       limit: PAGE_SIZE,
       sort: gridSort.value,
       refresh: options.refresh,
-      // 时间线的等高行要真实宽高比（v4.6.19），只有这个列表需要
-      dims: true,
+      // 等高行布局要真实宽高比（时间线与影视都不例外）；音乐库是列表，省下这批文件头
+      dims: kind !== 'audio',
     })
+    // 连点分区时可能同时有两条流在飞：回来的不是当前这条就丢弃
+    if (kind !== streamKind.value) return
     items.value = []
     loadedPaths.clear()
     appendItems(result.items)
+    loadedKind.value = kind
     root.value = result.root
     total.value = result.total
     counts.value = result.counts
@@ -1566,10 +1590,13 @@ async function load(options: { refresh?: boolean } = {}) {
 
 async function loadMoreMedia() {
   const cursor = nextCursor.value
+  const kind = loadedKind.value ?? streamKind.value
+  // 分区刚切过来、这条流还没换好时不能续页：旧游标配新 kind 会拉出错位的数据
+  if (kind !== streamKind.value) return
   if (!hasMore.value || !cursor || loading.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseMedia(undefined, 'media', 2, {
+    const result = await browseMedia(undefined, kind, 2, {
       limit: PAGE_SIZE,
       cursor,
       sort: gridSort.value,
@@ -1597,13 +1624,14 @@ async function loadMoreMedia() {
 async function reloadTimeline() {
   nextCursor.value = null
   const sort = gridSort.value
+  const kind = loadedKind.value ?? streamKind.value
   try {
-    const result = await browseMedia(undefined, 'media', 2, {
+    const result = await browseMedia(undefined, kind, 2, {
       limit: PAGE_SIZE,
       sort,
-      dims: true,
+      dims: kind !== 'audio',
     })
-    if (sort !== gridSort.value) return
+    if (sort !== gridSort.value || kind !== streamKind.value) return
     items.value = []
     loadedPaths.clear()
     appendItems(result.items)
@@ -1630,12 +1658,15 @@ function setGridSort(next: SortValue) {
   timelineFlip.capture()
   albumGridFlip.capture()
   cinemaGridFlip.capture()
+  cinemaFlowFlip.capture()
   void Promise.all([reloadTimeline(), reloadOpenAlbums()]).then(() => {
     // 排序变了，原来的滚动位置在内容坐标里已失去意义，回到顶部再看
     timelineEl.value?.scrollTo({ top: 0 })
+    cinemaAllEl.value?.scrollTo({ top: 0 })
     void timelineFlip.play()
     void albumGridFlip.play()
     void cinemaGridFlip.play()
+    void cinemaFlowFlip.play()
   })
 }
 
@@ -1696,7 +1727,10 @@ interface AlbumsSnapshot {
   mounts?: string
 }
 
-const MEDIA_SNAPSHOT_KEY = 'gallery:media'
+const STREAM_KINDS = ['media', 'video', 'audio'] as const
+type StreamKind = (typeof STREAM_KINDS)[number]
+/** 媒体流快照按 kind 分开存：切分区时贴回来的是**这一区**的上一帧，不是别人的 */
+const mediaSnapshotKey = (kind: StreamKind) => `gallery:media:${kind}`
 const ALBUMS_SNAPSHOT_KEY = 'gallery:albums:image'
 const CINEMA_ALBUMS_SNAPSHOT_KEY = 'gallery:albums:video'
 
@@ -1720,7 +1754,7 @@ function currentSignature(): string | undefined {
 }
 
 function saveMediaSnapshot() {
-  writeCache(MEDIA_SNAPSHOT_KEY, {
+  writeCache(mediaSnapshotKey(loadedKind.value ?? streamKind.value), {
     items: items.value,
     root: root.value,
     total: total.value,
@@ -1756,7 +1790,7 @@ let snapshotMounts: string | undefined
 
 /** 有上一帧就贴上去并返回 true；此时 `loading` 保持 false，骨架整屏不出现 */
 function seedFromCache(): boolean {
-  const media = readCache<MediaSnapshot>(MEDIA_SNAPSHOT_KEY)
+  const media = readCache<MediaSnapshot>(mediaSnapshotKey(streamKind.value))
   const photos = readCache<AlbumsSnapshot>(ALBUMS_SNAPSHOT_KEY)
   const cinema = readCache<AlbumsSnapshot>(CINEMA_ALBUMS_SNAPSHOT_KEY)
   if (!media && !photos && !cinema) return false
@@ -1764,6 +1798,7 @@ function seedFromCache(): boolean {
 
   if (media) {
     items.value = media.items
+    loadedKind.value = streamKind.value
     loadedPaths.clear()
     for (const item of media.items) loadedPaths.add(item.path)
     root.value = media.root
@@ -1792,7 +1827,7 @@ function seedFromCache(): boolean {
 
 /** 作废上一帧（挂载点变了，画面里那些目录已经不属于当前库） */
 function dropSnapshots() {
-  writeCache(MEDIA_SNAPSHOT_KEY, null)
+  for (const kind of STREAM_KINDS) writeCache(mediaSnapshotKey(kind), null)
   writeCache(ALBUMS_SNAPSHOT_KEY, null)
   writeCache(CINEMA_ALBUMS_SNAPSHOT_KEY, null)
   items.value = []
@@ -2638,6 +2673,7 @@ useEventListener(window, 'keydown', onKey)
                     v-for="cell in row.cells"
                     :key="cell.item.path"
                     class="shrink-0"
+                    :data-flip-key="cell.item.path"
                     :style="{ width: `${cell.width}px` }"
                   >
                     <VideoCard
@@ -2703,7 +2739,11 @@ useEventListener(window, 'keydown', onKey)
     </div>
 
     <!-- 音乐库（原型版式：封面头 + 播放全部 + 曲目表） -->
-    <div v-else class="min-h-0 flex-1 overflow-y-auto px-4 py-4 pb-24 md:px-6 md:py-6">
+    <div
+      v-else
+      class="min-h-0 flex-1 overflow-y-auto px-4 py-4 pb-24 md:px-6 md:py-6"
+      data-testid="music-library"
+    >
       <div v-if="audios.length === 0" class="grid h-full place-items-center text-center">
         <div>
           <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
