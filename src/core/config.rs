@@ -76,6 +76,13 @@ upload_chunk_size_mb = 10
 # and rewrites the directories that changed; this is also how long an external
 # file copy can take to show up (unless you hit Rescan). 0 = disable.
 index_scan_interval_secs = 300
+# Thumbnail pre-generation. Right after a scan the server renders a small batch
+# so the next browse hits the disk cache instead of re-reading the source file
+# over the network. `thumb_preheat_days` limits it to the last N days (0 = all)
+# and applies to the manual run from Settings too. `thumb_preheat_per_scan` is
+# that per-scan batch (0 = off); the manual run ignores it and walks the window.
+thumb_preheat_days = 365
+thumb_preheat_per_scan = 200
 
 # Terminal PTY overrides. Both empty = auto-detect (pwsh then powershell on
 # Windows; $SHELL, zsh, bash, sh elsewhere).

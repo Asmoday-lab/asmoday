@@ -745,25 +745,47 @@ pub fn dims_get_many(
     hits
 }
 
+/// 预生成的一条候选：算缓存键所需的全部输入。
+#[derive(Debug, Clone)]
+pub struct PreheatCandidate {
+    /// 扫描时的真实路径（取图用）
+    pub real: String,
+    /// 源文件 mtime（秒）
+    pub mtime: u64,
+    /// 源文件长度
+    pub size: u64,
+    /// 已缓存的像素宽高；`None` 表示还没人读过这张图的图头
+    pub dims: Option<(u32, u32)>,
+}
+
 /// 预生成缩略图的候选：图片，按 mtime 从新到旧。
 ///
 /// 用**索引**而不是再走一遍文件系统 —— 索引里已经有 `real`（真实路径）、
 /// `mtime`、`size`，够算缓存键了。`since` 为 0 表示不按时间过滤。
-pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<(String, u64, u64)> {
+///
+/// 顺带带出已缓存的像素宽高（`media_dims`，浏览时顺手填的）：预生成必须按
+/// **有效宽度**入键，否则一张 200×150 的图会按 400 存一份浏览时永远命中不到
+/// 的副本，等于白跑一遍（v4.9.12）。宽高未知时由调用方现读图头。
+pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<PreheatCandidate> {
     let Ok(mut stmt) = conn.prepare(
-        "SELECT real, mtime, size FROM media_assets
-         WHERE kind = 'image' AND mtime >= ?1
-         ORDER BY mtime DESC
+        "SELECT a.real, a.mtime, a.size, d.w, d.h FROM media_assets a
+         LEFT JOIN media_dims d
+                ON d.path = a.path AND d.mtime = a.mtime AND d.size = a.size
+         WHERE a.kind = 'image' AND a.mtime >= ?1
+         ORDER BY a.mtime DESC
          LIMIT ?2",
     ) else {
         return Vec::new();
     };
     stmt.query_map(params![since as i64, limit as i64], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?.max(0) as u64,
-            row.get::<_, i64>(2)?.max(0) as u64,
-        ))
+        let w = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+        let h = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+        Ok(PreheatCandidate {
+            real: row.get::<_, String>(0)?,
+            mtime: row.get::<_, i64>(1)?.max(0) as u64,
+            size: row.get::<_, i64>(2)?.max(0) as u64,
+            dims: (w > 0 && h > 0).then_some((w as u32, h as u32)),
+        })
     })
     .map(|rows| rows.filter_map(Result::ok).collect())
     .unwrap_or_default()
@@ -1493,5 +1515,44 @@ mod tests {
         // 盘符根不能让前缀多出一个斜杠
         assert_eq!(Scope::new("C:/", 1).prefix(), "C:/");
         assert_eq!(Scope::new("//srv/share", 1).prefix(), "//srv/share/");
+    }
+
+    /// 预生成候选要带上已缓存的像素宽高，否则调用方只能按请求宽度入键，
+    /// 小图会存出一份浏览时命中不到的副本（v4.9.12）。
+    #[test]
+    fn preheat_candidates_carry_cached_dims() {
+        let index = index("preheat");
+        let dir = "D:/shots";
+        let wide = asset(dir, "wide.jpg", 5000);
+        let tiny = asset(dir, "tiny.jpg", 4000);
+        let mut clip = asset(dir, "clip.mp4", 3000);
+        clip.kind = "video".to_string();
+        clip.ext = "mp4".to_string();
+
+        index
+            .with_conn(|conn| replace_dir(conn, dir, 0, 1, &[wide.clone(), tiny.clone(), clip]))
+            .expect("写入索引");
+        index
+            .with_conn(|conn| {
+                dims_put_many(conn, &[(&tiny.path, tiny.mtime, tiny.size, 200, 150)]);
+                Ok(())
+            })
+            .expect("写入宽高");
+
+        let rows = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 0, 10)))
+            .expect("查候选");
+        // 视频不进候选；两张图按 mtime 从新到旧
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].real, wide.real);
+        assert_eq!(rows[0].dims, None, "没读过图头就是 None，交给调用方现读");
+        assert_eq!(rows[1].dims, Some((200, 150)));
+
+        // 时间窗以 mtime 过滤
+        let recent = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 4500, 10)))
+            .expect("查候选");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].real, wide.real);
     }
 }

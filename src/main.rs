@@ -85,6 +85,8 @@ pub struct AppState {
     pub rebuild: Arc<api::system::RebuildState>,
     /// 预生成缩略图的进度（v4.9.11）：与「重建」分开，两者语义不同
     pub preheat: Arc<api::system::RebuildState>,
+    /// 缩略图后台任务的互斥位（v4.9.12）：预生成与全量重建一次只跑一个
+    pub thumb_jobs: Arc<api::system::ThumbJobSlot>,
     /// 挂载点版本号：配置里 `system.mounts` 每变一次 +1。
     ///
     /// 前端拿它判断「后端认识的那套挂载点是不是已经换了」—— 配置热重载后浏览器
@@ -322,6 +324,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         started,
         rebuild: Arc::new(api::system::RebuildState::default()),
         preheat: Arc::new(api::system::RebuildState::default()),
+        thumb_jobs: Arc::new(api::system::ThumbJobSlot::default()),
         mounts_revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_changed: Arc::new(tokio::sync::Notify::new()),
         cwd,

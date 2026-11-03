@@ -128,6 +128,9 @@ const rawDirty = ref(false)
 const preheat = ref<PreheatStatus | null>(null)
 const preheatBusy = ref(false)
 let preheatTimer: number | null = null
+// 卸载标志：`clearTimeout` 只能拦住「还没发」的那一轮，拦不住「已经发出、
+// 响应还在路上」的那一轮 —— 它回来后会再排一个 timer，于是页面走了轮询还在跑。
+let preheatAlive = false
 
 const preheatRunning = computed(() => preheat.value?.is_running === true)
 const preheatPercent = computed(() => {
@@ -137,11 +140,13 @@ const preheatPercent = computed(() => {
 })
 
 async function refreshPreheat() {
+  if (!preheatAlive) return
   try {
     preheat.value = await systemApi.preheatStatus()
   } catch {
     // 网络抖动不打扰用户，下一轮再试
   }
+  if (!preheatAlive) return
   if (preheat.value?.is_running) {
     preheatTimer ??= window.setTimeout(() => {
       preheatTimer = null
@@ -756,6 +761,7 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onBeforeRouteLeave(() => !unsavedConfig.value || window.confirm(t('settings.advanced.unsavedLeave')))
 
 onMounted(() => {
+  preheatAlive = true
   void refreshPreheat()
   window.addEventListener('beforeunload', onBeforeUnload)
   void loadConfig()
@@ -766,6 +772,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  preheatAlive = false
   if (preheatTimer !== null) window.clearTimeout(preheatTimer)
   preheatTimer = null
   window.removeEventListener('beforeunload', onBeforeUnload)

@@ -649,14 +649,14 @@ fn render_thumbnail(
     width: u32,
     ffmpeg_bin: Option<&Path>,
 ) -> Option<(image::RgbaImage, Vec<u8>)> {
-    let (source_w, source_h, rgba) = decode_rgba(path, width, ffmpeg_bin)?;
+    let (source_w, source_h, mut rgba) = decode_rgba(path, width, ffmpeg_bin)?;
 
-    let tiny = fir_scale(&rgba, source_w, source_h, 32)?;
+    let tiny = fir_scale(&mut rgba, source_w, source_h, 32)?;
     let hash = thumbhash::rgba_to_thumb_hash(tiny.0 as usize, tiny.1 as usize, &tiny.2);
 
     // 不放大：请求尺寸比原图大时按原图长边封顶（否则灯箱占位会被拉大一圈）
     let bound = width.min(source_w.max(source_h));
-    let (tw, th, buf) = fir_scale(&rgba, source_w, source_h, bound)?;
+    let (tw, th, buf) = fir_scale(&mut rgba, source_w, source_h, bound)?;
     Some((image::RgbaImage::from_raw(tw, th, buf)?, hash))
 }
 
@@ -728,7 +728,11 @@ fn ffmpeg_decode_scaled(path: &Path, bound: u32, bin: &Path) -> Option<(u32, u32
 ///
 /// 比 `imageops::thumbnail`（标量 box filter）快 3~5 倍，且不会把细节糊成一片。
 /// 返回 `(宽, 高, RGBA 缓冲)`。
-fn fir_scale(src: &[u8], w: u32, h: u32, bound: u32) -> Option<(u32, u32, Vec<u8>)> {
+///
+/// 入参是 `&mut [u8]` 而不是所有者：FIR 的 `from_slice_u8` 直接借用这块内存，
+/// 一次 4000×3000 的图少拷 48MB（v4.9.12 之前这里是 `src.to_vec()`，
+/// 而 `render_thumbnail` 要缩两次，峰值多出两幅整图）。
+fn fir_scale(src: &mut [u8], w: u32, h: u32, bound: u32) -> Option<(u32, u32, Vec<u8>)> {
     use fast_image_resize::images::Image as FirImage;
     use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 
@@ -741,7 +745,7 @@ fn fir_scale(src: &[u8], w: u32, h: u32, bound: u32) -> Option<(u32, u32, Vec<u8
         return Some((w, h, src.to_vec()));
     }
 
-    let src_image = FirImage::from_vec_u8(w, h, src.to_vec(), PixelType::U8x4).ok()?;
+    let src_image = FirImage::from_slice_u8(w, h, src, PixelType::U8x4).ok()?;
     let mut dst = FirImage::new(dw, dh, PixelType::U8x4);
     let mut resizer = Resizer::new();
     resizer

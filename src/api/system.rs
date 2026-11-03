@@ -10,6 +10,7 @@
 //! 探测类接口都只跑 `ffmpeg -version` / `-encoders`，不碰任何转码。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,35 @@ pub struct RebuildStatus {
 
 /// 进度状态容器
 pub type RebuildState = Mutex<RebuildStatus>;
+
+/// 缩略图后台任务的**进程级互斥位**：预生成与全量重建一次只许跑一个。
+///
+/// 两者都会对同一批源图解码，还共用同一个全局信号量。此前各自只看自己的
+/// `is_running`，于是「手动预生成 + 顺手点一下重建」能让两份任务并行抢许可：
+/// 浏览请求被挤到队尾，两份任务谁也快不了（v4.9.12）。
+///
+/// 用独立的原子位而不是去锁另一份状态：两把 `Mutex` 互相检查的写法既容易
+/// 死锁，也说不清「谁先谁后」。
+#[derive(Debug, Default)]
+pub struct ThumbJobSlot(AtomicBool);
+
+impl ThumbJobSlot {
+    fn try_claim(self: &Arc<Self>) -> Option<ThumbJobGuard> {
+        self.0
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ThumbJobGuard(Arc::clone(self)))
+    }
+}
+
+/// 互斥位的持有凭证。`Drop` 即释放 —— 任务 panic、被取消、提前 `return` 都不会漏。
+pub struct ThumbJobGuard(Arc<ThumbJobSlot>);
+
+impl Drop for ThumbJobGuard {
+    fn drop(&mut self) {
+        self.0.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// 单次重建的候选上限：低功耗设备上一口气扫几十万张没有意义
 const REBUILD_SCAN_LIMIT: usize = 5000;
@@ -328,6 +358,10 @@ async fn mount_roots(state: &AppState) -> Vec<PathBuf> {
 
 /// POST /api/system/thumbnails/rebuild：立即返回，进度靠轮询
 pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
+    // 先抢进程级互斥位：预生成正在跑时也让这次请求直接退回去，不再并行抢 CPU
+    let Some(job) = state.thumb_jobs.try_claim() else {
+        return Json(json!({ "status": "already_running" })).into_response();
+    };
     {
         let mut status = match state.rebuild.lock() {
             Ok(status) => status,
@@ -338,9 +372,6 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
                 );
             }
         };
-        if status.is_running {
-            return Json(json!({ "status": "already_running" })).into_response();
-        }
         *status = RebuildStatus {
             is_running: true,
             ..Default::default()
@@ -349,6 +380,8 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        // 凭证活到任务结束（含 panic）：`Drop` 里释放互斥位
+        let _job = job;
         run_rebuild(state_clone).await;
     });
 
@@ -363,6 +396,10 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
 /// 候选直接从**索引**取，不再走一遍文件系统；已生成的在 `get_prepared` 里
 /// 先查缓存就返回，所以重复调用是安全的（幂等）。
 pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
+    // 与「全量重建」共用一条互斥位：两边都想跑时，谁先谁跑，另一个直接返回
+    let Some(job) = state.thumb_jobs.try_claim() else {
+        return Json(json!({ "status": "already_running" })).into_response();
+    };
     {
         let mut status = match state.preheat.lock() {
             Ok(status) => status,
@@ -373,9 +410,6 @@ pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
                 );
             }
         };
-        if status.is_running {
-            return Json(json!({ "status": "already_running" })).into_response();
-        }
         *status = RebuildStatus {
             is_running: true,
             ..Default::default()
@@ -384,6 +418,7 @@ pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
 
     let worker = state.clone();
     tokio::spawn(async move {
+        let _job = job;
         run_preheat(worker).await;
     });
 
@@ -417,13 +452,14 @@ pub async fn preheat_batch(state: &AppState, limit: usize) {
     if limit == 0 {
         return;
     }
+    // 与重建 / 手动预生成互斥；抢不到就让路，下一轮索引扫描还会再来
+    let Some(_job) = state.thumb_jobs.try_claim() else {
+        return;
+    };
     {
         let Ok(mut status) = state.preheat.lock() else {
             return;
         };
-        if status.is_running {
-            return;
-        }
         *status = RebuildStatus {
             is_running: true,
             ..Default::default()
@@ -516,15 +552,33 @@ async fn run_preheat_inner(state: &AppState, limit: Option<usize>) {
                     Ok(mut guard) => guard.next(),
                     Err(_) => break,
                 };
-                let Some((real, mtime, size)) = job else {
+                let Some(job) = job else {
                     break;
                 };
 
-                let path = PathBuf::from(&real);
+                let path = PathBuf::from(&job.real);
+                // 有效宽度入键（v4.9.12）：与浏览端同一口径，小图只留一份、且**能命中**。
+                // 索引里带了宽高就直接算，省一次读盘；没有时现读图头（阻塞 IO，扔给线程池）。
+                let width = match job.dims {
+                    Some((w, h)) => PREHEAT_WIDTH.min(w.max(h)).max(1),
+                    None => {
+                        let probe = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::core::thumbnail::Thumbnailer::effective_width(
+                                &probe,
+                                PREHEAT_WIDTH,
+                            )
+                        })
+                        .await
+                        .unwrap_or(PREHEAT_WIDTH)
+                    }
+                };
                 // 键直接由索引里的 size/mtime 算出，不用为「判断有没有缓存」再 stat 一次
                 let key = crate::core::thumbnail::ThumbKey {
-                    width: PREHEAT_WIDTH,
-                    fingerprint: crate::core::thumbnail::Thumbnailer::fingerprint_from(size, mtime),
+                    width,
+                    fingerprint: crate::core::thumbnail::Thumbnailer::fingerprint_from(
+                        job.size, job.mtime,
+                    ),
                     fresh_write: false,
                 };
                 let (outcome, _) = worker
@@ -681,7 +735,8 @@ fn walk_candidates(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
 
 #[cfg(test)]
 mod tests {
-    use super::utc_stamp;
+    use super::{ThumbJobSlot, utc_stamp};
+    use std::sync::Arc;
 
     #[test]
     fn utc_stamp_matches_known_instants() {
@@ -691,5 +746,18 @@ mod tests {
         assert_eq!(utc_stamp(1_700_000_000), "20231114-221320");
         // 闰日：2024-02-29T12:00:00Z
         assert_eq!(utc_stamp(1_709_208_000), "20240229-120000");
+    }
+
+    /// 预生成与全量重建共用一条互斥位：同一时刻只许一个任务持有。
+    #[test]
+    fn thumb_job_slot_is_exclusive_and_releases_on_drop() {
+        let slot = Arc::new(ThumbJobSlot::default());
+        let first = slot.try_claim().expect("第一次必须抢到");
+        assert!(slot.try_claim().is_none(), "持有期间不能再抢");
+
+        drop(first);
+        let second = slot.try_claim().expect("释放后应能重新抢到");
+        drop(second);
+        assert!(slot.try_claim().is_some(), "再次释放后仍可抢");
     }
 }
