@@ -362,6 +362,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     core::config::spawn_watcher(state.clone());
     // 缩略图缓存后台淘汰（容量 + 过期天数，设计文档 3.4）
     spawn_media_janitor(state.clone());
+    // 媒体索引预建 + 定时增量（v4.8.0）
+    spawn_media_indexer(state.clone());
     // `.asmoday-part` 残留清理：不阻塞启动（设计文档 3.2.6.4）
     spawn_part_cleanup(state.clone());
 
@@ -699,6 +701,95 @@ async fn build_router(state: AppState) -> Router {
         // 必须包在路由之后、安全头之外，才能把 index.html 回落也覆盖到。
         .layer(api::compress::layer())
         .with_state(state)
+}
+
+/// 媒体索引后台维护（v4.8.0）：启动后预建一遍，之后按 `[media].index_scan_interval_secs` 轮询。
+///
+/// 两件事一起解决：
+/// 1. **预建**：挂载点一进配置就开始建索引，用户第一次点开媒体库不必等整棵树；
+/// 2. **保鲜**：外部拷进来的文件下一轮就能看到，不再依赖「用户请求自己扫一遍」。
+///
+/// 刻意用**独立连接**（不是 `state.media_index`）：走一棵两万条的树在 NAS 上要几十秒，
+/// 共用那把 `Mutex` 会让期间所有浏览请求排队等锁 —— 后台宁可自己慢，也不能堵前台。
+/// WAL + `busy_timeout=5000` 在 `MediaIndex::open` 里已设好，两条连接只会在提交时排队。
+fn spawn_media_indexer(state: AppState) {
+    // 取相册墙的深度上限：一次走到底，时间线（depth=2）与相册（depth=3）都能命中窗口
+    const DEPTH: usize = 3;
+
+    tokio::spawn(async move {
+        let index = Arc::new(core::media_index::MediaIndex::new(
+            state.auth.db_path().clone(),
+        ));
+        // 先让监听与静态资源就绪：这活一跑就是几十秒的读盘
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        loop {
+            let (interval, mounts) = {
+                let config = state.config.read().await;
+                (
+                    config.media.index_scan_interval_secs,
+                    config
+                        .system
+                        .mounts
+                        .iter()
+                        .map(|mount| resolve_mount_root(&mount.path))
+                        .collect::<Vec<_>>(),
+                )
+            };
+
+            if interval > 0 && !mounts.is_empty() {
+                let mount_count = mounts.len();
+                let started = Instant::now();
+                let mut scanned_total = 0usize;
+                for root in mounts {
+                    let index = Arc::clone(&index);
+                    let cache = Arc::clone(&state.dir_cache);
+                    let probe = root.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        api::media::sync_index(
+                            &index,
+                            &root,
+                            DEPTH,
+                            api::media::SyncMode::Background,
+                            Some(&cache),
+                        )
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Some(scanned)) => scanned_total += scanned,
+                        Ok(None) => {
+                            crate::log_warn!("media index unavailable for {}", probe.display())
+                        }
+                        Err(err) => crate::log_warn!("media index task failed: {err}"),
+                    }
+                }
+                crate::log_info!(
+                    "media index scan: {} mount(s), {} entries in {}ms",
+                    mount_count,
+                    scanned_total,
+                    started.elapsed().as_millis()
+                );
+            }
+
+            // interval=0 时也要睡着，否则变成忙等；配置热重载后下一轮自然生效
+            let sleep_for = if interval > 0 { interval } else { 300 };
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_for)).await;
+        }
+    });
+}
+
+/// 与 `path_guard::load` 同一个口径：能 canonicalize 就用规范路径。
+///
+/// 索引里的 root 是**展示串**（`//server/share`），由 canonical 路径经
+/// `normalize_display` 得来。这里若直接拿配置里的原始串，UNC 挂载点会被写成
+/// `\\server\share`，与前端传的 `//server/share` 对不上 —— 新鲜窗口永远失效，
+/// 等于每轮请求都在重扫。
+fn resolve_mount_root(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    std::fs::canonicalize(&path)
+        .ok()
+        .filter(|resolved| resolved.is_dir())
+        .unwrap_or(path)
 }
 
 /// 缩略图缓存后台淘汰：每 30 分钟按 `[media]` 策略清理一次。

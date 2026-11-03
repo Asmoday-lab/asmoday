@@ -72,6 +72,10 @@ ffmpeg_path = ""
 upload_max_size_mb = 0
 # Chunk size (MiB) for resumable uploads; larger files use tus. 0 = single PUT.
 upload_chunk_size_mb = 10
+# Media index background scan interval (seconds). It only stats directory mtimes
+# and rewrites the directories that changed; this is also how long an external
+# file copy can take to show up (unless you hit Rescan). 0 = disable.
+index_scan_interval_secs = 300
 
 # Terminal PTY overrides. Both empty = auto-detect (pwsh then powershell on
 # Windows; $SHELL, zsh, bash, sh elsewhere).
@@ -189,6 +193,11 @@ pub struct MediaConfig {
     pub upload_max_size_mb: u64,
     /// 分块上传片大小（MiB），0 = 关闭分块（设计文档 3.2.3.1）
     pub upload_chunk_size_mb: u64,
+    /// 媒体索引后台轮询间隔（秒）。0 = 关闭后台扫描（退回「请求时自己核对」）。
+    ///
+    /// 后台每轮只读目录 mtime 并比对索引里的戳，变化的目录才重写；这条链路
+    /// 决定「外部新增的文件多久能被看到」（v4.8.0）。
+    pub index_scan_interval_secs: u64,
 }
 
 impl Default for MediaConfig {
@@ -199,6 +208,7 @@ impl Default for MediaConfig {
             ffmpeg_path: String::new(),
             upload_max_size_mb: 0,
             upload_chunk_size_mb: 10,
+            index_scan_interval_secs: 300,
         }
     }
 }
@@ -828,6 +838,10 @@ impl Config {
         }
         if self.media.thumb_cache_max_age_days == 0 {
             return Err("media.thumb_cache_max_age_days 必须大于 0".to_string());
+        }
+        // 这个旋钮最容易被填成「1 秒」：每次都整树 stat，NAS 上等于常驻满载
+        if self.media.index_scan_interval_secs != 0 && self.media.index_scan_interval_secs < 30 {
+            return Err("media.index_scan_interval_secs 必须为 0 或不小于 30（秒）".to_string());
         }
 
         // 日志：级别与格式必须是可识别的枚举值（设计文档 3.7）

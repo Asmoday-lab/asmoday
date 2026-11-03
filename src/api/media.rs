@@ -552,7 +552,12 @@ fn browse_indexed(
     cache: Option<&crate::core::dir_cache::DirCache>,
     auth: &crate::core::auth::AuthStore,
 ) -> Option<BrowsePage> {
-    let scanned = sync_index(index, root, depth, refresh, cache)?;
+    let mode = if refresh {
+        SyncMode::Force
+    } else {
+        SyncMode::Request
+    };
+    let scanned = sync_index(index, root, depth, mode, cache)?;
     let scope = Scope::new(&fs::normalize_display(root), depth);
     // 查询本身是毫秒级，先一次性取完（数据库锁只在这一小段里握着）
     let (assets, has_more, counts, total) = index.with_conn(|conn| {
@@ -742,7 +747,12 @@ fn albums_indexed(
     cache: Option<&crate::core::dir_cache::DirCache>,
     auth: &crate::core::auth::AuthStore,
 ) -> Option<AlbumPage> {
-    sync_index(index, root, depth, refresh, cache)?;
+    let mode = if refresh {
+        SyncMode::Force
+    } else {
+        SyncMode::Request
+    };
+    sync_index(index, root, depth, mode, cache)?;
     let scope = Scope::new(&fs::normalize_display(root), depth);
     // 聚合 + 本页封面一次性取完（都是小查询），后面拼卡片时不占着数据库锁
     let (rows, covers, has_more, total) = index.with_conn(|conn| {
@@ -1024,16 +1034,43 @@ fn scan_raw(
 /// 窗口期外仍要把树走一遍，但只做「stat 目录 + 读目录快照」：目录 mtime 与索引里
 /// 记的一致就不写库，也不重建两万条 `RawMedia`、不排序，比旧实现便宜一个量级。
 /// （目录 mtime 不会因子目录内容变化而变化，所以想零延迟只能 stat 全树。）
-fn sync_index(
+/// 索引同步的触发方式（v4.8.0）。
+///
+/// 三者的差别只在「跳过什么」：
+/// - 请求落在新鲜窗口内 → 一步 IO 都不做（这是常规浏览路径）；
+/// - 用户点「重新扫描」→ 连目录戳都不信，整棵树重写；
+/// - 后台轮询 → **不查窗口**（它自己就是来续窗口的），但目录戳一致仍然跳过写库。
+///   后台要是也走窗口判断，每次都会在第一行就返回，永远不干活。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncMode {
+    Request,
+    Force,
+    Background,
+}
+
+impl SyncMode {
+    /// 是否强制重写所有目录行（无视目录戳）
+    fn refresh(self) -> bool {
+        matches!(self, Self::Force)
+    }
+
+    /// 是否服从「新鲜窗口」：窗口内直接返回 0
+    fn honors_window(self) -> bool {
+        matches!(self, Self::Request)
+    }
+}
+
+pub(crate) fn sync_index(
     index: &MediaIndex,
     root: &Path,
     depth: usize,
-    refresh: bool,
+    mode: SyncMode,
     cache: Option<&crate::core::dir_cache::DirCache>,
 ) -> Option<usize> {
+    let refresh = mode.refresh();
     let scope = Scope::new(&fs::normalize_display(root), depth);
     index.with_conn(|conn| {
-        if !refresh
+        if mode.honors_window()
             && let Some((synced_depth, at)) = media_index::synced(conn, &scope.root)?
             && synced_depth >= depth as i64
             && (crate::core::auth::now_secs().max(0) as u64).saturating_sub(at)
@@ -1064,6 +1101,28 @@ fn sync_index(
 ///
 /// 与 `scan_raw` 的口径必须完全一致（junk / svg / SKIP_DIRS / 深度 / 分类），
 /// 否则「索引版」和「回退版」会给出两套结果。
+/// 走树时攒下来的「待写目录」：readdir 已经做完，只等一个短事务写进去
+struct PendingDir {
+    dir: String,
+    depth: i64,
+    stamp: i64,
+    assets: Vec<media_index::Asset>,
+}
+
+/// 一批目录一个事务。只做写，不夹任何文件系统调用 —— 事务时长直接等于写锁时长。
+fn flush_dirs(conn: &rusqlite::Connection, batch: &mut Vec<PendingDir>) -> rusqlite::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for item in batch.iter() {
+        media_index::replace_dir(&tx, &item.dir, item.depth, item.stamp, &item.assets)?;
+    }
+    tx.commit()?;
+    batch.clear();
+    Ok(())
+}
+
 fn walk_into_index(
     conn: &rusqlite::Connection,
     root: &Path,
@@ -1080,9 +1139,11 @@ fn walk_into_index(
     let mut reused = 0usize;
     let mut io_time = std::time::Duration::ZERO;
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    // 首次建库要写两万行：分块提交，别拿一个长事务把缩略图那边的写锁卡住
-    let mut tx = conn.unchecked_transaction()?;
-    let mut pending = 0usize;
+    // 首次建库要写两万行。**读盘与写库必须分开**：NAS 上 readdir 一个目录 250ms，
+    // 要是把 readdir 包在事务里，写锁会被持有几十秒，登录 / 上传 / 缩略图缓存
+    // 全部撞 `database is locked`（v4.8.0 修的就是这个）。现在循环只做读，
+    // 攒够一批才开一个几毫秒的写事务。
+    let mut batch: Vec<PendingDir> = Vec::new();
 
     while let Some((dir, level)) = stack.pop() {
         let display = if level == 0 {
@@ -1103,7 +1164,7 @@ fn walk_into_index(
         scanned += entries.len();
         // 快照命中（戳一致）就认为库里这一目录的行还是对的；`stamp` 取不到时一律重写
         let unchanged =
-            !refresh && stamp.is_some() && media_index::dir_stamp(&tx, &display)? == stamp;
+            !refresh && stamp.is_some() && media_index::dir_stamp(conn, &display)? == stamp;
         if unchanged {
             reused += 1;
         }
@@ -1151,23 +1212,21 @@ fn walk_into_index(
         }
 
         if !unchanged {
-            media_index::replace_dir(
-                &tx,
-                &display,
-                scope.depth_of(level),
-                stamp.unwrap_or(0),
-                &assets,
-            )?;
-            pending += 1;
-            if pending >= media_index::CHUNK {
-                tx.commit()?;
-                tx = conn.unchecked_transaction()?;
-                pending = 0;
+            batch.push(PendingDir {
+                dir: display,
+                depth: scope.depth_of(level),
+                stamp: stamp.unwrap_or(0),
+                assets,
+            });
+            if batch.len() >= media_index::CHUNK {
+                flush_dirs(conn, &mut batch)?;
             }
         }
     }
+    flush_dirs(conn, &mut batch)?;
 
     // 这次没走到的目录（外面删掉了）连同条目一起清掉，索引不能留死行
+    let tx = conn.unchecked_transaction()?;
     media_index::prune(&tx, scope, &visited)?;
     tx.commit()?;
     crate::log_debug!(
@@ -2037,7 +2096,7 @@ mod tests {
 
         let (db_dir, index) = index_db("parity");
         // 深度 1：根 + sub，两层的媒体都进索引；系统垃圾与 svg 不进
-        let scanned = sync_index(&index, &root, 1, false, None).expect("索引不可用");
+        let scanned = sync_index(&index, &root, 1, SyncMode::Request, None).expect("索引不可用");
         assert!(scanned >= 11, "至少要读到根与 sub 两层的条目");
 
         let scope = Scope::new(&fs::normalize_display(&root), 1);
@@ -2073,18 +2132,72 @@ mod tests {
         let (db_dir, index) = index_db("window");
 
         assert!(
-            sync_index(&index, &root, 1, false, None).unwrap() > 0,
+            sync_index(&index, &root, 1, SyncMode::Request, None).unwrap() > 0,
             "第一次要真扫"
         );
         assert_eq!(
-            sync_index(&index, &root, 1, false, None),
+            sync_index(&index, &root, 1, SyncMode::Request, None),
             Some(0),
             "窗口期内必须一个目录都不碰"
         );
         assert!(
-            sync_index(&index, &root, 1, true, None).unwrap() > 0,
+            sync_index(&index, &root, 1, SyncMode::Force, None).unwrap() > 0,
             "refresh 必须穿透窗口"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// 后台轮询（v4.8.0）：不服从新鲜窗口，但目录戳一致时不重写行
+    ///
+    /// 两件事都要成立 —— 只绕过窗口不跳过写库，等于每 5 分钟把整库重写一遍；
+    /// 只跳过写库不绕过窗口，后台任务第一行就返回，永远不干活。
+    #[test]
+    fn background_sync_ignores_window_but_reuses_rows() {
+        let root = scratch("bg-sync");
+        touch(&root, "a.jpg", 1_700_000_000);
+        touch(&root, "b.mp4", 1_700_000_100);
+        let (db_dir, index) = index_db("bg-sync");
+
+        assert!(sync_index(&index, &root, 1, SyncMode::Request, None).unwrap() > 0);
+        // 记下隐式 rowid：replace_dir 是「先删后插」，重写就会换一批新 rowid
+        let ids_before: Vec<i64> = index
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT rowid FROM media_assets ORDER BY path")?;
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                Ok(rows.filter_map(Result::ok).collect::<Vec<i64>>())
+            })
+            .expect("查询失败");
+
+        // 请求模式：窗口内一步不动
+        assert_eq!(
+            sync_index(&index, &root, 1, SyncMode::Request, None),
+            Some(0)
+        );
+        // 后台模式：照样走树（返回条目数 > 0），但戳没变 → 一行都不重写
+        assert!(
+            sync_index(&index, &root, 1, SyncMode::Background, None).unwrap() > 0,
+            "后台轮询必须绕过窗口"
+        );
+        let ids_after: Vec<i64> = index
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT rowid FROM media_assets ORDER BY path")?;
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                Ok(rows.filter_map(Result::ok).collect::<Vec<i64>>())
+            })
+            .expect("查询失败");
+        assert_eq!(ids_before, ids_after, "目录戳没变就不该重写行");
+
+        // 目录里多一个文件 → 下一轮后台必须把它收进来
+        touch(&root, "c.jpg", 1_700_000_200);
+        assert!(sync_index(&index, &root, 1, SyncMode::Background, None).unwrap() > 0);
+        let total = index
+            .with_conn(|conn| {
+                media_index::totals(conn, &Scope::new(&fs::normalize_display(&root), 1))
+            })
+            .expect("计数失败");
+        assert_eq!(total.0, 2, "新增的那张图要被后台轮询发现");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&db_dir);
