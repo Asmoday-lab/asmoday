@@ -83,6 +83,13 @@ pub struct AppState {
     pub started: Instant,
     /// 批量重建缩略图的进度
     pub rebuild: Arc<api::system::RebuildState>,
+    /// 挂载点版本号：配置里 `system.mounts` 每变一次 +1。
+    ///
+    /// 前端拿它判断「后端认识的那套挂载点是不是已经换了」—— 配置热重载后浏览器
+    /// 自己不知道，不通知就只能靠用户手动刷新页面（v4.9.2）。
+    pub mounts_revision: Arc<std::sync::atomic::AtomicU64>,
+    /// 配置变更信号：后台索引器在 sleep 里 select 它，改完挂载点不必再等一整轮
+    pub config_changed: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -312,6 +319,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         started,
         rebuild: Arc::new(api::system::RebuildState::default()),
+        mounts_revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
         cwd,
     };
 
@@ -802,7 +811,14 @@ fn spawn_media_indexer(state: AppState) {
 
             // interval=0 时也要睡着，否则变成忙等；配置热重载后下一轮自然生效
             let sleep_for = if interval > 0 { interval } else { 300 };
-            tokio::time::sleep(std::time::Duration::from_secs(sleep_for)).await;
+            // 改了挂载点就不该再干等一整轮（默认 300s）：配置看门狗会 notify，
+            // 这里被叫醒后立刻走下一次循环（retain + 增量扫描新根）
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_for)) => {}
+                _ = state.config_changed.notified() => {
+                    crate::log_info!("media index woken by config change, rescanning now");
+                }
+            }
         }
     });
 }

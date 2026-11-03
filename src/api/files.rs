@@ -188,10 +188,16 @@ pub async fn mounts(State(state): State<AppState>) -> Response {
     let items: Vec<_> = set.mounts.iter().map(|m| m.info.clone()).collect();
     // 分片大小随挂载点清单下发：文件页据此决定整包 PUT 还是 tus 分块（3.2.3.1）
     let chunk_size_mb = state.config.read().await.media.upload_chunk_size_mb;
+    // 挂载点版本号（v4.9.2）：配置热重载后前端靠它发现「后端那套挂载点换了」，
+    // 不用等用户手动刷新页面。前端只需轻量轮询这个接口比对数字。
+    let revision = state
+        .mounts_revision
+        .load(std::sync::atomic::Ordering::Relaxed);
     Json(json!({
         "mounts": items,
         "implicit": set.implicit,
         "upload_chunk_size_mb": chunk_size_mb,
+        "revision": revision,
     }))
     .into_response()
 }

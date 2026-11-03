@@ -52,7 +52,8 @@
     "loadedOf": "已加载 {loaded} / 共 {total}",
     "sortPath": "按文件夹路径",
     "sortModified": "按修改日期",
-    "more": "更多"
+    "more": "更多",
+    "indexingMounts": "正在索引新挂载点…"
   },
   "favorite": {
     "add": "收藏",

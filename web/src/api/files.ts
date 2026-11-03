@@ -201,9 +201,13 @@ const encodePath = (path: string) => encodeURIComponent(path)
 export const filesApi = {
   /** 挂载点清单：每次进入文件管理都要重新拉，禁止缓存（设计文档 3.2.1） */
   mounts: () =>
-    getJson<{ mounts: MountPoint[]; implicit: boolean; upload_chunk_size_mb?: number }>(
-      '/api/files/mounts',
-    ),
+    getJson<{
+      mounts: MountPoint[]
+      implicit: boolean
+      upload_chunk_size_mb?: number
+      /** 挂载点版本号（v4.9.2）：配置热重载后 +1，前端靠它发现「清单换了」 */
+      revision?: number
+    }>('/api/files/mounts'),
 
   roots: () => getJson<RootsResponse>('/api/files/roots'),
 

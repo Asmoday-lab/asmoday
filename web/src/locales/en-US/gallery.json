@@ -52,7 +52,8 @@
     "loadedOf": "{loaded} of {total} loaded",
     "sortPath": "Folder path",
     "sortModified": "Date modified",
-    "more": "More"
+    "more": "More",
+    "indexingMounts": "Indexing new mounts…"
   },
   "favorite": {
     "add": "Add to favorites",

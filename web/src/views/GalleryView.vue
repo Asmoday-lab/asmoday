@@ -797,6 +797,9 @@ watch([() => cinemaRows.value.length, cinemaWidth], () => {
 onBeforeUnmount(() => {
   timelineRo?.disconnect()
   cinemaRo?.disconnect()
+  if (mountTimer !== null) window.clearInterval(mountTimer)
+  mountTimer = null
+  document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 
 async function openAlbum(album: Album) {
@@ -1615,6 +1618,60 @@ async function loadMoreMedia() {
   }
 }
 
+// ---------------- 挂载点监测（v4.9.2） ----------------
+//
+// 配置热重载只换后端内存里的那份配置，浏览器这边毫无感知：用户改完挂载点回到页面，
+// 看到的还是旧库，只能去「更多 → 重新扫描」碰运气 —— 而那个按钮藏得连入口都找不到。
+// 现在每 15s 轻量拉一次 `/api/files/mounts` 比对 `revision`（几十字节的响应），
+// 一变就作废快照、重拉清单与列表；后端那边收到配置变更会同时唤醒索引器，
+// 所以用户看到的不是「等 5 分钟」，而是「几秒后新挂载点的内容自己出现」。
+const MOUNT_POLL_MS = 10_000
+let mountTimer: number | null = null
+let mountRevision: number | null = null
+/** 刚发现挂载点变了、索引还在补：工具栏给一条看得见的说明 */
+const indexingMounts = ref(false)
+
+async function syncMounts() {
+  if (document.visibilityState !== 'visible') return
+  let data: Awaited<ReturnType<typeof filesApi.mounts>>
+  try {
+    data = await filesApi.mounts()
+  } catch {
+    // 网络抖动不是「挂载点变了」，别把正在看的库清掉
+    return
+  }
+  const nextRevision = data.revision ?? null
+  const revisionChanged =
+    mountRevision !== null && nextRevision !== null && nextRevision !== mountRevision
+  mountRevision = nextRevision
+  mounts.value = data.mounts
+  const live = mountsSignature()
+  const fingerprintChanged = Boolean(snapshotMounts && live && snapshotMounts !== live)
+  if (!revisionChanged && !fingerprintChanged) return
+
+  dropSnapshots()
+  indexingMounts.value = true
+  try {
+    await Promise.all([
+      load(),
+      tab.value === 'photos' ? loadAlbums() : Promise.resolve(),
+      tab.value === 'cinema' ? loadCinemaAlbums() : Promise.resolve(),
+    ])
+  } finally {
+    indexingMounts.value = false
+  }
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible') void syncMounts()
+}
+
+/** 「重新扫描」：用户显式要求穿透快照，重扫整棵树 */
+function rescan() {
+  if (refreshing.value) return
+  void load({ refresh: true })
+}
+
 /**
  * 排序换了：时间线（以及影院的影片流）从第一页重来。
  *
@@ -1865,20 +1922,11 @@ onMounted(() => {
   seedFromCache()
   void load()
   void loadLibraryState()
-  // 挂载点清单：既给「只读挂载点置灰」用，也用来判断上一帧是不是别的库的
-  void filesApi
-    .mounts()
-    .then((data) => {
-      mounts.value = data.mounts
-      const live = mountsSignature()
-      // 挂载点集合变了（v4.8.1）：快照属于上一套挂载点，立刻作废并重拉。
-      // 否则用户改完配置回来，看到的还是旧挂载点的目录，直到时间线扫完才换。
-      if (snapshotMounts && live && snapshotMounts !== live) {
-        dropSnapshots()
-        void load()
-      }
-    })
-    .catch(() => {})
+  // 挂载点清单：既给「只读挂载点置灰」用，也用来判断上一帧是不是别的库的。
+  // v4.9.2 起改成轮询（配置热重载后前端必须能自己发现），切回标签页时也补一次。
+  void syncMounts()
+  mountTimer = window.setInterval(() => void syncMounts(), MOUNT_POLL_MS)
+  document.addEventListener('visibilitychange', onVisibilityChange)
 })
 
 // 切换视图会换掉 sentinel 元素（v-if 分支互斥），这里跟着重新 observe
@@ -1997,7 +2045,28 @@ useEventListener(window, 'keydown', onKey)
       />
 
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
-        <span class="hidden truncate md:inline">{{ t('gallery.toolbar.indexed') }}</span>
+        <!-- 改完挂载点能看见「系统在干活」，而不是一排没来的空骨架 -->
+        <span
+          v-if="indexingMounts"
+          class="hidden items-center gap-1.5 text-accent md:flex"
+          data-testid="indexing-mounts"
+        >
+          <span class="size-3 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+          {{ t('gallery.toolbar.indexingMounts') }}
+        </span>
+        <span v-else-if="showProgress" class="hidden text-[11px] md:inline">
+          {{ t('gallery.toolbar.loadedOf', { loaded: progress.loaded, total: progress.total }) }}
+        </span>
+        <!-- 重新扫描（v4.9.2）：以前塞在「更多」里，改完挂载点根本找不到入口 -->
+        <button
+          class="grid size-7 place-items-center rounded-md transition-colors hover:bg-elevated hover:text-ink disabled:opacity-50"
+          :title="t('gallery.toolbar.rescan')"
+          :disabled="refreshing"
+          data-testid="gallery-rescan"
+          @click="rescan"
+        >
+          <AppIcon name="refresh" :size="15" :class="refreshing || indexingMounts ? 'animate-spin' : ''" />
+        </button>
         <!-- 次要开关收进「更多」：顶栏只留视图、排序这些每次都会用的东西 -->
         <div ref="moreWrap" class="relative">
           <button
@@ -2014,9 +2083,6 @@ useEventListener(window, 'keydown', onKey)
             v-if="moreOpen"
             class="absolute top-full right-0 z-30 mt-1 w-52 rounded-lg border border-line bg-panel p-1 text-xs shadow-lg"
           >
-            <p v-if="showProgress" class="px-2 py-1.5 text-[11px] text-muted">
-              {{ t('gallery.toolbar.loadedOf', { loaded: progress.loaded, total: progress.total }) }}
-            </p>
             <button
               v-if="tab === 'cinema' || tab === 'music'"
               class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
@@ -2034,15 +2100,6 @@ useEventListener(window, 'keydown', onKey)
               <AppIcon name="play" :size="13" />
               <span class="flex-1">{{ t('gallery.cinema.native') }}</span>
               <AppIcon v-if="nativePlayer" name="check" :size="13" class="text-accent" />
-            </button>
-            <button
-              class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
-              data-testid="gallery-rescan"
-              @click="load({ refresh: true })"
-            >
-              <!-- 后台刷新不再有骨架屏可看，图标转起来才是「正在扫」的唯一反馈 -->
-              <AppIcon name="refresh" :size="13" :class="refreshing ? 'animate-spin' : ''" />
-              {{ t('gallery.toolbar.rescan') }}
             </button>
           </div>
         </div>

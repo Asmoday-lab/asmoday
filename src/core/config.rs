@@ -1243,7 +1243,27 @@ fn apply_text(state: &crate::AppState, raw: &str) -> bool {
     let mut config = config;
     // 热重载同样要过一遍危险配置自检，不许绕过启动时的拦截
     let _ = config.apply_safety();
+    let mounts_changed = {
+        let current = state.config.blocking_read();
+        current.system.mounts != config.system.mounts
+    };
     *state.config.blocking_write() = config;
+    if mounts_changed {
+        // 挂载点换了是一等事件（v4.9.2）：
+        // - 版本号 +1，浏览器轮询到就知道该重拉清单；
+        // - 索引新鲜窗口作废，否则新挂载点要等 `FRESH`（600s）过期才被看见；
+        // - 叫醒后台索引器，不必干等下一个 `index_scan_interval_secs`（默认 300s）。
+        // 以前这三件事一件都没做，用户改完配置只能自己去「更多 → 重新扫描」，
+        // 或者干脆重启进程。
+        state
+            .mounts_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state
+            .media_index
+            .with_conn(crate::core::media_index::invalidate);
+        state.config_changed.notify_one();
+        crate::log_info!("mounts changed: invalidated media index and woke the indexer");
+    }
     true
 }
 
