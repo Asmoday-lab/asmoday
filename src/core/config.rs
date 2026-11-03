@@ -1234,37 +1234,50 @@ fn apply_text(state: &crate::AppState, raw: &str) -> bool {
         return false;
     }
 
+    let previous = state.config.blocking_read().clone();
+    let mut config = config;
+    apply_side_effects(state, &previous, &mut config);
+    *state.config.blocking_write() = config;
+    true
+}
+
+/// 新配置生效时的公共副作用。**任何写入配置的路径都必须调它。**
+///
+/// 三条路径共用：文件热重载（[`apply_text`]）、设置页 `POST /api/config`、
+/// 源码模式 `POST /api/config/raw`。
+///
+/// v4.9.6 之前这些副作用只写在文件热重载里，于是**从设置页改挂载点什么都不发生**——
+/// 内存里的配置换了，但索引不重扫、版本号不动、浏览器也不知道。用户看到的现象是
+/// 「更新挂载点目录后没有立即开始索引」，而日志里连一条相关记录都没有。
+///
+/// `previous` 是生效前的那份配置，用来判断挂载点是否真的变了。
+pub fn apply_side_effects(state: &crate::AppState, previous: &Config, next: &mut Config) {
+    // 危险配置自检：任何路径都不许绕过启动时的拦截
+    let _ = next.apply_safety();
     // 缩略图策略随配置一起生效
     state
         .thumbnails
-        .apply_limits(config.media.limit_bytes(), config.media.max_age_secs());
+        .apply_limits(next.media.limit_bytes(), next.media.max_age_secs());
     // 日志分级同样随配置热更新（设计文档 3.7：排障时改配置即生效，无需重启）
-    crate::core::logging::apply(&config.log);
-    let mut config = config;
-    // 热重载同样要过一遍危险配置自检，不许绕过启动时的拦截
-    let _ = config.apply_safety();
-    let mounts_changed = {
-        let current = state.config.blocking_read();
-        current.system.mounts != config.system.mounts
-    };
-    *state.config.blocking_write() = config;
-    if mounts_changed {
-        // 挂载点换了是一等事件（v4.9.2）：
-        // - 版本号 +1，浏览器轮询到就知道该重拉清单；
-        // - 索引新鲜窗口作废，否则新挂载点要等 `FRESH`（600s）过期才被看见；
-        // - 叫醒后台索引器，不必干等下一个 `index_scan_interval_secs`（默认 300s）。
-        // 以前这三件事一件都没做，用户改完配置只能自己去「更多 → 重新扫描」，
-        // 或者干脆重启进程。
-        state
-            .mounts_revision
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        state
-            .media_index
-            .with_conn(crate::core::media_index::invalidate);
-        state.config_changed.notify_one();
-        crate::log_info!("mounts changed: invalidated media index and woke the indexer");
+    crate::core::logging::apply(&next.log);
+    if previous.system.mounts != next.system.mounts {
+        on_mounts_changed(state);
     }
-    true
+}
+
+/// 挂载点换了是一等事件（v4.9.2）：
+/// - 版本号 +1，浏览器轮询到就知道该重拉清单；
+/// - 索引新鲜窗口作废，否则新挂载点要等 `FRESH`（600s）过期才被看见；
+/// - 叫醒后台索引器，不必干等下一个 `index_scan_interval_secs`（默认 300s）。
+fn on_mounts_changed(state: &crate::AppState) {
+    state
+        .mounts_revision
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .media_index
+        .with_conn(crate::core::media_index::invalidate);
+    state.config_changed.notify_one();
+    crate::log_info!("mounts changed: invalidated media index and woke the indexer");
 }
 
 // ---------------------------------------------------------------------------

@@ -48,7 +48,12 @@ pub async fn update_config(
         return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
 
-    // 落盘成功后再切换内存态，避免保存失败却已生效
+    // 落盘成功后再切换内存态，避免保存失败却已生效。
+    // v4.9.6：副作用（缩略图策略 / 日志分级 / 挂载点变更）必须在这里也走一遍 ——
+    // 以前只有文件热重载做了这件事，从设置页改挂载点等于什么都没发生。
+    let previous = state.config.read().await.clone();
+    let mut incoming = incoming;
+    crate::core::config::apply_side_effects(&state, &previous, &mut incoming);
     {
         let mut guard = state.config.write().await;
         *guard = incoming;
@@ -122,6 +127,9 @@ pub async fn update_config_raw(State(state): State<AppState>, body: String) -> R
         }
     }
 
+    let previous = state.config.read().await.clone();
+    let mut parsed = parsed;
+    crate::core::config::apply_side_effects(&state, &previous, &mut parsed);
     {
         let mut guard = state.config.write().await;
         *guard = parsed;
