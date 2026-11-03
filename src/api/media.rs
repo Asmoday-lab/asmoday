@@ -1440,6 +1440,67 @@ fn image_dims(path: &Path, mtime: u64, size: u64) -> Option<(u32, u32)> {
     dims
 }
 
+/// 一页里并发读图头的线程数（v4.9.3）。
+///
+/// 网盘上单次 `open + read` 是 200~400ms：120 张串行就是 40 秒以上（用户实测
+/// 45000ms，就是「图片库比文件夹视图慢几十倍」的唯一原因 —— 文件夹墙根本不读文件头）。
+/// 并发在这里是纯收益：请求重叠的是网络往返，不是磁盘寻道。
+const DIMS_THREADS: usize = 6;
+
+/// `(位置, 缓存键, 真实路径, mtime, size)`：一个待读的图头
+type DimJob = (usize, String, PathBuf, u64, u64);
+/// `(位置, 缓存键, mtime, size, 宽高)`
+type DimResult = (usize, String, u64, u64, Option<(u32, u32)>);
+
+/// 把一批「每条都要碰一次文件」的活并行跑掉（v4.9.3）。
+///
+/// 顺序不保证 —— 每条任务的返回值里都带着自己的下标，调用方按它归位。
+/// 只有一两条时不值得开线程，直接串行（省掉建线程的固定开销）。
+fn run_parallel<T, R>(jobs: Vec<T>, worker: impl Fn(T) -> R + Sync) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+{
+    let total = jobs.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    if total == 1 {
+        let job = jobs.into_iter().next().unwrap();
+        return vec![worker(job)];
+    }
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let done = std::sync::Mutex::new(Vec::with_capacity(total));
+    std::thread::scope(|scope| {
+        for _ in 0..DIMS_THREADS.min(total) {
+            scope.spawn(|| {
+                loop {
+                    // 取任务只锁一瞬间，真正的读盘在锁外
+                    let job = match queue.lock() {
+                        Ok(mut guard) => guard.next(),
+                        Err(_) => None,
+                    };
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let out = worker(job);
+                    if let Ok(mut guard) = done.lock() {
+                        guard.push(out);
+                    }
+                }
+            });
+        }
+    });
+    done.into_inner().unwrap_or_default()
+}
+
+/// 并发读一批图头，返回 `(位置, 缓存键, mtime, size, 宽高)`
+fn read_dims_parallel(jobs: Vec<DimJob>) -> Vec<DimResult> {
+    run_parallel(jobs, |(position, key, path, mtime, size)| {
+        (position, key, mtime, size, image_dims(&path, mtime, size))
+    })
+}
+
 /// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash 与像素宽高。
 /// `conn` 是索引连接（可能没有）：宽高缓存读写都走它，**不能**在这里再锁一次
 /// `MediaIndex` —— 调用方（`browse_indexed`）已经握着那把锁，重入就是死锁。
@@ -1484,41 +1545,93 @@ fn build_items(
                 media_index::dims_get_many(conn, &borrowed)
             })
             .unwrap_or_default();
-        let mut fresh: Vec<(String, u64, u64, u32, u32)> = Vec::new();
+        let mut jobs: Vec<DimJob> = Vec::new();
         for (slot, &position) in dim_candidates.iter().enumerate() {
             let (key, mtime, size) = &keys[slot];
-            if let Some(pair) = cached.get(key) {
-                dims.insert(position, Some(*pair));
+            if let Some((w, h)) = cached.get(key) {
+                // (0,0) 是「读过、但解不出宽高」的负缓存，别再读一遍
+                dims.insert(position, (*w > 0 && *h > 0).then_some((*w, *h)));
                 continue;
             }
-            let read = image_dims(&raw[position].path, *mtime, *size);
-            if let Some((w, h)) = read {
-                fresh.push((key.clone(), *mtime, *size, w, h));
-            }
-            dims.insert(position, read);
+            jobs.push((
+                position,
+                key.clone(),
+                raw[position].path.clone(),
+                *mtime,
+                *size,
+            ));
         }
-        if let Some(conn) = conn
-            && !fresh.is_empty()
-        {
-            let borrowed: Vec<(&str, u64, u64, u32, u32)> = fresh
-                .iter()
-                .map(|(path, mtime, size, w, h)| (path.as_str(), *mtime, *size, *w, *h))
-                .collect();
-            media_index::dims_put_many(conn, &borrowed);
+        if !jobs.is_empty() {
+            let started = std::time::Instant::now();
+            let cached_hits = dim_candidates.len() - jobs.len();
+            let disk_reads = jobs.len();
+            let mut fresh: Vec<(String, u64, u64, u32, u32)> = Vec::new();
+            for (position, key, mtime, size, read) in read_dims_parallel(jobs) {
+                // 读不出也写回 (0,0)：坏图 / HEIC 这类每开一次页面重读一次纯属浪费
+                let (w, h) = read.unwrap_or((0, 0));
+                fresh.push((key, mtime, size, w, h));
+                dims.insert(position, read);
+            }
+            if let Some(conn) = conn
+                && !fresh.is_empty()
+            {
+                let borrowed: Vec<(&str, u64, u64, u32, u32)> = fresh
+                    .iter()
+                    .map(|(path, mtime, size, w, h)| (path.as_str(), *mtime, *size, *w, *h))
+                    .collect();
+                media_index::dims_put_many(conn, &borrowed);
+            }
+            crate::log_debug!(
+                "像素宽高：{} 张图（缓存命中 {}，读盘 {}）耗时 {}ms",
+                dim_candidates.len(),
+                cached_hits,
+                disk_reads,
+                started.elapsed().as_millis()
+            );
         }
     }
 
+    // 音频 ID3 与视频外挂字幕同样是网盘 IO：一个读几十 KB 标签块，一个对每条
+    // 视频做两次 `is_file`（.vtt / .srt）。串行时一页 120 条又是几十秒的量级。
+    let probe_started = std::time::Instant::now();
+    let audio_jobs: Vec<(usize, PathBuf)> = raw
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == "audio")
+        .map(|(position, entry)| (position, entry.path.clone()))
+        .collect();
+    let tags_by_pos: HashMap<usize, crate::core::audio_tags::TrackTags> =
+        run_parallel(audio_jobs, |(position, path)| {
+            (position, crate::core::audio_tags::read_tags(&path))
+        })
+        .into_iter()
+        .collect();
+
+    let video_jobs: Vec<(usize, PathBuf, u64)> = raw
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == "video")
+        .map(|(position, entry)| (position, entry.path.clone(), entry.mtime))
+        .collect();
+    let subtitle_by_pos: HashMap<usize, Option<String>> =
+        run_parallel(video_jobs, |(position, path, mtime)| {
+            (position, find_subtitle_cached(&path, mtime))
+        })
+        .into_iter()
+        .collect();
+
+    if !tags_by_pos.is_empty() || !subtitle_by_pos.is_empty() {
+        crate::log_debug!(
+            "音频标签 / 字幕探测：{} 条音频、{} 条视频，耗时 {}ms",
+            tags_by_pos.len(),
+            subtitle_by_pos.len(),
+            probe_started.elapsed().as_millis()
+        );
+    }
+
     for (position, entry) in raw.iter().enumerate() {
-        let tags = if entry.kind == "audio" {
-            crate::core::audio_tags::read_tags(&entry.path)
-        } else {
-            Default::default()
-        };
-        let subtitle = if entry.kind == "video" {
-            find_subtitle_cached(&entry.path, entry.mtime)
-        } else {
-            None
-        };
+        let tags = tags_by_pos.get(&position).cloned().unwrap_or_default();
+        let subtitle = subtitle_by_pos.get(&position).cloned().flatten();
         if entry.kind == "image" {
             hash_slots.push((items.len(), entry.path.as_path()));
         }
@@ -1972,6 +2085,29 @@ mod tests {
         assert_eq!(image_dims(&broken, 1, 11), None);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// v4.9.3：一页 120 张图头串行要几十秒，必须并行跑
+    #[test]
+    fn run_parallel_actually_overlaps_jobs() {
+        // 30 个任务、每个 20ms：串行要 600ms，6 路并发应在 100~200ms 完成
+        let jobs: Vec<usize> = (0..30).collect();
+        let started = std::time::Instant::now();
+        let mut out = run_parallel(jobs, |n| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            n * 2
+        });
+        out.sort_unstable();
+        assert_eq!(
+            out,
+            (0..30).map(|n| n * 2).collect::<Vec<_>>(),
+            "任务不能漏也不能重"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(450),
+            "并发没生效，耗时 {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
