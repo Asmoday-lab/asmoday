@@ -16,17 +16,15 @@ pub const DEFAULT_PORT: u16 = 4242;
 pub const ENV_CONFIG_PATH: &str = "ASMODAY_CONFIG_PATH";
 
 /// 首次运行时落盘的默认配置：全部带注释，端口 4242，无挂载点、无外部服务。
-pub const DEFAULT_CONFIG_TOML: &str = r#"# Asmoday 配置文件 — TOML 格式
-# 本文件由程序首次启动时自动生成；也可在“系统设置”页面通过可视化表单或源码模式修改。
+pub const DEFAULT_CONFIG_TOML: &str = r#"# Asmoday configuration (TOML).
+# Written on first start; edit here or through Settings in the web UI.
 
 [server]
-# 监听地址。默认为 "0.0.0.0"（方便局域网访问及 Docker 映射）。
-# 若仅本机使用或已前置 Nginx/Caddy 反代，建议改为 "127.0.0.1"。
-# IPv6：写 "::" 即双栈监听（同一端口同时收 IPv4 + IPv6 连接），
-# 只收 v6 写 "::1"（本机）或具体地址；IPv6 字面量不需要方括号。
-# 命令行 -H / 环境变量 ASMODAY_HOST 优先级更高。
+# Listen address. "0.0.0.0" exposes every interface; use "127.0.0.1" behind a
+# reverse proxy. "::" listens on IPv4 + IPv6.
+# CLI -H / env ASMODAY_HOST take precedence.
 host = "0.0.0.0"
-# 监听端口（1-65535）。命令行 -p / 环境变量 ASMODAY_PORT 优先级更高。
+# Listen port. CLI -p / env ASMODAY_PORT take precedence.
 port = 4242
 
 [server.ssl]
@@ -34,109 +32,79 @@ enabled = false
 cert_path = ""
 key_path = ""
 
-# 反向代理兼容性
 [server.proxy]
-# 是否信任 X-Forwarded-For / X-Real-IP / X-Forwarded-Proto / X-Forwarded-Host。
-# 默认关闭：开着的代价是同网段任何设备（含同一 Docker 网络里的其它容器）都能伪造
-# 来源 IP，绕过按 IP 的防爆破白名单、污染访问日志。前置了 Nginx/Caddy 再打开。
+# Trust X-Forwarded-* headers. Only enable behind a proxy you control: anyone
+# who can reach the port could otherwise forge their source IP and bypass bans.
 trust_proxy_headers = false
-# 仅信任来自这些地址的转发头（支持 IPv4/IPv6 CIDR 写法）。
-# Docker 里 asmoday 常与反代同网，按需补 "172.16.0.0/12"；不要为了省事写 0.0.0.0/0。
+# CIDRs allowed to send those headers. Never use 0.0.0.0/0.
 trusted_ips = ["127.0.0.1", "::1"]
-# 子路径部署前缀，如挂载在 /asmoday 则填 "/asmoday"，根路径留空
+# Sub-path deployment prefix, e.g. "/asmoday". Empty for root.
 base_url = ""
 
-# 批量文件操作上限（copy / move / delete）
 [server.limits]
-# 单次操作的顶层条目数上限，0 = 不限。
-# 注意：这里数的是「选中的条目」，不是目录里的文件总数——删/搬一个装着一万张照片的
-# 目录只算 1 项。目录内部的大小只在复制/跨盘移动时按需累加。
+# Top-level entries per batch operation (copy / move / delete). 0 = unlimited.
+# This counts selected entries, not files inside them.
 batch_max_items = 100
-# 单次复制/跨盘移动的总字节上限（MiB），0 = 不限。删除不受此项约束。
+# Total bytes per copy or cross-device move, in MiB. 0 = unlimited.
 batch_max_bytes_mb = 2048
 
 [auth]
-# 本地账号密码登录开关。
-# 安全约束：local_enabled 与 proxy_trust.enabled 不允许同时为 false，
-# 配置里不存在“关闭认证/免密”开关，忘记密码只能走 CLI 重置。
+# Local username/password login. Cannot be disabled together with proxy_trust.
+# Forgot the password? Use --reset-password on the command line.
 local_enabled = true
 
-# “座上宾”模式：信任反向代理传入的用户名 Header，实现外部 IdP 免密跳转
 [auth.proxy_trust]
 enabled = false
 user_header = "Remote-User"
 
-# 分享 / 图床防盗链：referer_allowlist 非空时，公开直链请求若携带
-# Referer 且其主机不在白名单内，一律 403（无 Referer 的直接打开不受影响）
+# Hotlink protection for public shares: a request whose Referer host is not in
+# this list gets 403. Requests without a Referer are allowed.
 # [shares]
 # referer_allowlist = ["example.com", "cdn.example.org"]
 
-# 媒体缓存策略（设计文档 3.4：缩略图 LRU 淘汰，防磁盘被撑爆）
 [media]
-# 缩略图缓存总容量上限（MiB）
+# Thumbnail cache ceiling (MiB) and retention (days).
 thumb_cache_max_size_mb = 1024
-# 缩略图最长保留天数（源文件 mtime 更新会立即失效重建）
 thumb_cache_max_age_days = 90
-# 外部 FFmpeg 路径（可选）。仅用于给影视库截取首帧封面，绝不参与转码。
-# 可填可执行文件，也可直接填安装目录（如 C:/ffmpeg/bin）。
-# 留空时依次读取环境变量 ASMODAY_FFMPEG_PATH，再自动探测系统 PATH。
+# Optional FFmpeg path for video posters. Empty = env ASMODAY_FFMPEG_PATH, then PATH.
 ffmpeg_path = ""
-# 单文件上传上限（MiB）。0 = 不限制，仅受磁盘空间约束。
+# Per-file upload limit (MiB). 0 = only limited by disk space.
 upload_max_size_mb = 0
-# 分块上传片大小（MiB）。超过该大小的文件走 tus 分块上传（断点续传），
-# 不超过则整包 PUT。0 = 关闭分块，一律整包（设计文档 3.2.3.1）。
+# Chunk size (MiB) for resumable uploads; larger files use tus. 0 = single PUT.
 upload_chunk_size_mb = 10
 
-# 终端 PTY 拉起覆盖（设计文档 3.3.5）。两项都留空/缺省时走自动探测：
-# Windows pwsh → powershell；类 Unix $SHELL → zsh → bash → sh。
+# Terminal PTY overrides. Both empty = auto-detect (pwsh then powershell on
+# Windows; $SHELL, zsh, bash, sh elsewhere).
 # [terminal]
-# 自定义 shell（绝对路径或 PATH 内可执行名，如 "/usr/bin/zsh"、"pwsh"）
 # shell = ""
-# 自定义启动参数。**设置后完全替换**内置参数（-l / -NoExit 等都不再加），
-# 例如接入 tmux：args = ["-c", "tmux new -A -s asmoday"]。
-# 注意：历史记录隔离依赖 shell 自身的 HISTFILE / PSReadLine 配置，
-# 走自定义参数时这部分由你自己的配置负责。
 # args = []
-# 断线后 PTY 保活秒数（默认 180）。手机切网 / 锁屏回来不该直接丢 shell，
-# 低功耗设备又不能让僵尸终端常驻——按需调大即可。
 # idle_kill_seconds = 180
-# 单用户并发 PTY 上限（默认 10）。超限时前端会弹出「活动会话」面板让你强制关闭。
 # max_sessions = 10
 
-# 日志策略（设计文档 3.7）：默认生产级克制，排障时分级开启，结构化可选。
 [log]
-# 控制台最低级别：debug | info | warn | error | off。默认 info——终端里只出现关键信息。
+# debug | info | warn | error | off
 console_level = "info"
-# 主文件最低级别（data/logs/asmoday.log，10MiB × 5 轮转）。默认 debug，事后排障有完整线索。
 file_level = "debug"
-# HTTP 访问日志独立级别（方法/路径/状态码/耗时，不含请求体；off 关闭）。默认 info。
 api_level = "info"
-# 输出格式：text（人读，默认）| json（每行一个 JSON 对象，便于机器解析）。
+# text | json
 format = "text"
 
-# ==========================================
-# 以下为可选配置，默认注释。需要时取消注释即可。
-# ==========================================
-
-# 挂载点（可多个）
+# Mount points. `name` is optional: when omitted it is derived from the last
+# path segment. Set it only when two mounts would otherwise look the same.
+# Duplicate paths are rejected; nested mounts are allowed and warn on startup.
 # [[system.mounts]]
-# name = "Local Storage"
 # path = "D:/Media"
 # readonly = false
 
-# 软链接逃逸（默认 true，与 FileBrowser 行为一致）：挂载点内的符号链接 / junction
-# 可以点进去，目标在挂载点外也照常浏览、预览；寻址始终以「链接路径」为前缀，
-# 直接访问挂载点外的绝对路径依旧拒绝。**写操作不跟随**：新建 / 上传 / WebDAV PUT
-# 落到「最后一段本身是外向链接」的路径上一律拒绝（2026-11-02 安全收紧，此前
-# 放开时可以借链接写到挂载点外）。改成 false 恢复严格边界——
-# 逃逸一律按断链处理（列表置灰、接口 403，跨盘链接不可用）。
+# Follow symlinks that point outside a mount point. Traversal stays on the link
+# path; writes never follow the final segment.
 # [system]
 # follow_symlinks = true
 
-# 外部聚合服务（可多个），由内置反向代理网关透传
+# External services proxied by the built-in gateway.
 # [[services]]
 # id = "grafana"
-# name = "监控面板"
+# name = "Dashboard"
 # icon = "chart"
 # type = "external"
 # target_url = "http://192.168.1.50:3000"
@@ -425,7 +393,10 @@ impl Default for SystemConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MountConfig {
-    pub name: String,
+    /// 展示名。**可省略**：缺省时由路径末段派生（`path_guard::load`），
+    /// 只有「末段不足以区分」（如 `D:/Media/电影` 与 `E:/Media/电影`）时才需要手填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub path: String,
     /// 只读挂载点：后端拦截一切写操作，前端置灰全部变更入口（设计文档 3.2.6）
     #[serde(default)]
@@ -459,6 +430,21 @@ pub struct ServiceConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// 挂载路径的归一化键：分隔符统一 + 去掉尾部斜杠。
+///
+/// Windows 文件系统大小写不敏感，`C:/Media` 与 `c:/media` 是同一个目录；
+/// Unix 上 `/mnt/A` 和 `/mnt/a` 是两个目录，不能一并小写。
+fn normalize_mount_path(raw: &str) -> String {
+    let unified = raw.trim().replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    let base = if trimmed.is_empty() { "/" } else { trimmed };
+    if cfg!(windows) {
+        base.to_lowercase()
+    } else {
+        base.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,16 +853,27 @@ impl Config {
         // 解压版安装包给出的就是 `...\ffmpeg\bin`，运行时会自动补上可执行文件名。
         // 这里只做「不是空串」之外的宽松校验，真正的可用性由探测接口判断。
 
+        // 挂载点的身份是 path，不是 name：name 可省略（由路径末段派生），
+        // 但同一个目录绝不能配两次 —— 否则卡片重复、只读判定取「最后的那个」。
         let mut names = HashSet::new();
+        let mut paths = HashSet::new();
         for mount in &self.system.mounts {
-            if mount.name.trim().is_empty() {
-                return Err("system.mounts[].name 不能为空".to_string());
+            let path = mount.path.trim();
+            if path.is_empty() {
+                return Err("system.mounts[].path 不能为空".to_string());
             }
-            if mount.path.trim().is_empty() {
-                return Err(format!("system.mounts[{}].path 不能为空", mount.name));
+            // 显式填了名字才要求唯一；派生名冲突由 load() 自动加后缀区分
+            if let Some(name) = mount
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                && !names.insert(name.to_lowercase())
+            {
+                return Err(format!("system.mounts[].name 重复: {name}"));
             }
-            if !names.insert(mount.name.clone()) {
-                return Err(format!("system.mounts[].name 重复: {}", mount.name));
+            if !paths.insert(normalize_mount_path(path)) {
+                return Err(format!("system.mounts[].path 重复: {path}"));
             }
         }
 
@@ -1278,11 +1275,11 @@ mod tests {
         );
         // 关键注释文案必须还在（不能是“只剩几个 #”）
         for needle in [
-            "# Asmoday 配置文件",
-            "# 监听地址",
-            "# 媒体缓存策略",
-            "# HTTP 访问日志独立级别",
-            "# 以下为可选配置，默认注释",
+            "# Asmoday configuration",
+            "# Listen address",
+            "# Thumbnail cache ceiling",
+            "# Mount points.",
+            "# External services",
         ] {
             assert!(text.contains(needle), "注释丢失：{needle}\n---\n{text}");
         }
@@ -1318,10 +1315,60 @@ thumb_cache_max_size_mb = 512
     }
 
     #[test]
+    fn duplicate_mount_paths_are_rejected_but_names_are_optional() {
+        let mount = |name: Option<&str>, path: &str| MountConfig {
+            name: name.map(str::to_string),
+            path: path.to_string(),
+            readonly: false,
+        };
+
+        // 同一目录配两次（尾斜杠 / 分隔符差异）必须拒绝
+        let mut config = Config::default();
+        config.system.mounts.push(mount(None, "/mnt/nas"));
+        config.system.mounts.push(mount(None, "/mnt/nas/"));
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("path 重复"), "{err}");
+
+        // 同名目录不同来源 → 允许，派生名在 load() 里补序号
+        let mut ok = Config::default();
+        ok.system.mounts.push(mount(None, "/mnt/a/电影"));
+        ok.system.mounts.push(mount(None, "/mnt/b/电影"));
+        assert!(ok.validate().is_ok());
+
+        // 显式重名仍然报错：用户手填的名字重复，UI 无法区分
+        let mut dup = Config::default();
+        dup.system.mounts.push(mount(Some("电影"), "/mnt/a"));
+        dup.system.mounts.push(mount(Some("电影"), "/mnt/b"));
+        assert!(dup.validate().unwrap_err().contains("name 重复"));
+
+        // 空白 name 视为未填
+        let mut blank = Config::default();
+        blank.system.mounts.push(mount(Some("   "), "/mnt/a"));
+        assert!(blank.validate().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_paths_are_case_insensitive_on_windows() {
+        let mut config = Config::default();
+        config.system.mounts.push(MountConfig {
+            name: None,
+            path: "D:/Media".to_string(),
+            readonly: false,
+        });
+        config.system.mounts.push(MountConfig {
+            name: None,
+            path: "d:/media".to_string(),
+            readonly: false,
+        });
+        assert!(config.validate().unwrap_err().contains("path 重复"));
+    }
+
+    #[test]
     fn mounts_and_services_are_added_then_removed_cleanly() {
         let mut config = parsed(DEFAULT_CONFIG_TOML);
         config.system.mounts.push(MountConfig {
-            name: "Local Storage".to_string(),
+            name: Some("Local Storage".to_string()),
             path: "/mnt/nas".to_string(),
             readonly: true,
         });
@@ -1342,10 +1389,7 @@ thumb_cache_max_size_mb = 512
         assert!(has_headers(&text, "[[system.mounts]]"), "{text}");
         assert!(has_headers(&text, "[[services]]"), "{text}");
         assert!(has_headers(&text, "[services.inject_headers]"), "{text}");
-        assert!(
-            text.contains("# 以下为可选配置，默认注释"),
-            "模板注释不能丢：\n{text}"
-        );
+        assert!(text.contains("# Mount points."), "模板注释不能丢：\n{text}");
         assert_eq!(parsed(&text), config);
 
         // 删干净之后，文档里不该留下空段或空数组
@@ -1477,7 +1521,7 @@ thumb_cache_max_size_mb = 512
         config.save_to(&path).await.unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# Asmoday 配置文件 — TOML 格式"), "{text}");
+        assert!(text.contains("# Asmoday configuration (TOML)"), "{text}");
         assert!(text.contains("port = 4243"), "{text}");
         assert_eq!(parsed(&text), config);
 

@@ -152,10 +152,10 @@
     "baseUrlPlaceholder": "留空表示根路径",
     "trustProxy": "信任反向代理转发的 X-Forwarded-* / X-Real-IP",
     "mounts": "挂载点",
-    "mountsHint": "未配置挂载点时，只允许浏览进程工作目录。",
+    "mountsHint": "名字留空时按目录末段自动命名；同一路径不能重复挂载。",
     "followSymlinks": "跟随软链接（含 junction）",
     "followSymlinksHint": "开启后，挂载点内指向其它位置的软链接/Junction 可以点进去浏览、预览、上传、改名；直接访问挂载点外的绝对路径仍会被拒绝。关闭则一律按断链处理（跨盘链接不可用）。",
-    "protected": "挂载点与外部服务属于高级配置：面板重置不会覆盖它们，请在此处或源码模式修改。",
+    "protected": "挂载点与外部服务在此处或源码模式修改；「恢复默认值」只作用于通用与媒体，不会覆盖它们。",
     "add": "添加",
     "mountName": "名称",
     "mountPath": "/mnt/nas 或 D:/Media",
@@ -170,7 +170,12 @@
     "injectValue": "注入值",
     "newMount": "新挂载点",
     "newService": "新服务",
-    "resetHint": "恢复默认值只会作用于通用与媒体面板；挂载点、外部服务需手动修改。"
+    "resetHint": "恢复默认值只会作用于通用与媒体面板；挂载点、外部服务需手动修改。",
+    "mountReadonly": "只读",
+    "mountReadonlyHint": "只读挂载点：后端拒绝一切写入，前端隐藏变更入口",
+    "mountNameAuto": "默认取目录名",
+    "remove": "移除",
+    "mountNameAutoPrefix": "自动：{name}"
   },
   "safety": {
     "HOST_ALL_INTERFACES_NO_SSL": "监听地址为 0.0.0.0 且未启用 SSL：服务暴露在所有网卡上。若要暴露到公网，请前置 Caddy/Nginx 等 HTTPS 反向代理。",

@@ -10,6 +10,7 @@
 //!    严禁对不存在的完整路径直接 `canonicalize`（会 ENOENT）。
 //! 4. 防覆盖一律靠平台原子 no-replace 原语，不用 `exists()` 再 `rename()`。
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -164,7 +165,7 @@ pub fn load(config: &Config, cwd: &Path) -> MountSet {
         mounts.push(MountEntry {
             info: MountPoint {
                 id: format!("m{index}"),
-                name: mount.name.clone(),
+                name: mount_name(mount.name.as_deref(), &display),
                 path: display,
                 readonly: mount.readonly,
                 implicit: false,
@@ -174,6 +175,10 @@ pub fn load(config: &Config, cwd: &Path) -> MountSet {
             root: canonical,
         });
     }
+
+    // 派生名可能撞车（`D:/Media/电影` 与 `E:/Media/电影`），补序号区分；
+    // 显式名在配置校验里已保证唯一，这里只兜派生结果。
+    dedupe_mount_names(&mut mounts);
 
     if !online_any {
         let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
@@ -198,6 +203,41 @@ pub fn load(config: &Config, cwd: &Path) -> MountSet {
     MountSet {
         mounts,
         implicit: false,
+    }
+}
+
+/// 挂载点展示名：显式填了就用，否则从路径末段派生（设计文档 6.1）。
+///
+/// 用 canonicalize 之后的展示路径，`D:/Media` 与 `d:/media/` 得到同一个名字。
+/// 根路径（`/`、`C:/`）没有末段：盘符根保留盘符，其余回退 `Root`；
+/// UNC 路径经 `normalize_display` 后是 `UNC/server/share`，末段正好是共享名。
+fn mount_name(explicit: Option<&str>, display: &str) -> String {
+    if let Some(name) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return name.to_string();
+    }
+    let trimmed = display.trim_end_matches('/');
+    let tail = trimmed.rsplit('/').next().unwrap_or_default();
+    if !tail.is_empty() {
+        return tail.to_string();
+    }
+    if trimmed.ends_with(':') && trimmed.len() <= 3 {
+        return trimmed.to_string();
+    }
+    "Root".to_string()
+}
+
+/// 同名挂载点补序号：第二个起叫 `名字 (2)`、`名字 (3)`。
+///
+/// 只在派生名上生效——显式重名会被配置校验直接拒绝，不会走到这里。
+fn dedupe_mount_names(mounts: &mut [MountEntry]) {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for mount in mounts.iter_mut() {
+        let base = mount.info.name.clone();
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            mount.info.name = format!("{base} ({count})");
+        }
     }
 }
 
@@ -776,6 +816,43 @@ fn truncate_utf8(input: &str, bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stub(id: &str, name: &str) -> MountEntry {
+        MountEntry {
+            info: MountPoint {
+                id: id.to_string(),
+                name: name.to_string(),
+                path: String::new(),
+                readonly: false,
+                implicit: false,
+                online: true,
+                follow_symlinks: true,
+            },
+            root: None,
+        }
+    }
+
+    #[test]
+    fn mount_name_falls_back_to_last_segment() {
+        assert_eq!(mount_name(None, "/mnt/nas"), "nas");
+        assert_eq!(mount_name(None, "/mnt/nas/"), "nas");
+        assert_eq!(mount_name(None, "D:/Media"), "Media");
+        assert_eq!(mount_name(None, "D:/"), "D:");
+        assert_eq!(mount_name(None, "/"), "Root");
+        assert_eq!(mount_name(None, "UNC/server/share"), "share");
+        assert_eq!(mount_name(Some(" 我的电影 "), "/mnt/nas"), "我的电影");
+        // 空白等同未填，不写进 UI
+        assert_eq!(mount_name(Some("   "), "/mnt/nas"), "nas");
+    }
+
+    #[test]
+    fn duplicate_derived_names_get_a_suffix() {
+        let mut mounts = vec![stub("m0", "电影"), stub("m1", "电影"), stub("m2", "电影")];
+        dedupe_mount_names(&mut mounts);
+        assert_eq!(mounts[0].info.name, "电影");
+        assert_eq!(mounts[1].info.name, "电影 (2)");
+        assert_eq!(mounts[2].info.name, "电影 (3)");
+    }
 
     #[test]
     fn rejects_dangerous_names() {

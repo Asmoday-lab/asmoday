@@ -152,10 +152,10 @@
     "baseUrlPlaceholder": "Leave empty for the root path",
     "trustProxy": "Trust X-Forwarded-* / X-Real-IP from the reverse proxy",
     "mounts": "Mounts",
-    "mountsHint": "Without mounts only the process working directory is browsable.",
+    "mountsHint": "Leave the name empty to use the folder name; the same path cannot be mounted twice.",
     "followSymlinks": "Follow symlinks (incl. junctions)",
     "followSymlinksHint": "When on, symlinks/junctions inside a mount can be browsed, previewed, uploaded into and renamed even if the target lives outside the mount. Absolute paths outside the mount are still rejected. When off, escaping links are treated as broken (cross-drive links stop working).",
-    "protected": "Mounts and external services are advanced settings: panel resets never overwrite them. Edit them here or in source mode.",
+    "protected": "Mounts and services are edited here or in source mode; Reset defaults only touches General and Media.",
     "add": "Add",
     "mountName": "Name",
     "mountPath": "/mnt/nas or D:/Media",
@@ -170,7 +170,12 @@
     "injectValue": "Header value",
     "newMount": "New mount",
     "newService": "New service",
-    "resetHint": "Default resets only apply to the General and Media panels; mounts and services must be edited by hand."
+    "resetHint": "Default resets only apply to the General and Media panels; mounts and services must be edited by hand.",
+    "mountReadonly": "Read-only",
+    "mountReadonlyHint": "Read-only mount: every write is rejected and change actions are hidden",
+    "mountNameAuto": "Defaults to folder name",
+    "remove": "Remove",
+    "mountNameAutoPrefix": "Auto: {name}"
   },
   "safety": {
     "HOST_ALL_INTERFACES_NO_SSL": "Listening on 0.0.0.0 without SSL: the service is exposed on all interfaces. If you plan to expose it to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS.",

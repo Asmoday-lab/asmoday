@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -276,6 +276,29 @@ fn build_handler(root: &Path, strip_prefix: &str, readonly: bool) -> DavHandler 
 async fn mount_load(state: &AppState) -> path_guard::MountSet {
     let config = state.config.read().await;
     path_guard::load(&config, &state.cwd)
+}
+
+/// 目标路径真实的只读状态（与 Web 文件管理、上传口径一致）。
+///
+/// 目标可能还不存在（PUT 新文件 / MKCOL），此时向上找最近的已存在目录判定，
+/// 保证在只读子挂载点里新建文件也会被拦住。
+fn effective_readonly(
+    set: &path_guard::MountSet,
+    mount: &path_guard::MountEntry,
+    root: &Path,
+    rest: &str,
+) -> bool {
+    let mut cursor: Option<PathBuf> = Some(root.join(rest.trim_end_matches('/')));
+    while let Some(path) = cursor {
+        if let Ok(real) = std::fs::canonicalize(&path) {
+            return set
+                .mount_of(&real)
+                .map(|hit| hit.info.readonly)
+                .unwrap_or(mount.info.readonly);
+        }
+        cursor = path.parent().map(Path::to_path_buf);
+    }
+    mount.info.readonly
 }
 
 /// 请求路径的逃逸 / 垃圾文件校验（同步实现，调用方包 `spawn_blocking`）。
@@ -581,7 +604,9 @@ pub async fn handle(
     };
     let root = root.clone();
     let mount_owned = mount.clone();
-    let readonly = access.readonly || mount.info.readonly;
+    // 只读按「最深命中」判定：父挂载点里嵌了只读子挂载点时，经父路径写子目录
+    // 必须被拦住（此前只看 URL 段的 mount，父可写就能写穿子只读）。
+    let readonly = access.readonly || effective_readonly(&set, mount, &root, &rest);
 
     // 只读令牌：写方法直接 403，不让 dav-server 先落盘再报错
     if readonly && !matches!(method.as_str(), "OPTIONS" | "GET" | "HEAD" | "PROPFIND") {

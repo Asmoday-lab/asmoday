@@ -31,8 +31,11 @@ const { t, locale } = useI18n()
 const { mode: themeMode, setTheme, isDark } = useTheme()
 
 interface Mount {
-  name: string
+  /** 留空时由后端按路径末段派生，不再强制必填 */
+  name?: string
   path: string
+  /** 只读挂载点：后端拒绝一切写入（设计文档 3.2.6） */
+  readonly?: boolean
 }
 
 interface Service {
@@ -450,7 +453,18 @@ async function saveForm(successMessage?: string) {
     const res = await fetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft.value),
+      body: JSON.stringify({
+        ...draft.value,
+        system: {
+          ...draft.value.system,
+          // 空 name 不落盘：后端 Option<String> 收到 "" 会写出 `name = ""`
+          mounts: draft.value.system.mounts.map((mount) => ({
+            path: mount.path,
+            readonly: !!mount.readonly,
+            ...(mount.name?.trim() ? { name: mount.name.trim() } : {}),
+          })),
+        },
+      }),
     })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
     showToast(successMessage ?? t('settings.advanced.saved'))
@@ -485,7 +499,17 @@ async function saveRaw() {
 }
 
 function addMount() {
-  draft.value?.system.mounts.push({ name: t('settings.advanced.newMount'), path: '' })
+  // 不预填文案：默认值来自 UI 语言，会被原样写进 config.toml（且加第二个必然重名）
+  draft.value?.system.mounts.push({ name: '', path: '', readonly: false })
+}
+
+/** 名字留空时预览后端将派生的名字（与 path_guard::mount_name 同一规则） */
+function mountNameHint(path: string): string {
+  const trimmed = path.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  const tail = trimmed.split('/').filter(Boolean).pop() ?? ''
+  return tail
+    ? t('settings.advanced.mountNameAutoPrefix', { name: tail })
+    : t('settings.advanced.mountNameAuto')
 }
 
 function removeMount(index: number) {
@@ -694,7 +718,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-5xl px-4 py-6 md:px-8 md:py-10">
+  <section class="mx-auto w-full max-w-6xl px-4 py-6 md:px-8 md:py-10">
     <div class="md:flex md:items-start md:gap-8">
       <!-- 分区导航（v4.4.11 重排）：桌面左侧竖排常驻，移动端横向滑动 -->
       <nav class="mb-5 md:sticky md:top-8 md:mb-0 md:w-44 md:shrink-0">
@@ -932,12 +956,23 @@ onBeforeUnmount(() => {
 
     <!-- ================= 安全 ================= -->
     <div v-else-if="tab === 'security'" class="space-y-6">
+      <p
+        v-if="securityError"
+        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
+      >
+        {{ securityError }}
+      </p>
+
+      <!-- 两栏：左「账号与数据」，右「客户端凭据」。
+           xl 以下回落单列——密码三连框在 2×400px 里会被挤扁。 -->
+      <div class="grid gap-6 xl:grid-cols-2 xl:items-start">
+      <div class="space-y-6">
       <div class="rounded-xl border border-line p-6">
         <div class="mb-4">
           <p class="text-sm font-semibold text-ink">{{ t('settings.security.password') }}</p>
           <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.security.hint') }}</p>
         </div>
-        <div class="grid gap-3 md:grid-cols-3">
+        <div class="grid gap-3">
           <PasswordInput
             v-model="currentPassword"
             :placeholder="t('settings.security.current')"
@@ -954,7 +989,7 @@ onBeforeUnmount(() => {
             class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
           />
         </div>
-        <div class="mt-3">
+        <div class="mt-3 flex justify-end">
           <button
             class="h-9 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
             :disabled="securityBusy"
@@ -1059,13 +1094,50 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <p
-        v-if="securityError"
-        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
-      >
-        {{ securityError }}
-      </p>
+      <div class="rounded-xl border border-line p-6">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="min-w-0">
+            <p class="text-sm font-semibold text-ink">
+              {{ t('settings.security.backupTitle') }}
+            </p>
+            <p class="mt-1 text-[12px] leading-relaxed text-muted">
+              {{ t('settings.security.backupHint') }}
+            </p>
+          </div>
+          <button
+            class="flex h-10 shrink-0 items-center gap-1.5 rounded-md border border-line px-4 text-xs text-ink transition-colors hover:border-accent/60 disabled:opacity-50"
+            :disabled="backupBusy"
+            data-testid="download-backup"
+            @click="downloadBackup"
+          >
+            <AppIcon name="download" :size="13" />
+            {{ backupBusy ? t('settings.security.backupBusy') : t('settings.security.backupNow') }}
+          </button>
+        </div>
 
+        <!-- 高敏确认（仅备份）：需要时展开，15 分钟内免重复输入 -->
+        <div v-if="backupVerifyVisible" class="mt-3 flex flex-wrap items-center gap-2">
+          <PasswordInput
+            v-model="backupPassword"
+            :placeholder="t('settings.security.verifyPlaceholder')"
+            class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+            data-testid="backup-verify-password"
+            @keyup.enter="confirmBackupVerify"
+          />
+          <button
+            class="rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+            :disabled="backupVerifyBusy || !backupPassword"
+            data-testid="backup-verify-confirm"
+            @click="confirmBackupVerify"
+          >
+            {{ backupVerifyBusy ? t('settings.security.verifyBusy') : t('settings.security.verifyConfirm') }}
+          </button>
+          <span class="text-[12px] text-muted">{{ t('settings.security.verifyHint') }}</span>
+        </div>
+      </div>
+      </div>
+
+      <div class="space-y-6">
       <!-- WebDAV 令牌 -->
       <div class="rounded-xl border border-line p-6">
         <p class="mb-3 text-sm font-semibold text-ink">
@@ -1213,56 +1285,13 @@ onBeforeUnmount(() => {
         {{ tokenError }}
       </p>
 
-      <div class="rounded-xl border border-line p-6">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div class="min-w-0">
-            <p class="text-sm font-semibold text-ink">
-              {{ t('settings.security.backupTitle') }}
-            </p>
-            <p class="mt-1 text-[12px] leading-relaxed text-muted">
-              {{ t('settings.security.backupHint') }}
-            </p>
-          </div>
-          <button
-            class="flex h-10 shrink-0 items-center gap-1.5 rounded-md border border-line px-4 text-xs text-ink transition-colors hover:border-accent/60 disabled:opacity-50"
-            :disabled="backupBusy"
-            data-testid="download-backup"
-            @click="downloadBackup"
-          >
-            <AppIcon name="download" :size="13" />
-            {{ backupBusy ? t('settings.security.backupBusy') : t('settings.security.backupNow') }}
-          </button>
-        </div>
-
-        <!-- 高敏确认（仅备份）：需要时展开，15 分钟内免重复输入 -->
-        <div
-          v-if="backupVerifyVisible"
-          class="mt-3 flex flex-wrap items-center gap-2"
-        >
-          <PasswordInput
-            v-model="backupPassword"
-            :placeholder="t('settings.security.verifyPlaceholder')"
-            class="w-48 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
-            data-testid="backup-verify-password"
-            @keyup.enter="confirmBackupVerify"
-          />
-          <button
-            class="rounded-md bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
-            :disabled="backupVerifyBusy || !backupPassword"
-            data-testid="backup-verify-confirm"
-            @click="confirmBackupVerify"
-          >
-            {{ backupVerifyBusy ? t('settings.security.verifyBusy') : t('settings.security.verifyConfirm') }}
-          </button>
-          <span class="text-[12px] text-muted">{{ t('settings.security.verifyHint') }}</span>
-        </div>
-      </div>
-
       <div class="rounded-xl border border-line p-6 text-[12px] leading-relaxed text-muted">
         <p class="mb-1 font-medium text-ink">{{ t('settings.security.forgotTitle') }}</p>
         {{ t('settings.security.forgotBody') }}
         <code class="rounded bg-elevated px-1 py-0.5">asmoday --reset-password</code>
         {{ t('settings.security.forgotBody2') }}
+      </div>
+      </div>
       </div>
     </div>
 
@@ -1359,7 +1388,7 @@ onBeforeUnmount(() => {
               + {{ t('settings.advanced.add') }}
             </button>
           </div>
-          <p v-if="!draft.system.mounts.length" class="text-[12px] text-muted">
+          <p class="mb-2 text-[12px] text-muted">
             {{ t('settings.advanced.mountsHint') }}
           </p>
           <label class="mt-3 flex items-start gap-2 text-xs text-ink">
@@ -1371,18 +1400,35 @@ onBeforeUnmount(() => {
               </span>
             </span>
           </label>
-          <div v-for="(mount, index) in draft.system.mounts" :key="index" class="mb-2 flex gap-2">
+          <div
+            v-for="(mount, index) in draft.system.mounts"
+            :key="index"
+            class="mb-2 flex items-center gap-2"
+          >
             <input
               v-model="mount.name"
-              :placeholder="t('settings.advanced.mountName')"
-              class="w-32 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+              :placeholder="mountNameHint(mount.path)"
+              data-testid="mount-name"
+              class="w-36 shrink-0 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
             />
             <input
               v-model="mount.path"
               :placeholder="t('settings.advanced.mountPath')"
+              data-testid="mount-path"
               class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
             />
-            <button class="text-muted hover-danger" @click="removeMount(index)">
+            <label
+              class="flex shrink-0 cursor-pointer items-center gap-1 text-[12px] text-muted"
+              :title="t('settings.advanced.mountReadonlyHint')"
+            >
+              <input v-model="mount.readonly" type="checkbox" data-testid="mount-readonly" />
+              {{ t('settings.advanced.mountReadonly') }}
+            </label>
+            <button
+              class="shrink-0 text-muted hover-danger"
+              :title="t('settings.advanced.remove')"
+              @click="removeMount(index)"
+            >
               <AppIcon name="close" :size="14" />
             </button>
           </div>

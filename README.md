@@ -61,9 +61,13 @@ The first start writes `config.toml` and `data/` into the current directory. Wit
 
 ```toml
 [[system.mounts]]
-name = "Media"
-path = "D:/Media"        # on Linux, e.g. /mnt/media
-readonly = false
+path = "D:/Media"        # on Linux, e.g. /mnt/media; the same path cannot be mounted twice
+readonly = false         # read-only mounts reject every write
+
+[[system.mounts]]
+name = "Backup"          # optional: defaults to the last path segment ("Media" here)
+path = "E:/Media"
+readonly = true
 ```
 
 > macOS has no prebuilt package — build from source (see [Development](#development)).

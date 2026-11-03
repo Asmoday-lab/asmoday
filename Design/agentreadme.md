@@ -1657,6 +1657,18 @@ GWT-GAL-01 Given 图片库相册视图  When 切「分层」  Then 从挂载根�
 GWT-GAL-02 Given 时间线  When 切「按文件夹」  Then 分组头为目录名；影视库切「全部影片」  Then 媒体流按文件夹/按时间分组，触底续接走同一条分页流
 ```
 
+#### GWT 验收（挂载点配置与设置页，v4.6.17）
+
+```
+GWT-CFG-01 Given [[system.mounts]] 只写 path  When 启动  Then name 由末段派生（/mnt/nas → nas、D:/ → D:、/ → Root、UNC/server/share → share）；两个末段同名的挂载点得到 "电影" 与 "电影 (2)"
+GWT-CFG-02 Given 两段配置指向同一目录（尾斜杠 / 反斜杠 / Windows 大小写差异）  When 保存或启动  Then 400/启动失败「path 重复」；显式 name 重复同样拒绝；name 留空不报错
+GWT-CFG-03 Given 父目录可写、其子目录单独挂载为只读  When WebDAV PUT 到 /dav/{父}/{子}/x  Then 403（按最长前缀判定只读，不再按 URL 段的挂载点放行）；同样的路径走 /dav/{子}/x 也是 403
+GWT-CFG-04 Given 启动日志  When 存在嵌套挂载  Then 输出 nested mount 告警（子、父的名称与路径），说明「经父挂载点访问按父的 flags」
+GWT-CFG-05 Given 设置页「高级」  When 新增挂载点  Then 名称框为空、placeholder 显示「自动：<末段>」；点只读复选框后保存  Then config.toml 出现 readonly = true，name 留空时不写 name 键
+GWT-CFG-06 Given 首次启动生成的 config.toml  Then 注释为英文单语（模板不再随 UI 语言变化），且能被自身解析；已有文件里的中文注释在保存后原样保留
+GWT-CFG-07 Given 设置页「安全」  When 视口 ≥1280  Then 两栏（左：改密码/2FA/备份，右：挂载地址/令牌/忘记密码）；<1280 回落单列且密码框不被挤扁、无横向滚动
+```
+
 #### GWT 验收（安全收紧，v4.6.13）
 
 ```gwt

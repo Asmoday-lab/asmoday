@@ -61,9 +61,13 @@ asmoday.exe
 
 ```toml
 [[system.mounts]]
-name = "媒体库"
-path = "D:/Media"        # Linux 上形如 /mnt/media
-readonly = false
+path = "D:/Media"        # Linux 上形如 /mnt/media；同一路径不能重复挂载
+readonly = false         # 只读挂载点拒绝一切写入
+
+[[system.mounts]]
+name = "备份盘"          # 可选：留空则取目录末段（这里会是「Media」）
+path = "E:/Media"
+readonly = true
 ```
 
 > macOS 没有预编译产物，请从源码构建（见[开发](#开发)）。

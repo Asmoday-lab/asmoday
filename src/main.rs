@@ -378,7 +378,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         if core::reserved::is_reserved(std::path::Path::new(&mount.path)) {
             crate::log_warn!(
                 "mount '{}' ({}) is inside the application data directory and will be hidden",
-                mount.name,
+                mount.name.as_deref().unwrap_or(&mount.path),
                 mount.path
             );
         }
@@ -413,6 +413,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             "no administrator yet: open the web UI to finish setup, or run with --init"
         );
     }
+    // 嵌套挂载点（父目录里又挂了子目录）是合法配置，但只读按「最深命中」判定：
+    // 通过父挂载点的路径访问子目录时用的是父的权限。明确告知，免得当成 bug 排查。
+    let mount_set = core::path_guard::load(&*state.config.read().await, &state.cwd);
+    warn_nested_mounts(&mount_set);
+
     // 终端历史已强制隔离到 data/terminal_history/（设计文档 3.3.5），
     // 受限令牌不再影响终端体验，因此启动日志也不再提示权限问题。
     crate::log_info!("startup completed in {} ms", started.elapsed().as_millis());
@@ -439,6 +444,39 @@ async fn run(cli: Cli) -> Result<(), String> {
 /// `host = "::"` 即双栈（v4 连接的 peer 是 `::ffff:a.b.c.d`，由
 /// `auth::peer_ip` 归一回 IPv4 字面量）。IPv4 路径行为与
 /// `TcpListener::bind` 完全一致。
+/// 嵌套挂载点告警：父目录与子目录各自挂了，路径归属按最长前缀（子胜出），
+/// 于是「经父挂载点访问子目录」和「直接访问子挂载点」拿到的 readonly 可能不同。
+fn warn_nested_mounts(set: &core::path_guard::MountSet) {
+    for (index, outer) in set.mounts.iter().enumerate() {
+        let Some(outer_root) = outer.root.as_ref() else {
+            continue;
+        };
+        for inner in set.mounts.iter().skip(index + 1) {
+            let Some(inner_root) = inner.root.as_ref() else {
+                continue;
+            };
+            if outer_root == inner_root {
+                continue;
+            }
+            let (parent, child) = if inner_root.starts_with(outer_root) {
+                (outer, inner)
+            } else if outer_root.starts_with(inner_root) {
+                (inner, outer)
+            } else {
+                continue;
+            };
+            crate::log_warn!(
+                "nested mount: '{}' ({}) sits inside '{}' ({}); readonly is resolved per path, \
+                 so access through the outer mount keeps the outer flags",
+                child.info.name,
+                child.info.path,
+                parent.info.name,
+                parent.info.path
+            );
+        }
+    }
+}
+
 async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
