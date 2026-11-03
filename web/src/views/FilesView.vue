@@ -724,6 +724,55 @@ function loadSortPref(): { key: SortKey; dir: SortDir } {
 const sortKey = ref<SortKey>(loadSortPref().key)
 const sortDir = ref<SortDir>(loadSortPref().dir)
 const sortMenuOpen = ref(false)
+
+/**
+ * 工具栏下拉的定位（v4.9.4）。
+ *
+ * 动作区带 `overflow-x-auto`（窄屏要横向滚动），`absolute` 菜单会被它裁剪 ——
+ * 用户看到的就是「点排序冒出一条细边 + 一根滚动条，没有选项」。改成 Teleport 到 body
+ * + `fixed`，按触发按钮算坐标：优先右对齐，贴边就夹回视口，下面放不下就翻到上方。
+ * 顺带把自己也搬出路由过渡的 transform 祖先，fixed 才是真的相对视口。
+ */
+const newTriggerEl = ref<HTMLElement | null>(null)
+const sortTriggerEl = ref<HTMLElement | null>(null)
+const newMenuStyle = ref<Record<string, string>>({})
+const sortMenuStyle = ref<Record<string, string>>({})
+
+function menuPlacement(
+  trigger: HTMLElement | null,
+  width: number,
+  items: number,
+): Record<string, string> {
+  const rect = trigger?.getBoundingClientRect()
+  if (!rect) return {}
+  const maxLeft = Math.max(8, window.innerWidth - width - 8)
+  const left = Math.min(Math.max(8, rect.right - width), maxLeft)
+  const estimated = 12 + items * 36
+  const below = rect.bottom + 4
+  const top =
+    below + estimated > window.innerHeight ? Math.max(8, rect.top - 4 - estimated) : below
+  return { left: `${Math.round(left)}px`, top: `${Math.round(top)}px`, width: `${width}px` }
+}
+
+async function toggleNewMenu() {
+  newMenuOpen.value = !newMenuOpen.value
+  if (!newMenuOpen.value) return
+  await nextTick()
+  newMenuStyle.value = menuPlacement(newTriggerEl.value, 160, 2)
+}
+
+async function toggleSortMenu() {
+  sortMenuOpen.value = !sortMenuOpen.value
+  if (!sortMenuOpen.value) return
+  await nextTick()
+  sortMenuStyle.value = menuPlacement(sortTriggerEl.value, 160, SORT_OPTIONS.length)
+}
+
+/** 滚动 / 缩放之后 fixed 菜单会和按钮错位，直接收起最省事 */
+function closeToolbarMenus() {
+  newMenuOpen.value = false
+  sortMenuOpen.value = false
+}
 /** 工具栏上的当前排序摘要（如「名称 ↑」） */
 const sortLabel = computed(
   () => `${t(`files.sort.${sortKey.value}`)} ${sortDir.value === 'asc' ? '↑' : '↓'}`,
@@ -2406,6 +2455,9 @@ onMounted(() => {
   document.addEventListener('visibilitychange', probeMounts)
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('beforeunload', onBeforeUnload)
+  // fixed 菜单靠坐标定位，滚动/缩放之后必然对不上，直接收起
+  window.addEventListener('scroll', closeToolbarMenus, true)
+  window.addEventListener('resize', closeToolbarMenus)
 })
 
 onBeforeUnmount(() => {
@@ -2414,6 +2466,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', probeMounts)
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('beforeunload', onBeforeUnload)
+  window.removeEventListener('scroll', closeToolbarMenus, true)
+  window.removeEventListener('resize', closeToolbarMenus)
   inflight?.abort()
   inflight = null
 })
@@ -2891,30 +2945,35 @@ onBeforeUnmount(() => {
                 <div class="flex shrink-0 items-center gap-2">
                   <div class="relative shrink-0">
                     <button
+                      ref="newTriggerEl"
                       class="touch-chip flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
                       :disabled="readonly"
                       :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
                       data-testid="new-entry"
                       :aria-expanded="newMenuOpen"
-                      @click="newMenuOpen = !newMenuOpen"
+                      @click="toggleNewMenu"
                     >
                       <AppIcon name="plus" :size="13" />
                       <span class="inline">{{ t('files.toolbar.new') }}</span>
                     </button>
-                    <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
-                    <div
-                      v-if="newMenuOpen"
-                      class="absolute left-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
-                    >
-                      <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
-                        <AppIcon name="folder" :size="14" />
-                        {{ t('files.toolbar.newFolder') }}
-                      </button>
-                      <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
-                        <AppIcon name="file" :size="14" />
-                        {{ t('files.toolbar.newFile') }}
-                      </button>
-                    </div>
+                    <Teleport to="body">
+                      <div v-if="newMenuOpen" class="fixed inset-0 z-40" @click="newMenuOpen = false" />
+                      <div
+                        v-if="newMenuOpen"
+                        class="fixed z-50 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+                        :style="newMenuStyle"
+                        data-testid="new-menu"
+                      >
+                        <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('dir')">
+                          <AppIcon name="folder" :size="14" />
+                          {{ t('files.toolbar.newFolder') }}
+                        </button>
+                        <button class="menu-item" @click="newMenuOpen = false; openCreateDialog('file')">
+                          <AppIcon name="file" :size="14" />
+                          {{ t('files.toolbar.newFile') }}
+                        </button>
+                      </div>
+                    </Teleport>
                   </div>
 
                   <button
@@ -3001,11 +3060,12 @@ onBeforeUnmount(() => {
                   <!-- 排序（设计文档 v2.7.0 3.2.1：名称/修改时间/大小 + 升降序，状态持久化） -->
                   <div class="relative shrink-0">
                     <button
+                      ref="sortTriggerEl"
                       class="touch-chip flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
                       :title="sortLabel"
                       data-testid="sort-menu"
                       :aria-expanded="sortMenuOpen"
-                      @click="sortMenuOpen = !sortMenuOpen"
+                      @click="toggleSortMenu"
                     >
                       <AppIcon name="sort" :size="13" />
                       <!-- 维度名 + 独立小三角（与媒体库的排序按钮同一套视觉；
@@ -3022,11 +3082,14 @@ onBeforeUnmount(() => {
                         </svg>
                       </span>
                     </button>
-                    <div v-if="sortMenuOpen" class="fixed inset-0 z-40" @click="sortMenuOpen = false" />
-                    <div
-                      v-if="sortMenuOpen"
-                      class="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
-                    >
+                    <Teleport to="body">
+                      <div v-if="sortMenuOpen" class="fixed inset-0 z-40" @click="sortMenuOpen = false" />
+                      <div
+                        v-if="sortMenuOpen"
+                        class="fixed z-50 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-xl"
+                        :style="sortMenuStyle"
+                        data-testid="sort-popover"
+                      >
                       <button
                         v-for="option in SORT_OPTIONS"
                         :key="option.key"
@@ -3045,7 +3108,8 @@ onBeforeUnmount(() => {
                           class="ml-auto text-[11px] text-muted"
                         >{{ sortDir === 'asc' ? '↑' : '↓' }}</span>
                       </button>
-                    </div>
+                      </div>
+                    </Teleport>
                   </div>
 
                   <button
