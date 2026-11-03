@@ -3,8 +3,9 @@
 //! 媒体索引只做「按目录扫描 + 分类」，不做刮削、不联网。
 //! 视频封面可选：配置了外部 FFmpeg 才截首帧，否则回占位图。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 
 use axum::Json;
@@ -48,6 +49,10 @@ pub struct BrowseQuery {
     /// 强制穿透目录快照重扫（前端「重新扫描」按钮；默认走缓存）
     #[serde(default, deserialize_with = "crate::api::boolish")]
     pub refresh: Option<bool>,
+    /// 带上图片真实像素宽高（v4.6.19）：等高行布局要按真实宽高比排，
+    /// 只有时间线这种「按比例铺」的视图才需要，其它调用省下这批文件头读取。
+    #[serde(default, deserialize_with = "crate::api::boolish")]
+    pub dims: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +77,12 @@ pub struct MediaItem {
     pub color: Option<String>,
     /// 同目录同名字幕（.vtt / .srt）的路径，没有则为 null
     pub subtitle: Option<String>,
+    /// 图片真实像素宽高（v4.6.19，仅 `dims=1` 时返回）：时间线的等高行要按真实
+    /// 宽高比算格子宽度。ThumbHash 里也存了比例，但只量化到 3/5/7 几档，铺出来会失真。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 /// 各类型总数：一键切换分区时不必等全部翻完就知道「库里到底有多少」
@@ -426,6 +437,7 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
     let auth_store = Arc::clone(&state.auth);
     let dir_cache = Arc::clone(&state.dir_cache);
     let refresh = query.refresh.unwrap_or(false);
+    let want_dims = query.dims.unwrap_or(false);
     let outcome = tokio::task::spawn_blocking(move || {
         let (raw, scanned, counts) = scan_raw(
             &scan_root,
@@ -446,8 +458,8 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
         let start = page_start(&raw, cursor.as_ref());
         let end = start.saturating_add(limit).min(total);
         let has_more = end < total;
-        // 只对当前页做重活（ID3 解析、字幕探测、ThumbHash 查询）
-        let items = build_items(&raw[start.min(total)..end], &auth_store);
+        // 只对当前页做重活（ID3 解析、字幕探测、ThumbHash 查询、像素宽高）
+        let items = build_items(&raw[start.min(total)..end], &auth_store, want_dims);
         let next_cursor = if has_more && end > start {
             Some(encode_cursor(raw[end - 1].mtime, &raw[end - 1].display))
         } else {
@@ -773,8 +785,48 @@ fn scan_raw(
     (out, scanned, counts)
 }
 
-/// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash。
-fn build_items(raw: &[RawMedia], auth: &crate::core::auth::AuthStore) -> Vec<MediaItem> {
+/// 图片像素宽高的进程内缓存（v4.6.19）。
+///
+/// 时间线的等高行要按真实宽高比排，`image::image_dimensions` 只读文件头，但一页
+/// 最多 300 张、网盘挂载点上的 open 并不便宜，所以按「路径 + mtime + 大小」记住结果：
+/// 同一张图反复翻页只碰一次磁盘，文件被替换（mtime/大小变了）会自动重读。
+struct DimEntry {
+    mtime: u64,
+    size: u64,
+    dims: Option<(u32, u32)>,
+}
+
+static IMAGE_DIMS: LazyLock<Mutex<HashMap<PathBuf, DimEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 缓存的条目上限：够放十万张图，超了就整体清空重来（画廊场景极少走到）
+const IMAGE_DIMS_CAP: usize = 100_000;
+
+fn image_dims(path: &Path, mtime: u64, size: u64) -> Option<(u32, u32)> {
+    if let Ok(cache) = IMAGE_DIMS.lock()
+        && let Some(hit) = cache.get(path)
+        && hit.mtime == mtime
+        && hit.size == size
+    {
+        return hit.dims;
+    }
+    // 解不开的格式（HEIC/AVIF 等）返回 None，前端回落到默认比例，不影响列表
+    let dims = image::image_dimensions(path).ok();
+    if let Ok(mut cache) = IMAGE_DIMS.lock() {
+        if cache.len() >= IMAGE_DIMS_CAP {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), DimEntry { mtime, size, dims });
+    }
+    dims
+}
+
+/// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash 与像素宽高。
+fn build_items(
+    raw: &[RawMedia],
+    auth: &crate::core::auth::AuthStore,
+    want_dims: bool,
+) -> Vec<MediaItem> {
     let mut items: Vec<MediaItem> = Vec::with_capacity(raw.len());
     let mut hash_slots: Vec<(usize, &Path)> = Vec::new();
 
@@ -792,6 +844,11 @@ fn build_items(raw: &[RawMedia], auth: &crate::core::auth::AuthStore) -> Vec<Med
         if entry.kind == "image" {
             hash_slots.push((items.len(), entry.path.as_path()));
         }
+        let dims = if want_dims && entry.kind == "image" {
+            image_dims(&entry.path, entry.mtime, entry.size)
+        } else {
+            None
+        };
         items.push(MediaItem {
             name: entry.name.clone(),
             path: entry.display.clone(),
@@ -807,6 +864,8 @@ fn build_items(raw: &[RawMedia], auth: &crate::core::auth::AuthStore) -> Vec<Med
             hash: None,
             color: None,
             subtitle,
+            width: dims.map(|(w, _)| w),
+            height: dims.map(|(_, h)| h),
         });
     }
 
@@ -1220,6 +1279,28 @@ mod tests {
         assert_eq!(counts.image, 5000);
         assert_eq!(counts.video, 1);
         assert_eq!(counts.audio, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 图片像素宽高（v4.6.19）：时间线的等高行要真实宽高比，解不开的格式退回 None
+    #[test]
+    fn image_dims_reads_header_and_survives_broken_files() {
+        let root = scratch("dims");
+        let wide = root.join("wide.png");
+        image::RgbImage::new(40, 20).save(&wide).unwrap();
+        let tall = root.join("tall.png");
+        image::RgbImage::new(20, 40).save(&tall).unwrap();
+
+        assert_eq!(image_dims(&wide, 1, 1), Some((40, 20)));
+        assert_eq!(image_dims(&tall, 1, 1), Some((20, 40)));
+        // mtime/大小变了当成新文件重读（缓存不能把换过的图按旧尺寸铺）
+        assert_eq!(image_dims(&wide, 2, 1), Some((40, 20)));
+
+        // 坏文件（或 HEIC 这类没编解码器的格式）只返回 None，不 panic
+        let broken = root.join("broken.jpg");
+        std::fs::write(&broken, b"not an image").unwrap();
+        assert_eq!(image_dims(&broken, 1, 11), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }

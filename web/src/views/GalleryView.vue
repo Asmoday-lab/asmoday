@@ -9,6 +9,7 @@ import { useEventListener } from '@vueuse/core'
 import {
   computed,
   defineAsyncComponent,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   ref,
@@ -42,14 +43,16 @@ import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
 import { useLongPress } from '../composables/useLongPress'
 import { useDeferredLoading } from '../composables/useDeferredLoading'
+import { useYearRail } from '../composables/useYearRail'
 import { player } from '../stores/player'
 import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
+import { justifiedRows } from '../lib/justified'
 import { readCache, writeCache } from '../lib/view-cache'
 
 const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 type MediaTab = 'photos' | 'cinema' | 'music'
 
@@ -330,52 +333,94 @@ const audioRowIndex = computed(() => {
   return map
 })
 
-/** 按年-月分组（时间线的默认分组维度；影视「全部影片」的按时间分组同款） */
-function groupByMonth(list: MediaItem[]): Array<{ label: string; items: MediaItem[] }> {
-  const groups = new Map<string, MediaItem[]>()
+/** 时间线的一组（v4.6.19：按天；也用于「按文件夹」分组，此时 year 为 null） */
+interface MediaGroup {
+  key: string
+  label: string
+  /** 分组所属年份（按时间分组才有），右侧年份刻度尺用 */
+  year: number | null
+  items: MediaItem[]
+}
+
+/** 元信息不可用时的宽高比占位：图片按 4:3、视频按 16:9，排出来不会太离谱 */
+function tileRatio(item: MediaItem): number {
+  if (item.width && item.height && item.height > 0) return item.width / item.height
+  return item.kind === 'video' ? 16 / 9 : 4 / 3
+}
+
+/**
+ * 按「天」分组（v4.6.19，Immich 时间线口径）：标题形如 `2025年4月30日 周三`。
+ *
+ * 之前是按年月分组，一个月的几百张会连成一大片，看不出「哪天拍的」；
+ * 按天后每一天都是一小段，配合下面的等高行就是 Immich 那一屏的样子。
+ * 星期几走 `Intl.DateTimeFormat`，中英文都跟着语言包走，不硬编码「周一」。
+ */
+function groupByDay(list: MediaItem[]): MediaGroup[] {
+  const groups = new Map<string, MediaGroup>()
+  const weekday = new Intl.DateTimeFormat(locale.value, { weekday: 'short' })
   for (const item of list) {
     const date = item.modified ? new Date(item.modified * 1000) : null
     const key = date
-      ? t('common.time.yearMonth', { year: date.getFullYear(), month: date.getMonth() + 1 })
-      : t('common.time.unknown')
-    const bucket = groups.get(key)
-    if (bucket) bucket.push(item)
-    else groups.set(key, [item])
+      ? `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
+      : 'unknown'
+    let group = groups.get(key)
+    if (!group) {
+      group = {
+        key,
+        label: date
+          ? t('common.time.dayLabel', {
+              year: date.getFullYear(),
+              month: date.getMonth() + 1,
+              day: date.getDate(),
+              weekday: weekday.format(date),
+            })
+          : t('common.time.unknown'),
+        year: date ? date.getFullYear() : null,
+        items: [],
+      }
+      groups.set(key, group)
+    }
+    group.items.push(item)
   }
-  return [...groups.entries()].map(([label, items]) => ({ label, items }))
+  return [...groups.values()]
 }
 
-/** 时间线：分组维度可选（v4.6.16）——按时间（默认）/ 按文件夹 */
-const timelineGroups = computed(() => {
+/** 时间线：分组维度可选（v4.6.16）——按天（默认）/ 按文件夹 */
+const timelineGroups = computed<MediaGroup[]>(() => {
   if (photoGroup.value === 'folder') {
-    return groupByFolder(photoItems.value).map((group) => ({ label: group.label, items: group.items }))
+    return groupByFolder(photoItems.value).map((group) => ({
+      key: group.key,
+      label: group.label,
+      year: null,
+      items: group.items,
+    }))
   }
-  return groupByMonth(photoItems.value).map((group) => ({
-    label: group.label,
-    items: [...group.items].sort((a, b) => (b.modified ?? 0) - (a.modified ?? 0)),
-  }))
+  return groupByDay(photoItems.value)
 })
 
-/** 影视「全部影片」媒体流的分组（v4.6.16）：按文件夹（默认）/ 按时间 */
-const cinemaVideoGroups = computed(() => {
+/** 影视「全部影片」媒体流的分组（v4.6.16）：按天 / 按文件夹 */
+const cinemaVideoGroups = computed<MediaGroup[]>(() => {
   if (cinemaGroup.value === 'folder') {
-    return groupByFolder(videos.value).map((group) => ({ label: group.label, items: group.items }))
+    return groupByFolder(videos.value).map((group) => ({
+      key: group.key,
+      label: group.label,
+      year: null,
+      items: group.items,
+    }))
   }
-  return groupByMonth(videos.value).map((group) => ({
-    label: group.label,
-    items: [...group.items].sort((a, b) => (b.modified ?? 0) - (a.modified ?? 0)),
-  }))
+  return groupByDay(videos.value)
 })
 
 // ---------------- 照片库双视图（设计文档 3.4.3） ----------------
 //
-// 相册视图 = 子文件夹卡片（封面取册内最新一张图，空册由后端剔除）；
-// 时间线视图 = 忽略目录层级、按月吸顶的全部照片。两个视图平级，用户显式切换，
+// 时间线 = 主视图（v4.6.19 起默认，Immich 那种「按天 + 等高行」的媒体流）；
+// 文件夹 = 全库文件夹墙（按目录路径升序，同父目录相邻）。两个视图平级、用户显式切换，
 // 绝不允许以「优化」为由只留一种（设计文档 1.4 第 9 条）。
 type PhotoView = 'albums' | 'timeline'
-const PHOTO_VIEW_KEY = 'asmoday.photos.view'
+/** v4.6.19 换过默认值：键名带 v2，老用户存量偏好不会再把人按回文件夹墙 */
+const PHOTO_VIEW_KEY = 'asmoday.photos.view.v2'
 const photoView = ref<PhotoView>(
-  localStorage.getItem(PHOTO_VIEW_KEY) === 'timeline' ? 'timeline' : 'albums',
+  localStorage.getItem(PHOTO_VIEW_KEY) === 'albums' ? 'albums' : 'timeline',
 )
 
 const albums = ref<Album[]>([])
@@ -474,21 +519,21 @@ function persisted<T extends string>(key: string, allowed: readonly T[], fallbac
   return ref(allowed.includes(saved as T) ? (saved as T) : fallback)
 }
 
-/** 影视库顶层视图：folders=文件夹卡片（原行为），videos=全部影片媒体流 */
+/** 影视库顶层视图：videos=全部影片媒体流（v4.6.19 起默认），folders=文件夹卡片 */
 const cinemaView = persisted<'folders' | 'videos'>(
-  'asmoday.cinema.view',
+  'asmoday.cinema.view.v2',
   ['folders', 'videos'],
-  'folders',
+  'videos',
 )
-/** 时间线的分组维度：按时间（原行为）/ 按文件夹 */
+/** 时间线的分组维度：按天（默认）/ 按文件夹 */
 const photoGroup = persisted<GroupBy>('asmoday.photos.group', ['time', 'folder'], 'time')
-/** 全部影片的分组维度：按文件夹 / 按时间 */
-const cinemaGroup = persisted<GroupBy>('asmoday.cinema.group', ['folder', 'time'], 'folder')
+/** 全部影片的分组维度：按天（默认）/ 按文件夹 */
+const cinemaGroup = persisted<GroupBy>('asmoday.cinema.group.v2', ['time', 'folder'], 'time')
 
 function setCinemaView(view: 'folders' | 'videos') {
   if (cinemaView.value === view) return
   cinemaView.value = view
-  localStorage.setItem('asmoday.cinema.view', view)
+  localStorage.setItem('asmoday.cinema.view.v2', view)
   if (view === 'folders') closeCinemaAlbum()
 }
 
@@ -501,7 +546,7 @@ function setPhotoGroup(group: GroupBy) {
 function setCinemaGroup(group: GroupBy) {
   if (cinemaGroup.value === group) return
   cinemaGroup.value = group
-  localStorage.setItem('asmoday.cinema.group', group)
+  localStorage.setItem('asmoday.cinema.group.v2', group)
 }
 
 /** 分段开关（按时间/按文件夹、文件夹/全部影片）共用的选项与样式 */
@@ -510,6 +555,113 @@ function segActive(active: boolean): string {
   return active ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'
 }
 
+// ---------------- 等高行布局 + 年份刻度（v4.6.19） ----------------
+//
+// 时间线从「等宽方格网格」换成 Immich 那一屏的样子：按天一段，每段里是若干**等高行**，
+// 同一行每张图按自己的真实宽高比占宽，行高由「排满容器宽度」反推出来 —— 横图竖图
+// 都完整、不裁不拉伸，也不会像方格那样把竖图裁成方图。
+//
+// 行宽必须依赖容器实测宽度，所以两个滚动区各自挂一个 ResizeObserver；
+// 图片真实宽高由后端 `dims=1` 附带（见 src/api/media.rs 的 image_dims）。
+function measureWidth(el: HTMLElement): number {
+  const style = getComputedStyle(el)
+  const pad = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight)
+  const width = el.clientWidth - (Number.isFinite(pad) ? pad : 0)
+  return Math.max(0, width)
+}
+
+const timelineEl = ref<HTMLElement | null>(null)
+const timelineWidth = ref(0)
+const cinemaAllEl = ref<HTMLElement | null>(null)
+const cinemaWidth = ref(0)
+let timelineRo: ResizeObserver | null = null
+let cinemaRo: ResizeObserver | null = null
+
+watch(timelineEl, (el) => {
+  timelineRo?.disconnect()
+  timelineRo = null
+  if (!el) return
+  timelineWidth.value = measureWidth(el)
+  timelineRo = new ResizeObserver((entries) => {
+    const entry = entries[0]
+    if (entry) timelineWidth.value = entry.contentRect.width
+  })
+  timelineRo.observe(el)
+})
+
+watch(cinemaAllEl, (el) => {
+  cinemaRo?.disconnect()
+  cinemaRo = null
+  if (!el) return
+  cinemaWidth.value = measureWidth(el)
+  cinemaRo = new ResizeObserver((entries) => {
+    const entry = entries[0]
+    if (entry) cinemaWidth.value = entry.contentRect.width
+  })
+  cinemaRo.observe(el)
+})
+
+/** 行高：窄屏矮一点一屏能多放两行，宽屏拉高让单张更有存在感 */
+function targetRowHeight(width: number): number {
+  if (width < 640) return 132
+  if (width < 1100) return 168
+  return 196
+}
+
+/** 行内格子间距，对齐 Immich 的紧凑感 */
+const ROW_GAP = 3
+
+const timelineRows = computed(() =>
+  timelineGroups.value.map((group) => ({
+    group,
+    rows: justifiedRows(group.items, tileRatio, timelineWidth.value, {
+      targetHeight: targetRowHeight(timelineWidth.value || 1200),
+      gap: ROW_GAP,
+    }),
+  })),
+)
+
+const cinemaRows = computed(() =>
+  cinemaVideoGroups.value.map((group) => ({
+    group,
+    rows: justifiedRows(group.items, tileRatio, cinemaWidth.value, {
+      targetHeight: targetRowHeight(cinemaWidth.value || 1200),
+      gap: ROW_GAP,
+    }),
+  })),
+)
+
+// 照片库与影视库各一条独立滚动流，年份刻度尺共用同一个组合式函数（解构出来给模板用）
+const timelineRail = useYearRail(timelineEl, timelineGroups)
+const {
+  years: timelineYears,
+  active: activeYear,
+  setEl: setGroupEl,
+  onScroll: onTimelineScroll,
+  jump: jumpToYear,
+} = timelineRail
+
+const cinemaRail = useYearRail(cinemaAllEl, cinemaVideoGroups)
+const {
+  years: cinemaYears,
+  active: cinemaActiveYear,
+  setEl: setCinemaGroupEl,
+  onScroll: onCinemaScroll,
+  jump: jumpToCinemaYear,
+} = cinemaRail
+
+// 首屏、续页、窗口缩放都会改变各组的纵向位置，重排后重新认一次当前年份
+watch([() => timelineRows.value.length, timelineWidth], () => {
+  void nextTick(timelineRail.update)
+})
+watch([() => cinemaRows.value.length, cinemaWidth], () => {
+  void nextTick(cinemaRail.update)
+})
+
+onBeforeUnmount(() => {
+  timelineRo?.disconnect()
+  cinemaRo?.disconnect()
+})
 
 async function openAlbum(album: Album) {
   activeAlbum.value = album
@@ -844,6 +996,15 @@ const press = useLongPress<{ item: MediaItem; context: MediaTab }>(({ item, cont
 function openPhotoTile(list: MediaItem[], index: number) {
   if (press.takeFired()) return
   openViewer(list, index)
+}
+
+/**
+ * 等高行里点某一格（v4.6.19）：格子里只有条目，灯箱要的是「这一组里的第几张」。
+ * 同一天/同一文件夹内顺序稳定，按路径找回序号即可，灯箱左右翻页仍在当组之内。
+ */
+function openPhotoCell(group: MediaGroup, item: MediaItem) {
+  const index = group.items.findIndex((entry) => entry.path === item.path)
+  if (index >= 0) openPhotoTile(group.items, index)
 }
 
 /**
@@ -1192,6 +1353,8 @@ async function load(options: { refresh?: boolean } = {}) {
     const result = await browseMedia(undefined, 'media', 2, {
       limit: PAGE_SIZE,
       refresh: options.refresh,
+      // 时间线的等高行要真实宽高比（v4.6.19），只有这个列表需要
+      dims: true,
     })
     items.value = []
     loadedPaths.clear()
@@ -1229,7 +1392,11 @@ async function loadMoreMedia() {
   if (!hasMore.value || !cursor || loading.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseMedia(undefined, 'media', 2, { limit: PAGE_SIZE, cursor })
+    const result = await browseMedia(undefined, 'media', 2, {
+      limit: PAGE_SIZE,
+      cursor,
+      dims: true,
+    })
     appendItems(result.items)
     total.value = result.total
     counts.value = result.counts
@@ -1410,23 +1577,12 @@ useEventListener(window, 'keydown', onKey)
   <section class="flex h-full min-h-0 flex-col">
     <!-- 顶部：照片子视图 + 控制区 -->
     <header class="flex shrink-0 flex-wrap items-center gap-4 border-b border-line px-4 py-2 md:px-6">
-      <!-- 照片库双视图（设计文档 3.4.3）：[相册] 与 [时间线] 是两个平级视图，缺一不可 -->
+      <!-- 照片库双视图（设计文档 3.4.3）：[时间线]（默认）与 [文件夹]，两个平级视图缺一不可 -->
       <div
         v-if="tab === 'photos'"
         class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
         data-testid="photo-view-switch"
       >
-        <button
-          class="rounded px-2.5 py-1 transition-colors"
-          :class="
-            photoView === 'albums'
-              ? 'bg-accent-soft text-accent'
-              : 'text-muted hover:text-ink'
-          "
-          @click="setPhotoView('albums')"
-        >
-          {{ t('gallery.photos.folders') }}
-        </button>
         <button
           class="rounded px-2.5 py-1 transition-colors"
           :class="
@@ -1438,9 +1594,20 @@ useEventListener(window, 'keydown', onKey)
         >
           {{ t('gallery.photos.timeline') }}
         </button>
+        <button
+          class="rounded px-2.5 py-1 transition-colors"
+          :class="
+            photoView === 'albums'
+              ? 'bg-accent-soft text-accent'
+              : 'text-muted hover:text-ink'
+          "
+          @click="setPhotoView('albums')"
+        >
+          {{ t('gallery.photos.folders') }}
+        </button>
       </div>
 
-      <!-- 时间线分组（v4.6.16）：按时间（原行为）/ 按文件夹 -->
+      <!-- 时间线分组：按时间（默认）/ 按文件夹 -->
       <div
         v-if="tab === 'photos' && photoView === 'timeline'"
         class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
@@ -1454,17 +1621,17 @@ useEventListener(window, 'keydown', onKey)
         </button>
       </div>
 
-      <!-- 影视库顶层视图（v4.6.16）：文件夹卡片（原行为）/ 全部影片媒体流 -->
+      <!-- 影视库顶层视图：全部影片媒体流（默认）/ 文件夹卡片 -->
       <div
         v-if="tab === 'cinema'"
         class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
         data-testid="cinema-view-switch"
       >
-        <button :class="[SEG_CLASS, segActive(cinemaView === 'folders')]" @click="setCinemaView('folders')">
-          {{ t('gallery.view.folders') }}
-        </button>
         <button :class="[SEG_CLASS, segActive(cinemaView === 'videos')]" @click="setCinemaView('videos')">
           {{ t('gallery.view.allVideos') }}
+        </button>
+        <button :class="[SEG_CLASS, segActive(cinemaView === 'folders')]" @click="setCinemaView('folders')">
+          {{ t('gallery.view.folders') }}
         </button>
       </div>
 
@@ -1810,45 +1977,59 @@ useEventListener(window, 'keydown', onKey)
           </p>
       </div>
 
-      <!-- 时间线：忽略目录层级、吸顶分组（设计文档 3.4.3 视图二；分组维度可选） -->
-      <div v-else class="h-full overflow-y-auto" data-testid="photo-timeline">
-        <div v-if="photoItems.length === 0" class="grid h-full place-items-center text-center">
-          <div>
-            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-              <AppIcon name="gallery" :size="22" />
-            </span>
-            <p class="text-sm text-ink">{{ t('gallery.photos.empty') }}</p>
-            <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.emptyHint') }}</p>
-          </div>
-        </div>
-
-        <template v-else>
-          <div v-for="group in timelineGroups" :key="group.label" class="mb-6">
-            <div
-              class="sticky top-0 z-10 border-b border-line/60 bg-base/85 px-4 py-2 text-sm font-semibold text-ink backdrop-blur md:px-6"
-            >
-              {{ group.label }}
-              <span class="ml-2 text-[12px] font-normal text-muted">
-                {{ t('gallery.photos.albumItems', { count: group.items.length }) }}
+      <!-- 时间线（v4.6.19，主视图）：按天分段 + 等高行，右侧年份刻度，对齐 Immich -->
+      <div v-else class="relative h-full min-h-0">
+        <div
+          ref="timelineEl"
+          class="h-full overflow-y-auto pr-1 md:pr-7"
+          data-testid="photo-timeline"
+          @scroll.passive="onTimelineScroll"
+        >
+          <div v-if="photoItems.length === 0" class="grid h-full place-items-center text-center">
+            <div>
+              <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+                <AppIcon name="gallery" :size="22" />
               </span>
-            </div>
-            <div
-              class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 p-2 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2 md:p-3"
-            >
-              <PhotoTile
-                v-for="(item, index) in group.items"
-                :key="item.path"
-                :item="item"
-                @click="openPhotoTile(group.items, index)"
-                @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
-                @touchstart.passive="press.start($event, { item, context: 'photos' })"
-                @touchmove.passive="press.move"
-                @touchend="press.cancel"
-                @touchcancel="press.cancel"
-              />
+              <p class="text-sm text-ink">{{ t('gallery.photos.empty') }}</p>
+              <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.emptyHint') }}</p>
             </div>
           </div>
-        </template>
+
+          <template v-else>
+            <section
+              v-for="block in timelineRows"
+              :key="block.group.key"
+              :ref="(el) => setGroupEl(block.group.key, el)"
+              class="pb-1.5"
+              :data-day="block.group.key"
+            >
+              <h2
+                class="sticky top-0 z-10 flex items-baseline gap-2 bg-base/85 px-3 pt-2.5 pb-1.5 text-[13px] font-semibold text-ink backdrop-blur md:px-4 md:text-sm"
+              >
+                {{ block.group.label }}
+                <span class="text-[11px] font-normal text-muted">
+                  {{ t('gallery.photos.albumItems', { count: block.group.items.length }) }}
+                </span>
+              </h2>
+              <div class="flex flex-col gap-[3px] px-1 md:px-2">
+                <div v-for="(row, rowIndex) in block.rows" :key="rowIndex" class="flex gap-[3px]">
+                  <PhotoTile
+                    v-for="cell in row.cells"
+                    :key="cell.item.path"
+                    :item="cell.item"
+                    :cell-width="cell.width"
+                    :cell-height="cell.height"
+                    @click="openPhotoCell(block.group, cell.item)"
+                    @contextmenu.prevent="openMediaMenu($event, cell.item, 'photos')"
+                    @touchstart.passive="press.start($event, { item: cell.item, context: 'photos' })"
+                    @touchmove.passive="press.move"
+                    @touchend="press.cancel"
+                    @touchcancel="press.cancel"
+                  />
+                </div>
+              </div>
+            </section>
+          </template>
           <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
           <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
             <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
@@ -1858,6 +2039,31 @@ useEventListener(window, 'keydown', onKey)
           <p v-else-if="photoItems.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
             {{ t('gallery.toolbar.allLoaded') }}
           </p>
+        </div>
+
+        <!-- 年份刻度尺（v4.6.19）：滚动时跟随高亮，点击跳到该年第一天 -->
+        <aside
+          v-if="photoGroup === 'time' && timelineYears.length > 1"
+          class="absolute top-1/2 right-0.5 z-20 hidden -translate-y-1/2 flex-col items-end gap-0.5 md:flex"
+          data-testid="timeline-years"
+        >
+          <button
+            v-for="year in timelineYears"
+            :key="year"
+            type="button"
+            class="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] transition-colors"
+            :class="activeYear === year ? 'font-semibold text-accent' : 'text-muted/70 hover:text-ink'"
+            :data-year="year"
+            :title="String(year)"
+            @click="jumpToYear(year)"
+          >
+            <span
+              class="h-px transition-all"
+              :class="activeYear === year ? 'w-3 bg-accent' : 'w-2 bg-line'"
+            />
+            {{ year }}
+          </button>
+        </aside>
       </div>
     </div>
 
@@ -2052,61 +2258,105 @@ useEventListener(window, 'keydown', onKey)
         </p>
       </div>
 
-      <!-- 全部影片（v4.6.16）：不分文件夹的媒体流，分组维度可选 -->
-      <div v-else class="h-full overflow-y-auto px-4 py-4 md:px-6 md:py-6" data-testid="cinema-videos-all">
-        <div class="mb-4 flex items-center justify-between">
-          <h1 class="text-xl font-bold text-ink md:text-2xl">{{ t('gallery.view.allVideos') }}</h1>
-          <span class="hidden text-sm text-muted md:block">
-            {{ t('gallery.cinema.count', { count: videos.length || counts.video }) }}
-          </span>
-        </div>
-
-        <div v-if="videos.length === 0" class="grid h-full place-items-center text-center">
-          <div>
-            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-              <AppIcon name="video" :size="22" />
-            </span>
-            <p class="text-sm text-ink">{{ t('gallery.cinema.empty') }}</p>
-          </div>
-        </div>
-
-        <template v-else>
-          <div v-for="group in cinemaVideoGroups" :key="group.label" class="mb-6">
-            <div
-              class="sticky top-0 z-10 border-b border-line/60 bg-base/85 px-1 py-2 text-sm font-semibold text-ink backdrop-blur"
-            >
-              {{ group.label }}
-              <span class="ml-2 text-[12px] font-normal text-muted">
-                {{ t('gallery.cinema.albumItems', { count: group.items.length }) }}
-              </span>
-            </div>
-            <div
-              class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 pt-3 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
-            >
-              <VideoCard
-                v-for="video in group.items"
-                :key="video.path"
-                :video="video"
-                :favorite="isFavorite(video.path)"
-                :resume-at="resumeAt(video.path)"
-                @play="playing = video"
-                @menu="openMediaMenu($event, video, 'cinema')"
-                @favorite="toggleFavorite(video)"
-              />
-            </div>
-          </div>
-        </template>
-        <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
-          <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
-          {{ t('gallery.toolbar.loadingMore') }}
-        </div>
-        <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
-        <p
-          v-else-if="videos.length > 0 && !loadingMore"
-          class="py-4 text-center text-[11px] text-muted"
+      <!-- 全部影片（v4.6.19）：不分文件夹的媒体流，按天分段 + 等高行，右侧年份刻度 -->
+      <div v-else class="relative h-full min-h-0">
+        <div
+          ref="cinemaAllEl"
+          class="h-full overflow-y-auto px-4 py-4 pr-1 md:px-6 md:py-6 md:pr-8"
+          data-testid="cinema-videos-all"
+          @scroll.passive="onCinemaScroll"
         >
-          {{ t('gallery.toolbar.allLoaded') }}
-        </p>
+          <div class="mb-3 flex items-center justify-between">
+            <h1 class="text-xl font-bold text-ink md:text-2xl">{{ t('gallery.view.allVideos') }}</h1>
+            <span class="hidden text-sm text-muted md:block">
+              {{ t('gallery.cinema.count', { count: videos.length || counts.video }) }}
+            </span>
+          </div>
+
+          <div v-if="videos.length === 0" class="grid h-full place-items-center text-center">
+            <div>
+              <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+                <AppIcon name="video" :size="22" />
+              </span>
+              <p class="text-sm text-ink">{{ t('gallery.cinema.empty') }}</p>
+            </div>
+          </div>
+
+          <template v-else>
+            <section
+              v-for="block in cinemaRows"
+              :key="block.group.key"
+              :ref="(el) => setCinemaGroupEl(block.group.key, el)"
+              class="pb-1.5"
+              :data-day="block.group.key"
+            >
+              <h2
+                class="sticky top-0 z-10 flex items-baseline gap-2 bg-base/85 pt-2.5 pb-1.5 text-[13px] font-semibold text-ink backdrop-blur md:text-sm"
+              >
+                {{ block.group.label }}
+                <span class="text-[11px] font-normal text-muted">
+                  {{ t('gallery.cinema.albumItems', { count: block.group.items.length }) }}
+                </span>
+              </h2>
+              <div class="flex flex-col gap-[3px]">
+                <div v-for="(row, rowIndex) in block.rows" :key="rowIndex" class="flex gap-[3px]">
+                  <div
+                    v-for="cell in row.cells"
+                    :key="cell.item.path"
+                    class="shrink-0"
+                    :style="{ width: `${cell.width}px` }"
+                  >
+                    <VideoCard
+                      :video="cell.item"
+                      :favorite="isFavorite(cell.item.path)"
+                      :resume-at="resumeAt(cell.item.path)"
+                      @play="playing = cell.item"
+                      @menu="openMediaMenu($event, cell.item, 'cinema')"
+                      @favorite="toggleFavorite(cell.item)"
+                    />
+                  </div>
+                </div>
+              </div>
+            </section>
+          </template>
+          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
+            {{ t('gallery.toolbar.loadingMore') }}
+          </div>
+          <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
+          <p
+            v-else-if="videos.length > 0 && !loadingMore"
+            class="py-4 text-center text-[11px] text-muted"
+          >
+            {{ t('gallery.toolbar.allLoaded') }}
+          </p>
+        </div>
+
+        <!-- 年份刻度尺：与照片库同一套（影视库按天分组时才出现） -->
+        <aside
+          v-if="cinemaGroup === 'time' && cinemaYears.length > 1"
+          class="absolute top-1/2 right-0.5 z-20 hidden -translate-y-1/2 flex-col items-end gap-0.5 md:flex"
+          data-testid="cinema-years"
+        >
+          <button
+            v-for="year in cinemaYears"
+            :key="year"
+            type="button"
+            class="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] transition-colors"
+            :class="
+              cinemaActiveYear === year ? 'font-semibold text-accent' : 'text-muted/70 hover:text-ink'
+            "
+            :data-year="year"
+            :title="String(year)"
+            @click="jumpToCinemaYear(year)"
+          >
+            <span
+              class="h-px transition-all"
+              :class="cinemaActiveYear === year ? 'w-3 bg-accent' : 'w-2 bg-line'"
+            />
+            {{ year }}
+          </button>
+        </aside>
       </div>
     </div>
 

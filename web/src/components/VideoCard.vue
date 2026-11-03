@@ -47,7 +47,7 @@ const resumeLabel = computed(() => {
 <template>
   <button
     type="button"
-    class="group text-left"
+    class="group w-full text-left"
     :data-video="video.path"
     @click="emit('play')"
     @contextmenu.prevent="emit('menu', $event)"

@@ -25,6 +25,9 @@ export interface MediaItem {
   color?: string | null
   /** 同目录同名外挂字幕（.vtt / .srt，视频才有） */
   subtitle?: string | null
+  /** 图片真实像素宽高（v4.6.19，仅 `dims` 请求时返回）：等高行按它算格子宽度 */
+  width?: number | null
+  height?: number | null
 }
 
 /** 各类型总数：切换分区时不必等全部翻完就知道库里到底有多少 */
@@ -51,6 +54,8 @@ export interface PageOptions {
   cursor?: string | null
   /** 强制穿透后端目录快照重扫（「重新扫描」按钮用；默认走缓存） */
   refresh?: boolean
+  /** 额外返回图片真实像素宽高（时间线的等高行布局用；其它视图不必带） */
+  dims?: boolean
 }
 
 /**
@@ -68,6 +73,7 @@ export async function browseMedia(
   if (options.limit) params.set('limit', String(options.limit))
   if (options.cursor) params.set('cursor', options.cursor)
   if (options.refresh) params.set('refresh', '1')
+  if (options.dims) params.set('dims', '1')
   const res = await fetch(`/api/media/browse?${params.toString()}`)
   if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   return (await res.json()) as BrowseResult

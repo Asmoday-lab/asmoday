@@ -16,8 +16,12 @@ const props = withDefaults(
     item: MediaItem
     /** 请求的缩略图宽度 */
     width?: number
+    /** 等高行布局：格子像素宽度（v4.6.19，时间线用；给了就不用方格比例） */
+    cellWidth?: number
+    /** 等高行布局：格子像素高度，与 `cellWidth` 成对出现 */
+    cellHeight?: number
   }>(),
-  { width: THUMB_WIDTH.tile },
+  { width: THUMB_WIDTH.tile, cellWidth: 0, cellHeight: 0 },
 )
 
 const { t } = useI18n()
@@ -25,14 +29,23 @@ const { t } = useI18n()
 /** 缩略图加载失败（坏文件 / 无权限）时回落图标，别留一块空色块 */
 const failed = ref(false)
 const placeholder = computed(() => thumbHashToDataUrl(props.item.hash))
+/** 等高行里的格子是确定性尺寸，方格网格里则是 1:1 自适应 */
+const sized = computed(() => props.cellWidth > 0 && props.cellHeight > 0)
+const boxStyle = computed(() => {
+  const background = { backgroundColor: placeholderFor(props.item) }
+  return sized.value
+    ? { ...background, width: `${props.cellWidth}px`, height: `${props.cellHeight}px` }
+    : background
+})
 </script>
 
 <template>
   <button
     type="button"
-    class="group relative aspect-square w-full overflow-hidden rounded-lg border border-transparent transition-colors hover:border-line"
+    class="group relative overflow-hidden rounded-lg border border-transparent transition-colors hover:border-line"
+    :class="sized ? 'block shrink-0' : 'aspect-square w-full'"
     style="content-visibility: auto; contain-intrinsic-size: 150px"
-    :style="{ backgroundColor: placeholderFor(item) }"
+    :style="boxStyle"
     :title="item.name"
     :data-photo="item.path"
     :data-kind="item.kind"

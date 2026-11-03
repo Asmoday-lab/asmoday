@@ -71,6 +71,7 @@
     "permanent": "Never expires",
     "expiresAt": "Expires {time}",
     "yearMonth": "{year}-{month}",
+    "dayLabel": "{weekday}, {month}/{day}/{year}",
     "unknown": "Unknown date"
   },
   "clipboard": {

@@ -24,8 +24,8 @@ It is built for the "own machine + browser" setup: a NAS, a Raspberry Pi, a mini
 - 📂 **File management** — multiple mounts (individually read-only), grid and list views, drag-and-drop upload (large files are chunked with resumable transfers), batch copy/move/delete, whole-folder ZIP download, recursive search.
 - ✏️ **Built-in editor** — CodeMirror 6 with syntax highlighting, Markdown preview, read-only CSV and PDF previews; line endings (LF / CRLF) and encoding are written back unchanged.
 - 🖥️ **Web terminal** — a real PTY via `portable-pty`, multiple tabs, sessions that survive disconnects, an on-screen key bar on phones, and "Open terminal here" from the file manager.
-- 🖼️ **Photo library** — albums and timeline, virtual scrolling, ThumbHash placeholders, slideshow and favorites.
-- 🎬 **Cinema library** — folder cards, resume from the last position, external subtitles (`.srt` converted to WebVTT on the fly, or `.vtt`), Video.js with a native-player switch.
+- 🖼️ **Photo library** — Immich-style day timeline (justified rows that keep every aspect ratio, year scrubber) plus a folder wall, ThumbHash placeholders, slideshow and favorites.
+- 🎬 **Cinema library** — the same day timeline for all videos, folder cards, resume from the last position, external subtitles (`.srt` converted to WebVTT on the fly, or `.vtt`), Video.js with a native-player switch.
 - 🎵 **Music library** — ID3v2 / FLAC / MP4 / Ogg tags and LRC lyrics, a persistent bottom player bar, list loop / single loop / shuffle.
 - 🔗 **Share links** — unguessable links for files or folders, with password, expiry date, download toggle and Referer allowlist.
 - 🗄️ **WebDAV** — the full method set with real locks; tokens can be scoped to one mount. Works with phone sync apps and system file managers.

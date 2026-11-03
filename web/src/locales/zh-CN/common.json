@@ -71,6 +71,7 @@
     "permanent": "永久有效",
     "expiresAt": "过期于 {time}",
     "yearMonth": "{year} 年 {month} 月",
+    "dayLabel": "{year}年{month}月{day}日 {weekday}",
     "unknown": "未知时间"
   },
   "clipboard": {
