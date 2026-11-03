@@ -4,7 +4,7 @@
  * 登录页（meta.public）走独立整页布局。
  * 另挂：全局音乐播放条（跨页面常驻）与一次性密码强制改密弹窗。
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onScopeDispose, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import AppIcon from './components/AppIcon.vue'
@@ -37,6 +37,50 @@ function pickTheme(next: ThemeMode) {
 
 const drawerOpen = ref(false)
 const accountOpen = ref(false)
+
+/**
+ * 账号菜单只在点按钮时开合，此前点页面任何别处都不会收起 —— 菜单盖在内容上，
+ * 用户点「看起来是页面」的位置其实点在菜单边缘外的空白里，菜单还杵在那儿（v4.6.18）。
+ * 这里补三条最朴素的失焦语义：点到菜单与按钮之外、按 Esc、窗口失焦（切标签页 /
+ * 点到浏览器外），都当作用户已经离开菜单。
+ *
+ * 用捕获阶段的 pointerdown 而不是 click：按下即收起，不等手指抬起；
+ * 判定放在按钮与菜单的公共父节点上，点菜单里的主题项不算「点到外面」。
+ */
+const accountWrap = ref<HTMLElement | null>(null)
+
+function closeAccountOnOutside(event: PointerEvent) {
+  if (!accountOpen.value) return
+  const target = event.target as Node | null
+  if (target && accountWrap.value?.contains(target)) return
+  accountOpen.value = false
+}
+
+function closeAccountOnEsc(event: KeyboardEvent) {
+  if (event.key === 'Escape' && accountOpen.value) accountOpen.value = false
+}
+
+function closeAccountOnBlur() {
+  if (accountOpen.value) accountOpen.value = false
+}
+
+watch(accountOpen, (open) => {
+  if (open) {
+    document.addEventListener('pointerdown', closeAccountOnOutside, true)
+    document.addEventListener('keydown', closeAccountOnEsc)
+    window.addEventListener('blur', closeAccountOnBlur)
+    return
+  }
+  document.removeEventListener('pointerdown', closeAccountOnOutside, true)
+  document.removeEventListener('keydown', closeAccountOnEsc)
+  window.removeEventListener('blur', closeAccountOnBlur)
+})
+
+onScopeDispose(() => {
+  document.removeEventListener('pointerdown', closeAccountOnOutside, true)
+  document.removeEventListener('keydown', closeAccountOnEsc)
+  window.removeEventListener('blur', closeAccountOnBlur)
+})
 
 // 移动端抽屉与账号菜单也是一层历史：按返回先收起它，而不是直接退出当前页面
 useBackClose(computed(() => drawerOpen.value || accountOpen.value), () => {
@@ -175,7 +219,7 @@ const playerSpace = computed(() => {
           </p>
         </div>
 
-        <div class="relative">
+        <div ref="accountWrap" class="relative">
           <button
             class="grid size-8 place-items-center rounded-full bg-accent text-xs font-semibold text-white"
             :title="username ?? t('common.account.label')"

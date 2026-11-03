@@ -1,20 +1,19 @@
 {
   "photos": {
-    "albums": "Albums",
+    "folders": "Folders",
     "timeline": "Timeline",
     "empty": "No photos or videos yet",
     "emptyHint": "Put media into a mount, or sync from your phone over WebDAV",
     "albumMeta": "{count} photos · {folder}",
     "albumItems": "{count} items",
     "slideshow": "Slideshow",
-    "backToAlbums": "Albums",
+    "backToFoldersView": "Folders",
     "videoBadge": "Video",
     "rootFolder": "Root",
     "albumEmpty": "No folders with photos yet",
     "albumEmptyHint": "Photos loose in the root still show up in the timeline",
-    "albumStale": "Album list did not load",
-    "albumStaleHint": "{count} photos are indexed but no albums came back — usually the scan has not finished; try rescanning",
-    "folderEmpty": "No folders or photos at this level"
+    "albumStale": "Folder list did not load",
+    "albumStaleHint": "{count} photos are indexed but no folders came back — usually the scan has not finished; try rescanning"
   },
   "cinema": {
     "title": "Cinema",
@@ -112,8 +111,6 @@
     "rootLocked": "The library root cannot be renamed, moved or deleted — it is the mount point itself"
   },
   "view": {
-    "flat": "Flat",
-    "layered": "Layered",
     "folders": "Folders",
     "allVideos": "All videos"
   },

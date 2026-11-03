@@ -143,6 +143,11 @@ pub struct AlbumsQuery {
     pub limit: Option<usize>,
     /// 上一页返回的 `next_cursor`
     pub cursor: Option<String>,
+    /// 排序维度：mtime（默认，最近有媒体的在前）/ path（目录路径升序，同父目录的相邻）
+    ///
+    /// 文件夹墙按路径排是用户要的「相近的文件夹排在一起」：mtime 会把不同父目录
+    /// 的册子按「最后一张照片的日期」打散，翻找时毫无方位感（v4.6.18）。
+    pub sort: Option<String>,
     /// 强制穿透目录快照重扫（与媒体列表同一口径）
     #[serde(default, deserialize_with = "crate::api::boolish")]
     pub refresh: Option<bool>,
@@ -490,6 +495,11 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
         None => vec!["image"],
     };
     let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let by_path = match query.sort.as_deref() {
+        None | Some("") | Some("mtime") => false,
+        Some("path") => true,
+        Some(other) => return fs_error(FsError::BadRequest(format!("不支持的排序：{other}"))),
+    };
     let cursor = query
         .cursor
         .as_deref()
@@ -509,9 +519,26 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
             Some(dir_cache.as_ref()),
             refresh,
         );
+        let total = raw.len();
+
+        // 按路径排序（v4.6.18）：同父目录的册子自然排在一起，翻找有方位感。
+        // 游标只带路径（mtime 占位 0），分页键必须与排序键严格一致，否则会重/漏。
+        if by_path {
+            sort_albums_by_path(&mut raw);
+            let start = albums_path_start(&raw, cursor.as_ref());
+            let end = start.saturating_add(limit).min(total);
+            let has_more = end < total;
+            let items = build_albums(&raw[start.min(total)..end], &auth_store);
+            let next_cursor = if has_more && end > start {
+                Some(encode_cursor(0, &raw[end - 1].path))
+            } else {
+                None
+            };
+            return (items, total, has_more, next_cursor);
+        }
+
         // 新的在前；同 mtime 用路径兜底，保证翻页稳定
         raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
-        let total = raw.len();
         let start = match &cursor {
             Some(cur) => raw.partition_point(|item| {
                 item.mtime > cur.m || (item.mtime == cur.m && item.path <= cur.p)
@@ -912,6 +939,29 @@ fn scan_albums(
     albums
 }
 
+/// 按路径升序排（忽略大小写，同路径再按原串兜底）。
+///
+/// 文件夹墙的排序口径（v4.6.18）：按 mtime 排会把不同父目录的册子按「最后一张
+/// 照片的日期」打散，用户找不到方位感；路径序让同一父目录下的册子挨在一起。
+fn sort_albums_by_path(raw: &mut [RawAlbum]) {
+    raw.sort_by_cached_key(|item| (item.path.to_lowercase(), item.path.clone()));
+}
+
+/// 路径序游标之后的起始下标 —— 分页键与 `sort_albums_by_path` 必须是同一个键，
+/// 否则翻页会重/漏。
+fn albums_path_start(raw: &[RawAlbum], cursor: Option<&MediaCursor>) -> usize {
+    match cursor {
+        Some(cur) => {
+            let key = cur.p.to_lowercase();
+            raw.partition_point(|item| {
+                let path_key = item.path.to_lowercase();
+                path_key < key || (path_key == key && item.path.as_str() <= cur.p.as_str())
+            })
+        }
+        None => 0,
+    }
+}
+
 /// 给当前页的相册补封面 ThumbHash（一次批量查询，不逐本开连接）。
 fn build_albums(raw: &[RawAlbum], auth: &crate::core::auth::AuthStore) -> Vec<Album> {
     let mut albums: Vec<Album> = raw
@@ -1302,6 +1352,47 @@ mod tests {
             });
         }
         assert_eq!(seen.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 文件夹墙排序（v4.6.18）：路径升序让同父目录的册子相邻，翻页不重不漏。
+    #[test]
+    fn albums_by_path_keep_siblings_together() {
+        let root = scratch("albums-path");
+        for rel in ["zeta/a", "alpha/b", "alpha/c", "beta"] {
+            let dir = root.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            touch(&dir, "1.jpg", 1_700_000_000);
+        }
+
+        let mut raw = scan_albums(&root, 3, &["image"], None, false);
+        sort_albums_by_path(&mut raw);
+        let names: Vec<&str> = raw.iter().map(|item| item.name.as_str()).collect();
+        // alpha 自己不放图，不算一本册；alpha/b、alpha/c 必须相邻
+        assert_eq!(
+            names,
+            vec!["b", "c", "beta", "a"],
+            "alpha 下的 b/c 必须紧挨着，跨父目录不会被按时间打散"
+        );
+
+        // 分页键与排序键同源：每页 2 本走到底，结果与一次排好的完全一致
+        let expected: Vec<String> = raw.iter().map(|item| item.path.clone()).collect();
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<MediaCursor> = None;
+        loop {
+            let start = albums_path_start(&raw, cursor.as_ref());
+            let end = (start + 2).min(raw.len());
+            seen.extend(raw[start..end].iter().map(|item| item.path.clone()));
+            if end >= raw.len() {
+                break;
+            }
+            cursor = Some(MediaCursor {
+                m: 0,
+                p: raw[end - 1].path.clone(),
+            });
+        }
+        assert_eq!(seen, expected);
 
         let _ = std::fs::remove_dir_all(&root);
     }

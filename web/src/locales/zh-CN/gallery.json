@@ -1,20 +1,19 @@
 {
   "photos": {
-    "albums": "相册",
+    "folders": "文件夹",
     "timeline": "照片时间线",
     "empty": "这里还没有照片或视频",
     "emptyHint": "把媒体放进挂载点，或用 WebDAV 从手机同步过来",
     "albumMeta": "{count} 张 · {folder}",
     "albumItems": "{count} 项",
     "slideshow": "幻灯片",
-    "backToAlbums": "相册",
+    "backToFoldersView": "文件夹",
     "videoBadge": "视频",
     "rootFolder": "根目录",
     "albumEmpty": "没有找到含图片的文件夹",
     "albumEmptyHint": "把图片放进挂载点（含根目录）就会出现在这里",
-    "albumStale": "相册清单没有加载出来",
-    "albumStaleHint": "已索引 {count} 张图片，但分册清单是空的——通常是扫描还没完成或快照未建立，重新扫描一次即可",
-    "folderEmpty": "这一层没有文件夹和照片"
+    "albumStale": "文件夹清单没有加载出来",
+    "albumStaleHint": "已索引 {count} 张图片，但分册清单是空的——通常是扫描还没完成或快照未建立，重新扫描一次即可"
   },
   "cinema": {
     "title": "影视库",
@@ -112,8 +111,6 @@
     "rootLocked": "库根目录不能改名、移动或删除（它就是这个挂载点本身）"
   },
   "view": {
-    "flat": "平铺",
-    "layered": "分层",
     "folders": "文件夹",
     "allVideos": "全部影片"
   },

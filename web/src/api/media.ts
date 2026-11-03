@@ -104,11 +104,16 @@ export interface AlbumsResult {
 export async function browseAlbums(
   path?: string,
   depth = 3,
-  options: PageOptions & { kind?: 'image' | 'video' | 'audio' } = {},
+  options: PageOptions & {
+    kind?: 'image' | 'video' | 'audio'
+    /** mtime=最近有媒体的在前（默认）；path=目录路径升序（文件夹墙用） */
+    sort?: 'mtime' | 'path'
+  } = {},
 ): Promise<AlbumsResult> {
   const params = new URLSearchParams({ depth: String(depth) })
   if (path) params.set('path', path)
   if (options.kind) params.set('kind', options.kind)
+  if (options.sort) params.set('sort', options.sort)
   if (options.limit) params.set('limit', String(options.limit))
   if (options.cursor) params.set('cursor', options.cursor)
   if (options.refresh) params.set('refresh', '1')

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 媒体画廊：照片（相册 / 时间线）+ 影视库 + 音乐库。
+ * 媒体画廊：照片（文件夹 / 时间线）+ 影视库 + 音乐库。
  *
  * 视频播放器由 defineAsyncComponent 按需加载（可在「原生播放器」降级开关切换）；
  * 照片网格用虚拟列表渲染；音乐走全局悬浮播放条（跨页面不中断）。
@@ -11,7 +11,6 @@ import {
   defineAsyncComponent,
   onBeforeUnmount,
   onMounted,
-  reactive,
   ref,
   watch,
 } from 'vue'
@@ -262,10 +261,10 @@ const progress = computed(() => {
   return { loaded: photoItems.value.length, total: counts.value.image + counts.value.video }
 })
 
-/** 相册/分层视图看的是卡片，不是媒体流，这枚进度标签没有意义 */
+/** 文件夹墙看的是卡片，不是媒体流，这枚进度标签没有意义 */
 const showProgress = computed(() => {
   if (tab.value === 'photos' && photoView.value === 'albums') return false
-  // 影视库：文件夹卡片（含分层）与分子分母对不上；「全部影片」媒体流才显示
+  // 影视库：文件夹卡片与分子分母对不上；「全部影片」媒体流才显示
   if (tab.value === 'cinema') return cinemaView.value === 'videos'
   return progress.value.loaded < progress.value.total
 })
@@ -412,7 +411,7 @@ async function loadAlbums(refresh = false) {
   albumsLoading.value = true
   albumsError.value = ''
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, refresh })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: 'path', refresh })
     albums.value = result.items
     albumsTotal.value = result.total
     albumsCursor.value = result.next_cursor ?? null
@@ -435,7 +434,7 @@ async function loadMoreAlbums() {
   if (!albumsHasMore.value || !cursor || albumsLoading.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, cursor })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: 'path', cursor })
     const seen = new Set(albums.value.map((album) => album.path))
     albums.value = [...albums.value, ...result.items.filter((album) => !seen.has(album.path))]
     albumsTotal.value = result.total
@@ -457,15 +456,17 @@ function setPhotoView(view: PhotoView) {
   if (view === 'albums' && albums.value.length === 0) void loadAlbums()
 }
 
-// ---------------- 视图选择与分组选择（v4.6.16） ----------------
+// ---------------- 分组选择（v4.6.16，v4.6.18 收敛铺法） ----------------
 //
-// 相册/影视文件夹此前只有一种铺法：全库所有「直接含媒体的目录」平铺成卡片墙，
-// 目录层级完全不可见（v4.6.15 用户反馈）。现在两边都有两套选择：
-// - **视图选择**：文件夹视图（平铺 / 分层）+ 影视库额外的「全部影片」媒体流；
-// - **分组选择**：媒体流按时间 / 按文件夹分组。
-// 偏好都记 localStorage，刷新后保持。
+// v4.6.16 给文件夹视图加过「平铺 / 分层」二选一，分层 = 从挂载根逐层下钻。
+// 实际用下来这套下钻很别扭：面包屑 + 每层把「当前目录自己」也画成一张卡片、
+// 点击后整页换一批内容，用户要的只是「文件夹堆在一起」（v4.6.18 反馈）。
+// 现在铺法只有一种：全库文件夹一面墙，按目录路径升序（同父目录相邻），
+// 点卡片进册。剩下可选的只有媒体流的分组维度：
+// - 时间线：按时间（默认）/ 按文件夹；
+// - 全部影片：按文件夹（默认）/ 按时间。
+// 偏好记 localStorage，刷新后保持。
 
-type BrowseMode = 'flat' | 'layered'
 type GroupBy = 'time' | 'folder'
 
 function persisted<T extends string>(key: string, allowed: readonly T[], fallback: T) {
@@ -473,10 +474,6 @@ function persisted<T extends string>(key: string, allowed: readonly T[], fallbac
   return ref(allowed.includes(saved as T) ? (saved as T) : fallback)
 }
 
-/** 相册视图的铺法：flat=全库平铺（原行为），layered=从挂载根逐层浏览 */
-const photosBrowse = persisted<BrowseMode>('asmoday.photos.browse', ['flat', 'layered'], 'flat')
-/** 影视库文件夹视图的铺法，同上 */
-const cinemaBrowse = persisted<BrowseMode>('asmoday.cinema.browse', ['flat', 'layered'], 'flat')
 /** 影视库顶层视图：folders=文件夹卡片（原行为），videos=全部影片媒体流 */
 const cinemaView = persisted<'folders' | 'videos'>(
   'asmoday.cinema.view',
@@ -487,30 +484,6 @@ const cinemaView = persisted<'folders' | 'videos'>(
 const photoGroup = persisted<GroupBy>('asmoday.photos.group', ['time', 'folder'], 'time')
 /** 全部影片的分组维度：按文件夹 / 按时间 */
 const cinemaGroup = persisted<GroupBy>('asmoday.cinema.group', ['folder', 'time'], 'folder')
-
-function setPhotosBrowse(mode: BrowseMode) {
-  if (photosBrowse.value === mode) return
-  photosBrowse.value = mode
-  localStorage.setItem('asmoday.photos.browse', mode)
-  if (mode === 'layered') {
-    closeAlbum()
-    if (!photosLayer.albums.length && !photosLayer.items.length && !photosLayer.loading) {
-      void loadLayer(photosLayer, 'image', null)
-    }
-  }
-}
-
-function setCinemaBrowse(mode: BrowseMode) {
-  if (cinemaBrowse.value === mode) return
-  cinemaBrowse.value = mode
-  localStorage.setItem('asmoday.cinema.browse', mode)
-  if (mode === 'layered') {
-    closeCinemaAlbum()
-    if (!cinemaLayer.albums.length && !cinemaLayer.items.length && !cinemaLayer.loading) {
-      void loadLayer(cinemaLayer, 'video', null)
-    }
-  }
-}
 
 function setCinemaView(view: 'folders' | 'videos') {
   if (cinemaView.value === view) return
@@ -531,152 +504,12 @@ function setCinemaGroup(group: GroupBy) {
   localStorage.setItem('asmoday.cinema.group', group)
 }
 
-/** 分段开关（平铺/分层、按时间/按文件夹……）共用的选项与样式 */
+/** 分段开关（按时间/按文件夹、文件夹/全部影片）共用的选项与样式 */
 const SEG_CLASS = 'rounded px-2.5 py-1 transition-colors'
 function segActive(active: boolean): string {
   return active ? 'bg-accent-soft text-accent' : 'text-muted hover:text-ink'
 }
 
-// ---------------- 分层浏览（相册 / 影视文件夹共用一套状态机） ----------------
-//
-// 每层 = 该层直接包含的媒体 + 下一层有内容的文件夹卡片。两条流各自游标分页，
-// 触底续接先补文件夹、再补媒体（文件夹一屏通常就完，媒体才是长尾）。
-interface LayerState {
-  /** null = 挂载根 */
-  path: string | null
-  albums: Album[]
-  items: MediaItem[]
-  loading: boolean
-  error: string
-  albumCursor: string | null
-  albumHasMore: boolean
-  itemCursor: string | null
-  itemHasMore: boolean
-}
-
-function emptyLayer(): LayerState {
-  return {
-    path: null,
-    albums: [],
-    items: [],
-    loading: false,
-    error: '',
-    albumCursor: null,
-    albumHasMore: false,
-    itemCursor: null,
-    itemHasMore: false,
-  }
-}
-
-const photosLayer = reactive<LayerState>(emptyLayer())
-const cinemaLayer = reactive<LayerState>(emptyLayer())
-
-async function loadLayer(
-  layer: LayerState,
-  kind: 'image' | 'video',
-  path: string | null,
-  refresh = false,
-) {
-  if (layer.loading) return
-  layer.loading = true
-  layer.error = ''
-  layer.path = path
-  layer.albums = []
-  layer.items = []
-  layer.albumCursor = null
-  layer.albumHasMore = false
-  layer.itemCursor = null
-  layer.itemHasMore = false
-  try {
-    const [albumRes, itemRes] = await Promise.all([
-      browseAlbums(path ?? undefined, 1, { kind, limit: PAGE_SIZE, refresh }),
-      browseMedia(path ?? undefined, kind, 0, { limit: PAGE_SIZE, refresh }),
-    ])
-    layer.albums = albumRes.items
-    layer.albumCursor = albumRes.next_cursor ?? null
-    layer.albumHasMore = albumRes.has_more && Boolean(albumRes.next_cursor)
-    layer.items = itemRes.items
-    layer.itemCursor = itemRes.next_cursor ?? null
-    layer.itemHasMore = itemRes.has_more && Boolean(itemRes.next_cursor)
-  } catch (err) {
-    layer.error = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
-  } finally {
-    layer.loading = false
-  }
-}
-
-async function loadMoreLayer(layer: LayerState, kind: 'image' | 'video') {
-  if (layer.loading) return
-  try {
-    if (layer.albumHasMore && layer.albumCursor) {
-      const res = await browseAlbums(layer.path ?? undefined, 1, {
-        kind,
-        limit: PAGE_SIZE,
-        cursor: layer.albumCursor,
-      })
-      const seen = new Set(layer.albums.map((album) => album.path))
-      layer.albums = [...layer.albums, ...res.items.filter((album) => !seen.has(album.path))]
-      layer.albumCursor = res.next_cursor ?? null
-      layer.albumHasMore = res.has_more && Boolean(res.next_cursor)
-      return
-    }
-    if (layer.itemHasMore && layer.itemCursor) {
-      const res = await browseMedia(layer.path ?? undefined, kind, 0, {
-        limit: PAGE_SIZE,
-        cursor: layer.itemCursor,
-      })
-      const seen = new Set(layer.items.map((item) => item.path))
-      layer.items = [...layer.items, ...res.items.filter((item) => !seen.has(item.path))]
-      layer.itemCursor = res.next_cursor ?? null
-      layer.itemHasMore = res.has_more && Boolean(res.next_cursor)
-    }
-  } catch (err) {
-    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
-  }
-}
-
-/** 绝对路径 → 上一层（null = 已到挂载根） */
-function layerParent(path: string): string | null {
-  const base = root.value.replace(/\\/g, '/').replace(/\/+$/, '')
-  const current = path.replace(/\\/g, '/').replace(/\/+$/, '')
-  if (!base || !current.toLowerCase().startsWith(base.toLowerCase())) return null
-  const rest = current.slice(base.length).replace(/^\/+/, '')
-  if (!rest) return null
-  const segments = rest.split('/').filter(Boolean)
-  segments.pop()
-  return segments.length ? `${base}/${segments.join('/')}` : null
-}
-
-function upLayer(layer: LayerState, kind: 'image' | 'video') {
-  if (!layer.path || layer.loading) return
-  void loadLayer(layer, kind, layerParent(layer.path))
-}
-
-/** 分层浏览的面包屑（根 + 逐级段），点击即跳层 */
-function layerCrumbs(path: string | null): Array<{ label: string; path: string | null }> {
-  const base = root.value.replace(/\\/g, '/').replace(/\/+$/, '')
-  const crumbs: Array<{ label: string; path: string | null }> = [
-    { label: t('gallery.photos.rootFolder'), path: null },
-  ]
-  if (!path) return crumbs
-  const normalized = path.replace(/\\/g, '/')
-  const rest =
-    base && normalized.toLowerCase().startsWith(base.toLowerCase())
-      ? normalized.slice(base.length).replace(/^\/+/, '')
-      : normalized.replace(/^\/+/, '')
-  let walked: string | null = null
-  for (const segment of rest.split('/').filter(Boolean)) {
-    walked = walked ? `${walked}/${segment}` : segment
-    crumbs.push({ label: segment, path: walked })
-  }
-  return crumbs
-}
-
-/** 分层里点文件夹卡片：下钻一层（长按弹菜单的场合不抢） */
-function openLayerFolder(layer: LayerState, kind: 'image' | 'video', album: Album) {
-  if (folderPress.takeFired()) return
-  void loadLayer(layer, kind, album.path)
-}
 
 async function openAlbum(album: Album) {
   activeAlbum.value = album
@@ -767,7 +600,12 @@ async function loadCinemaAlbums(refresh = false) {
   cinemaAlbumsLoading.value = true
   cinemaAlbumsError.value = ''
   try {
-    const result = await browseAlbums(undefined, 3, { kind: 'video', limit: PAGE_SIZE, refresh })
+    const result = await browseAlbums(undefined, 3, {
+      kind: 'video',
+      limit: PAGE_SIZE,
+      sort: 'path',
+      refresh,
+    })
     cinemaAlbums.value = result.items
     cinemaAlbumsTotal.value = result.total
     cinemaAlbumsCursor.value = result.next_cursor ?? null
@@ -790,7 +628,12 @@ async function loadMoreCinemaAlbums() {
   if (!cinemaAlbumsHasMore.value || !cursor || cinemaAlbumsLoading.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseAlbums(undefined, 3, { kind: 'video', limit: PAGE_SIZE, cursor })
+    const result = await browseAlbums(undefined, 3, {
+      kind: 'video',
+      limit: PAGE_SIZE,
+      sort: 'path',
+      cursor,
+    })
     const seen = new Set(cinemaAlbums.value.map((album) => album.path))
     cinemaAlbums.value = [
       ...cinemaAlbums.value,
@@ -910,6 +753,16 @@ function albumSubtitle(album: Album): string {
     : t('gallery.photos.albumMeta', { count: album.count, folder })
 }
 
+/**
+ * 文件夹墙卡片的副标题（v4.6.18，照片库与影视库共用）：只写「它在库里哪一层」。
+ * 数量已经在角标上，路径才是同名文件夹之间唯一的区别；库根没有更有用的上级，留空。
+ */
+function folderPathHint(album: Album): string {
+  if (album.is_root) return ''
+  const folder = relativeFolder(album.path)
+  return folder === album.name ? '' : folder
+}
+
 function markAlbumCoverFailed(path: string) {
   albumCoverFailed.value = new Set(albumCoverFailed.value).add(path)
 }
@@ -970,18 +823,9 @@ function readonlyAt(path: string): boolean {
   return mountForPath(path)?.readonly ?? false
 }
 
-/** 变更弹窗的默认目标目录：当前打开的册 / 分层当前层，否则库根 */
+/** 变更弹窗的默认目标目录：当前打开的册，否则库根 */
 const opsStartDir = computed(
-  () =>
-    activeAlbum.value?.path ??
-    activeCinemaAlbum.value?.path ??
-    (tab.value === 'photos' && photoView.value === 'albums' && photosBrowse.value === 'layered'
-      ? photosLayer.path
-      : null) ??
-    (tab.value === 'cinema' && cinemaView.value === 'folders' && cinemaBrowse.value === 'layered'
-      ? cinemaLayer.path
-      : null) ??
-    root.value,
+  () => activeAlbum.value?.path ?? activeCinemaAlbum.value?.path ?? root.value,
 )
 
 function openMediaMenu(event: MouseEvent, item: MediaItem, context: MediaTab) {
@@ -1148,23 +992,14 @@ const folderPress = useLongPress<{ album: Album; context: MediaTab }>(({ album, 
   folderMenu.value = { x: 0, y: 0, album, context }
 })
 
-/** 相册卡片单击：长按已经弹过菜单就不再进册 */
+/** 文件夹卡片单击：长按已经弹过菜单就不再进册 */
 function openAlbumCard(album: Album) {
   if (folderPress.takeFired()) return
-  // 分层浏览下点卡片 = 下钻一层，不是打开册详情
-  if (photosBrowse.value === 'layered') {
-    void loadLayer(photosLayer, 'image', album.path)
-    return
-  }
   void openAlbum(album)
 }
 
 function openCinemaCard(album: Album) {
   if (folderPress.takeFired()) return
-  if (cinemaView.value === 'folders' && cinemaBrowse.value === 'layered') {
-    void loadLayer(cinemaLayer, 'video', album.path)
-    return
-  }
   void openCinemaAlbum(album)
 }
 
@@ -1249,16 +1084,8 @@ function onFolderMenuSelect(id: string) {
   const album = current.album
   switch (id) {
     case 'open':
-      if (current.context === 'photos') {
-        if (photosBrowse.value === 'layered') void loadLayer(photosLayer, 'image', album.path)
-        else void openAlbum(album)
-      } else if (current.context === 'cinema') {
-        if (cinemaView.value === 'folders' && cinemaBrowse.value === 'layered') {
-          void loadLayer(cinemaLayer, 'video', album.path)
-        } else {
-          void openCinemaAlbum(album)
-        }
-      }
+      if (current.context === 'photos') void openAlbum(album)
+      else if (current.context === 'cinema') void openCinemaAlbum(album)
       break
     case 'download':
       triggerDownload(filesApi.archiveUrl(album.path))
@@ -1289,12 +1116,6 @@ function onFolderMenuSelect(id: string) {
  */
 async function refreshAfterOps() {
   if (tab.value === 'photos') {
-    if (photoView.value === 'albums' && photosBrowse.value === 'layered') {
-      // 分层：重拉当前层 + 底层媒体流（进度/总数要跟着对上）
-      await loadLayer(photosLayer, 'image', photosLayer.path, true)
-      void load()
-      return
-    }
     if (photoView.value === 'albums' && activeAlbum.value) {
       await loadAlbumItems(activeAlbum.value)
       void loadAlbums()
@@ -1306,11 +1127,6 @@ async function refreshAfterOps() {
   if (tab.value === 'cinema') {
     if (cinemaView.value === 'videos') {
       await load()
-      return
-    }
-    if (cinemaBrowse.value === 'layered') {
-      await loadLayer(cinemaLayer, 'video', cinemaLayer.path, true)
-      void load()
       return
     }
     if (activeCinemaAlbum.value) {
@@ -1358,24 +1174,6 @@ function onKey(event: KeyboardEvent) {
   if (event.key === 'Escape' && !event.defaultPrevented && activeCinemaAlbum.value) {
     closeCinemaAlbum()
   }
-  // 分层浏览：Esc 逐层向上（v4.6.16），到根后不再后退
-  if (event.key === 'Escape' && !event.defaultPrevented) {
-    if (
-      tab.value === 'photos' &&
-      photoView.value === 'albums' &&
-      photosBrowse.value === 'layered' &&
-      photosLayer.path
-    ) {
-      upLayer(photosLayer, 'image')
-    } else if (
-      tab.value === 'cinema' &&
-      cinemaView.value === 'folders' &&
-      cinemaBrowse.value === 'layered' &&
-      cinemaLayer.path
-    ) {
-      upLayer(cinemaLayer, 'video')
-    }
-  }
 }
 
 /**
@@ -1405,21 +1203,15 @@ async function load(options: { refresh?: boolean } = {}) {
     hasMore.value = result.has_more && Boolean(result.next_cursor)
     hasContent.value = true
     saveMediaSnapshot()
-    // 照片库同时刷新相册清单（后端会剔除空相册）；分层浏览则重拉当前层
+    // 照片库同时刷新文件夹清单（后端会剔除空目录）
     if (tab.value === 'photos') {
       closeAlbum()
       void loadAlbums(options.refresh)
-      if (photoView.value === 'albums' && photosBrowse.value === 'layered') {
-        void loadLayer(photosLayer, 'image', photosLayer.path, options.refresh)
-      }
     }
     // 影视库同构：进页面就把文件夹卡片拉出来
     if (tab.value === 'cinema') {
       closeCinemaAlbum()
       void loadCinemaAlbums(options.refresh)
-      if (cinemaView.value === 'folders' && cinemaBrowse.value === 'layered') {
-        void loadLayer(cinemaLayer, 'video', cinemaLayer.path, options.refresh)
-      }
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
@@ -1451,14 +1243,10 @@ async function loadMoreMedia() {
   }
 }
 
-/** 触底续接：按当前视图决定续哪条流（媒体列表 / 相册卡片 / 册内图片 / 分层两条流） */
+/** 触底续接：按当前视图决定续哪条流（媒体列表 / 文件夹卡片 / 册内图片） */
 async function loadMore() {
   if (loading.value || loadingMore.value) return
   if (tab.value === 'photos' && photoView.value === 'albums') {
-    if (photosBrowse.value === 'layered') {
-      await loadMoreLayer(photosLayer, 'image')
-      return
-    }
     if (activeAlbum.value) await loadMoreAlbumItems()
     else await loadMoreAlbums()
     return
@@ -1467,10 +1255,6 @@ async function loadMore() {
     // 「全部影片」与媒体流共用同一条分页流（videos 只是 items 的过滤视图）
     if (cinemaView.value === 'videos') {
       await loadMoreMedia()
-      return
-    }
-    if (cinemaBrowse.value === 'layered') {
-      await loadMoreLayer(cinemaLayer, 'video')
       return
     }
     if (activeCinemaAlbum.value) await loadMoreCinemaItems()
@@ -1641,7 +1425,7 @@ useEventListener(window, 'keydown', onKey)
           "
           @click="setPhotoView('albums')"
         >
-          {{ t('gallery.photos.albums') }}
+          {{ t('gallery.photos.folders') }}
         </button>
         <button
           class="rounded px-2.5 py-1 transition-colors"
@@ -1653,23 +1437,6 @@ useEventListener(window, 'keydown', onKey)
           @click="setPhotoView('timeline')"
         >
           {{ t('gallery.photos.timeline') }}
-        </button>
-      </div>
-
-      <!-- 相册铺法（v4.6.16）：平铺=全库文件夹一屏铺完（原行为），分层=逐层进入 -->
-      <div
-        v-if="tab === 'photos' && photoView === 'albums'"
-        class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
-        data-testid="photos-browse-switch"
-      >
-        <button :class="[SEG_CLASS, segActive(photosBrowse === 'flat')]" @click="setPhotosBrowse('flat')">
-          {{ t('gallery.view.flat') }}
-        </button>
-        <button
-          :class="[SEG_CLASS, segActive(photosBrowse === 'layered')]"
-          @click="setPhotosBrowse('layered')"
-        >
-          {{ t('gallery.view.layered') }}
         </button>
       </div>
 
@@ -1698,23 +1465,6 @@ useEventListener(window, 'keydown', onKey)
         </button>
         <button :class="[SEG_CLASS, segActive(cinemaView === 'videos')]" @click="setCinemaView('videos')">
           {{ t('gallery.view.allVideos') }}
-        </button>
-      </div>
-
-      <!-- 影视文件夹铺法（v4.6.16）：平铺 / 分层 -->
-      <div
-        v-if="tab === 'cinema' && cinemaView === 'folders'"
-        class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
-        data-testid="cinema-browse-switch"
-      >
-        <button :class="[SEG_CLASS, segActive(cinemaBrowse === 'flat')]" @click="setCinemaBrowse('flat')">
-          {{ t('gallery.view.flat') }}
-        </button>
-        <button
-          :class="[SEG_CLASS, segActive(cinemaBrowse === 'layered')]"
-          @click="setCinemaBrowse('layered')"
-        >
-          {{ t('gallery.view.layered') }}
         </button>
       </div>
 
@@ -1842,7 +1592,7 @@ useEventListener(window, 'keydown', onKey)
     <!-- 照片：相册 / 时间线 两个平级视图（设计文档 3.4.3） -->
     <div v-else-if="tab === 'photos'" class="min-h-0 flex-1">
       <!-- 相册详情：只看当前这本相册里的图片 -->
-      <div v-if="photoView === 'albums' && photosBrowse === 'flat' && activeAlbum" class="flex h-full flex-col">
+      <div v-if="photoView === 'albums' && activeAlbum" class="flex h-full flex-col">
         <!-- 相册详情头（对齐 v2.9 交互）：返回 + 册名/册内路径 + 幻灯片，滚动时始终可见 -->
         <header
           class="sticky top-0 z-10 flex shrink-0 items-center gap-3 border-b border-line bg-base/85 px-4 py-2 backdrop-blur md:px-6"
@@ -1853,7 +1603,7 @@ useEventListener(window, 'keydown', onKey)
             @click="closeAlbum"
           >
             <AppIcon name="chevronLeft" :size="13" />
-            {{ t('gallery.photos.backToAlbums') }}
+            {{ t('gallery.photos.backToFoldersView') }}
           </button>
           <div class="min-w-0 flex-1">
             <p class="truncate text-sm font-semibold text-ink">{{ albumLabel(activeAlbum) }}</p>
@@ -1932,21 +1682,23 @@ useEventListener(window, 'keydown', onKey)
       </div>
 
       <!-- 相册卡片：封面取册内最新一张图，空相册后端已剔除 -->
-      <!-- 平铺相册墙：全库所有含图目录一屏铺完（原行为） -->
+      <!-- 文件夹墙（v4.6.18）：全库所有含图目录按路径升序铺一面墙，同父目录自然相邻；
+           卡片是紧凑的「文件夹」样式（图标 + 名字 + 数量，封面只做淡背景），不再用大封面
+           把人骗成「点开能看这组照片」的相册封皮 -->
       <div
-        v-else-if="photoView === 'albums' && photosBrowse === 'flat'"
+        v-else-if="photoView === 'albums'"
         class="h-full overflow-y-auto p-2 md:p-3"
         data-testid="photo-albums"
       >
         <!-- 首次加载：骨架连「标题 + 副标题」两行一起占位，真卡片接上来高度不跳 -->
         <div
           v-if="albums.length === 0 && albumsSkeleton"
-          class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
+          class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-3"
         >
-          <div v-for="i in 8" :key="i">
-            <div class="skeleton aspect-[4/3] rounded-xl" />
-            <div class="skeleton mt-2 h-3 w-2/3 rounded" />
-            <div class="skeleton mt-1.5 h-2.5 w-1/3 rounded" />
+          <div v-for="i in 12" :key="i">
+            <div class="skeleton aspect-[4/3] rounded-lg" />
+            <div class="skeleton mt-1.5 h-3 w-2/3 rounded" />
+            <div class="skeleton mt-1 h-2.5 w-1/2 rounded" />
           </div>
         </div>
 
@@ -1993,13 +1745,13 @@ useEventListener(window, 'keydown', onKey)
 
         <div
           v-else
-          class="fade-in grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
+          class="fade-in grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-3"
         >
           <button
             v-for="album in albums"
             :key="album.path"
             type="button"
-            class="group text-left"
+            class="group min-w-0 text-left"
             :data-album="album.name"
             :title="albumLabel(album)"
             @click="openAlbumCard(album)"
@@ -2010,37 +1762,41 @@ useEventListener(window, 'keydown', onKey)
             @touchcancel="folderPress.cancel"
           >
             <div
-              class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line"
+              class="relative grid aspect-[4/3] place-items-center overflow-hidden rounded-lg border border-line bg-elevated"
               :style="{ backgroundColor: albumColor(album) }"
             >
-              <!-- ThumbHash 打底：封面还没加载完也不是一块死色 -->
+              <!-- 封面只做底纹：文件夹的身份靠图标和名字，不靠一张「像相册封皮」的图 -->
               <img
                 v-if="albumHash(album)"
                 :src="albumHash(album)!"
-                class="absolute inset-0 size-full scale-110 object-cover blur-md"
+                class="absolute inset-0 size-full scale-110 object-cover opacity-60 blur-md"
                 aria-hidden="true"
                 alt=""
               />
               <img
                 v-if="album.cover && !albumCoverFailed.has(album.path)"
                 :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
-                class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                class="absolute inset-0 size-full object-cover opacity-35 transition-opacity duration-300 group-hover:opacity-50"
                 loading="lazy"
                 alt=""
                 @error="markAlbumCoverFailed(album.path)"
               />
-              <span v-else class="relative grid size-full place-items-center text-white/60">
-                <AppIcon name="gallery" :size="26" />
+              <span
+                class="relative grid size-9 place-items-center rounded-lg bg-black/25 text-white/90 backdrop-blur-sm"
+              >
+                <AppIcon name="folder" :size="18" />
               </span>
               <span
-                class="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
+                class="absolute right-1 bottom-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white backdrop-blur"
               >
                 {{ t('gallery.photos.albumItems', { count: album.count }) }}
               </span>
             </div>
-            <p class="mt-2 truncate text-sm font-medium text-ink">{{ albumLabel(album) }}</p>
-            <!-- 副标题（对齐 v2.9）：数量 + 册内路径，卡片不只剩一个封面和名字 -->
-            <p class="truncate text-[12px] text-muted">{{ albumSubtitle(album) }}</p>
+            <p class="mt-1.5 truncate text-[13px] font-medium text-ink">{{ albumLabel(album) }}</p>
+            <!-- 副标题只报「它在库里哪一层」：同名文件夹靠这一行区分，数量已在角标上 -->
+            <p v-if="folderPathHint(album)" class="truncate text-[11px] text-muted">
+              {{ folderPathHint(album) }}
+            </p>
           </button>
         </div>
           <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
@@ -2052,127 +1808,6 @@ useEventListener(window, 'keydown', onKey)
           <p v-else-if="albums.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
             {{ t('gallery.toolbar.allLoaded') }}
           </p>
-      </div>
-
-      <!-- 分层浏览（v4.6.16）：从挂载根逐层进入，每层 = 子文件夹卡片 + 该层直接包含的照片 -->
-      <div
-        v-else-if="photoView === 'albums' && photosBrowse === 'layered'"
-        class="h-full overflow-y-auto"
-        data-testid="photo-layered"
-      >
-        <!-- 面包屑：根 + 逐级段，点击即跳层 -->
-        <div class="sticky top-0 z-10 flex items-center gap-1 border-b border-line/60 bg-base/85 px-4 py-2 text-xs backdrop-blur md:px-6">
-          <template v-for="(crumb, index) in layerCrumbs(photosLayer.path)" :key="String(crumb.path)">
-            <span v-if="index > 0" class="text-muted">/</span>
-            <button
-              v-if="index < layerCrumbs(photosLayer.path).length - 1"
-              class="max-w-[160px] truncate rounded px-1 py-0.5 text-muted transition-colors hover:bg-elevated hover:text-ink"
-              @click="loadLayer(photosLayer, 'image', crumb.path)"
-            >
-              {{ crumb.label }}
-            </button>
-            <span v-else class="max-w-[200px] truncate font-medium text-ink">{{ crumb.label }}</span>
-          </template>
-        </div>
-
-        <div class="px-4 py-4 md:px-6">
-          <div v-if="photosLayer.loading" class="grid place-items-center py-16">
-            <span class="size-5 animate-spin rounded-full border-2 border-line border-t-accent" />
-          </div>
-          <div v-else-if="photosLayer.error" class="grid place-items-center gap-3 py-16 text-center">
-            <p class="text-sm text-ink">{{ photosLayer.error }}</p>
-            <button
-              class="rounded-md border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:bg-elevated"
-              data-testid="photo-layered-retry"
-              @click="loadLayer(photosLayer, 'image', photosLayer.path, true)"
-            >
-              {{ t('gallery.toolbar.retry') }}
-            </button>
-          </div>
-          <template v-else>
-            <!-- 下一层文件夹卡片 -->
-            <div
-              v-if="photosLayer.albums.length"
-              class="mb-6 grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 md:grid-cols-[repeat(auto-fill,minmax(190px,1fr))]"
-              data-testid="photo-layered-folders"
-            >
-              <button
-                v-for="album in photosLayer.albums"
-                :key="album.path"
-                type="button"
-                class="group text-left"
-                :title="albumLabel(album)"
-                @click="openLayerFolder(photosLayer, 'image', album)"
-                @contextmenu.prevent="openFolderMenu($event, album, 'photos')"
-                @touchstart.passive="folderPress.start($event, { album, context: 'photos' })"
-                @touchmove.passive="folderPress.move"
-                @touchend="folderPress.cancel"
-                @touchcancel="folderPress.cancel"
-              >
-                <div
-                  class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line"
-                  :style="{ backgroundColor: albumColor(album) }"
-                >
-                  <img
-                    v-if="albumHash(album)"
-                    :src="albumHash(album)!"
-                    class="absolute inset-0 size-full scale-110 object-cover blur-md"
-                    aria-hidden="true"
-                    alt=""
-                  />
-                  <img
-                    v-if="album.cover && !albumCoverFailed.has(album.path)"
-                    :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
-                    class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-                    loading="lazy"
-                    alt=""
-                    @error="markAlbumCoverFailed(album.path)"
-                  />
-                  <span v-else class="relative grid size-full place-items-center text-white/60">
-                    <AppIcon name="gallery" :size="26" />
-                  </span>
-                  <span
-                    class="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
-                  >
-                    {{ t('gallery.photos.albumItems', { count: album.count }) }}
-                  </span>
-                </div>
-                <p class="mt-2 truncate text-sm font-medium text-ink">{{ albumLabel(album) }}</p>
-                <p class="truncate text-[12px] text-muted">{{ albumSubtitle(album) }}</p>
-              </button>
-            </div>
-
-            <!-- 该层直接包含的照片 -->
-            <div
-              v-if="photosLayer.items.length"
-              class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 pb-2 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
-              data-testid="photo-layered-items"
-            >
-              <PhotoTile
-                v-for="(item, index) in photosLayer.items"
-                :key="item.path"
-                :item="item"
-                @click="openPhotoTile(photosLayer.items, index)"
-                @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
-                @touchstart.passive="press.start($event, { item, context: 'photos' })"
-                @touchmove.passive="press.move"
-                @touchend="press.cancel"
-                @touchcancel="press.cancel"
-              />
-            </div>
-            <div
-              v-if="!photosLayer.albums.length && !photosLayer.items.length"
-              class="grid place-items-center py-16 text-center"
-            >
-              <p class="text-sm text-muted">{{ t('gallery.photos.folderEmpty') }}</p>
-            </div>
-          </template>
-          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
-            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
-            {{ t('gallery.toolbar.loadingMore') }}
-          </div>
-          <div v-if="photosLayer.albumHasMore || photosLayer.itemHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
-        </div>
       </div>
 
       <!-- 时间线：忽略目录层级、吸顶分组（设计文档 3.4.3 视图二；分组维度可选） -->
@@ -2294,9 +1929,9 @@ useEventListener(window, 'keydown', onKey)
       </div>
 
       <!-- 文件夹卡片：封面取文件夹里最新的视频首帧，空文件夹后端已剔除 -->
-      <!-- 平铺文件夹墙（原行为） -->
+      <!-- 文件夹墙（v4.6.18）：与照片库同一套紧凑卡片，按路径升序 -->
       <div
-        v-else-if="cinemaView === 'folders' && cinemaBrowse === 'flat'"
+        v-else-if="cinemaView === 'folders'"
         class="h-full overflow-y-auto px-4 py-4 md:px-6 md:py-6"
         data-testid="cinema-albums"
       >
@@ -2309,12 +1944,12 @@ useEventListener(window, 'keydown', onKey)
 
         <div
           v-if="cinemaAlbums.length === 0 && cinemaAlbumsSkeleton"
-          class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+          class="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-3"
         >
-          <div v-for="i in 6" :key="i">
-            <div class="skeleton aspect-video rounded-xl" />
-            <div class="skeleton mt-2 h-3 w-3/4 rounded" />
-            <div class="skeleton mt-1.5 h-2.5 w-1/3 rounded" />
+          <div v-for="i in 12" :key="i">
+            <div class="skeleton aspect-[4/3] rounded-lg" />
+            <div class="skeleton mt-1.5 h-3 w-2/3 rounded" />
+            <div class="skeleton mt-1 h-2.5 w-1/2 rounded" />
           </div>
         </div>
 
@@ -2351,13 +1986,13 @@ useEventListener(window, 'keydown', onKey)
 
         <div
           v-else
-          class="fade-in grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
+          class="fade-in grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-3"
         >
           <button
             v-for="album in cinemaAlbums"
             :key="album.path"
             type="button"
-            class="group text-left"
+            class="group min-w-0 text-left"
             :data-cinema-album="album.name"
             :title="cinemaAlbumLabel(album)"
             @click="openCinemaCard(album)"
@@ -2368,41 +2003,39 @@ useEventListener(window, 'keydown', onKey)
             @touchcancel="folderPress.cancel"
           >
             <div
-              class="relative aspect-video overflow-hidden rounded-xl border border-line"
+              class="relative grid aspect-[4/3] place-items-center overflow-hidden rounded-lg border border-line bg-elevated"
               :style="{ backgroundColor: cinemaAlbumColor(album) }"
             >
               <img
                 v-if="cinemaAlbumHash(album)"
                 :src="cinemaAlbumHash(album)!"
-                class="absolute inset-0 size-full scale-110 object-cover blur-md"
+                class="absolute inset-0 size-full scale-110 object-cover opacity-60 blur-md"
                 aria-hidden="true"
                 alt=""
               />
               <img
                 v-if="album.cover && !cinemaCoverFailed.has(album.path)"
                 :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
-                class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                class="absolute inset-0 size-full object-cover opacity-35 transition-opacity duration-300 group-hover:opacity-50"
                 loading="lazy"
                 alt=""
                 @error="markCinemaCoverFailed(album.path)"
               />
-              <span v-else class="relative grid size-full place-items-center text-white/60">
-                <AppIcon name="video" :size="26" />
-              </span>
-              <span class="absolute inset-0 grid place-items-center">
-                <span
-                  class="grid size-9 place-items-center rounded-full bg-black/50 text-white backdrop-blur transition-transform group-hover:scale-110"
-                >
-                  <AppIcon name="play" :size="15" />
-                </span>
+              <span
+                class="relative grid size-9 place-items-center rounded-lg bg-black/25 text-white/90 backdrop-blur-sm"
+              >
+                <AppIcon name="folder" :size="18" />
               </span>
               <span
-                class="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
+                class="absolute right-1 bottom-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white backdrop-blur"
               >
                 {{ t('gallery.cinema.albumItems', { count: album.count }) }}
               </span>
             </div>
-            <p class="mt-2 truncate text-sm font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
+            <p class="mt-1.5 truncate text-[13px] font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
+            <p v-if="folderPathHint(album)" class="truncate text-[11px] text-muted">
+              {{ folderPathHint(album) }}
+            </p>
           </button>
         </div>
 
@@ -2417,129 +2050,6 @@ useEventListener(window, 'keydown', onKey)
         >
           {{ t('gallery.toolbar.allLoaded') }}
         </p>
-      </div>
-
-      <!-- 分层浏览（v4.6.16）：从挂载根逐层进入，每层 = 子文件夹卡片 + 该层直接包含的影片 -->
-      <div
-        v-else-if="cinemaView === 'folders' && cinemaBrowse === 'layered'"
-        class="h-full overflow-y-auto"
-        data-testid="cinema-layered"
-      >
-        <div class="sticky top-0 z-10 flex items-center gap-1 border-b border-line/60 bg-base/85 px-4 py-2 text-xs backdrop-blur md:px-6">
-          <template v-for="(crumb, index) in layerCrumbs(cinemaLayer.path)" :key="String(crumb.path)">
-            <span v-if="index > 0" class="text-muted">/</span>
-            <button
-              v-if="index < layerCrumbs(cinemaLayer.path).length - 1"
-              class="max-w-[160px] truncate rounded px-1 py-0.5 text-muted transition-colors hover:bg-elevated hover:text-ink"
-              @click="loadLayer(cinemaLayer, 'video', crumb.path)"
-            >
-              {{ crumb.label }}
-            </button>
-            <span v-else class="max-w-[200px] truncate font-medium text-ink">{{ crumb.label }}</span>
-          </template>
-        </div>
-
-        <div class="px-4 py-4 md:px-6">
-          <div v-if="cinemaLayer.loading" class="grid place-items-center py-16">
-            <span class="size-5 animate-spin rounded-full border-2 border-line border-t-accent" />
-          </div>
-          <div v-else-if="cinemaLayer.error" class="grid place-items-center gap-3 py-16 text-center">
-            <p class="text-sm text-ink">{{ cinemaLayer.error }}</p>
-            <button
-              class="rounded-md border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:bg-elevated"
-              data-testid="cinema-layered-retry"
-              @click="loadLayer(cinemaLayer, 'video', cinemaLayer.path, true)"
-            >
-              {{ t('gallery.toolbar.retry') }}
-            </button>
-          </div>
-          <template v-else>
-            <div
-              v-if="cinemaLayer.albums.length"
-              class="mb-6 grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
-              data-testid="cinema-layered-folders"
-            >
-              <button
-                v-for="album in cinemaLayer.albums"
-                :key="album.path"
-                type="button"
-                class="group text-left"
-                :title="cinemaAlbumLabel(album)"
-                @click="openLayerFolder(cinemaLayer, 'video', album)"
-                @contextmenu.prevent="openFolderMenu($event, album, 'cinema')"
-                @touchstart.passive="folderPress.start($event, { album, context: 'cinema' })"
-                @touchmove.passive="folderPress.move"
-                @touchend="folderPress.cancel"
-                @touchcancel="folderPress.cancel"
-              >
-                <div
-                  class="relative aspect-video overflow-hidden rounded-xl border border-line"
-                  :style="{ backgroundColor: cinemaAlbumColor(album) }"
-                >
-                  <img
-                    v-if="cinemaAlbumHash(album)"
-                    :src="cinemaAlbumHash(album)!"
-                    class="absolute inset-0 size-full scale-110 object-cover blur-md"
-                    aria-hidden="true"
-                    alt=""
-                  />
-                  <img
-                    v-if="album.cover && !cinemaCoverFailed.has(album.path)"
-                    :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
-                    class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-                    loading="lazy"
-                    alt=""
-                    @error="markCinemaCoverFailed(album.path)"
-                  />
-                  <span v-else class="relative grid size-full place-items-center text-white/60">
-                    <AppIcon name="video" :size="26" />
-                  </span>
-                  <span class="absolute inset-0 grid place-items-center">
-                    <span
-                      class="grid size-9 place-items-center rounded-full bg-black/50 text-white backdrop-blur transition-transform group-hover:scale-110"
-                    >
-                      <AppIcon name="play" :size="15" />
-                    </span>
-                  </span>
-                  <span
-                    class="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white backdrop-blur"
-                  >
-                    {{ t('gallery.cinema.albumItems', { count: album.count }) }}
-                  </span>
-                </div>
-                <p class="mt-2 truncate text-sm font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
-              </button>
-            </div>
-
-            <div
-              v-if="cinemaLayer.items.length"
-              class="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 pb-2 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
-              data-testid="cinema-layered-items"
-            >
-              <VideoCard
-                v-for="video in cinemaLayer.items"
-                :key="video.path"
-                :video="video"
-                :favorite="isFavorite(video.path)"
-                :resume-at="resumeAt(video.path)"
-                @play="playing = video"
-                @menu="openMediaMenu($event, video, 'cinema')"
-                @favorite="toggleFavorite(video)"
-              />
-            </div>
-            <div
-              v-if="!cinemaLayer.albums.length && !cinemaLayer.items.length"
-              class="grid place-items-center py-16 text-center"
-            >
-              <p class="text-sm text-muted">{{ t('gallery.cinema.folderEmpty') }}</p>
-            </div>
-          </template>
-          <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
-            <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
-            {{ t('gallery.toolbar.loadingMore') }}
-          </div>
-          <div v-if="cinemaLayer.albumHasMore || cinemaLayer.itemHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
-        </div>
       </div>
 
       <!-- 全部影片（v4.6.16）：不分文件夹的媒体流，分组维度可选 -->
