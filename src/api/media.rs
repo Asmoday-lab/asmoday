@@ -1051,39 +1051,23 @@ const SKIP_DIRS: &[&str] = &[
     "thumbnails",
 ];
 
-/// 找同目录同名外挂字幕：优先 .vtt，其次 .srt
-fn find_subtitle(video: &Path) -> Option<String> {
+/// 从**目录清单**里找同名字幕，不再逐条 `is_file`（v4.9.9）。
+///
+/// `listings` 是 `目录 -> (小写文件名 -> 磁盘上的真实文件名)`。优先级与旧实现一致：
+/// `.vtt` 先于 `.srt`。
+fn subtitle_from_listing(
+    listings: &HashMap<PathBuf, HashMap<String, String>>,
+    video: &Path,
+) -> Option<String> {
+    let dir = video.parent()?;
+    let names = listings.get(dir)?;
+    let stem = video.file_stem()?.to_string_lossy().to_lowercase();
     for ext in ["vtt", "srt"] {
-        let candidate = video.with_extension(ext);
-        if candidate.is_file() {
-            return Some(fs::normalize_display(&candidate));
+        if let Some(actual) = names.get(&format!("{stem}.{ext}")) {
+            return Some(fs::normalize_display(&dir.join(actual)));
         }
     }
     None
-}
-
-/// 字幕探测的会话缓存（v4.7.0）：`is_file()` 在网盘上是一次真实 stat，
-/// 一页七个视频就是十几次往返（实测单次 200ms+）。同一路径 + mtime 只探一次。
-/// `路径 -> (mtime, 字幕展示路径)`
-type SubtitleCache = HashMap<PathBuf, (u64, Option<String>)>;
-
-static SUBTITLES: LazyLock<Mutex<SubtitleCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn find_subtitle_cached(video: &Path, mtime: u64) -> Option<String> {
-    if let Ok(cache) = SUBTITLES.lock()
-        && let Some((stamp, hit)) = cache.get(video)
-        && *stamp == mtime
-    {
-        return hit.clone();
-    }
-    let found = find_subtitle(video);
-    if let Ok(mut cache) = SUBTITLES.lock() {
-        if cache.len() >= 20_000 {
-            cache.clear();
-        }
-        cache.insert(video.to_path_buf(), (mtime, found.clone()));
-    }
-    found
 }
 
 /// ThumbHash → 平均色（#rrggbb）。解码失败就当没有，前端回退纯色。
@@ -1326,6 +1310,11 @@ pub(crate) fn sync_index(
             return Ok(0);
         }
         let started = std::time::Instant::now();
+        // 用户点「重新扫描」（Force）：连带清掉字幕缓存。给视频补了 .srt 之后
+        // 视频自身的 mtime 不变，不清负缓存就要等 7 天 TTL 才看得见。
+        if refresh {
+            media_index::subtitles_clear(conn);
+        }
         let scanned = walk_into_index(conn, root, &scope, refresh, cache)?;
         media_index::mark_synced(conn, &scope.root, depth)?;
         crate::log_debug!(
@@ -1839,18 +1828,82 @@ fn build_items(
         media_index::durations_put_many(conn, &borrowed);
     }
 
-    let video_jobs: Vec<(usize, PathBuf, u64)> = raw
+    // 外挂字幕（v4.9.9）：原先每条视频两次 `is_file`（.vtt / .srt）。4002 个视频
+    // 翻起来就是上万次 UNC stat，单次 200ms+。现在两级省：
+    //   1. 持久化缓存（`media_subtitles`，NULL = 确认没有字幕，负缓存也要存）；
+    //   2. miss 的按**目录**批量 `readdir`，一次枚举换掉该目录下所有视频的 stat。
+    let video_rows: Vec<(usize, String, PathBuf, u64)> = raw
         .iter()
         .enumerate()
         .filter(|(_, entry)| entry.kind == "video")
-        .map(|(position, entry)| (position, entry.path.clone(), entry.mtime))
+        .map(|(position, entry)| {
+            (
+                position,
+                entry.path.to_string_lossy().to_string(),
+                entry.path.clone(),
+                entry.mtime,
+            )
+        })
         .collect();
-    let subtitle_by_pos: HashMap<usize, Option<String>> =
-        run_parallel(video_jobs, |(position, path, mtime)| {
-            (position, find_subtitle_cached(&path, mtime))
+    let cached_subs: HashMap<String, Option<String>> = conn
+        .map(|conn| {
+            let borrowed: Vec<(&str, u64)> = video_rows
+                .iter()
+                .map(|(_, key, _, mtime)| (key.as_str(), *mtime))
+                .collect();
+            media_index::subtitles_get_many(conn, &borrowed)
+        })
+        .unwrap_or_default();
+
+    let mut subtitle_by_pos: HashMap<usize, Option<String>> = HashMap::new();
+    let mut pending_subs: Vec<(usize, String, PathBuf, u64)> = Vec::new();
+    for (position, key, path, mtime) in video_rows {
+        // 注意用 contains_key：值是 None 也是「查过了，没有字幕」
+        if cached_subs.contains_key(&key) {
+            subtitle_by_pos.insert(position, cached_subs.get(&key).cloned().flatten());
+        } else {
+            pending_subs.push((position, key, path, mtime));
+        }
+    }
+
+    if !pending_subs.is_empty() {
+        // 同一目录只枚举一次；一页 120 条视频通常散在几十个目录里
+        let mut dirs: Vec<PathBuf> = pending_subs
+            .iter()
+            .filter_map(|(_, _, path, _)| path.parent().map(Path::to_path_buf))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        let listings: HashMap<PathBuf, HashMap<String, String>> = run_parallel(dirs, |dir| {
+            let mut names: HashMap<String, String> = HashMap::new();
+            if let Ok(iter) = std::fs::read_dir(&dir) {
+                for entry in iter.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        // 小写做键、原名做值：Windows 大小写不敏感，但回给前端的
+                        // 路径必须是磁盘上真实的那个，否则字幕请求会 404
+                        names.insert(name.to_lowercase(), name.to_string());
+                    }
+                }
+            }
+            (dir, names)
         })
         .into_iter()
         .collect();
+
+        let mut fresh_subs: Vec<(String, u64, Option<String>)> = Vec::new();
+        for (position, key, path, mtime) in pending_subs {
+            let found = subtitle_from_listing(&listings, &path);
+            subtitle_by_pos.insert(position, found.clone());
+            fresh_subs.push((key, mtime, found));
+        }
+        if let Some(conn) = conn {
+            let borrowed: Vec<(&str, u64, Option<&str>)> = fresh_subs
+                .iter()
+                .map(|(path, mtime, sub)| (path.as_str(), *mtime, sub.as_deref()))
+                .collect();
+            media_index::subtitles_put_many(conn, &borrowed);
+        }
+    }
 
     if !tags_by_pos.is_empty() || !subtitle_by_pos.is_empty() {
         crate::log_debug!(

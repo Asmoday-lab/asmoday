@@ -230,8 +230,9 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
 /// - **v3** 目录快照缓存（`dir_snapshots`，见 `core/dir_cache.rs`）。
 /// - **v4** 媒体库快照（`media_snapshots`，带 size / mtime，见 `core/dir_cache.rs`）。
 /// - **v5** 媒体索引（`media_assets` / `media_dirs` / `media_roots`，见 `core/media_index.rs`）。
-/// - **v7** 音频时长缓存；**v8** 音频标签缓存（两者都按 `path+mtime+size` 失效）。
 /// - **v6** 名称排序键 `media_assets.sort_name`（自然序，v4.9.0）+ 触发一次索引重建。
+/// - **v7** 音频时长缓存；**v8** 音频标签缓存（按 `path+mtime+size` 失效）；
+///   **v9** 外挂字幕探测缓存（按 `path+mtime` 失效，NULL 表示「确认没有」）。
 ///
 /// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
 fn migrations() -> Migrations<'static> {
@@ -343,6 +344,19 @@ fn migrations() -> Migrations<'static> {
                 artist    TEXT,
                 album     TEXT,
                 has_cover INTEGER NOT NULL
+            );",
+        ),
+        // v9：外挂字幕探测缓存（v4.9.9）。影视库每页要为每条视频做两次 `is_file`
+        // （.vtt / .srt），4002 个视频翻起来就是上万次 UNC stat。
+        // `sub_path` 为 NULL 表示「查过了，没有字幕」—— 负缓存同样重要，
+        // 否则每次都要重新确认一遍「确实没有」。`checked_at` 给负缓存兜一个
+        // 保鲜期：用户后来补了 .srt，视频本身的 mtime 并不会变。
+        M::up(
+            "CREATE TABLE IF NOT EXISTS media_subtitles (
+                path       TEXT PRIMARY KEY,
+                mtime      INTEGER NOT NULL,
+                sub_path   TEXT,
+                checked_at INTEGER NOT NULL DEFAULT 0
             );",
         ),
     ])

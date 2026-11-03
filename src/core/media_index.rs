@@ -773,6 +773,76 @@ pub fn audio_missing_meta(conn: &Connection, limit: usize) -> Vec<(String, u64, 
     .unwrap_or_default()
 }
 
+/// 「确认没有字幕」这个结论的保鲜期（v4.9.9）。
+///
+/// 视频自己的 mtime 不会因为旁边多了一个 `.srt` 而变，所以负缓存必须有期限，
+/// 否则用户补字幕之后永远看不到。7 天是一次页面级 readdir 与新鲜度的折中。
+const NEGATIVE_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// 批量读外挂字幕缓存（v4.9.9）。
+///
+/// 返回 `路径 -> 字幕展示路径`；**值为 `None` 也是一条命中的记录**（负缓存：
+/// 这个视频确认过没有字幕）。调用方用 `contains_key` 判断「查过了」，不要用 `get`。
+pub fn subtitles_get_many(
+    conn: &Connection,
+    keys: &[(&str, u64)],
+) -> std::collections::HashMap<String, Option<String>> {
+    use std::collections::HashMap;
+    let mut hits = HashMap::new();
+    if keys.is_empty() {
+        return hits;
+    }
+    // 只认「有字幕」和「近期确认过没有」两种。负缓存过期后重探：用户后来补了
+    // .srt / .vtt，视频自身的 mtime 不会变，光靠 mtime 永远发现不了。
+    let fresh_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - NEGATIVE_TTL_SECS;
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT sub_path FROM media_subtitles
+         WHERE path = ?1 AND mtime = ?2 AND (sub_path IS NOT NULL OR checked_at >= ?3)",
+    ) else {
+        return hits;
+    };
+    for (path, mtime) in keys {
+        if let Ok(sub) = stmt.query_row(params![path, *mtime as i64, fresh_after], |row| {
+            row.get::<_, Option<String>>(0)
+        }) {
+            hits.insert((*path).to_string(), sub);
+        }
+    }
+    hits
+}
+
+/// 清空字幕缓存（用户点「重新扫描」时用，v4.9.9）。
+///
+/// 补了 `.srt` 之后视频自身的 mtime 不会变，不清掉负缓存就得等 TTL 过期。
+/// 表很小（每条一行），整表重探的代价是「每个目录一次 readdir」。
+pub fn subtitles_clear(conn: &Connection) {
+    let _ = conn.execute("DELETE FROM media_subtitles", []);
+}
+
+/// 写回字幕探测结果（`sub` 为 `None` 表示确认没有字幕）
+pub fn subtitles_put_many(conn: &Connection, rows: &[(&str, u64, Option<&str>)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let Ok(mut stmt) = conn.prepare_cached(
+        "INSERT OR REPLACE INTO media_subtitles (path, mtime, sub_path, checked_at)
+         VALUES (?1, ?2, ?3, ?4)",
+    ) else {
+        return;
+    };
+    for (path, mtime, sub) in rows {
+        let _ = stmt.execute(params![path, *mtime as i64, *sub, now]);
+    }
+}
+
 /// 批量读音频标签缓存（v4.9.8）。
 ///
 /// 音乐库列表一页 120 首，每首读一次 ID3 在 SMB/UNC 上要 0.5~1 秒 —— 6 路并发
