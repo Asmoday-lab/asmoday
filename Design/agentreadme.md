@@ -1660,7 +1660,8 @@ GWT-GAL-02 Given 时间线  When 切「按文件夹」  Then 分组头为目录�
 #### GWT 验收（挂载点配置与设置页，v4.6.17）
 
 ```
-GWT-CFG-01 Given [[system.mounts]] 只写 path  When 启动  Then name 由末段派生（/mnt/nas → nas、D:/ → D:、/ → Root、UNC/server/share → share）；两个末段同名的挂载点得到 "电影" 与 "电影 (2)"
+GWT-CFG-01 Given [[system.mounts]] 只写 path  When 启动  Then name 由末段派生（/mnt/nas → nas、D:/ → D:、/ → Root、//server/share → share）；两个末段同名的挂载点得到 "电影" 与 "电影 (2)"
+GWT-CFG-08 Given Windows 把网络驱动器挂成 Z:（或直接写 \\server\share）  When 读挂载点清单  Then path 是 //server/share（保住 UNC 锚点）；随后拿这个字符串列表根目录与子目录  Then 200，不再 E_PATH_TRAVERSAL / E_NOT_FOUND（v4.6.20）
 GWT-CFG-02 Given 两段配置指向同一目录（尾斜杠 / 反斜杠 / Windows 大小写差异）  When 保存或启动  Then 400/启动失败「path 重复」；显式 name 重复同样拒绝；name 留空不报错
 GWT-CFG-03 Given 父目录可写、其子目录单独挂载为只读  When WebDAV PUT 到 /dav/{父}/{子}/x  Then 403（按最长前缀判定只读，不再按 URL 段的挂载点放行）；同样的路径走 /dav/{子}/x 也是 403
 GWT-CFG-04 Given 启动日志  When 存在嵌套挂载  Then 输出 nested mount 告警（子、父的名称与路径），说明「经父挂载点访问按父的 flags」

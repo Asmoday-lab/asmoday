@@ -149,7 +149,7 @@ pub(crate) async fn resolve_upload_dir(
         && !roots
             .allowed
             .iter()
-            .any(|root| canonical_parent.starts_with(root))
+            .any(|root| path_guard::within(&canonical_parent, root))
         && !(roots.follow_symlinks && path_guard::escaped_via_symlink(&resolved, &roots.allowed))
     {
         return Err(fail_code(

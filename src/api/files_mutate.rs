@@ -132,7 +132,7 @@ fn check_symlink_target(path: &Path, root: &Path, follow_symlinks: bool) -> Resu
     }
     let canon = std::fs::canonicalize(path)
         .map_err(|_| FsError::SymlinkEscape("软链接目标不存在或无法解析，拒绝复制".to_string()))?;
-    if !follow_symlinks && !canon.starts_with(root) {
+    if !follow_symlinks && !crate::core::path_guard::within(&canon, root) {
         return Err(FsError::SymlinkEscape(format!(
             "软链接指向挂载点外：{}",
             fs::normalize_display(&canon)

@@ -286,7 +286,7 @@ async fn open_frame(
     // 游标是客户端输入，不是凭证：`rel` 里带 `..`、绝对路径或 Windows 盘符
     // （`C:` / UNC）都会让 `push` 整体替换前缀而逃出搜索根。拼完做一次词法
     // 归属断言——逃出就按「这一层已失效」处理（与目录被删同口径），绝不去读。
-    if !abs.starts_with(root) {
+    if !crate::core::path_guard::within(&abs, root) {
         return Err(FsError::Forbidden("搜索游标指向搜索根之外".to_string()));
     }
 

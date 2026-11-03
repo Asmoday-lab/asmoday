@@ -124,11 +124,7 @@ impl MountSet {
     pub fn mount_of(&self, canon_path: &Path) -> Option<&MountEntry> {
         self.mounts
             .iter()
-            .filter(|m| {
-                m.root
-                    .as_ref()
-                    .is_some_and(|root| canon_path.starts_with(root))
-            })
+            .filter(|m| m.root.as_ref().is_some_and(|root| within(canon_path, root)))
             .max_by_key(|m| m.root.as_ref().map(|r| r.as_os_str().len()).unwrap_or(0))
     }
 
@@ -321,6 +317,17 @@ fn lexical_inside(candidate: &Path, root: &Path) -> bool {
             .all(|(a, b)| same_segment(a, b))
 }
 
+/// 归属判定：`candidate` 是否落在 `root` 之下（两者都应是 `canonicalize` 的结果）。
+///
+/// **不能只用 `Path::starts_with`**：UNC 路径在 Windows 上有两种组件形态 ——
+/// `\\?\UNC\srv\share\`（Prefix + RootDir）与 `\\?\UNC\srv\share`（只有 Prefix），
+/// 取决于 canonicalize 拿到的是「带尾分隔符的根」还是「字面 UNC 路径」。
+/// 只差一个 RootDir 组件，`starts_with` 就会把**同一共享下的所有子路径**判成越权
+/// （整棵树点不开、报「路径不在挂载点内」）。段比较会丢掉空段，两种形态都认。
+pub fn within(candidate: &Path, root: &Path) -> bool {
+    candidate.starts_with(root) || lexical_inside(candidate, root)
+}
+
 /// 沿软链接链走到尽头（最多 32 跳），返回它**本应指向**的字面路径。
 ///
 /// 断链（终点不存在）时同样返回那个字面路径 —— 这正是用来堵「顺着悬空链接
@@ -382,7 +389,7 @@ pub fn resolve_existing(mount: &MountEntry, raw: &str) -> Result<PathBuf, FsErro
             "该路径属于应用数据目录，不对外开放".to_string(),
         ));
     }
-    if canon.starts_with(root) {
+    if within(&canon, root) {
         return Ok(canon);
     }
     if mount.info.follow_symlinks && escaped_via_symlink_in(&candidate, root) {
@@ -417,7 +424,7 @@ pub fn resolve_existing_nofollow(mount: &MountEntry, raw: &str) -> Result<PathBu
             "该路径属于应用数据目录，不对外开放".to_string(),
         ));
     }
-    if !parent_canon.starts_with(root) {
+    if !within(&parent_canon, root) {
         // 父目录经软链接逃出挂载点：配置允许时继续按**链接前缀**寻址
         // （最后一段仍不跟随，删除/重命名作用于链接路径本身指向的条目）。
         if mount.info.follow_symlinks && escaped_via_symlink_in(parent, root) {
@@ -448,7 +455,7 @@ pub fn resolve_child(mount: &MountEntry, parent: &str, name: &str) -> Result<Pat
             "该目录属于应用数据目录，不对外开放".to_string(),
         ));
     }
-    if !parent_canon.starts_with(root) {
+    if !within(&parent_canon, root) {
         if mount.info.follow_symlinks
             && escaped_via_symlink_in(&parent_raw, root)
             && parent_canon.is_dir()
@@ -839,10 +846,31 @@ mod tests {
         assert_eq!(mount_name(None, "D:/Media"), "Media");
         assert_eq!(mount_name(None, "D:/"), "D:");
         assert_eq!(mount_name(None, "/"), "Root");
-        assert_eq!(mount_name(None, "UNC/server/share"), "share");
+        assert_eq!(mount_name(None, "//server/share"), "share");
         assert_eq!(mount_name(Some(" 我的电影 "), "/mnt/nas"), "我的电影");
         // 空白等同未填，不写进 UI
         assert_eq!(mount_name(Some("   "), "/mnt/nas"), "nas");
+    }
+
+    /// UNC 共享根的两种组件形态（带 / 不带尾分隔符）必须都认子路径。
+    ///
+    /// Windows 实测：`canonicalize("Z:/")` → `\\?\UNC\srv\share\`（Prefix + RootDir），
+    /// 而 `canonicalize("\\srv\share")` → `\\?\UNC\srv\share`（只有 Prefix）。
+    /// 后者配 `Path::starts_with` 会把共享下**每个**子目录判成越权。
+    #[test]
+    fn within_accepts_both_unc_root_shapes() {
+        let with_root = Path::new(r"\\?\UNC\srv\share\");
+        let bare_root = Path::new(r"\\?\UNC\srv\share");
+        let child = Path::new(r"\\?\UNC\srv\share\dir\file.txt");
+
+        assert!(within(child, with_root));
+        assert!(within(child, bare_root));
+
+        // 只按段比较，不能放松到「同名前缀」或「同服务器其它共享」
+        assert!(!within(Path::new(r"\\?\UNC\srv\share2\dir"), bare_root));
+        assert!(!within(Path::new(r"\\?\UNC\srv\other\dir"), bare_root));
+        assert!(!within(Path::new(r"\\?\UNC\srv"), bare_root));
+        assert!(!within(bare_root, child));
     }
 
     #[test]

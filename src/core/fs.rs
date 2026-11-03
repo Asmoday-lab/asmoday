@@ -148,10 +148,21 @@ pub fn load_roots(config: &Config, cwd: &Path) -> RootSet {
 }
 
 /// 把原生路径转成展示用字符串（Windows 反斜杠统一成 `/`，去掉 `\\?\` 前缀）。
+///
+/// 逐字（verbatim）UNC 必须还原成 `//server/share`：`\\?\UNC\srv\share` 直接
+/// 剥前缀会得到 `UNC/srv/share` —— 丢了 `//` 锚点就成了**相对路径**，前端拿它
+/// 回传（列表、缩略图、下载全靠这个字符串）必然 404。网络驱动器挂上之后
+/// 「能进挂载点、点任何目录都报路径不存在」就是这个形态造成的（2026-11-03）。
 pub fn normalize_display(path: &Path) -> String {
-    let text = path.to_string_lossy().to_string();
-    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
-    text.replace('\\', "/")
+    let raw = path.to_string_lossy().to_string();
+    let Some(rest) = raw.strip_prefix(r"\\?\") else {
+        return raw.replace('\\', "/");
+    };
+    // `\\?\UNC\` 换成 `//`，其余（`\\?\C:\`）照旧只换分隔符
+    match rest.strip_prefix(r"UNC\") {
+        Some(tail) => format!("//{}", tail.replace('\\', "/")),
+        None => rest.replace('\\', "/"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +231,10 @@ fn ensure_not_reserved(path: &Path) -> Result<(), FsError> {
 
 /// 第二道闸：真实路径必须落在允许根之内。
 fn ensure_within(canon: &Path, allowed: &[PathBuf]) -> Result<(), FsError> {
-    if allowed.iter().any(|root| canon.starts_with(root)) {
+    if allowed
+        .iter()
+        .any(|root| crate::core::path_guard::within(canon, root))
+    {
         Ok(())
     } else {
         Err(FsError::Forbidden("该路径不在已授权的挂载点内".to_string()))
@@ -479,7 +493,7 @@ async fn build_entry(
             .map(|target| target.to_string_lossy().into_owned());
         let resolved = tokio::fs::canonicalize(&full).await.ok().and_then(|canon| {
             let inside = mount_root.is_none_or(|root| {
-                canon.starts_with(root)
+                crate::core::path_guard::within(&canon, root)
                     || (follow_symlinks
                         && crate::core::path_guard::escaped_via_symlink_in(&full, root))
             });
@@ -988,6 +1002,27 @@ mod tests {
 
     fn allowed_unused() -> Result<(), FsError> {
         Ok(())
+    }
+
+    /// 展示路径必须保住 UNC 锚点：`\\?\UNC\srv\share` → `//srv/share`。
+    /// 变成 `UNC/srv/share`（相对路径）会让前端回传的每个路径都 404。
+    #[test]
+    fn display_keeps_unc_anchor() {
+        assert_eq!(
+            normalize_display(Path::new(r"\\?\UNC\srv\share")),
+            "//srv/share"
+        );
+        assert_eq!(
+            normalize_display(Path::new(r"\\?\UNC\srv\share\dir\x.txt")),
+            "//srv/share/dir/x.txt"
+        );
+        assert_eq!(
+            normalize_display(Path::new(r"\\?\UNC\srv\share\")),
+            "//srv/share/"
+        );
+        // 普通盘符 / 非 verbatim 路径的原有形态不变
+        assert_eq!(normalize_display(Path::new(r"\\?\C:\Media")), "C:/Media");
+        assert_eq!(normalize_display(Path::new("/mnt/nas")), "/mnt/nas");
     }
 
     #[test]
