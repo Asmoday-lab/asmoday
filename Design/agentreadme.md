@@ -1658,7 +1658,7 @@ GWT-GAL-05 Given 图片库「按文件夹」  Then 卡片是封面铺满 + 名�
 GWT-GAL-06 Given 图片库「按文件夹」  When 点排序下拉切「按修改日期」  Then 列表按册内最新图时间重排，游标作废从第一页重取；Given 顶栏  Then 只有视图切换、分组、排序与「更多」，重新扫描/收藏筛选/原生播放器/分页进度都在「更多」里
 GWT-GAL-07 Given 库里有 10698 张图  When 打开图片库  Then 首屏只取 120 条（时间线/相册同口径），触底续接；Given 文件管理打开 1030 条的目录  Then 单页 200 条 + has_more，可直接续到底
 GWT-GAL-08 Given 两万条媒体的库（v4.7.0）  When 连续翻页/切分区/进文件夹墙  Then 只有第一页走一次目录树，其余请求走 SQLite 索引（`scanned=0`，同页再取 <1s）；When 点「重新扫描」（`refresh=1`）  Then 立刻穿透窗口重扫
-GWT-GAL-10 Given 配置里新增（或热重载）一个挂载点（v4.8.0）  When 后台轮询跑到下一轮（默认 300 秒内）  Then 该挂载点自动建好索引，第一次打开 `scanned=0`；Given 外部往已索引目录拷进文件  When 一个轮询周期后  Then 请求能查到且 `scanned=0`；Given 首轮预建正在进行  When 同时登录 / 浏览别的挂载点  Then 不被写锁阻塞（读盘在事务外，写事务只覆盖 `DELETE`+`INSERT`）
+GWT-GAL-11 Given 索引里已有 A 挂载点的目录行（v4.8.1）  When 配置改成 B（A 从配置里消失）且后台跑到下一轮  Then A 的 `media_dirs` / `media_assets` / `media_roots` 全部清掉，接口只返回 B；Given 用户改完挂载点回到图片库  Then 相册墙不再贴上一帧的旧库目录（切视图即刷新，快照挂载点指纹不符就作废）；Given 所有挂载点暂时离线  When 后台轮询跑到  Then 不清索引（等网络恢复）
 GWT-GAL-09 Given 库里有 17800 图 / 4002 视频 / 96 音频  When 打开图片库首屏  Then `counts` 三类总数与 `total`（当前 kind 之和）一致，时间线按 mtime 倒序、同 mtime 用路径升序，翻到最后一页不重不漏
 GWT-GAL-02 Given 时间线  When 切「按文件夹」  Then 分组头为目录名且年份刻度隐藏；When 滚动  Then 右侧年份刻度跟随高亮，点年份跳到该年第一天，窄屏（<md）不显示刻度。Given 影视库  Then 默认落「全部影片」按天分段 + 等高行（16:9），与照片库同一套布局，触底续接走同一条分页流
 GWT-GAL-03 Given 照片时间线/相册网格（冷缓存）  When 首屏渲染  Then 缩略图请求按 DOM 行序发出（并发 6），前排先出图，不会「东一块西一块」随机亮；滚到密集日期  Then 下一批请求仍按行序；When 服务端解码队列打满  Then 回 503 + Retry-After，前端退避重试，最终可见格子全部出图（不留永久灰块）

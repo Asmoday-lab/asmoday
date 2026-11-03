@@ -527,7 +527,9 @@ function setPhotoView(view: PhotoView) {
   photoView.value = view
   localStorage.setItem(PHOTO_VIEW_KEY, view)
   closeAlbum()
-  if (view === 'albums' && albums.value.length === 0) void loadAlbums()
+  // 切到文件夹墙一律静默刷新（v4.8.1）：快照只保证第一帧有东西看，
+  // 但不能拿它当答案 —— 换挂载点后旧相册会一直赖着不走。
+  if (view === 'albums') void loadAlbums()
 }
 
 // ---------------- 分组选择（v4.6.16，v4.6.18 收敛铺法） ----------------
@@ -563,7 +565,10 @@ function setCinemaView(view: 'folders' | 'videos') {
   if (cinemaView.value === view) return
   cinemaView.value = view
   localStorage.setItem('asmoday.cinema.view.v2', view)
-  if (view === 'folders') closeCinemaAlbum()
+  if (view === 'folders') {
+    closeCinemaAlbum()
+    void loadCinemaAlbums()
+  }
 }
 
 function setPhotoGroup(group: GroupBy) {
@@ -1408,6 +1413,11 @@ async function load(options: { refresh?: boolean } = {}) {
   if (silent) refreshing.value = true
   else loading.value = true
   error.value = ''
+  // 文件夹墙 / 影视墙与时间线**并行**发起（v4.8.1）。以前排在 `browseMedia` 之后，
+  // NAS 上时间线要走两分钟的树，用户切到「文件夹」就一直盯着上一帧的旧相册
+  // ——「换了挂载点还显示旧目录」最直接的来源就是这个先后顺序。
+  if (tab.value === 'photos') void loadAlbums(options.refresh)
+  if (tab.value === 'cinema') void loadCinemaAlbums(options.refresh)
   try {
     const result = await browseMedia(undefined, 'media', 2, {
       limit: PAGE_SIZE,
@@ -1425,16 +1435,9 @@ async function load(options: { refresh?: boolean } = {}) {
     hasMore.value = result.has_more && Boolean(result.next_cursor)
     hasContent.value = true
     saveMediaSnapshot()
-    // 照片库同时刷新文件夹清单（后端会剔除空目录）
-    if (tab.value === 'photos') {
-      closeAlbum()
-      void loadAlbums(options.refresh)
-    }
-    // 影视库同构：进页面就把文件夹卡片拉出来
-    if (tab.value === 'cinema') {
-      closeCinemaAlbum()
-      void loadCinemaAlbums(options.refresh)
-    }
+    // 刷新时间线时退出已打开的册（数据可能整批变了）
+    if (tab.value === 'photos') closeAlbum()
+    if (tab.value === 'cinema') closeCinemaAlbum()
   } catch (err) {
     const message = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
     // 有旧内容就只提示：让用户继续看已经加载好的部分，别把屏幕清空
@@ -1514,6 +1517,8 @@ interface MediaSnapshot {
   counts: KindCounts
   nextCursor: string | null
   hasMore: boolean
+  /** 保存时的挂载点集合指纹（v4.8.1）：对不上说明换了库，这一帧必须作废 */
+  mounts?: string
 }
 
 interface AlbumsSnapshot {
@@ -1521,11 +1526,31 @@ interface AlbumsSnapshot {
   total: number
   cursor: string | null
   hasMore: boolean
+  mounts?: string
 }
 
 const MEDIA_SNAPSHOT_KEY = 'gallery:media'
 const ALBUMS_SNAPSHOT_KEY = 'gallery:albums:image'
 const CINEMA_ALBUMS_SNAPSHOT_KEY = 'gallery:albums:video'
+
+/**
+ * 挂载点集合指纹：排序后的路径拼一串。
+ *
+ * 快照只对「同一套挂载点」有意义。改了挂载点后如果还贴上一帧，用户看到的就是
+ * 别的库的目录（v4.8.1 反馈：换了挂载点图片库仍显示旧相册）。挂载点清单还没
+ * 拉回来时返回空串 —— 那表示「还不知道」，不参与判定。
+ */
+function mountsSignature(): string {
+  return mounts.value
+    .map((mount) => mount.path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase())
+    .sort()
+    .join('|')
+}
+
+/** 保存快照时记下当时的挂载点指纹（列表为空说明还没拉到，留空不判定） */
+function currentSignature(): string | undefined {
+  return mountsSignature() || undefined
+}
 
 function saveMediaSnapshot() {
   writeCache(MEDIA_SNAPSHOT_KEY, {
@@ -1535,6 +1560,7 @@ function saveMediaSnapshot() {
     counts: counts.value,
     nextCursor: nextCursor.value,
     hasMore: hasMore.value,
+    mounts: currentSignature(),
   } satisfies MediaSnapshot)
 }
 
@@ -1544,6 +1570,7 @@ function saveAlbumsSnapshot() {
     total: albumsTotal.value,
     cursor: albumsCursor.value,
     hasMore: albumsHasMore.value,
+    mounts: currentSignature(),
   } satisfies AlbumsSnapshot)
 }
 
@@ -1553,8 +1580,12 @@ function saveCinemaAlbumsSnapshot() {
     total: cinemaAlbumsTotal.value,
     cursor: cinemaAlbumsCursor.value,
     hasMore: cinemaAlbumsHasMore.value,
+    mounts: currentSignature(),
   } satisfies AlbumsSnapshot)
 }
+
+/** 上一帧快照属于哪套挂载点（`undefined` = 快照里没记 / 还没拉到清单，不判定） */
+let snapshotMounts: string | undefined
 
 /** 有上一帧就贴上去并返回 true；此时 `loading` 保持 false，骨架整屏不出现 */
 function seedFromCache(): boolean {
@@ -1562,6 +1593,7 @@ function seedFromCache(): boolean {
   const photos = readCache<AlbumsSnapshot>(ALBUMS_SNAPSHOT_KEY)
   const cinema = readCache<AlbumsSnapshot>(CINEMA_ALBUMS_SNAPSHOT_KEY)
   if (!media && !photos && !cinema) return false
+  snapshotMounts = media?.mounts ?? photos?.mounts ?? cinema?.mounts
 
   if (media) {
     items.value = media.items
@@ -1591,6 +1623,19 @@ function seedFromCache(): boolean {
   return true
 }
 
+/** 作废上一帧（挂载点变了，画面里那些目录已经不属于当前库） */
+function dropSnapshots() {
+  writeCache(MEDIA_SNAPSHOT_KEY, null)
+  writeCache(ALBUMS_SNAPSHOT_KEY, null)
+  writeCache(CINEMA_ALBUMS_SNAPSHOT_KEY, null)
+  items.value = []
+  albums.value = []
+  cinemaAlbums.value = []
+  loadedPaths.clear()
+  hasContent.value = false
+  snapshotMounts = undefined
+}
+
 async function loadLibraryState() {
   try {
     const [favPaths, history] = await Promise.all([libraryApi.favorites(), libraryApi.history()])
@@ -1618,10 +1663,19 @@ onMounted(() => {
   seedFromCache()
   void load()
   void loadLibraryState()
-  // 挂载点清单只为「只读挂载点要把变更项置灰」服务，拉失败不影响浏览
+  // 挂载点清单：既给「只读挂载点置灰」用，也用来判断上一帧是不是别的库的
   void filesApi
     .mounts()
-    .then((data) => (mounts.value = data.mounts))
+    .then((data) => {
+      mounts.value = data.mounts
+      const live = mountsSignature()
+      // 挂载点集合变了（v4.8.1）：快照属于上一套挂载点，立刻作废并重拉。
+      // 否则用户改完配置回来，看到的还是旧挂载点的目录，直到时间线扫完才换。
+      if (snapshotMounts && live && snapshotMounts !== live) {
+        dropSnapshots()
+        void load()
+      }
+    })
     .catch(() => {})
 })
 

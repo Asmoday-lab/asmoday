@@ -284,6 +284,76 @@ pub fn prune(
     Ok(removed)
 }
 
+/// `path` 是否落在 `root` 下面（含根本身）。
+///
+/// 段边界必须严格：`/mnt/a` 不能吃掉 `/mnt/ab`。Windows 盘符与 UNC 都不区分大小写，
+/// 而展示串统一用 `/`，所以这里只做「忽略大小写的前缀 + 段边界」判定。
+fn under(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    // 用 `get` 而不是直接切字节：中文目录名在字节中途截断会 panic
+    let Some(head) = path.get(..root.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(root) {
+        return false;
+    }
+    matches!(path.as_bytes().get(root.len()), None | Some(b'/'))
+}
+
+/// 丢掉不属于任何当前挂载点的索引行（v4.8.1）。
+///
+/// 换挂载点之后旧根的 `media_assets` / `media_dirs` / `media_roots` 没人清：查询按
+/// root 前缀过滤，旧行不会串进新视图，但它们会永久占库；更糟的是配置回落到
+/// 「挂载点全部离线 → cwd 隐式根」时，上一次挂载留下的相册会原样冒出来
+/// （2026-11-03「换了挂载点图片库还显示旧目录」就是这个 + 前端快照）。
+pub fn retain_roots(conn: &Connection, keep: &[String]) -> rusqlite::Result<usize> {
+    let keep: Vec<String> = keep
+        .iter()
+        .map(|root| root.trim_end_matches('/').to_string())
+        .filter(|root| !root.is_empty())
+        .collect();
+
+    let mut stmt = conn.prepare("SELECT dir FROM media_dirs")?;
+    let dirs: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut stmt = conn.prepare("SELECT root FROM media_roots")?;
+    let roots: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let tx = conn.unchecked_transaction()?;
+    let mut removed = 0usize;
+    for dir in dirs {
+        if keep.iter().any(|root| under(root, &dir)) {
+            continue;
+        }
+        forget_dir(&tx, &dir)?;
+        removed += 1;
+    }
+    for root in roots {
+        let stale = !keep
+            .iter()
+            .any(|keep| keep.eq_ignore_ascii_case(root.trim_end_matches('/')));
+        if stale {
+            tx.execute("DELETE FROM media_roots WHERE root = ?1", params![root])?;
+        }
+    }
+    // 目录行没了、条目还在的孤儿（旧版本 forget_dir 只删一头的残留）
+    tx.execute(
+        "DELETE FROM media_assets WHERE dir NOT IN (SELECT dir FROM media_dirs)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(removed)
+}
+
 /// 作用域内各类型总数 `(image, video, audio)`：不受 `kind` 过滤影响
 pub fn totals(conn: &Connection, scope: &Scope) -> rusqlite::Result<(usize, usize, usize)> {
     let sql = format!(
@@ -815,6 +885,59 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn retain_roots_drops_stale_mounts() {
+        let index = index("retain");
+        index
+            .with_conn(|conn| {
+                replace_dir(
+                    conn,
+                    "//srv/share/Photos",
+                    3,
+                    1,
+                    &[asset("//srv/share/Photos", "a.jpg", 10)],
+                )?;
+                mark_synced(conn, "//srv/share/", 3)?;
+                // 换掉的旧挂载点：换完之后这棵树再也不会有请求走到
+                replace_dir(
+                    conn,
+                    "C:/old/examples",
+                    4,
+                    1,
+                    &[asset("C:/old/examples", "b.jpg", 20)],
+                )?;
+                mark_synced(conn, "C:/old", 3)?;
+
+                assert_eq!(
+                    retain_roots(conn, &["//srv/share/".to_string()])?,
+                    1,
+                    "旧根整棵清掉，当前根一行不动"
+                );
+                let (image, _, _) = totals(conn, &Scope::new("//srv/share", 2))?;
+                assert_eq!(image, 1);
+                let (stale, _, _) = totals(conn, &Scope::new("C:/old", 3))?;
+                assert_eq!(stale, 0, "旧挂载点的条目不能留着");
+                assert_eq!(synced(conn, "C:/old")?, None, "废弃根的新鲜窗口也要删");
+                assert!(synced(conn, "//srv/share/")?.is_some());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn retain_roots_respects_segment_boundaries() {
+        assert!(under("/mnt/a", "/mnt/a"));
+        assert!(under("/mnt/a/", "/mnt/a/b.jpg"));
+        assert!(!under("/mnt/a", "/mnt/ab"), "段边界不能靠字符串前缀");
+        // 盘符根与 UNC 都按忽略大小写比：Windows 上 `Z:/` 与 `z:/` 是同一个盘
+        assert!(under("C:/", "C:/Users"));
+        assert!(under("c:/", "C:/Users"));
+        assert!(!under("", "/data"));
+        // 中文目录名：按字节切会在多字节字符中间断开，必须走 `get`
+        assert!(under("/媒体/照片", "/媒体/照片/a.jpg"));
+        assert!(!under("/媒体", "/媒"), "短路径不能被当成前缀命中");
     }
 
     #[test]

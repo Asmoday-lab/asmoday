@@ -724,18 +724,47 @@ fn spawn_media_indexer(state: AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         loop {
-            let (interval, mounts) = {
+            let (interval, mounts, keep) = {
                 let config = state.config.read().await;
-                (
-                    config.media.index_scan_interval_secs,
-                    config
-                        .system
-                        .mounts
-                        .iter()
-                        .map(|mount| resolve_mount_root(&mount.path))
-                        .collect::<Vec<_>>(),
-                )
+                let mounts = config
+                    .system
+                    .mounts
+                    .iter()
+                    .map(|mount| resolve_mount_root(&mount.path))
+                    .collect::<Vec<_>>();
+                let mut keep: Vec<String> = mounts
+                    .iter()
+                    .map(|path| core::fs::normalize_display(path))
+                    .collect();
+                if keep.is_empty() {
+                    // 没有显式挂载点时浏览落回 cwd（path_guard::load 的隐式根），
+                    // 索引也得认它，否则第一轮就把自己刚建的树清掉
+                    keep.push(core::fs::normalize_display(&state.cwd));
+                }
+                (config.media.index_scan_interval_secs, mounts, keep)
             };
+
+            // 清掉不属于当前挂载点的旧行（v4.8.1）。换挂载点之后旧根再也走不到，
+            // 目录 / 条目 / 新鲜窗口全是永久垃圾；一旦配置回落到「全部离线 → cwd
+            // 隐式根」，上一次挂载留下的相册就会冒出来（2026-11-03 的反馈）。
+            // 全离线时一律不清：那通常只是网络还没起来，清掉等于把索引白扔。
+            if mounts.iter().any(|path| path.is_dir()) {
+                let prune_index = Arc::clone(&index);
+                let prune_keep = keep.clone();
+                let removed = tokio::task::spawn_blocking(move || {
+                    prune_index
+                        .with_conn(|conn| core::media_index::retain_roots(conn, &prune_keep))
+                        .unwrap_or(0)
+                })
+                .await
+                .unwrap_or(0);
+                if removed > 0 {
+                    crate::log_info!(
+                        "media index garbage-collected: {} stale dir(s) left over from old mounts",
+                        removed
+                    );
+                }
+            }
 
             if interval > 0 && !mounts.is_empty() {
                 let mount_count = mounts.len();
