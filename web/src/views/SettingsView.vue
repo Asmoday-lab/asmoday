@@ -17,7 +17,12 @@ import PasswordInput from '../components/PasswordInput.vue'
 import type { IconName } from '../components/icons'
 import { authApi } from '../api/auth'
 import { cacheApi, type CacheStats } from '../api/media'
-import { systemApi, type FfmpegInfo, type FfmpegSource } from '../api/system'
+import {
+  systemApi,
+  type FfmpegInfo,
+  type FfmpegSource,
+  type PreheatStatus,
+} from '../api/system'
 import { ApiError, readApiError } from '../lib/errors'
 import { filesApi, type MountPoint } from '../api/files'
 import { APP_BASE } from '../lib/base'
@@ -119,6 +124,54 @@ const rawLoading = ref(false)
 const rawDirty = ref(false)
 
 // ---------------- 媒体：缓存 + FFmpeg ----------------
+// 预生成缩略图（v4.9.11）：把最近 N 天的图片提前渲好，图片库就不再每张都等网盘
+const preheat = ref<PreheatStatus | null>(null)
+const preheatBusy = ref(false)
+let preheatTimer: number | null = null
+
+const preheatRunning = computed(() => preheat.value?.is_running === true)
+const preheatPercent = computed(() => {
+  const status = preheat.value
+  if (!status || status.total === 0) return 0
+  return Math.min(100, Math.round((status.completed / status.total) * 100))
+})
+
+async function refreshPreheat() {
+  try {
+    preheat.value = await systemApi.preheatStatus()
+  } catch {
+    // 网络抖动不打扰用户，下一轮再试
+  }
+  if (preheat.value?.is_running) {
+    preheatTimer ??= window.setTimeout(() => {
+      preheatTimer = null
+      void refreshPreheat()
+    }, 1500)
+  }
+}
+
+async function startPreheat() {
+  if (preheatBusy.value) return
+  preheatBusy.value = true
+  try {
+    await systemApi.preheatStart()
+    await refreshPreheat()
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('settings.media.preheatFailed'))
+  } finally {
+    preheatBusy.value = false
+  }
+}
+
+async function stopPreheat() {
+  try {
+    await systemApi.preheatStop()
+    await refreshPreheat()
+  } catch {
+    // 停止失败无所谓：worker 下一张之前还会再查一次标志
+  }
+}
+
 const cache = ref<CacheStats | null>(null)
 const cacheBusy = ref(false)
 const ffmpeg = ref<FfmpegInfo | null>(null)
@@ -703,6 +756,7 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onBeforeRouteLeave(() => !unsavedConfig.value || window.confirm(t('settings.advanced.unsavedLeave')))
 
 onMounted(() => {
+  void refreshPreheat()
   window.addEventListener('beforeunload', onBeforeUnload)
   void loadConfig()
   void loadCache()
@@ -712,6 +766,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (preheatTimer !== null) window.clearTimeout(preheatTimer)
+  preheatTimer = null
   window.removeEventListener('beforeunload', onBeforeUnload)
   if (davCopyTimer !== null) window.clearTimeout(davCopyTimer)
 })
@@ -887,6 +943,47 @@ onBeforeUnmount(() => {
             />
           </label>
         </div>
+      </div>
+
+      <!-- 预生成缩略图（v4.9.11）：一次性把常用区渲好，之后浏览直接命中本地缓存 -->
+      <div class="rounded-xl border border-line p-6">
+        <div class="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <p class="text-sm font-semibold text-ink">{{ t('settings.media.preheat') }}</p>
+            <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.media.preheatHint') }}</p>
+          </div>
+          <button
+            class="shrink-0 rounded-lg border border-line px-3 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:opacity-50"
+            :disabled="preheatBusy"
+            data-testid="preheat-toggle"
+            @click="preheatRunning ? stopPreheat() : startPreheat()"
+          >
+            {{
+              preheatRunning
+                ? t('settings.media.preheatStop')
+                : t('settings.media.preheatStart')
+            }}
+          </button>
+        </div>
+
+        <div v-if="preheat && (preheat.is_running || preheat.total > 0)" class="space-y-2">
+          <div class="h-1.5 overflow-hidden rounded-full bg-elevated">
+            <div
+              class="h-full rounded-full bg-accent transition-[width] duration-300"
+              :style="{ width: `${preheatPercent}%` }"
+            />
+          </div>
+          <p class="text-xs text-muted" data-testid="preheat-progress">
+            {{
+              t('settings.media.preheatProgress', {
+                done: preheat.completed,
+                total: preheat.total,
+                failed: preheat.failed,
+              })
+            }}
+          </p>
+        </div>
+        <p v-else class="text-xs text-muted">{{ t('settings.media.preheatIdle') }}</p>
       </div>
 
       <!-- FFmpeg：三层优先级 + 状态检测 + 测试连通性 -->

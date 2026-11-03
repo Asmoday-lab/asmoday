@@ -16,12 +16,39 @@ export interface FfmpegInfo {
   webp_support: boolean
 }
 
+/** 预生成进度（v4.9.11）：与「重建」共用同一份结构 */
+export interface PreheatStatus {
+  is_running: boolean
+  total: number
+  completed: number
+  failed: number
+}
+
 export const systemApi = {
   /** 按「设置页 > 环境变量 > PATH」三层优先级探测当前生效的 FFmpeg */
   async ffmpegStatus(): Promise<FfmpegInfo> {
     const res = await fetch('/api/system/ffmpeg-status')
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
     return (await res.json()) as FfmpegInfo
+  },
+
+  /** 启动预生成：把最近 N 天的图片提前渲好（幂等，已生成的会跳过） */
+  async preheatStart(): Promise<void> {
+    const res = await fetch('/api/system/preheat-thumbnails', { method: 'POST' })
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+  },
+
+  /** 预生成进度 */
+  async preheatStatus(): Promise<PreheatStatus> {
+    const res = await fetch('/api/system/preheat-thumbnails/status')
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
+    return (await res.json()) as PreheatStatus
+  },
+
+  /** 请求停止（正在跑的那张会跑完） */
+  async preheatStop(): Promise<void> {
+    const res = await fetch('/api/system/preheat-thumbnails/stop', { method: 'POST' })
+    if (!res.ok) throw new ApiError(res.status, await readApiError(res))
   },
 
   /** 只测指定路径；留空则等价于探测当前生效的那个 */

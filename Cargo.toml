@@ -55,7 +55,7 @@ portable-pty = "0.8"
 # 不要自己读 USERPROFILE/HOME —— macOS/Linux 的规则并不一致）
 dirs = "6"
 # 缩略图解码/缩放（只处理静态图片；视频封面走外部可选 FFmpeg 截帧，不链接 libav*）
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 # 聚合服务反代。TLS 按目标平台分流（见文件末尾的两个 [target] 节）：
 # - 非 Linux：native-tls → Windows 落 SChannel（保持「TLS 走系统实现」的设计）；
 # - Linux（含 musl 交叉编译，见 9.3）：rustls —— native-tls 在 Linux 落到
@@ -94,6 +94,8 @@ dav-server = { version = "0.11", default-features = false, features = ["localfs"
 # dav-server 的 `DavFile::write_buf` 签名里要写 `Box<dyn bytes::Buf>`（本来就在依赖树里）
 bytes = "1"
 crc32fast = "1"
+heifer = { version = "0.3.26", features = ["image"] }
+fast_image_resize = "6.1.0"
 
 # 测试专用：把生成的二维码矩阵再解回来，证明「扫出来的就是那条 otpauth 链接」。
 # 只解码不编码（编码仍用上面的 qrcode），且仅在测试构建里链接，不进发布产物。

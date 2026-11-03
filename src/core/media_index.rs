@@ -745,6 +745,30 @@ pub fn dims_get_many(
     hits
 }
 
+/// 预生成缩略图的候选：图片，按 mtime 从新到旧。
+///
+/// 用**索引**而不是再走一遍文件系统 —— 索引里已经有 `real`（真实路径）、
+/// `mtime`、`size`，够算缓存键了。`since` 为 0 表示不按时间过滤。
+pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<(String, u64, u64)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT real, mtime, size FROM media_assets
+         WHERE kind = 'image' AND mtime >= ?1
+         ORDER BY mtime DESC
+         LIMIT ?2",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(params![since as i64, limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+            row.get::<_, i64>(2)?.max(0) as u64,
+        ))
+    })
+    .map(|rows| rows.filter_map(Result::ok).collect())
+    .unwrap_or_default()
+}
+
 /// 找出「标签或时长还没缓存」的音频（后台预热用，v4.9.8）。
 ///
 /// 音乐库列表只查缓存，缓存冷的时候首开还是慢；索引器每轮把缺的补齐，

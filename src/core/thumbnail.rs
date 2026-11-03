@@ -442,8 +442,9 @@ impl Thumbnailer {
         let webp_bin = webp_bin.map(Path::to_path_buf);
 
         // 渲染 + 编码放阻塞线程池；**落盘不在这条链路上**（见下）
+        let ffmpeg_for_decode = webp_bin.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (thumb, hash) = render_thumbnail(&source, width)?;
+            let (thumb, hash) = render_thumbnail(&source, width, ffmpeg_for_decode.as_deref())?;
             let (bytes, mime, codec) =
                 encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &work_dir)?;
             Some((bytes, mime, codec, hash))
@@ -632,25 +633,120 @@ impl Thumbnailer {
 /// 解码 → 等比缩放 → RGBA 位图，同时产出 32×32 的 ThumbHash。
 ///
 /// 统一转 RGBA：WebP 保留透明通道，JPEG 分支再降到 RGB（JPEG 不支持 alpha）。
-fn render_thumbnail(path: &Path, width: u32) -> Option<(image::RgbaImage, Vec<u8>)> {
-    let reader = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
+///
+/// 解码分两路（v4.9.11）：
+/// 1. `image` crate —— jpeg / png / gif / webp / bmp / tiff / ico，以及通过
+///    [`register_heif_hook`] 挂上去的 heic / heif / hif；
+/// 2. 上面失败时交给 ffmpeg：`-vf scale=` 让它**解码时直接降采样**，
+///    既覆盖 avif 这类 `image` 不认的格式，又把内存从「整张大图」压到目标尺寸。
+fn render_thumbnail(
+    path: &Path,
+    width: u32,
+    ffmpeg_bin: Option<&Path>,
+) -> Option<(image::RgbaImage, Vec<u8>)> {
+    let (source_w, source_h, rgba) = decode_rgba(path, width, ffmpeg_bin)?;
+
+    let tiny = fir_scale(&rgba, source_w, source_h, 32)?;
+    let hash = thumbhash::rgba_to_thumb_hash(tiny.0 as usize, tiny.1 as usize, &tiny.2);
+
+    // 不放大：请求尺寸比原图大时按原图长边封顶（否则灯箱占位会被拉大一圈）
+    let bound = width.min(source_w.max(source_h));
+    let (tw, th, buf) = fir_scale(&rgba, source_w, source_h, bound)?;
+    Some((image::RgbaImage::from_raw(tw, th, buf)?, hash))
+}
+
+/// 把 HEIF/HEIC 解码器挂到 `image` crate 上（只做一次）。
+///
+/// `heifer` 是纯 Rust 实现（自带 HEVC 解码），注册之后 `ImageReader::decode()`
+/// 就能直接解 `.heic` / `.heif` / `.hif`，调用点不必自己分派。
+fn register_heif_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if !heifer::image_crate::register_image_decoder_hooks() {
+            crate::log_warn!("HEIC 解码器注册失败：同名扩展名已被其它解码器占用");
+        }
+    });
+}
+
+/// 解码成 RGBA 原始像素。返回 `(宽, 高, RGBA 缓冲)`。
+fn decode_rgba(path: &Path, bound: u32, ffmpeg_bin: Option<&Path>) -> Option<(u32, u32, Vec<u8>)> {
+    register_heif_hook();
+    if let Ok(reader) = image::ImageReader::open(path)
+        && let Ok(reader) = reader.with_guessed_format()
+        && let Ok(decoded) = reader.decode()
+    {
+        let rgba = decoded.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        return Some((w, h, rgba.into_raw()));
+    }
+    // `image` 不认（avif / 没有解码器的 heic / 损坏文件）：交给 ffmpeg。
+    // `-vf scale=` 在解码阶段就降采样，不做「先解全图再缩」。
+    let bin = ffmpeg_bin?;
+    ffmpeg_decode_scaled(path, bound, bin)
+}
+
+/// ffmpeg 解码并直接缩到 `bound` 以内，输出 PNG 再读回内存。
+fn ffmpeg_decode_scaled(path: &Path, bound: u32, bin: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    use std::process::{Command, Stdio};
+
+    // `min(bound, iw)`：不放大；`-2` 让高度自动取偶数（多数编码器要求）
+    let filter = format!("scale='min({},iw)':-2", bound.max(1));
+    let out = Command::new(bin)
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            &filter,
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
         .ok()?;
-    let image = reader.decode().ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let decoded = image::load_from_memory(&out.stdout).ok()?;
+    let rgba = decoded.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
 
-    let small = image.thumbnail(32, 32).to_rgba8();
-    let hash = thumbhash::rgba_to_thumb_hash(
-        small.width() as usize,
-        small.height() as usize,
-        small.as_raw(),
-    );
+/// 用 fast_image_resize 等比缩到 `bound` 以内（Lanczos3，SIMD）。
+///
+/// 比 `imageops::thumbnail`（标量 box filter）快 3~5 倍，且不会把细节糊成一片。
+/// 返回 `(宽, 高, RGBA 缓冲)`。
+fn fir_scale(src: &[u8], w: u32, h: u32, bound: u32) -> Option<(u32, u32, Vec<u8>)> {
+    use fast_image_resize::images::Image as FirImage;
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 
-    // 不放大：`thumbnail` 是等比缩放，请求尺寸比原图大时会真的把小图拉大
-    // （340×475 的图请求 960 会得到 687×960）。灯箱用缩略图做加载占位，
-    // 放大后的占位比原图大一圈，撤下时会露出边——按原图长边封顶即可。
-    let bound = width.min(image.width().max(image.height()));
-    Some((image.thumbnail(bound, bound).to_rgba8(), hash))
+    let bound = bound.max(1);
+    let long = w.max(h).max(1);
+    let scale = (bound as f32 / long as f32).min(1.0);
+    let dw = ((w as f32 * scale).round() as u32).max(1);
+    let dh = ((h as f32 * scale).round() as u32).max(1);
+    if dw == w && dh == h {
+        return Some((w, h, src.to_vec()));
+    }
+
+    let src_image = FirImage::from_vec_u8(w, h, src.to_vec(), PixelType::U8x4).ok()?;
+    let mut dst = FirImage::new(dw, dh, PixelType::U8x4);
+    let mut resizer = Resizer::new();
+    resizer
+        .resize(
+            &src_image,
+            &mut dst,
+            Some(&ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))),
+        )
+        .ok()?;
+    Some((dw, dh, dst.buffer().to_vec()))
 }
 
 /// 编码缩略图：WebP 优先（外部 FFmpeg 的 libwebp），不可用则内置 JPEG。
@@ -1008,6 +1104,34 @@ mod tests {
 
     /// 缓存键只由源路径决定：同一文件永远落在同一个单元目录里。
     /// 旧实现把 mtime 混进文件名，改一次图就多一个文件 —— 「越用越多」的根源。
+    /// v4.9.11：HEIC 必须真的能解 —— iPhone 直出的照片全靠它。
+    ///
+    /// 用 `heifer` 自己编一张 HEIC，再走生产路径（`render_thumbnail`）解码，
+    /// 等于验证「注册 image hook → ImageReader 认得 .heic → FIR 缩放」整条链。
+    #[test]
+    fn heic_round_trips_through_image_hook() {
+        let (w, h) = (320u32, 240u32);
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for i in 0..(w * h) {
+            rgb.extend_from_slice(&[(i % 251) as u8, 96, 160]);
+        }
+        let heic = heifer::encode_rgb8(w, h, &rgb, &heifer::EncodeOptions::default())
+            .expect("heifer 编码 HEIC 失败");
+        assert_eq!(&heic[4..8], b"ftyp", "编出来的应该是 ISOBMFF 容器");
+
+        let dir = scratch_dir("heic");
+        let file = dir.join("sample.heic");
+        fs::write(&file, &heic).unwrap();
+
+        let (thumb, hash) =
+            render_thumbnail(&file, 160, None).expect("HEIC 应能被 image hook 解码");
+        assert_eq!(thumb.width().max(thumb.height()), 160, "长边应缩到 160");
+        assert_eq!(thumb.width() * 240, thumb.height() * 320, "宽高比要保住");
+        assert!(!hash.is_empty(), "ThumbHash 不能为空");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn entry_dir_is_stable_per_path_and_fanned_out() {
         let dir = scratch_dir("thumb-entry");
@@ -1093,7 +1217,7 @@ mod tests {
         image::RgbaImage::from_pixel(34, 47, image::Rgba([10, 20, 30, 255]))
             .save(&small)
             .unwrap();
-        let (thumb, _) = render_thumbnail(&small, 960).unwrap();
+        let (thumb, _) = render_thumbnail(&small, 960, None).unwrap();
         assert_eq!(
             (thumb.width(), thumb.height()),
             (34, 47),
@@ -1105,7 +1229,7 @@ mod tests {
         image::RgbaImage::from_pixel(1200, 800, image::Rgba([1, 2, 3, 255]))
             .save(&big)
             .unwrap();
-        let (scaled, _) = render_thumbnail(&big, 240).unwrap();
+        let (scaled, _) = render_thumbnail(&big, 240, None).unwrap();
         assert_eq!((scaled.width(), scaled.height()), (240, 160));
     }
 
@@ -1120,7 +1244,7 @@ mod tests {
         }
         source.save(&file).unwrap();
 
-        let (thumb, hash) = render_thumbnail(&file, 32).unwrap();
+        let (thumb, hash) = render_thumbnail(&file, 32, None).unwrap();
         assert!(thumb.width() <= 32 && thumb.height() <= 32);
         assert!(!hash.is_empty(), "ThumbHash 不能为空");
 

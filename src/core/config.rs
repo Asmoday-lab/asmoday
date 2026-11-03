@@ -186,6 +186,12 @@ pub struct MediaConfig {
     pub thumb_cache_max_size_mb: u64,
     /// 缩略图最长保留天数
     pub thumb_cache_max_age_days: u64,
+    /// 预生成缩略图的时间窗（天）。0 = 不限，只处理最近这么多天的图片
+    #[serde(default = "default_preheat_days")]
+    pub thumb_preheat_days: u64,
+    /// 每轮索引扫描后自动预生成多少张（0 = 关闭自动预生成）
+    #[serde(default = "default_preheat_per_scan")]
+    pub thumb_preheat_per_scan: usize,
     /// 外部 FFmpeg 可执行文件路径（设计文档 3.5 优先级 1）。
     /// 留空则依次读取 `ASMODAY_FFMPEG_PATH` 与系统 `PATH`。
     pub ffmpeg_path: String,
@@ -200,11 +206,23 @@ pub struct MediaConfig {
     pub index_scan_interval_secs: u64,
 }
 
+/// 预生成只看最近一年：更早的照片很少翻，先把近期内容做成秒开
+fn default_preheat_days() -> u64 {
+    365
+}
+
+/// 每轮索引后补 200 张：既不长时间占带宽，又能在几轮内把常用区补完
+fn default_preheat_per_scan() -> usize {
+    200
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
             thumb_cache_max_size_mb: 1024,
             thumb_cache_max_age_days: 90,
+            thumb_preheat_days: default_preheat_days(),
+            thumb_preheat_per_scan: default_preheat_per_scan(),
             ffmpeg_path: String::new(),
             upload_max_size_mb: 0,
             upload_chunk_size_mb: 10,

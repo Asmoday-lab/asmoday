@@ -58,7 +58,14 @@
     "resetHint": "只重置缓存阈值与 FFmpeg 路径。",
     "resetDone": "已恢复媒体面板默认值",
     "webpOn": "WebP 可用",
-    "webpOff": "无 libwebp（回退 JPEG）"
+    "webpOff": "无 libwebp（回退 JPEG）",
+    "preheat": "预生成缩略图",
+    "preheatHint": "把最近一年的图片提前渲好，之后打开图片库直接命中本地缓存，不再每张都从网盘读原图。",
+    "preheatStart": "开始预生成",
+    "preheatStop": "停止",
+    "preheatProgress": "{done} / {total} 张（失败 {failed}）",
+    "preheatIdle": "尚未运行。点右侧按钮可一次性补齐；索引扫描后也会自动补一批。",
+    "preheatFailed": "启动预生成失败"
   },
   "security": {
     "password": "修改密码",

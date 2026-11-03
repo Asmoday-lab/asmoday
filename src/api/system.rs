@@ -10,7 +10,8 @@
 //! 探测类接口都只跑 `ffmpeg -version` / `-encoders`，不碰任何转码。
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
-use crate::core::{ffmpeg, fs, fs_ops, path_guard, thumbnail};
+use crate::core::{ffmpeg, fs, fs_ops, media_index, path_guard, thumbnail};
 
 /// 批量重建缩略图的进度（进程内单份，重启即清零）
 #[derive(Debug, Clone, Default, Serialize)]
@@ -36,6 +37,10 @@ pub type RebuildState = Mutex<RebuildStatus>;
 
 /// 单次重建的候选上限：低功耗设备上一口气扫几十万张没有意义
 const REBUILD_SCAN_LIMIT: usize = 5000;
+
+/// 预生成用哪一档宽度：与前端网格的 `THUMB_WIDTH.tile` 保持一致，
+/// 否则生成的图与浏览时请求的键不同，等于白跑。
+const PREHEAT_WIDTH: u32 = 400;
 
 /// `GET /api/system/ffmpeg-status`
 pub async fn ffmpeg_status(State(state): State<AppState>) -> Response {
@@ -348,6 +353,214 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
     });
 
     Json(json!({ "status": "started" })).into_response()
+}
+
+/// POST /api/system/preheat-thumbnails
+///
+/// 预生成缩略图：把「最近 N 天的图片」提前渲好，之后浏览就是直接命中本地缓存，
+/// 不再每张都从网盘读原图（那是图片库卡顿的唯一原因）。
+///
+/// 候选直接从**索引**取，不再走一遍文件系统；已生成的在 `get_prepared` 里
+/// 先查缓存就返回，所以重复调用是安全的（幂等）。
+pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
+    {
+        let mut status = match state.preheat.lock() {
+            Ok(status) => status,
+            Err(_) => {
+                return crate::api::error::detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "preheat state poisoned",
+                );
+            }
+        };
+        if status.is_running {
+            return Json(json!({ "status": "already_running" })).into_response();
+        }
+        *status = RebuildStatus {
+            is_running: true,
+            ..Default::default()
+        };
+    }
+
+    let worker = state.clone();
+    tokio::spawn(async move {
+        run_preheat(worker).await;
+    });
+
+    Json(json!({ "status": "started" })).into_response()
+}
+
+/// GET /api/system/preheat-thumbnails/status
+pub async fn preheat_status(State(state): State<AppState>) -> Response {
+    let status = state
+        .preheat
+        .lock()
+        .map(|status| status.clone())
+        .unwrap_or_default();
+    Json(status).into_response()
+}
+
+/// POST /api/system/preheat-thumbnails/stop
+///
+/// 只置一个标志，worker 每张之间检查一次 —— 正在生成的那张会跑完。
+pub async fn preheat_stop(State(state): State<AppState>) -> Response {
+    if let Ok(mut status) = state.preheat.lock() {
+        status.is_running = false;
+    }
+    Json(json!({ "status": "stopping" })).into_response()
+}
+
+/// 索引扫描后顺带补一小批（v4.9.11）。
+///
+/// 与手动「全量预生成」共用同一份状态：正在手动跑就直接跳过，不抢带宽。
+pub async fn preheat_batch(state: &AppState, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    {
+        let Ok(mut status) = state.preheat.lock() else {
+            return;
+        };
+        if status.is_running {
+            return;
+        }
+        *status = RebuildStatus {
+            is_running: true,
+            ..Default::default()
+        };
+    }
+    run_preheat_inner(state, Some(limit)).await;
+}
+
+/// 预生成的实际执行体。
+///
+/// 并发刻意压到 3 路：缩略图全局信号量是「核数 - 1」，预生成只借其中三份，
+/// 剩下的留给正在浏览的请求，不会把页面卡成一片灰块。
+async fn run_preheat(state: AppState) {
+    run_preheat_inner(&state, None).await;
+}
+
+/// `limit` 为 `None` 表示按时间窗把候选全部补完；`Some(n)` 只补 n 张（索引后的小批）。
+async fn run_preheat_inner(state: &AppState, limit: Option<usize>) {
+    const WORKERS: usize = 3;
+    const MAX_CANDIDATES: usize = 200_000;
+    let batch_limit = limit.unwrap_or(MAX_CANDIDATES).min(MAX_CANDIDATES);
+
+    let (days, ffmpeg_path) = {
+        let config = state.config.read().await;
+        (
+            config.media.thumb_preheat_days,
+            config.media.ffmpeg_path.clone(),
+        )
+    };
+    let since = if days == 0 {
+        0
+    } else {
+        let now = crate::core::auth::now_secs().max(0) as u64;
+        now.saturating_sub(days.saturating_mul(24 * 3600))
+    };
+
+    let index = Arc::clone(&state.media_index);
+    let rows = match tokio::task::spawn_blocking(move || {
+        index.with_conn(|conn| Ok(media_index::images_for_preheat(conn, since, batch_limit)))
+    })
+    .await
+    {
+        Ok(Some(rows)) => rows,
+        _ => Vec::new(),
+    };
+
+    if rows.is_empty() {
+        if let Ok(mut status) = state.preheat.lock() {
+            *status = RebuildStatus::default();
+        }
+        crate::log_info!("thumbnail preheat: nothing to do (index empty or window too narrow)");
+        return;
+    }
+
+    let total = rows.len();
+    if let Ok(mut status) = state.preheat.lock() {
+        status.total = total;
+        status.completed = 0;
+        status.failed = 0;
+    }
+    crate::log_info!(
+        "thumbnail preheat started: {} image(s), window {} day(s)",
+        total,
+        if days == 0 { 0 } else { days }
+    );
+
+    let ffmpeg_bin = crate::core::ffmpeg::resolve(&ffmpeg_path)
+        .path
+        .filter(|bin| bin.is_file());
+
+    // 共享任务队列：三个 worker 各自取一张，互不等待
+    let queue = Arc::new(std::sync::Mutex::new(rows.into_iter()));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let queue = Arc::clone(&queue);
+        let worker = state.clone();
+        let ffmpeg_bin = ffmpeg_bin.clone();
+        workers.push(tokio::spawn(async move {
+            loop {
+                // 停止信号：每张之间检查，正在跑的那张会跑完
+                if !worker
+                    .preheat
+                    .lock()
+                    .map(|status| status.is_running)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                let job = match queue.lock() {
+                    Ok(mut guard) => guard.next(),
+                    Err(_) => break,
+                };
+                let Some((real, mtime, size)) = job else {
+                    break;
+                };
+
+                let path = PathBuf::from(&real);
+                // 键直接由索引里的 size/mtime 算出，不用为「判断有没有缓存」再 stat 一次
+                let key = crate::core::thumbnail::ThumbKey {
+                    width: PREHEAT_WIDTH,
+                    fingerprint: crate::core::thumbnail::Thumbnailer::fingerprint_from(size, mtime),
+                    fresh_write: false,
+                };
+                let (outcome, _) = worker
+                    .thumbnails
+                    .get_prepared(&path, key, ffmpeg_bin.as_deref())
+                    .await;
+                let ok = matches!(outcome, crate::core::thumbnail::ThumbOutcome::Ready(_));
+
+                if let Ok(mut status) = worker.preheat.lock() {
+                    status.completed += 1;
+                    if !ok {
+                        status.failed += 1;
+                    }
+                }
+                // 让出一点点：预生成是背景活，不该把浏览的带宽吃干
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }));
+    }
+    for handle in workers {
+        let _ = handle.await;
+    }
+
+    let (completed, failed) = match state.preheat.lock() {
+        Ok(mut status) => {
+            status.is_running = false;
+            (status.completed, status.failed)
+        }
+        Err(_) => (0, 0),
+    };
+    crate::log_info!(
+        "thumbnail preheat finished: {}/{} generated, {} failed",
+        completed.saturating_sub(failed),
+        total,
+        failed
+    );
 }
 
 /// GET /api/system/thumbnails/rebuild/status

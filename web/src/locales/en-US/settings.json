@@ -58,7 +58,14 @@
     "resetHint": "Only resets cache thresholds and the FFmpeg path.",
     "resetDone": "Media panel reset to defaults",
     "webpOn": "WebP available",
-    "webpOff": "No libwebp (JPEG fallback)"
+    "webpOff": "No libwebp (JPEG fallback)",
+    "preheat": "Pre-generate thumbnails",
+    "preheatHint": "Renders the last year of photos up front, so the gallery hits the local cache instead of pulling every original from the network share.",
+    "preheatStart": "Start",
+    "preheatStop": "Stop",
+    "preheatProgress": "{done} / {total} ({failed} failed)",
+    "preheatIdle": "Not started. Use the button to fill in one pass; indexing also fills a batch automatically.",
+    "preheatFailed": "Failed to start pre-generation"
   },
   "security": {
     "password": "Change password",
