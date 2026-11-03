@@ -1942,7 +1942,7 @@ useEventListener(window, 'keydown', onKey)
               />
               <img
                 v-if="album.cover && !albumCoverFailed.has(album.path)"
-                :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
+                :src="thumbUrl(album.cover, THUMB_WIDTH.tile, album.modified)"
                 class="absolute inset-0 size-full object-cover opacity-35 transition-opacity duration-300 group-hover:opacity-50"
                 loading="lazy"
                 alt=""
@@ -1961,8 +1961,8 @@ useEventListener(window, 'keydown', onKey)
             </div>
             <p class="mt-1.5 truncate text-[13px] font-medium text-ink">{{ albumLabel(album) }}</p>
             <!-- 副标题只报「它在库里哪一层」：同名文件夹靠这一行区分，数量已在角标上 -->
-            <p v-if="folderPathHint(album)" class="truncate text-[11px] text-muted">
-              {{ folderPathHint(album) }}
+            <p class="truncate text-[11px] text-muted">
+              {{ folderPathHint(album) || '\u00A0' }}
             </p>
           </button>
         </div>
@@ -2229,7 +2229,7 @@ useEventListener(window, 'keydown', onKey)
               />
               <img
                 v-if="album.cover && !cinemaCoverFailed.has(album.path)"
-                :src="thumbUrl(album.cover, THUMB_WIDTH.tile)"
+                :src="thumbUrl(album.cover, THUMB_WIDTH.tile, album.modified)"
                 class="absolute inset-0 size-full object-cover opacity-35 transition-opacity duration-300 group-hover:opacity-50"
                 loading="lazy"
                 alt=""
@@ -2247,8 +2247,8 @@ useEventListener(window, 'keydown', onKey)
               </span>
             </div>
             <p class="mt-1.5 truncate text-[13px] font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
-            <p v-if="folderPathHint(album)" class="truncate text-[11px] text-muted">
-              {{ folderPathHint(album) }}
+            <p class="truncate text-[11px] text-muted">
+              {{ folderPathHint(album) || '\u00A0' }}
             </p>
           </button>
         </div>

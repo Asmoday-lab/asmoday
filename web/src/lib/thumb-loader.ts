@@ -1,16 +1,22 @@
 /**
- * 缩略图装载调度（v4.6.21）。
+ * 缩略图装载调度（v4.6.22）。
  *
  * 为什么不用 `<img loading="lazy">`：浏览器给每个 img 独立发请求，谁先回来谁先亮。
- * 服务端缩略图是**按需生成**的（解码有并发上限，超时打回占位图），所以首屏几十个
- * 并行请求一拥而上时，完成顺序基本随机 —— 观感就是截图里那种「东一块西一块亮起来」。
- * Immich 的观感是「从上到下、一行一行填满」，靠的是客户端按可见顺序串行化。
+ * 服务端缩略图是**按需生成**的（解码有并发上限，超时打回 503），所以首屏几十个
+ * 并行请求一拥而上时，完成顺序基本随机 —— 观感就是「东一块西一块亮起来」。
  *
  * 这里的策略：
  * 1. **只等快到视口才请求**（IntersectionObserver，提前 600px 预热），不预载整页；
  * 2. **限量并发 + 按渲染顺序排队**（DOM 顺序 = 行序），前排先出图；
- * 3. **失败重试**：服务端拥塞时回 503（v4.6.21 起），退避后再排一次队，
- *    用尽才落图标 —— 以前占位图是 200，img 认为「加载成功」，那块灰就永远不走了。
+ * 3. **失败重试**：服务端拥塞回 503，退避后再排一次队，用尽才落图标；
+ * 4. **会话级缓存（v4.6.22）**：加载成功过的 URL 记进模块级集合，组件重挂
+ *    （切视图、进出相册、分页续排、view-cache 恢复上一帧）直接同步点亮，
+ *    不再排队重新请求 —— 以前每次挂载都从零排队，观感就是「毫无缓存」。
+ *    HTTP 缓存（immutable）管跨会话，这里管会话内的重复挂载。
+ * 5. **强引用防中止（v4.6.22）**：预载的 `new Image()` 进 in-flight 集合持引用，
+ *    完成后才释放 —— 以前加载中的 Image 没有任何引用，引擎回收时会连请求一起
+ *    掐掉（DevTools 里一排「已终止 0 B」、控制台刷 net::ERR_ABORTED 就是它），
+ *    被掐的响应进不了缓存，下回还得从头再来。
  */
 
 import { onBeforeUnmount, onMounted, ref, type Ref } from 'vue'
@@ -21,6 +27,11 @@ const CONCURRENCY = 6
 const NEAR_MARGIN = '600px 0px'
 /** 重试退避（毫秒）：依次等这么久再排队，用尽即认定真的取不到 */
 const RETRY_DELAYS = [250, 800, 1800]
+
+/** 本会话加载成功过的缩略图 URL：重挂时直接命中，不走队列 */
+const loadedUrls = new Set<string>()
+/** 加载中的 Image 元素：持强引用，防止被 GC 连请求一起掐掉 */
+const inflight = new Set<HTMLImageElement>()
 
 interface Queued {
   order: number
@@ -55,11 +66,15 @@ function push(order: number, start: () => void) {
 function fetchOnce(url: string, attempt: number, order: number, done: (ok: boolean) => void) {
   const image = new Image()
   image.decoding = 'async'
+  inflight.add(image)
   image.onload = () => {
+    inflight.delete(image)
+    loadedUrls.add(url)
     release()
     done(true)
   }
   image.onerror = () => {
+    inflight.delete(image)
     release()
     if (attempt >= RETRY_DELAYS.length) {
       done(false)
@@ -101,6 +116,7 @@ function ensureObserver(): IntersectionObserver | null {
  * `el` 是观测用的根节点，`url` 返回要取的缩略图地址。
  * 返回 `{ src, failed }`：`src` 为空时保持 ThumbHash 模糊打底，
  * 加载成功后才赋给 `<img>`，失败（含重试用尽）由 `failed` 切图标。
+ * URL 本会话加载成功过 → 跳过观测与排队，挂载即点亮。
  */
 export function useThumbSrc(el: Ref<HTMLElement | null>, url: () => string) {
   const src = ref('')
@@ -112,6 +128,11 @@ export function useThumbSrc(el: Ref<HTMLElement | null>, url: () => string) {
   function start() {
     const target = url()
     if (!target) return
+    if (loadedUrls.has(target)) {
+      // 会话内已经拿过这张图：同步赋 src（浏览器内存缓存瞬时出图）
+      src.value = target
+      return
+    }
     push(order, () => {
       if (!alive) {
         release()
@@ -131,6 +152,12 @@ export function useThumbSrc(el: Ref<HTMLElement | null>, url: () => string) {
     if (!node || !observer) {
       // 老浏览器 / 没拿到节点：退化成「立刻加载」，不因为优化把图卡住
       start()
+      return
+    }
+    // 先查会话缓存再决定要不要观测：命中就不用等 IntersectionObserver 那一拍
+    const target = url()
+    if (target && loadedUrls.has(target)) {
+      src.value = target
       return
     }
     nearCallbacks.set(node, start)
