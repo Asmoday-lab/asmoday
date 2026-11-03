@@ -95,10 +95,11 @@ const hasContent = ref(false)
 
 // ---------------- 游标分页（设计文档 3.4） ----------------
 //
-// 媒体库和文件管理同一口径：**没有扫描上限**，翻到最后一页为止。一页 300 条
-// （首屏 JSON 从「整个库」降到几百 KB），触底续接下一页，游标记的是
-// 「上一页最后一条的 (mtime, 路径)」，扫描期间新增/删除文件也不会重复或漏项。
-const PAGE_SIZE = 300
+// 媒体库和文件管理同一口径：**没有扫描上限**，翻到最后一页为止。一页 120 条
+// （v4.6.23 从 300 降下来：NAS 上 300 条的 scan + 宽高解析 + 300 个格子的首屏
+// 渲染会明显发木；120 条够铺满一屏，其余触底续接）。游标记的是「上一页最后一条的
+// (mtime, 路径)」，扫描期间新增/删除文件也不会重复或漏项。
+const PAGE_SIZE = 120
 const nextCursor = ref<string | null>(null)
 const hasMore = ref(false)
 const loadingMore = ref(false)
@@ -419,6 +420,34 @@ const cinemaVideoGroups = computed<MediaGroup[]>(() => {
 type PhotoView = 'albums' | 'timeline'
 /** v4.6.19 换过默认值：键名带 v2，老用户存量偏好不会再把人按回文件夹墙 */
 const PHOTO_VIEW_KEY = 'asmoday.photos.view.v2'
+/**
+ * 文件夹墙排序（v4.6.23，对齐 Immich 顶部的排序下拉）。
+ * path = 相近目录相邻（默认，翻找有方位感）；mtime = 最近有图的在前。
+ */
+const ALBUM_SORT_KEY = 'asmoday.gallery.folderSort.v1'
+const albumSort = ref<'path' | 'mtime'>(
+  localStorage.getItem(ALBUM_SORT_KEY) === 'mtime' ? 'mtime' : 'path',
+)
+function setAlbumSort(next: 'path' | 'mtime') {
+  if (albumSort.value === next) return
+  albumSort.value = next
+  localStorage.setItem(ALBUM_SORT_KEY, next)
+  // 排序键变了，旧游标就作废：必须从第一页重来
+  albumsCursor.value = null
+  cinemaAlbumsCursor.value = null
+  void loadAlbums()
+  void loadCinemaAlbums()
+}
+
+/** 顶部「更多」菜单（v4.6.23）：收藏筛选 / 原生播放器 / 重新扫描 / 分页进度都收进来 */
+const moreOpen = ref(false)
+const moreWrap = ref<HTMLElement | null>(null)
+function onMoreOutside(event: PointerEvent) {
+  if (!moreOpen.value) return
+  const node = moreWrap.value
+  if (node && event.target instanceof Node && node.contains(event.target)) return
+  moreOpen.value = false
+}
 const photoView = ref<PhotoView>(
   localStorage.getItem(PHOTO_VIEW_KEY) === 'albums' ? 'albums' : 'timeline',
 )
@@ -456,7 +485,7 @@ async function loadAlbums(refresh = false) {
   albumsLoading.value = true
   albumsError.value = ''
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: 'path', refresh })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: albumSort.value, refresh })
     albums.value = result.items
     albumsTotal.value = result.total
     albumsCursor.value = result.next_cursor ?? null
@@ -479,7 +508,7 @@ async function loadMoreAlbums() {
   if (!albumsHasMore.value || !cursor || albumsLoading.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: 'path', cursor })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: albumSort.value, cursor })
     const seen = new Set(albums.value.map((album) => album.path))
     albums.value = [...albums.value, ...result.items.filter((album) => !seen.has(album.path))]
     albumsTotal.value = result.total
@@ -755,7 +784,7 @@ async function loadCinemaAlbums(refresh = false) {
     const result = await browseAlbums(undefined, 3, {
       kind: 'video',
       limit: PAGE_SIZE,
-      sort: 'path',
+      sort: albumSort.value,
       refresh,
     })
     cinemaAlbums.value = result.items
@@ -783,7 +812,7 @@ async function loadMoreCinemaAlbums() {
     const result = await browseAlbums(undefined, 3, {
       kind: 'video',
       limit: PAGE_SIZE,
-      sort: 'path',
+      sort: albumSort.value,
       cursor,
     })
     const seen = new Set(cinemaAlbums.value.map((album) => album.path))
@@ -884,6 +913,36 @@ function albumColor(album: Album): string {
 /** 相册封面也没有缩略图时（首次浏览），用封面 ThumbHash 打底 */
 function albumHash(album: Album): string | null {
   return thumbHashToDataUrl(album.cover_hash)
+}
+
+/**
+ * 相册时间范围（v4.6.23，Immich 口径）：`2002/1 – 2012/6`，同一个月只写一次。
+ * 时间戳缺失（0）就整段省略，退回只显示条目数。
+ */
+function albumRange(album: Album): string {
+  const first = album.first_modified
+  const last = album.modified
+  if (!first || !last) return ''
+  const fmt = (sec: number) => {
+    const date = new Date(sec * 1000)
+    return `${date.getFullYear()}/${date.getMonth() + 1}`
+  }
+  const start = fmt(Math.min(first, last))
+  const end = fmt(Math.max(first, last))
+  return start === end ? start : `${start} – ${end}`
+}
+
+/** 相册卡第二行：时间范围 · N 项（没有时间范围就只报数量） */
+function albumMetaLabel(album: Album): string {
+  const count = t('gallery.photos.albumItems', { count: album.count })
+  const range = albumRange(album)
+  return range ? `${range} · ${count}` : count
+}
+
+function cinemaMetaLabel(album: Album): string {
+  const count = t('gallery.cinema.albumItems', { count: album.count })
+  const range = albumRange(album)
+  return range ? `${range} · ${count}` : count
 }
 
 /**
@@ -1569,6 +1628,21 @@ onMounted(() => {
 // 切换视图会换掉 sentinel 元素（v-if 分支互斥），这里跟着重新 observe
 watch(sentinel, (el) => observeSentinel(el), { flush: 'post' })
 
+// 「更多」菜单：按下即收（捕获阶段，免得被内部按钮的 click 抢走）+ Esc
+onMounted(() => {
+  window.addEventListener('pointerdown', onMoreOutside, true)
+})
+function onMoreEsc(event: KeyboardEvent) {
+  if (event.key === 'Escape') moreOpen.value = false
+}
+onMounted(() => {
+  window.addEventListener('keydown', onMoreEsc)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('pointerdown', onMoreOutside, true)
+  window.removeEventListener('keydown', onMoreEsc)
+})
+
 // 快捷键：挂载/卸载由 useEventListener 成对处理
 useEventListener(window, 'keydown', onKey)
 </script>
@@ -1649,43 +1723,76 @@ useEventListener(window, 'keydown', onKey)
         </button>
       </div>
 
+      <!-- 文件夹墙排序（v4.6.23，Immich 的排序下拉）：只在「按文件夹」视图里出现 -->
+      <label
+        v-if="
+          (tab === 'photos' && photoView === 'albums') ||
+          (tab === 'cinema' && cinemaView === 'folders')
+        "
+        class="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-xs text-muted"
+        data-testid="album-sort"
+      >
+        <AppIcon name="sort" :size="13" />
+        <select
+          class="cursor-pointer appearance-none bg-transparent text-xs text-ink outline-none"
+          :value="albumSort"
+          @change="setAlbumSort(($event.target as HTMLSelectElement).value as 'path' | 'mtime')"
+        >
+          <option value="path">{{ t('gallery.toolbar.sortPath') }}</option>
+          <option value="mtime">{{ t('gallery.toolbar.sortModified') }}</option>
+        </select>
+      </label>
+
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
-        <!-- 分页进度：翻到一半时也能看出库里还有多少（分母是后端给的真实总数） -->
-        <span
-          v-if="showProgress"
-          class="hidden rounded bg-accent-soft px-2 py-0.5 text-accent md:inline"
-        >
-          {{ t('gallery.toolbar.loadedOf', { loaded: progress.loaded, total: progress.total }) }}
-        </span>
-        <button
-          v-if="tab === 'cinema' || tab === 'music'"
-          class="flex items-center gap-1 rounded-full border px-2 py-1 transition-colors"
-          :class="onlyFavorites ? 'border-accent/50 text-accent' : 'border-line text-muted hover:text-ink'"
-          :title="t('gallery.toolbar.onlyFavorites')"
-          @click="onlyFavorites = !onlyFavorites"
-        >
-          <AppIcon name="heart" :size="12" />
-          {{ t('gallery.toolbar.favorites') }}
-        </button>
-        <button
-          v-if="tab === 'cinema'"
-          class="rounded-full border px-2 py-1 transition-colors"
-          :class="nativePlayer ? 'border-accent/50 text-accent' : 'border-line text-muted hover:text-ink'"
-          :title="nativePlayer ? t('gallery.cinema.nativeOn') : t('gallery.cinema.nativeOff')"
-          @click="setNativePlayer(!nativePlayer)"
-        >
-          {{ t('gallery.cinema.native') }}
-        </button>
         <span class="hidden truncate md:inline">{{ t('gallery.toolbar.indexed') }}</span>
-        <button
-          class="grid size-7 place-items-center rounded-md transition-colors hover:bg-elevated hover:text-ink"
-          :title="t('gallery.toolbar.rescan')"
-          data-testid="gallery-rescan"
-          @click="load({ refresh: true })"
-        >
-          <!-- 后台刷新不再有骨架屏可看，图标转起来才是「正在扫」的唯一反馈 -->
-          <AppIcon name="refresh" :size="14" :class="refreshing ? 'animate-spin' : ''" />
-        </button>
+        <!-- 次要开关收进「更多」：顶栏只留视图、排序这些每次都会用的东西 -->
+        <div ref="moreWrap" class="relative">
+          <button
+            class="grid size-7 place-items-center rounded-md transition-colors hover:bg-elevated hover:text-ink"
+            :class="moreOpen ? 'bg-elevated text-ink' : ''"
+            :title="t('gallery.toolbar.more')"
+            :aria-expanded="moreOpen"
+            data-testid="gallery-more"
+            @click="moreOpen = !moreOpen"
+          >
+            <AppIcon name="more" :size="16" />
+          </button>
+          <div
+            v-if="moreOpen"
+            class="absolute top-full right-0 z-30 mt-1 w-52 rounded-lg border border-line bg-panel p-1 text-xs shadow-lg"
+          >
+            <p v-if="showProgress" class="px-2 py-1.5 text-[11px] text-muted">
+              {{ t('gallery.toolbar.loadedOf', { loaded: progress.loaded, total: progress.total }) }}
+            </p>
+            <button
+              v-if="tab === 'cinema' || tab === 'music'"
+              class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
+              @click="onlyFavorites = !onlyFavorites"
+            >
+              <AppIcon name="heart" :size="13" />
+              <span class="flex-1">{{ t('gallery.toolbar.onlyFavorites') }}</span>
+              <AppIcon v-if="onlyFavorites" name="check" :size="13" class="text-accent" />
+            </button>
+            <button
+              v-if="tab === 'cinema'"
+              class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
+              @click="setNativePlayer(!nativePlayer)"
+            >
+              <AppIcon name="play" :size="13" />
+              <span class="flex-1">{{ t('gallery.cinema.native') }}</span>
+              <AppIcon v-if="nativePlayer" name="check" :size="13" class="text-accent" />
+            </button>
+            <button
+              class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
+              data-testid="gallery-rescan"
+              @click="load({ refresh: true })"
+            >
+              <!-- 后台刷新不再有骨架屏可看，图标转起来才是「正在扫」的唯一反馈 -->
+              <AppIcon name="refresh" :size="13" :class="refreshing ? 'animate-spin' : ''" />
+              {{ t('gallery.toolbar.rescan') }}
+            </button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -1920,7 +2027,7 @@ useEventListener(window, 'keydown', onKey)
             type="button"
             class="group min-w-0 text-left"
             :data-album="album.name"
-            :title="albumLabel(album)"
+            :title="folderPathHint(album) || albumLabel(album)"
             @click="openAlbumCard(album)"
             @contextmenu.prevent="openFolderMenu($event, album, 'photos')"
             @touchstart.passive="folderPress.start($event, { album, context: 'photos' })"
@@ -1928,42 +2035,37 @@ useEventListener(window, 'keydown', onKey)
             @touchend="folderPress.cancel"
             @touchcancel="folderPress.cancel"
           >
+            <!-- Immich 式封面卡（v4.6.23）：封面铺满 + 名称 + 「时间范围 · N 项」，
+                 不再叠文件夹图标、模糊底纹和数量角标 —— 那些是文件管理器的语言 -->
             <div
-              class="relative grid aspect-[4/3] place-items-center overflow-hidden rounded-lg border border-line bg-elevated"
+              class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line bg-elevated"
               :style="{ backgroundColor: albumColor(album) }"
             >
-              <!-- 封面只做底纹：文件夹的身份靠图标和名字，不靠一张「像相册封皮」的图 -->
+              <!-- ThumbHash 打底：封面还没到时先铺一层模糊色块，和 Immich 的占位一致 -->
               <img
                 v-if="albumHash(album)"
                 :src="albumHash(album)!"
-                class="absolute inset-0 size-full scale-110 object-cover opacity-60 blur-md"
+                class="absolute inset-0 size-full object-cover"
                 aria-hidden="true"
                 alt=""
               />
               <img
                 v-if="album.cover && !albumCoverFailed.has(album.path)"
                 :src="thumbUrl(album.cover, THUMB_WIDTH.tile, album.modified)"
-                class="absolute inset-0 size-full object-cover opacity-35 transition-opacity duration-300 group-hover:opacity-50"
+                class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
                 loading="lazy"
                 alt=""
                 @error="markAlbumCoverFailed(album.path)"
               />
               <span
-                class="relative grid size-9 place-items-center rounded-lg bg-black/25 text-white/90 backdrop-blur-sm"
+                v-else
+                class="absolute inset-0 grid place-items-center text-muted/60"
               >
-                <AppIcon name="folder" :size="18" />
-              </span>
-              <span
-                class="absolute right-1 bottom-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white backdrop-blur"
-              >
-                {{ t('gallery.photos.albumItems', { count: album.count }) }}
+                <AppIcon name="gallery" :size="22" />
               </span>
             </div>
-            <p class="mt-1.5 truncate text-[13px] font-medium text-ink">{{ albumLabel(album) }}</p>
-            <!-- 副标题只报「它在库里哪一层」：同名文件夹靠这一行区分，数量已在角标上 -->
-            <p class="truncate text-[11px] text-muted">
-              {{ folderPathHint(album) || '\u00A0' }}
-            </p>
+            <p class="mt-2 truncate text-[13px] font-medium text-ink">{{ albumLabel(album) }}</p>
+            <p class="mt-0.5 truncate text-[11px] text-muted">{{ albumMetaLabel(album) }}</p>
           </button>
         </div>
           <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
@@ -2208,7 +2310,7 @@ useEventListener(window, 'keydown', onKey)
             type="button"
             class="group min-w-0 text-left"
             :data-cinema-album="album.name"
-            :title="cinemaAlbumLabel(album)"
+            :title="folderPathHint(album) || cinemaAlbumLabel(album)"
             @click="openCinemaCard(album)"
             @contextmenu.prevent="openFolderMenu($event, album, 'cinema')"
             @touchstart.passive="folderPress.start($event, { album, context: 'cinema' })"
@@ -2217,39 +2319,33 @@ useEventListener(window, 'keydown', onKey)
             @touchcancel="folderPress.cancel"
           >
             <div
-              class="relative grid aspect-[4/3] place-items-center overflow-hidden rounded-lg border border-line bg-elevated"
+              class="relative aspect-[4/3] overflow-hidden rounded-xl border border-line bg-elevated"
               :style="{ backgroundColor: cinemaAlbumColor(album) }"
             >
               <img
                 v-if="cinemaAlbumHash(album)"
                 :src="cinemaAlbumHash(album)!"
-                class="absolute inset-0 size-full scale-110 object-cover opacity-60 blur-md"
+                class="absolute inset-0 size-full object-cover"
                 aria-hidden="true"
                 alt=""
               />
               <img
                 v-if="album.cover && !cinemaCoverFailed.has(album.path)"
                 :src="thumbUrl(album.cover, THUMB_WIDTH.tile, album.modified)"
-                class="absolute inset-0 size-full object-cover opacity-35 transition-opacity duration-300 group-hover:opacity-50"
+                class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
                 loading="lazy"
                 alt=""
                 @error="markCinemaCoverFailed(album.path)"
               />
               <span
-                class="relative grid size-9 place-items-center rounded-lg bg-black/25 text-white/90 backdrop-blur-sm"
+                v-else
+                class="absolute inset-0 grid place-items-center text-muted/60"
               >
-                <AppIcon name="folder" :size="18" />
-              </span>
-              <span
-                class="absolute right-1 bottom-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white backdrop-blur"
-              >
-                {{ t('gallery.cinema.albumItems', { count: album.count }) }}
+                <AppIcon name="film" :size="22" />
               </span>
             </div>
-            <p class="mt-1.5 truncate text-[13px] font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
-            <p class="truncate text-[11px] text-muted">
-              {{ folderPathHint(album) || '\u00A0' }}
-            </p>
+            <p class="mt-2 truncate text-[13px] font-medium text-ink">{{ cinemaAlbumLabel(album) }}</p>
+            <p class="mt-0.5 truncate text-[11px] text-muted">{{ cinemaMetaLabel(album) }}</p>
           </button>
         </div>
 

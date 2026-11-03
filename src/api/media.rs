@@ -23,7 +23,9 @@ use crate::core::thumbnail::{PLACEHOLDER_SVG, ThumbOutcome, Thumbnailer};
 
 /// 单页条目数（游标分页，设计文档 3.4）：只影响「一次返回多少条」，
 /// 不再有「扫到上限就截断、后面的永远看不到」这回事。
-const DEFAULT_PAGE: usize = 300;
+// v4.6.23：首屏 120 条（前端也传 120）。300 条要等一次完整的 scan + 300 个格子
+// 的宽高计算，NAS 上首屏会明显发木；120 条足够铺满一屏，其余触底续接。
+const DEFAULT_PAGE: usize = 120;
 const MAX_PAGE: usize = 1000;
 /// 默认扫描深度
 const DEFAULT_DEPTH: usize = 2;
@@ -197,6 +199,10 @@ pub struct Album {
     pub cover_color: Option<String>,
     /// 相册内最新一张图片的修改时间（排序用）
     pub modified: Option<u64>,
+    /// 相册内最早一张图片的修改时间（v4.6.23）：卡片副标题展示「2002/1 – 2012/6」
+    /// 这样的时间范围，和 Immich 的相册卡一致。缺失（时间戳为 0）时不出这一行
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_modified: Option<u64>,
 }
 
 fn placeholder() -> Response {
@@ -915,6 +921,8 @@ struct RawAlbum {
     cover_path: Option<PathBuf>,
     /// 归一化后的 mtime（缺失记 0，降序时沉底）
     mtime: u64,
+    /// 最早一张图的时间戳（0 = 未知）
+    first_mtime: u64,
 }
 
 fn scan_albums(
@@ -940,6 +948,8 @@ fn scan_albums(
         let mut count = 0usize;
         // (mtime, path)：相册封面取最新的一张图
         let mut newest: Option<(u64, PathBuf)> = None;
+        // 最早一张图的 mtime：卡片副标题的时间范围（v4.6.23）
+        let mut oldest: u64 = 0;
 
         for entry in entries {
             let name = entry.name;
@@ -974,6 +984,9 @@ fn scan_albums(
                 continue;
             }
             count += 1;
+            if entry.mtime > 0 && (oldest == 0 || entry.mtime < oldest) {
+                oldest = entry.mtime;
+            }
             if newest
                 .as_ref()
                 .map(|(best, _)| entry.mtime > *best)
@@ -1003,6 +1016,7 @@ fn scan_albums(
             is_root,
             cover_path,
             mtime: mtime.unwrap_or(0),
+            first_mtime: oldest,
         });
     }
 
@@ -1048,6 +1062,7 @@ fn build_albums(raw: &[RawAlbum], auth: &crate::core::auth::AuthStore) -> Vec<Al
             cover_hash: None,
             cover_color: None,
             modified: (entry.mtime > 0).then_some(entry.mtime),
+            first_modified: (entry.first_mtime > 0).then_some(entry.first_mtime),
         })
         .collect();
 

@@ -49,7 +49,10 @@
     "retry": "Retry",
     "loadingMore": "Loading more…",
     "allLoaded": "All loaded",
-    "loadedOf": "{loaded} of {total} loaded"
+    "loadedOf": "{loaded} of {total} loaded",
+    "sortPath": "Folder path",
+    "sortModified": "Date modified",
+    "more": "More"
   },
   "favorite": {
     "add": "Add to favorites",

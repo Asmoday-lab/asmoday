@@ -49,7 +49,10 @@
     "retry": "重试",
     "loadingMore": "正在加载更多…",
     "allLoaded": "已全部加载",
-    "loadedOf": "已加载 {loaded} / 共 {total}"
+    "loadedOf": "已加载 {loaded} / 共 {total}",
+    "sortPath": "按文件夹路径",
+    "sortModified": "按修改日期",
+    "more": "更多"
   },
   "favorite": {
     "add": "收藏",

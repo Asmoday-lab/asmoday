@@ -94,7 +94,10 @@ export interface Album {
   /** 封面的 ThumbHash 与平均色 */
   cover_hash: string | null
   cover_color: string | null
+  /** 相册内最新一张图的时间（秒），也是封面那张 */
   modified: number | null
+  /** 相册内最早一张图的时间（秒）：卡片副标题的时间范围（v4.6.23） */
+  first_modified?: number | null
 }
 
 export interface AlbumsResult {
