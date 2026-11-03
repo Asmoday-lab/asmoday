@@ -120,5 +120,22 @@
   "group": {
     "byTime": "按时间",
     "byFolder": "按文件夹"
+  },
+  "sort": {
+    "title": "排序",
+    "button": "排序：{key}（{dir}）",
+    "flip": "切换升序 / 降序",
+    "mtime": "时间",
+    "name": "名称",
+    "size": "大小",
+    "count": "数量",
+    "mtimeDesc": "最近优先",
+    "mtimeAsc": "最早优先",
+    "nameAsc": "A → Z",
+    "nameDesc": "Z → A",
+    "sizeDesc": "大 → 小",
+    "sizeAsc": "小 → 大",
+    "countDesc": "多 → 少",
+    "countAsc": "少 → 多"
   }
 }

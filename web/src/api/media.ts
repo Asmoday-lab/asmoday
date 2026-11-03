@@ -49,9 +49,27 @@ export interface BrowseResult {
   next_cursor?: string | null
 }
 
+/**
+ * 排序值：维度 + 方向拼成一个串，后端按白名单解析（v4.9.0）。
+ *
+ * 媒体列表认 mtime/name/size，相册墙额外认 count；传错的维度后端会 400，
+ * 所以这里的联合类型就是唯一真源，UI 只从它里面选项。
+ */
+export type SortValue =
+  | 'mtime_desc'
+  | 'mtime_asc'
+  | 'name_asc'
+  | 'name_desc'
+  | 'size_desc'
+  | 'size_asc'
+  | 'count_desc'
+  | 'count_asc'
+
 export interface PageOptions {
   limit?: number
   cursor?: string | null
+  /** 排序（维度 + 方向）；不传走后端默认（时间倒序） */
+  sort?: SortValue
   /** 强制穿透后端目录快照重扫（「重新扫描」按钮用；默认走缓存） */
   refresh?: boolean
   /** 额外返回图片真实像素宽高（时间线的等高行布局用；其它视图不必带） */
@@ -72,6 +90,7 @@ export async function browseMedia(
   if (path) params.set('path', path)
   if (options.limit) params.set('limit', String(options.limit))
   if (options.cursor) params.set('cursor', options.cursor)
+  if (options.sort) params.set('sort', options.sort)
   if (options.refresh) params.set('refresh', '1')
   if (options.dims) params.set('dims', '1')
   const res = await fetch(`/api/media/browse?${params.toString()}`)
@@ -115,8 +134,6 @@ export async function browseAlbums(
   depth = 3,
   options: PageOptions & {
     kind?: 'image' | 'video' | 'audio'
-    /** mtime=最近有媒体的在前（默认）；path=目录路径升序（文件夹墙用） */
-    sort?: 'mtime' | 'path'
   } = {},
 ): Promise<AlbumsResult> {
   const params = new URLSearchParams({ depth: String(depth) })

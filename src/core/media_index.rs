@@ -52,6 +52,114 @@ pub const FRESH: u64 = 600;
 /// 首次建库能把 `auth/setup` 直接卡成 `database is locked`。
 pub const CHUNK: usize = 16;
 
+/// 排序维度（v4.9.0）。
+///
+/// 只有这四个维度是**能走索引**的：时间、名称、体积、条目数。拍摄时间不在此列 ——
+/// 索引里存的是文件 mtime，不是 EXIF 拍摄时间，两者在「照片从相机导出」的场景里
+/// 经常差好几年，混用会让排序结果看起来随机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Mtime,
+    /// 名称：媒体按 [`natural_key`] 归一化后的列，相册按目录路径小写
+    Name,
+    Size,
+    /// 只有相册墙有「条目数」这个概念
+    Count,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// 一次排序：维度 + 方向
+#[derive(Debug, Clone, Copy)]
+pub struct Sort {
+    pub key: SortKey,
+    pub dir: SortDir,
+}
+
+impl Sort {
+    pub const fn new(key: SortKey, dir: SortDir) -> Self {
+        Self { key, dir }
+    }
+
+    /// 解析 `?sort=` 参数。
+    ///
+    /// 白名单而不是自由拼接：这个值会进 SQL 的 `ORDER BY`，绝不能透传。
+    /// 旧值 `mtime` / `path` 必须继续认（老书签、老前端缓存的 URL 还在用）。
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let raw = raw.unwrap_or("").trim().to_ascii_lowercase();
+        let parsed = match raw.as_str() {
+            "" | "mtime" | "mtime_desc" => Self::new(SortKey::Mtime, SortDir::Desc),
+            "mtime_asc" | "oldest" => Self::new(SortKey::Mtime, SortDir::Asc),
+            "path" | "name" | "name_asc" => Self::new(SortKey::Name, SortDir::Asc),
+            "name_desc" => Self::new(SortKey::Name, SortDir::Desc),
+            "size_desc" | "size" => Self::new(SortKey::Size, SortDir::Desc),
+            "size_asc" => Self::new(SortKey::Size, SortDir::Asc),
+            "count_desc" => Self::new(SortKey::Count, SortDir::Desc),
+            "count_asc" => Self::new(SortKey::Count, SortDir::Asc),
+            other => return Err(format!("不支持的排序：{other}")),
+        };
+        Ok(parsed)
+    }
+
+    pub fn is_desc(&self) -> bool {
+        matches!(self.dir, SortDir::Desc)
+    }
+
+    /// `ORDER BY` 里的方向关键字
+    pub fn sql_dir(&self) -> &'static str {
+        match self.dir {
+            SortDir::Asc => "ASC",
+            SortDir::Desc => "DESC",
+        }
+    }
+
+    /// keyset 游标的主键比较符：降序时「在游标之后」= 更小
+    pub fn sql_op(&self) -> &'static str {
+        match self.dir {
+            SortDir::Asc => ">",
+            SortDir::Desc => "<",
+        }
+    }
+}
+
+/// 名称排序键：小写 + 数字段左侧补零，让 SQL 的字符串比较退化成「自然序」。
+///
+/// SQLite 没有自然排序，`第10集` 按字节比会排在 `第2集` 前面。把数字段补到 10 位
+/// （`0000000002` / `0000000010`）之后，二进制比较的结果就和人类预期一致，
+/// 于是名称排序仍能走索引 + keyset 分页，不必把整页拉回内存重排。
+pub fn natural_key(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 8);
+    let mut digits = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        flush_digits(&mut out, &mut digits);
+        for low in ch.to_lowercase() {
+            out.push(low);
+        }
+    }
+    flush_digits(&mut out, &mut digits);
+    out
+}
+
+fn flush_digits(out: &mut String, digits: &mut String) {
+    if digits.is_empty() {
+        return;
+    }
+    let trimmed = digits.trim_start_matches('0');
+    for _ in 0..10usize.saturating_sub(trimmed.len()) {
+        out.push('0');
+    }
+    out.push_str(trimmed);
+    digits.clear();
+}
+
 /// 索引实例。一个进程一个，内部复用一条连接（懒打开）。
 pub struct MediaIndex {
     db_path: PathBuf,
@@ -115,6 +223,8 @@ pub struct AlbumRow {
     pub mtime: u64,
     /// 册内最早一条的 mtime（0 = 未知）
     pub first_mtime: u64,
+    /// 册内媒体总字节数（按体积排序 + 卡片副标题）
+    pub bytes: u64,
 }
 
 /// 一次查询的作用域：某个根目录下、`depth` 层以内
@@ -212,8 +322,8 @@ pub fn replace_dir(
     if !assets.is_empty() {
         let mut stmt = conn.prepare_cached(
             "INSERT OR REPLACE INTO media_assets
-             (path, real, dir, depth, name, kind, ext, size, mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (path, real, dir, depth, name, kind, ext, size, mtime, sort_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for asset in assets {
             stmt.execute(params![
@@ -226,6 +336,7 @@ pub fn replace_dir(
                 &asset.ext,
                 asset.size as i64,
                 asset.mtime as i64,
+                natural_key(&asset.name),
             ])?;
         }
     }
@@ -378,16 +489,22 @@ pub fn totals(conn: &Connection, scope: &Scope) -> rusqlite::Result<(usize, usiz
     Ok(totals)
 }
 
-/// 一页媒体（mtime 降序，同 mtime 用展示路径升序兜底）
+/// 一页媒体（默认 mtime 降序，同 mtime 用展示路径升序兜底）
 ///
-/// 返回 `(本页, 是否还有下一页)`；游标与排序键严格一致，翻页不重不漏。
+/// 游标是 `(主键, 展示路径)`：主键的形态由 `sort.key` 决定 —— 时间是毫秒戳、
+/// 名称是 [`natural_key`] 串、体积是字节数。**主键与次级键的顺序必须和
+/// `ORDER BY` 完全一致**，否则翻页会重复或漏项。降序时比较符翻成 `<`。
+///
+/// 返回 `(本页, 是否还有下一页)`。
 pub fn page(
     conn: &Connection,
     scope: &Scope,
     kinds: &[&str],
-    cursor: Option<&(u64, String)>,
+    sort: Sort,
+    cursor: Option<&(String, String)>,
     limit: usize,
 ) -> rusqlite::Result<(Vec<Asset>, bool)> {
+    let key = key_column(sort.key);
     let mut sql = String::from(
         "SELECT a.name, a.path, a.real, a.dir, a.kind, a.ext, a.size, a.mtime
          FROM media_assets a WHERE ",
@@ -396,15 +513,22 @@ pub fn page(
     sql.push_str(" AND ");
     sql.push_str(&kinds_clause(kinds));
     if cursor.is_some() {
-        sql.push_str(" AND (a.mtime < ? OR (a.mtime = ? AND a.path > ?))");
+        let op = sort.sql_op();
+        sql.push_str(&format!(
+            " AND ({key} {op} ? OR ({key} = ? AND a.path > ?))"
+        ));
     }
-    sql.push_str(" ORDER BY a.mtime DESC, a.path ASC LIMIT ?");
+    sql.push_str(&format!(
+        " ORDER BY {key} {}, a.path ASC LIMIT ?",
+        sort.sql_dir()
+    ));
 
     let mut values = scope.params();
     values.extend(kinds_params(kinds));
-    if let Some((mtime, path)) = cursor {
-        values.push(Value::Integer(*mtime as i64));
-        values.push(Value::Integer(*mtime as i64));
+    if let Some((cursor_key, path)) = cursor {
+        let key_value = cursor_value(sort.key, cursor_key);
+        values.push(key_value.clone());
+        values.push(key_value);
         values.push(Value::Text(path.clone()));
     }
     // 多取一条用来判断 has_more，省掉一次 COUNT
@@ -419,6 +543,23 @@ pub fn page(
     let has_more = items.len() > limit;
     items.truncate(limit);
     Ok((items, has_more))
+}
+
+/// 媒体表的排序列表达式。`Count` 在媒体列表里没有意义，退化成时间（调用方应先拦掉）
+fn key_column(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "a.sort_name",
+        SortKey::Size => "a.size",
+        SortKey::Mtime | SortKey::Count => "a.mtime",
+    }
+}
+
+/// 游标主键 → SQL 参数值（名称是文本，其余是整数）
+fn cursor_value(key: SortKey, raw: &str) -> Value {
+    match key {
+        SortKey::Name => Value::Text(raw.to_string()),
+        _ => Value::Integer(raw.parse::<i64>().unwrap_or(0)),
+    }
 }
 
 fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
@@ -436,18 +577,22 @@ fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
 
 /// 相册墙一页：按目录聚合
 ///
-/// `by_path = true` 走路径序（同父目录的册子挨在一起），否则按册内最新一张的时间倒序。
+/// 排序维度：`Name` 走目录路径小写（同父目录的册子挨在一起）、`Mtime` 走册内
+/// 最新一张、`Count` 走条目数、`Size` 走占用空间。四种都支持升降序，游标口径与
+/// `ORDER BY` 严格同源。
 pub fn album_page(
     conn: &Connection,
     scope: &Scope,
     kinds: &[&str],
-    by_path: bool,
-    cursor: Option<&(u64, String)>,
+    sort: Sort,
+    cursor: Option<&(String, String)>,
     limit: usize,
 ) -> rusqlite::Result<(Vec<AlbumRow>, bool)> {
+    let key = album_key_expr(sort.key);
     let mut sql = String::from(
         "SELECT a.dir, COUNT(*) AS c, MAX(a.mtime) AS m,
-                MIN(CASE WHEN a.mtime > 0 THEN a.mtime END) AS f
+                MIN(CASE WHEN a.mtime > 0 THEN a.mtime END) AS f,
+                SUM(a.size) AS b
          FROM media_assets a WHERE ",
     );
     sql.push_str(Scope::clause());
@@ -458,27 +603,24 @@ pub fn album_page(
     let mut values = scope.params();
     values.extend(kinds_params(kinds));
 
-    if let Some((mtime, path)) = cursor {
-        if by_path {
-            sql.push_str(
-                " HAVING lower(a.dir) > lower(?) OR (lower(a.dir) = lower(?) AND a.dir > ?)",
-            );
-            values.push(Value::Text(path.clone()));
-            values.push(Value::Text(path.clone()));
-            values.push(Value::Text(path.clone()));
-        } else {
-            sql.push_str(" HAVING MAX(a.mtime) < ? OR (MAX(a.mtime) = ? AND a.dir > ?)");
-            values.push(Value::Integer(*mtime as i64));
-            values.push(Value::Integer(*mtime as i64));
-            values.push(Value::Text(path.clone()));
-        }
+    if let Some((cursor_key, dir)) = cursor {
+        let op = sort.sql_op();
+        sql.push_str(&format!(
+            " HAVING {key} {op} ? OR ({key} = ? AND a.dir > ?)"
+        ));
+        let value = match sort.key {
+            SortKey::Name => Value::Text(cursor_key.to_lowercase()),
+            _ => Value::Integer(cursor_key.parse::<i64>().unwrap_or(0)),
+        };
+        values.push(value.clone());
+        values.push(value);
+        values.push(Value::Text(dir.clone()));
     }
 
-    if by_path {
-        sql.push_str(" ORDER BY lower(a.dir) ASC, a.dir ASC LIMIT ?");
-    } else {
-        sql.push_str(" ORDER BY MAX(a.mtime) DESC, a.dir ASC LIMIT ?");
-    }
+    sql.push_str(&format!(
+        " ORDER BY {key} {}, a.dir ASC LIMIT ?",
+        sort.sql_dir()
+    ));
     values.push(Value::Integer(limit as i64 + 1));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -488,6 +630,7 @@ pub fn album_page(
             count: row.get::<_, i64>(1)?.max(0) as usize,
             mtime: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
             first_mtime: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+            bytes: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
         })
     })?;
     let mut items = Vec::with_capacity(limit.min(256));
@@ -497,6 +640,16 @@ pub fn album_page(
     let has_more = items.len() > limit;
     items.truncate(limit);
     Ok((items, has_more))
+}
+
+/// 相册聚合后的排序表达式（与 `album_page` 的 `ORDER BY` / `HAVING` 必须一致）
+fn album_key_expr(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "lower(a.dir)",
+        SortKey::Count => "COUNT(*)",
+        SortKey::Size => "SUM(a.size)",
+        SortKey::Mtime => "MAX(a.mtime)",
+    }
 }
 
 /// 相册总数（`GROUP BY dir` 的行数）
@@ -626,6 +779,9 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// 测试里最常用的排序：新的在前
+    const NEWEST: Sort = Sort::new(SortKey::Mtime, SortDir::Desc);
+
     fn scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("asmoday-media-index-{tag}-{}", std::process::id()));
@@ -687,12 +843,12 @@ mod tests {
                 )?;
 
                 let mut seen = Vec::new();
-                let mut cursor: Option<(u64, String)> = None;
+                let mut cursor: Option<(String, String)> = None;
                 let mut rounds = 0;
                 loop {
                     rounds += 1;
                     assert!(rounds < 20, "分页没有收敛");
-                    let (items, more) = page(conn, &scope, &["image"], cursor.as_ref(), 3)?;
+                    let (items, more) = page(conn, &scope, &["image"], NEWEST, cursor.as_ref(), 3)?;
                     for item in &items {
                         seen.push(item.path.clone());
                     }
@@ -702,7 +858,7 @@ mod tests {
                     let last = items
                         .last()
                         .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
-                    cursor = Some((last.mtime, last.path.clone()));
+                    cursor = Some((last.mtime.to_string(), last.path.clone()));
                 }
 
                 assert_eq!(seen.len(), 8, "根 + 子目录共 8 张，作用域外的那张不能进来");
@@ -740,7 +896,7 @@ mod tests {
                 )?;
 
                 assert_eq!(totals(conn, &scope)?, (2, 1, 0), "深度外的不能算进来");
-                let (items, more) = page(conn, &scope, &["image"], None, 120)?;
+                let (items, more) = page(conn, &scope, &["image"], NEWEST, None, 120)?;
                 assert_eq!(items.len(), 2, "只取 image");
                 assert!(!more);
                 Ok(())
@@ -771,7 +927,7 @@ mod tests {
                     2,
                     &[asset("/data", "keep.jpg", 12)],
                 )?;
-                let (items, _) = page(conn, &scope, &["image"], None, 10)?;
+                let (items, _) = page(conn, &scope, &["image"], NEWEST, None, 10)?;
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].path, "/data/keep.jpg");
                 assert_eq!(dir_stamp(conn, "/data")?, Some(2));
@@ -803,7 +959,7 @@ mod tests {
 
                 let removed = prune(conn, &scope, &HashSet::from(["/data".to_string()]))?;
                 assert_eq!(removed, 1);
-                let (items, _) = page(conn, &scope, &["image"], None, 10)?;
+                let (items, _) = page(conn, &scope, &["image"], NEWEST, None, 10)?;
                 assert_eq!(items.len(), 1, "死目录的条目必须一起走");
                 assert_eq!(items[0].path, "/data/a.jpg");
                 Ok(())
@@ -846,7 +1002,7 @@ mod tests {
                     }],
                 )?;
 
-                let (rows, more) = album_page(conn, &scope, &["image"], false, None, 10)?;
+                let (rows, more) = album_page(conn, &scope, &["image"], NEWEST, None, 10)?;
                 assert!(!more);
                 assert_eq!(rows.len(), 2, "没有图片的目录不上架");
                 assert_eq!(rows[0].dir, "/lib/2020", "按册内最新一张倒序");
@@ -859,9 +1015,173 @@ mod tests {
                 assert!(cover.path.ends_with("b.jpg"));
 
                 // 路径序：同一父目录的册子挨在一起
-                let (by_path, _) = album_page(conn, &scope, &["image"], true, None, 10)?;
+                let (by_path, _) = album_page(
+                    conn,
+                    &scope,
+                    &["image"],
+                    Sort::new(SortKey::Name, SortDir::Asc),
+                    None,
+                    10,
+                )?;
                 assert_eq!(by_path[0].dir, "/lib/2020");
                 assert_eq!(by_path[1].dir, "/lib/2021");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn natural_key_orders_numbers_like_a_human() {
+        assert!(natural_key("第2集") < natural_key("第10集"));
+        assert!(natural_key("IMG_2.jpg") < natural_key("IMG_10.jpg"));
+        assert!(
+            natural_key("a1") < natural_key("a01b"),
+            "前导零不能改变大小关系"
+        );
+        assert_eq!(natural_key("AbC.TXT"), "abc.txt", "大小写必须折叠");
+        assert_eq!(natural_key("v1.2.10"), "v0000000001.0000000002.0000000010");
+    }
+
+    /// v4.9.0：四个维度 × 两个方向，每一页都靠游标接上，翻了不能重也不能漏
+    #[test]
+    fn every_sort_dimension_pages_without_gaps() {
+        let index = index("sorts");
+        index
+            .with_conn(|conn| {
+                let scope = Scope::new("/lib", 1);
+                let mut assets = Vec::new();
+                for i in 0..23u64 {
+                    let mut one = asset("/lib", &format!("ep{i}.jpg"), 100 + (i % 5));
+                    // 体积与时间反着来，两个维度不会「碰巧一样」掩盖 bug
+                    one.size = 1000 - i;
+                    assets.push(one);
+                }
+                replace_dir(conn, "/lib", scope.min_depth, 1, &assets)?;
+
+                let sorts = [
+                    Sort::new(SortKey::Mtime, SortDir::Desc),
+                    Sort::new(SortKey::Mtime, SortDir::Asc),
+                    Sort::new(SortKey::Name, SortDir::Desc),
+                    Sort::new(SortKey::Name, SortDir::Asc),
+                    Sort::new(SortKey::Size, SortDir::Desc),
+                    Sort::new(SortKey::Size, SortDir::Asc),
+                ];
+                for sort in sorts {
+                    let mut seen = Vec::new();
+                    let mut cursor: Option<(String, String)> = None;
+                    let mut rounds = 0;
+                    loop {
+                        rounds += 1;
+                        assert!(rounds < 40, "{sort:?} 分页没有收敛");
+                        let (items, more) =
+                            page(conn, &scope, &["image"], sort, cursor.as_ref(), 5)?;
+                        for item in &items {
+                            seen.push(item.path.clone());
+                        }
+                        if items.is_empty() {
+                            assert!(!more, "{sort:?} 空页却还有 next");
+                            break;
+                        }
+                        if !more {
+                            break;
+                        }
+                        let last = items
+                            .last()
+                            .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+                        let key = match sort.key {
+                            SortKey::Name => natural_key(&last.name),
+                            SortKey::Size => last.size.to_string(),
+                            _ => last.mtime.to_string(),
+                        };
+                        cursor = Some((key, last.path.clone()));
+                    }
+                    assert_eq!(seen.len(), 23, "{sort:?} 漏项或重复");
+                    let mut unique = seen.clone();
+                    unique.sort();
+                    unique.dedup();
+                    assert_eq!(unique.len(), 23, "{sort:?} 翻页出现重复");
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 相册墙的条目数 / 体积排序也要走同一套游标
+    #[test]
+    fn album_sorts_by_count_and_size() {
+        let index = index("album-sorts");
+        index
+            .with_conn(|conn| {
+                let scope = Scope::new("/lib", 1);
+                // bytes = count × size：a=300、b=150、c=400
+                for (dir, count, size) in [("a", 1u64, 300u64), ("b", 3, 50), ("c", 2, 200)] {
+                    let assets: Vec<Asset> = (0..count)
+                        .map(|i| {
+                            let mut one = asset(&format!("/lib/{dir}"), &format!("p{i}.jpg"), 10);
+                            one.size = size;
+                            one
+                        })
+                        .collect();
+                    replace_dir(
+                        conn,
+                        &format!("/lib/{dir}"),
+                        scope.min_depth + 1,
+                        1,
+                        &assets,
+                    )?;
+                }
+
+                let (rows, _) = album_page(
+                    conn,
+                    &scope,
+                    &["image"],
+                    Sort::new(SortKey::Count, SortDir::Desc),
+                    None,
+                    10,
+                )?;
+                let order: Vec<&str> = rows.iter().map(|row| row.dir.as_str()).collect();
+                assert_eq!(order, vec!["/lib/b", "/lib/c", "/lib/a"], "条目多的在前");
+
+                let (rows, _) = album_page(
+                    conn,
+                    &scope,
+                    &["image"],
+                    Sort::new(SortKey::Size, SortDir::Asc),
+                    None,
+                    10,
+                )?;
+                let order: Vec<&str> = rows.iter().map(|row| row.dir.as_str()).collect();
+                assert_eq!(
+                    order,
+                    vec!["/lib/b", "/lib/a", "/lib/c"],
+                    "按总体积从小到大"
+                );
+                assert_eq!(rows[2].bytes, 400, "体积是册内累加，不是单张");
+
+                // 游标：count 排序每页 1 本，三页走完不重不漏
+                let sort = Sort::new(SortKey::Count, SortDir::Desc);
+                let mut seen = Vec::new();
+                let mut cursor: Option<(String, String)> = None;
+                loop {
+                    let (items, more) =
+                        album_page(conn, &scope, &["image"], sort, cursor.as_ref(), 1)?;
+                    if items.is_empty() {
+                        break;
+                    }
+                    seen.extend(items.iter().map(|row| row.dir.clone()));
+                    if !more {
+                        break;
+                    }
+                    let last = items
+                        .last()
+                        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+                    cursor = Some((last.count.to_string(), last.dir.clone()));
+                }
+                assert_eq!(seen.len(), 3);
+                let mut unique = seen.clone();
+                unique.sort();
+                unique.dedup();
+                assert_eq!(unique.len(), 3, "相册翻页出现重复");
                 Ok(())
             })
             .unwrap();

@@ -3,6 +3,7 @@
 //! 媒体索引只做「按目录扫描 + 分类」，不做刮削、不联网。
 //! 视频封面可选：配置了外部 FFmpeg 才截首帧，否则回占位图。
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -56,6 +57,10 @@ pub struct BrowseQuery {
     /// 只有时间线这种「按比例铺」的视图才需要，其它调用省下这批文件头读取。
     #[serde(default, deserialize_with = "crate::api::boolish")]
     pub dims: Option<bool>,
+    /// 排序：mtime_desc（默认）/ mtime_asc / name_asc / name_desc / size_desc / size_asc
+    ///
+    /// `count_*` 只有相册墙认（媒体列表里「一本册子有多少条」没有意义）。
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,19 +115,37 @@ pub struct BrowseResult {
     pub next_cursor: Option<String>,
 }
 
-/// 游标：只记上一页最后一条的排序键（mtime 降序 + 展示路径升序）。
+/// 游标：只记上一页最后一条的排序主键 + 展示路径（keyset，不用 offset）。
 ///
-/// 刻意不用 offset —— 扫描期间新增/删除文件不会让下一页重复或漏项。
-/// 和文件列表（`core::fs`）同一套口径：稳定排序 + keyset。
+/// v4.9.0 起主键是**字符串**：时间/体积是十进制数字串，名称是自然序键。
+/// 老游标（v4.8.x）只有一个数字 `m`，继续认 —— 否则用户翻页途中刷新页面
+/// 会莫名其妙回到第一页。
 #[derive(Debug, Serialize, Deserialize)]
 struct MediaCursor {
-    m: u64,
+    /// 排序主键
+    #[serde(default)]
+    k: String,
+    /// 兼容字段：v4.8.x 游标里的 mtime
+    #[serde(default, skip_serializing)]
+    m: Option<u64>,
+    /// 次级键：展示路径（唯一，兜底保证顺序稳定）
     p: String,
 }
 
-fn encode_cursor(mtime: u64, display: &str) -> String {
+impl MediaCursor {
+    /// 主键原文；老游标回退成 mtime 的十进制串
+    fn key(&self) -> Option<String> {
+        if !self.k.is_empty() {
+            return Some(self.k.clone());
+        }
+        self.m.map(|mtime| mtime.to_string())
+    }
+}
+
+fn encode_cursor(key: &str, display: &str) -> String {
     let cursor = MediaCursor {
-        m: mtime,
+        k: key.to_string(),
+        m: None,
         p: display.to_string(),
     };
     let json = serde_json::to_vec(&cursor).unwrap_or_default();
@@ -136,14 +159,81 @@ fn decode_cursor(raw: &str) -> Option<MediaCursor> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 游标之后的起始下标（`raw` 必须已按 mtime 降序 + 路径升序排好）
-fn page_start(raw: &[RawMedia], cursor: Option<&MediaCursor>) -> usize {
-    match cursor {
-        Some(cur) => raw.partition_point(|item| {
-            item.mtime > cur.m || (item.mtime == cur.m && item.display.as_str() <= cur.p.as_str())
-        }),
-        None => 0,
+/// 把游标规整成 `(主键, 路径)`；主键形态与排序维度不匹配就当没传（回第一页）。
+///
+/// 宁可重来一页，也不要把一个解析不出的键塞进 SQL —— 那会悄悄返回空页，
+/// 用户看到的是「翻页翻丢了」，比回到第一页难排查得多。
+fn cursor_key(sort: media_index::Sort, cursor: Option<&MediaCursor>) -> Option<(String, String)> {
+    let cur = cursor?;
+    let key = cur.key()?;
+    match sort.key {
+        media_index::SortKey::Name => {
+            if key.is_empty() {
+                return None;
+            }
+        }
+        _ => {
+            key.parse::<i64>().ok()?;
+        }
     }
+    Some((key, cur.p.clone()))
+}
+
+/// 游标之后的起始下标（`raw` 必须已按同一 `sort` 排好）
+///
+/// `partition_point` 要的是「**落在游标之前（含游标自身）**」这个单调前缀，
+/// 不是「在游标之后」—— 降序时主键大的在前，判断方向也跟着反过来。
+fn page_start(raw: &[RawMedia], sort: media_index::Sort, key: Option<&(String, String)>) -> usize {
+    let Some((cursor_key, cursor_path)) = key else {
+        return 0;
+    };
+    raw.partition_point(|item| {
+        let order = compare_media_key(item, sort.key, cursor_key);
+        match order {
+            Ordering::Greater if sort.is_desc() => true,
+            Ordering::Less if !sort.is_desc() => true,
+            Ordering::Equal => item.display.as_str() <= cursor_path.as_str(),
+            _ => false,
+        }
+    })
+}
+
+fn compare_media_key(item: &RawMedia, key: media_index::SortKey, cursor_key: &str) -> Ordering {
+    match key {
+        media_index::SortKey::Name => media_index::natural_key(&item.name)
+            .as_str()
+            .cmp(cursor_key),
+        media_index::SortKey::Size => item.size.cmp(&cursor_key.parse::<u64>().unwrap_or(0)),
+        _ => item.mtime.cmp(&cursor_key.parse::<u64>().unwrap_or(0)),
+    }
+}
+
+/// 一条记录在某个维度上的游标主键（索引路径与内存路径必须生成同一种形态）
+fn sort_cursor_key(item: &RawMedia, key: media_index::SortKey) -> String {
+    match key {
+        media_index::SortKey::Name => media_index::natural_key(&item.name),
+        media_index::SortKey::Size => item.size.to_string(),
+        _ => item.mtime.to_string(),
+    }
+}
+
+/// 内存回退路径的整表排序（索引不可用时才会用到）
+fn sort_media(raw: &mut [RawMedia], sort: media_index::Sort) {
+    raw.sort_by(|a, b| {
+        let by_key = match sort.key {
+            media_index::SortKey::Name => {
+                media_index::natural_key(&a.name).cmp(&media_index::natural_key(&b.name))
+            }
+            media_index::SortKey::Size => a.size.cmp(&b.size),
+            _ => a.mtime.cmp(&b.mtime),
+        };
+        let by_key = if sort.is_desc() {
+            by_key.reverse()
+        } else {
+            by_key
+        };
+        by_key.then_with(|| a.display.cmp(&b.display))
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -444,6 +534,16 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
     // depth=0 合法：只扫起点目录第一层（相册详情用，卡片条数必须与看到的一致）
     let depth = query.depth.unwrap_or(DEFAULT_DEPTH).clamp(0, 4);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let sort = match media_index::Sort::parse(query.sort.as_deref()) {
+        Ok(sort) => sort,
+        Err(err) => return fs_error(FsError::BadRequest(err)),
+    };
+    // 「条目数」是相册墙的概念，媒体列表里排它等于排时间，直接拒绝比默默改成时间好
+    if matches!(sort.key, media_index::SortKey::Count) {
+        return fs_error(FsError::BadRequest(
+            "媒体列表不支持按条目数排序".to_string(),
+        ));
+    }
     let cursor = query
         .cursor
         .as_deref()
@@ -465,6 +565,7 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
             &scan_root,
             depth,
             limit,
+            sort,
             cursor.as_ref(),
             &wanted,
             want_dims,
@@ -482,16 +583,13 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
             Some(dir_cache.as_ref()),
             refresh,
         );
-        // 稳定排序：mtime 降序（新的在前），同 mtime 用展示路径兜底，保证翻页不重不漏
+        // 稳定排序：主键 + 展示路径兜底，保证翻页不重不漏（方向由用户选的来）
         let mut raw = raw;
-        raw.sort_by(|a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then_with(|| a.display.cmp(&b.display))
-        });
+        sort_media(&mut raw, sort);
 
         let total = raw.len();
-        let start = page_start(&raw, cursor.as_ref());
+        let key = cursor_key(sort, cursor.as_ref());
+        let start = page_start(&raw, sort, key.as_ref());
         let end = start.saturating_add(limit).min(total);
         let has_more = end < total;
         // 只对当前页做重活（ID3 解析、字幕探测、ThumbHash 查询、像素宽高）
@@ -504,7 +602,11 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
             None => build_items(slice, &auth_store, want_dims, None),
         };
         let next_cursor = if has_more && end > start {
-            Some(encode_cursor(raw[end - 1].mtime, &raw[end - 1].display))
+            let last = &raw[end - 1];
+            Some(encode_cursor(
+                &sort_cursor_key(last, sort.key),
+                &last.display,
+            ))
         } else {
             None
         };
@@ -545,6 +647,7 @@ fn browse_indexed(
     root: &Path,
     depth: usize,
     limit: usize,
+    sort: media_index::Sort,
     cursor: Option<&MediaCursor>,
     wanted: &[&str],
     want_dims: bool,
@@ -559,6 +662,7 @@ fn browse_indexed(
     };
     let scanned = sync_index(index, root, depth, mode, cache)?;
     let scope = Scope::new(&fs::normalize_display(root), depth);
+    let key = cursor_key(sort, cursor);
     // 查询本身是毫秒级，先一次性取完（数据库锁只在这一小段里握着）
     let (assets, has_more, counts, total) = index.with_conn(|conn| {
         let (image, video, audio) = media_index::totals(conn, &scope)?;
@@ -576,15 +680,20 @@ fn browse_indexed(
                 _ => 0,
             })
             .sum();
-        let key = cursor.map(|cur| (cur.m, cur.p.clone()));
-        let (assets, has_more) = media_index::page(conn, &scope, wanted, key.as_ref(), limit)?;
+        let (assets, has_more) =
+            media_index::page(conn, &scope, wanted, sort, key.as_ref(), limit)?;
         Ok((assets, has_more, counts, total))
     })?;
 
     let next_cursor = if has_more {
-        assets
-            .last()
-            .map(|asset| encode_cursor(asset.mtime, &asset.path))
+        assets.last().map(|asset| {
+            let key = match sort.key {
+                media_index::SortKey::Name => media_index::natural_key(&asset.name),
+                media_index::SortKey::Size => asset.size.to_string(),
+                _ => asset.mtime.to_string(),
+            };
+            encode_cursor(&key, &asset.path)
+        })
     } else {
         None
     };
@@ -638,10 +747,9 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
         None => vec!["image"],
     };
     let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-    let by_path = match query.sort.as_deref() {
-        None | Some("") | Some("mtime") => false,
-        Some("path") => true,
-        Some(other) => return fs_error(FsError::BadRequest(format!("不支持的排序：{other}"))),
+    let sort = match media_index::Sort::parse(query.sort.as_deref()) {
+        Ok(sort) => sort,
+        Err(err) => return fs_error(FsError::BadRequest(err)),
     };
     let cursor = query
         .cursor
@@ -663,9 +771,9 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
             &scan_root,
             depth,
             limit,
+            sort,
             cursor.as_ref(),
             &wanted,
-            by_path,
             refresh,
             Some(dir_cache.as_ref()),
             &auth_store,
@@ -680,36 +788,15 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
             refresh,
         );
         let total = raw.len();
-
-        // 按路径排序（v4.6.18）：同父目录的册子自然排在一起，翻找有方位感。
-        // 游标只带路径（mtime 占位 0），分页键必须与排序键严格一致，否则会重/漏。
-        if by_path {
-            sort_albums_by_path(&mut raw);
-            let start = albums_path_start(&raw, cursor.as_ref());
-            let end = start.saturating_add(limit).min(total);
-            let has_more = end < total;
-            let items = build_albums(&raw[start.min(total)..end], &auth_store);
-            let next_cursor = if has_more && end > start {
-                Some(encode_cursor(0, &raw[end - 1].path))
-            } else {
-                None
-            };
-            return (items, total, has_more, next_cursor);
-        }
-
-        // 新的在前；同 mtime 用路径兜底，保证翻页稳定
-        raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
-        let start = match &cursor {
-            Some(cur) => raw.partition_point(|item| {
-                item.mtime > cur.m || (item.mtime == cur.m && item.path <= cur.p)
-            }),
-            None => 0,
-        };
+        sort_albums(&mut raw, sort);
+        let key = album_cursor_key(sort, cursor.as_ref());
+        let start = album_page_start(&raw, sort, key.as_ref());
         let end = start.saturating_add(limit).min(total);
         let has_more = end < total;
         let items = build_albums(&raw[start.min(total)..end], &auth_store);
         let next_cursor = if has_more && end > start {
-            Some(encode_cursor(raw[end - 1].mtime, &raw[end - 1].path))
+            let last = &raw[end - 1];
+            Some(encode_cursor(&album_sort_key(last, sort.key), &last.path))
         } else {
             None
         };
@@ -740,9 +827,9 @@ fn albums_indexed(
     root: &Path,
     depth: usize,
     limit: usize,
+    sort: media_index::Sort,
     cursor: Option<&MediaCursor>,
     wanted: &[&str],
-    by_path: bool,
     refresh: bool,
     cache: Option<&crate::core::dir_cache::DirCache>,
     auth: &crate::core::auth::AuthStore,
@@ -754,11 +841,11 @@ fn albums_indexed(
     };
     sync_index(index, root, depth, mode, cache)?;
     let scope = Scope::new(&fs::normalize_display(root), depth);
+    let key = album_cursor_key(sort, cursor);
     // 聚合 + 本页封面一次性取完（都是小查询），后面拼卡片时不占着数据库锁
     let (rows, covers, has_more, total) = index.with_conn(|conn| {
-        let key = cursor.map(|cur| (cur.m, cur.p.clone()));
         let (rows, has_more) =
-            media_index::album_page(conn, &scope, wanted, by_path, key.as_ref(), limit)?;
+            media_index::album_page(conn, &scope, wanted, sort, key.as_ref(), limit)?;
         let total = media_index::album_total(conn, &scope, wanted)?;
         let mut covers = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -782,22 +869,101 @@ fn albums_indexed(
             cover_path: cover.as_ref().map(|asset| PathBuf::from(&asset.real)),
             mtime: row.mtime,
             first_mtime: row.first_mtime,
+            bytes: row.bytes,
         })
         .collect();
     let items = build_albums(&raw, auth);
     let next_cursor = if has_more {
-        rows.last().map(|row| {
-            if by_path {
-                encode_cursor(0, &row.dir)
-            } else {
-                encode_cursor(row.mtime, &row.dir)
-            }
-        })
+        rows.last()
+            .map(|row| encode_cursor(&album_sort_key_of_row(row, sort.key), &row.dir))
     } else {
         None
     };
     index.with_conn(|conn| media_index::touch_synced(conn, &scope.root));
     Some((items, total, has_more, next_cursor))
+}
+
+/// 相册游标主键（内存路径用）
+fn album_sort_key(item: &RawAlbum, key: media_index::SortKey) -> String {
+    match key {
+        media_index::SortKey::Name => item.path.to_lowercase(),
+        media_index::SortKey::Count => item.count.to_string(),
+        media_index::SortKey::Size => item.bytes.to_string(),
+        media_index::SortKey::Mtime => item.mtime.to_string(),
+    }
+}
+
+/// 相册游标主键（索引路径用，与 `album_sort_key` 必须同源）
+fn album_sort_key_of_row(row: &media_index::AlbumRow, key: media_index::SortKey) -> String {
+    match key {
+        media_index::SortKey::Name => row.dir.to_lowercase(),
+        media_index::SortKey::Count => row.count.to_string(),
+        media_index::SortKey::Size => row.bytes.to_string(),
+        media_index::SortKey::Mtime => row.mtime.to_string(),
+    }
+}
+
+/// 相册游标规整：形态不匹配就当没传
+fn album_cursor_key(
+    sort: media_index::Sort,
+    cursor: Option<&MediaCursor>,
+) -> Option<(String, String)> {
+    let cur = cursor?;
+    let key = cur.key()?;
+    if matches!(sort.key, media_index::SortKey::Name) {
+        return if key.is_empty() {
+            None
+        } else {
+            Some((key, cur.p.clone()))
+        };
+    }
+    key.parse::<i64>().ok()?;
+    Some((key, cur.p.clone()))
+}
+
+/// 相册内存排序（索引不可用时的回退路径）
+fn sort_albums(raw: &mut [RawAlbum], sort: media_index::Sort) {
+    raw.sort_by(|a, b| {
+        let by_key = match sort.key {
+            media_index::SortKey::Name => a.path.to_lowercase().cmp(&b.path.to_lowercase()),
+            media_index::SortKey::Count => a.count.cmp(&b.count),
+            media_index::SortKey::Size => a.bytes.cmp(&b.bytes),
+            media_index::SortKey::Mtime => a.mtime.cmp(&b.mtime),
+        };
+        let by_key = if sort.is_desc() {
+            by_key.reverse()
+        } else {
+            by_key
+        };
+        by_key.then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+/// 相册游标之后的起始下标
+fn album_page_start(
+    raw: &[RawAlbum],
+    sort: media_index::Sort,
+    key: Option<&(String, String)>,
+) -> usize {
+    let Some((cursor_key, cursor_path)) = key else {
+        return 0;
+    };
+    raw.partition_point(|item| {
+        let order = match sort.key {
+            media_index::SortKey::Name => item.path.to_lowercase().cmp(cursor_key),
+            media_index::SortKey::Count => {
+                item.count.cmp(&cursor_key.parse::<usize>().unwrap_or(0))
+            }
+            media_index::SortKey::Size => item.bytes.cmp(&cursor_key.parse::<u64>().unwrap_or(0)),
+            media_index::SortKey::Mtime => item.mtime.cmp(&cursor_key.parse::<u64>().unwrap_or(0)),
+        };
+        match order {
+            Ordering::Greater if sort.is_desc() => true,
+            Ordering::Less if !sort.is_desc() => true,
+            Ordering::Equal => item.path.as_str() <= cursor_path.as_str(),
+            _ => false,
+        }
+    })
 }
 /// 扫描时要跳过的目录名：应用自身的数据/构建产物不算媒体库
 const SKIP_DIRS: &[&str] = &[
@@ -1414,6 +1580,8 @@ struct RawAlbum {
     mtime: u64,
     /// 最早一张图的时间戳（0 = 未知）
     first_mtime: u64,
+    /// 册内媒体总字节数（v4.9.0：按体积排序）
+    bytes: u64,
 }
 
 fn scan_albums(
@@ -1437,6 +1605,7 @@ fn scan_albums(
     while let Some((dir, level, is_root)) = stack.pop() {
         let entries = read_dir_entries(&dir, cache, refresh);
         let mut count = 0usize;
+        let mut bytes = 0u64;
         // (mtime, path)：相册封面取最新的一张图
         let mut newest: Option<(u64, PathBuf)> = None;
         // 最早一张图的 mtime：卡片副标题的时间范围（v4.6.23）
@@ -1475,6 +1644,7 @@ fn scan_albums(
                 continue;
             }
             count += 1;
+            bytes += entry.size;
             if entry.mtime > 0 && (oldest == 0 || entry.mtime < oldest) {
                 oldest = entry.mtime;
             }
@@ -1508,33 +1678,11 @@ fn scan_albums(
             cover_path,
             mtime: mtime.unwrap_or(0),
             first_mtime: oldest,
+            bytes,
         });
     }
 
     albums
-}
-
-/// 按路径升序排（忽略大小写，同路径再按原串兜底）。
-///
-/// 文件夹墙的排序口径（v4.6.18）：按 mtime 排会把不同父目录的册子按「最后一张
-/// 照片的日期」打散，用户找不到方位感；路径序让同一父目录下的册子挨在一起。
-fn sort_albums_by_path(raw: &mut [RawAlbum]) {
-    raw.sort_by_cached_key(|item| (item.path.to_lowercase(), item.path.clone()));
-}
-
-/// 路径序游标之后的起始下标 —— 分页键与 `sort_albums_by_path` 必须是同一个键，
-/// 否则翻页会重/漏。
-fn albums_path_start(raw: &[RawAlbum], cursor: Option<&MediaCursor>) -> usize {
-    match cursor {
-        Some(cur) => {
-            let key = cur.p.to_lowercase();
-            raw.partition_point(|item| {
-                let path_key = item.path.to_lowercase();
-                path_key < key || (path_key == key && item.path.as_str() <= cur.p.as_str())
-            })
-        }
-        None => 0,
-    }
 }
 
 /// 给当前页的相册补封面 ThumbHash（一次批量查询，不逐本开连接）。
@@ -1758,6 +1906,10 @@ pub async fn clear_cache(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// 测试里的默认排序：新的在前
+    const NEWEST: media_index::Sort =
+        media_index::Sort::new(media_index::SortKey::Mtime, media_index::SortDir::Desc);
+
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1830,11 +1982,7 @@ mod tests {
         }
 
         let (mut raw, _, _) = scan_raw(&root, &["image"], 0, None, false);
-        raw.sort_by(|a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then_with(|| a.display.cmp(&b.display))
-        });
+        sort_media(&mut raw, NEWEST);
         let expected: Vec<String> = raw.iter().map(|item| item.display.clone()).collect();
         // 新的在前
         assert!(expected[0].ends_with("p16.jpg"));
@@ -1845,7 +1993,8 @@ mod tests {
         loop {
             rounds += 1;
             assert!(rounds < 20, "分页没有收敛");
-            let start = page_start(&raw, cursor.as_ref());
+            let key = cursor_key(NEWEST, cursor.as_ref());
+            let start = page_start(&raw, NEWEST, key.as_ref());
             let end = (start + 5).min(raw.len());
             for item in &raw[start..end] {
                 seen.push(item.display.clone());
@@ -1854,7 +2003,8 @@ mod tests {
                 break;
             }
             cursor = Some(MediaCursor {
-                m: raw[end - 1].mtime,
+                k: raw[end - 1].mtime.to_string(),
+                m: None,
                 p: raw[end - 1].display.clone(),
             });
         }
@@ -1876,23 +2026,21 @@ mod tests {
             touch(&root, &format!("same{index}.jpg"), 1_700_000_000);
         }
         let (mut raw, _, _) = scan_raw(&root, &["image"], 0, None, false);
-        raw.sort_by(|a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then_with(|| a.display.cmp(&b.display))
-        });
+        sort_media(&mut raw, NEWEST);
 
         let mut seen = Vec::new();
         let mut cursor: Option<MediaCursor> = None;
         loop {
-            let start = page_start(&raw, cursor.as_ref());
+            let key = cursor_key(NEWEST, cursor.as_ref());
+            let start = page_start(&raw, NEWEST, key.as_ref());
             let end = (start + 4).min(raw.len());
             seen.extend(raw[start..end].iter().map(|item| item.display.clone()));
             if end >= raw.len() {
                 break;
             }
             cursor = Some(MediaCursor {
-                m: raw[end - 1].mtime,
+                k: raw[end - 1].mtime.to_string(),
+                m: None,
                 p: raw[end - 1].display.clone(),
             });
         }
@@ -1903,12 +2051,22 @@ mod tests {
 
     #[test]
     fn cursor_decodes_what_encode_produced() {
-        let raw = encode_cursor(1_700_000_123, "D:/media/a.jpg");
+        let raw = encode_cursor("1700000123", "D:/media/a.jpg");
         let cursor = decode_cursor(&raw).expect("游标必须能解回来");
-        assert_eq!(cursor.m, 1_700_000_123);
+        assert_eq!(cursor.key().as_deref(), Some("1700000123"));
         assert_eq!(cursor.p, "D:/media/a.jpg");
         // 手工改坏的游标当第一页处理，不报错
         assert!(decode_cursor("not-a-cursor").is_none());
+    }
+
+    #[test]
+    fn legacy_cursor_without_key_still_decodes() {
+        // v4.8.x 的游标只有数字 m：升级后翻页途中刷新不能回到第一页
+        let legacy = serde_json::json!({ "m": 1_700_000_123u64, "p": "D:/media/a.jpg" });
+        let encoded = data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&legacy).unwrap());
+        let cursor = decode_cursor(&encoded).expect("老游标必须还能解");
+        assert_eq!(cursor.key().as_deref(), Some("1700000123"));
+        assert_eq!(cursor.p, "D:/media/a.jpg");
     }
 
     #[test]
@@ -1927,25 +2085,22 @@ mod tests {
         touch(&data, "cache.jpg", 1_700_000_009);
 
         let mut raw = scan_albums(&root, 3, &["image"], None, false);
-        raw.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+        sort_albums(&mut raw, NEWEST);
         assert_eq!(raw.len(), 3, "只该有 a/b/c 三本，空目录与数据目录都不算");
 
         let mut seen = Vec::new();
         let mut cursor: Option<MediaCursor> = None;
         loop {
-            let start = match &cursor {
-                Some(cur) => raw.partition_point(|item| {
-                    item.mtime > cur.m || (item.mtime == cur.m && item.path <= cur.p)
-                }),
-                None => 0,
-            };
+            let key = album_cursor_key(NEWEST, cursor.as_ref());
+            let start = album_page_start(&raw, NEWEST, key.as_ref());
             let end = (start + 2).min(raw.len());
             seen.extend(raw[start..end].iter().map(|item| item.path.clone()));
             if end >= raw.len() {
                 break;
             }
             cursor = Some(MediaCursor {
-                m: raw[end - 1].mtime,
+                k: album_sort_key(&raw[end - 1], NEWEST.key),
+                m: None,
                 p: raw[end - 1].path.clone(),
             });
         }
@@ -1965,7 +2120,8 @@ mod tests {
         }
 
         let mut raw = scan_albums(&root, 3, &["image"], None, false);
-        sort_albums_by_path(&mut raw);
+        let by_name = media_index::Sort::new(media_index::SortKey::Name, media_index::SortDir::Asc);
+        sort_albums(&mut raw, by_name);
         let names: Vec<&str> = raw.iter().map(|item| item.name.as_str()).collect();
         // alpha 自己不放图，不算一本册；alpha/b、alpha/c 必须相邻
         assert_eq!(
@@ -1979,14 +2135,16 @@ mod tests {
         let mut seen: Vec<String> = Vec::new();
         let mut cursor: Option<MediaCursor> = None;
         loop {
-            let start = albums_path_start(&raw, cursor.as_ref());
+            let key = album_cursor_key(by_name, cursor.as_ref());
+            let start = album_page_start(&raw, by_name, key.as_ref());
             let end = (start + 2).min(raw.len());
             seen.extend(raw[start..end].iter().map(|item| item.path.clone()));
             if end >= raw.len() {
                 break;
             }
             cursor = Some(MediaCursor {
-                m: 0,
+                k: album_sort_key(&raw[end - 1], by_name.key),
+                m: None,
                 p: raw[end - 1].path.clone(),
             });
         }
@@ -2101,17 +2259,15 @@ mod tests {
 
         let scope = Scope::new(&fs::normalize_display(&root), 1);
         let (assets, more) = index
-            .with_conn(|conn| media_index::page(conn, &scope, &["image", "video"], None, 100))
+            .with_conn(|conn| {
+                media_index::page(conn, &scope, &["image", "video"], NEWEST, None, 100)
+            })
             .expect("查询失败");
         assert!(!more);
 
         let indexed: Vec<String> = assets.iter().map(|asset| asset.path.clone()).collect();
         let (mut raw, _, _) = scan_raw(&root, &["image", "video"], 1, None, true);
-        raw.sort_by(|a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then_with(|| a.display.cmp(&b.display))
-        });
+        sort_media(&mut raw, NEWEST);
         let expected: Vec<String> = raw.iter().map(|item| item.display.clone()).collect();
         assert_eq!(indexed, expected, "顺序与内存扫描必须完全一致");
 

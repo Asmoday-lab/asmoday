@@ -22,6 +22,7 @@ import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue
 import FileOpsDialogs, { type FileOpDone } from '../components/FileOpsDialogs.vue'
 import PhotoTile from '../components/PhotoTile.vue'
 import VideoCard from '../components/VideoCard.vue'
+import SortMenu, { type SortKey } from '../components/SortMenu.vue'
 import {
   browseAlbums,
   browseMedia,
@@ -34,6 +35,7 @@ import {
   type Album,
   type KindCounts,
   type MediaItem,
+  type SortValue,
 } from '../api/media'
 import { filesApi, type MountPoint } from '../api/files'
 import { sharesApi } from '../api/shares'
@@ -49,6 +51,7 @@ import { openLightbox } from '../stores/lightbox'
 import { openShare } from '../stores/share'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
 import { justifiedRows } from '../lib/justified'
+import { useFlip } from '../lib/flip'
 import { readCache, writeCache } from '../lib/view-cache'
 
 const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
@@ -386,7 +389,18 @@ function groupByDay(list: MediaItem[]): MediaGroup[] {
   return [...groups.values()]
 }
 
-/** 时间线：分组维度可选（v4.6.16）——按天（默认）/ 按文件夹 */
+/** 排序串 → 维度（`name_desc` → `name`） */
+function sortKeyOf(value: SortValue): SortKey {
+  return value.split('_')[0] as SortKey
+}
+
+/**
+ * 时间线分组。
+ *
+ * 只有「按时间」排序时才有「按天分段」可言：换成名称或体积之后，同一天的照片会被
+ * 别的天的文件插进来，日期头就成了谎话。这时退化成一块普通网格（不显示日期头），
+ * 年份刻度尺也跟着收起来 —— Immich 换排序之后也是这个行为。
+ */
 const timelineGroups = computed<MediaGroup[]>(() => {
   if (photoGroup.value === 'folder') {
     return groupByFolder(photoItems.value).map((group) => ({
@@ -395,6 +409,9 @@ const timelineGroups = computed<MediaGroup[]>(() => {
       year: null,
       items: group.items,
     }))
+  }
+  if (sortKeyOf(gridSort.value) !== 'mtime') {
+    return [{ key: 'flat', label: '', year: null, items: photoItems.value }]
   }
   return groupByDay(photoItems.value)
 })
@@ -408,6 +425,9 @@ const cinemaVideoGroups = computed<MediaGroup[]>(() => {
       year: null,
       items: group.items,
     }))
+  }
+  if (sortKeyOf(gridSort.value) !== 'mtime') {
+    return [{ key: 'flat', label: '', year: null, items: videos.value }]
   }
   return groupByDay(videos.value)
 })
@@ -424,19 +444,64 @@ const PHOTO_VIEW_KEY = 'asmoday.photos.view.v2'
  * 文件夹墙排序（v4.6.23，对齐 Immich 顶部的排序下拉）。
  * path = 相近目录相邻（默认，翻找有方位感）；mtime = 最近有图的在前。
  */
-const ALBUM_SORT_KEY = 'asmoday.gallery.folderSort.v1'
-const albumSort = ref<'path' | 'mtime'>(
-  localStorage.getItem(ALBUM_SORT_KEY) === 'mtime' ? 'mtime' : 'path',
+const FOLDER_SORT_KEY = 'asmoday.gallery.folderSort.v2'
+const GRID_SORT_KEY = 'asmoday.gallery.gridSort.v1'
+
+/** 文件夹墙支持哪些维度：名称（同父相邻）、时间、体积、条目数 */
+const FOLDER_SORT_KEYS: SortKey[] = ['name', 'mtime', 'size', 'count']
+/** 网格 / 时间线支持哪些维度：时间、名称、体积 */
+const GRID_SORT_KEYS: SortKey[] = ['mtime', 'name', 'size']
+
+const ALL_SORTS = new Set<string>([
+  'mtime_desc',
+  'mtime_asc',
+  'name_asc',
+  'name_desc',
+  'size_desc',
+  'size_asc',
+  'count_desc',
+  'count_asc',
+])
+
+/**
+ * 读本地偏好，顺手折算 v4.6.23 的老值（`path` / `mtime`）。
+ * 老值语义没变，但新的存储键带了 v2 —— 旧键继续读一次，读完就让新键接管。
+ */
+function readSort(storageKey: string, legacyKey: string, fallback: SortValue): SortValue {
+  const raw = localStorage.getItem(storageKey) ?? (legacyKey ? localStorage.getItem(legacyKey) : null)
+  if (raw === 'path') return 'name_asc'
+  if (raw === 'mtime') return 'mtime_desc'
+  return raw && ALL_SORTS.has(raw) ? (raw as SortValue) : fallback
+}
+
+/** 文件夹墙排序（默认名称升序：同父目录相邻，v4.6.18 的口径） */
+const folderSort = ref<SortValue>(
+  readSort(FOLDER_SORT_KEY, 'asmoday.gallery.folderSort.v1', 'name_asc'),
 )
-function setAlbumSort(next: 'path' | 'mtime') {
-  if (albumSort.value === next) return
-  albumSort.value = next
-  localStorage.setItem(ALBUM_SORT_KEY, next)
+/** 时间线 / 册内网格排序（默认最近在前） */
+const gridSort = ref<SortValue>(readSort(GRID_SORT_KEY, '', 'mtime_desc'))
+
+/** 当前看到的是「文件夹墙」吗（墙用文件夹维度，网格用媒体维度） */
+const folderSortVisible = computed(
+  () =>
+    (tab.value === 'photos' && photoView.value === 'albums' && !activeAlbum.value) ||
+    (tab.value === 'cinema' && cinemaView.value === 'folders' && !activeCinemaAlbum.value),
+)
+
+function setFolderSort(next: SortValue) {
+  if (folderSort.value === next) return
+  folderSort.value = next
+  localStorage.setItem(FOLDER_SORT_KEY, next)
   // 排序键变了，旧游标就作废：必须从第一页重来
   albumsCursor.value = null
   cinemaAlbumsCursor.value = null
-  void loadAlbums()
-  void loadCinemaAlbums()
+  const flip = tab.value === 'cinema' ? cinemaFolderFlip : photoFolderFlip
+  const scroller = tab.value === 'cinema' ? cinemaAlbumsEl.value : photoAlbumsEl.value
+  flip.capture()
+  void Promise.all([loadAlbums(), loadCinemaAlbums()]).then(() => {
+    scroller?.scrollTo({ top: 0 })
+    void flip.play()
+  })
 }
 
 /** 顶部「更多」菜单（v4.6.23）：收藏筛选 / 原生播放器 / 重新扫描 / 分页进度都收进来 */
@@ -484,8 +549,11 @@ async function loadAlbums(refresh = false) {
   }
   albumsLoading.value = true
   albumsError.value = ''
+  // 连点排序时会同时有两个请求在飞：回来的旧排序结果绝不能覆盖新的
+  const sort = folderSort.value
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: albumSort.value, refresh })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort, refresh })
+    if (sort !== folderSort.value) return
     albums.value = result.items
     albumsTotal.value = result.total
     albumsCursor.value = result.next_cursor ?? null
@@ -508,7 +576,7 @@ async function loadMoreAlbums() {
   if (!albumsHasMore.value || !cursor || albumsLoading.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: albumSort.value, cursor })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: folderSort.value, cursor })
     const seen = new Set(albums.value.map((album) => album.path))
     albums.value = [...albums.value, ...result.items.filter((album) => !seen.has(album.path))]
     albumsTotal.value = result.total
@@ -635,6 +703,21 @@ watch(cinemaAllEl, (el) => {
   cinemaRo.observe(el)
 })
 
+// ---------------- 排序重排动画（v4.9.0，FLIP） ----------------
+//
+// 容器必须是滚动容器本身（时间线）或它的直接子层（各种网格墙）。`useFlip` 用
+// 「相对容器的内容坐标」记录位置，所以滚动位置变了也不会算错位移。
+const photoAlbumsEl = ref<HTMLElement | null>(null)
+const cinemaAlbumsEl = ref<HTMLElement | null>(null)
+const albumGridEl = ref<HTMLElement | null>(null)
+const cinemaGridEl = ref<HTMLElement | null>(null)
+
+const timelineFlip = useFlip(timelineEl)
+const photoFolderFlip = useFlip(photoAlbumsEl)
+const cinemaFolderFlip = useFlip(cinemaAlbumsEl)
+const albumGridFlip = useFlip(albumGridEl)
+const cinemaGridFlip = useFlip(cinemaGridEl)
+
 /** 行高：窄屏矮一点一屏能多放两行，宽屏拉高让单张更有存在感 */
 function targetRowHeight(width: number): number {
   if (width < 640) return 132
@@ -702,24 +785,37 @@ async function openAlbum(album: Album) {
   await loadAlbumItems(album)
 }
 
-/** 拉册内第一屏（重试按钮也走这里，避免失败只能退出再进） */
-async function loadAlbumItems(album: Album) {
-  albumLoading.value = true
+/**
+ * 拉册内第一屏（重试按钮也走这里，避免失败只能退出再进）。
+ *
+ * `silent` 用于「只换排序」：不清列表、不进骨架态，否则网格会被卸载一瞬，
+ * 排序动画（FLIP）就没地方播了。数据到了直接整体替换。
+ */
+async function loadAlbumItems(album: Album, options: { silent?: boolean } = {}) {
+  const silent = options.silent === true && albumItems.value.length > 0
+  if (!silent) {
+    albumLoading.value = true
+    albumItems.value = []
+    albumCursor.value = null
+    albumHasMore.value = false
+  }
   albumError.value = ''
-  albumItems.value = []
-  albumCursor.value = null
-  albumHasMore.value = false
+  const sort = gridSort.value
   try {
     // 只列册内第一层（depth=0 = 不进子目录，与后端统计 count 的口径一致，
     // v2.8 相册视图同款；递归会把子目录的图也算进来，条数就对不上了）
-    const result = await browseMedia(album.path, 'image', 0, { limit: PAGE_SIZE })
+    const result = await browseMedia(album.path, 'image', 0, {
+      limit: PAGE_SIZE,
+      sort,
+    })
+    if (sort !== gridSort.value) return
     albumItems.value = result.items
     albumCursor.value = result.next_cursor ?? null
     albumHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
     albumError.value = err instanceof Error ? err.message : t('gallery.toolbar.loadFailed')
   } finally {
-    albumLoading.value = false
+    if (!silent) albumLoading.value = false
   }
 }
 
@@ -729,7 +825,11 @@ async function loadMoreAlbumItems() {
   if (!album || !albumHasMore.value || !cursor || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseMedia(album.path, 'image', 0, { limit: PAGE_SIZE, cursor })
+    const result = await browseMedia(album.path, 'image', 0, {
+      limit: PAGE_SIZE,
+      cursor,
+      sort: gridSort.value,
+    })
     const seen = new Set(albumItems.value.map((item) => item.path))
     albumItems.value = [...albumItems.value, ...result.items.filter((item) => !seen.has(item.path))]
     albumCursor.value = result.next_cursor ?? null
@@ -785,13 +885,15 @@ async function loadCinemaAlbums(refresh = false) {
   }
   cinemaAlbumsLoading.value = true
   cinemaAlbumsError.value = ''
+  const sort = folderSort.value
   try {
     const result = await browseAlbums(undefined, 3, {
       kind: 'video',
       limit: PAGE_SIZE,
-      sort: albumSort.value,
+      sort,
       refresh,
     })
+    if (sort !== folderSort.value) return
     cinemaAlbums.value = result.items
     cinemaAlbumsTotal.value = result.total
     cinemaAlbumsCursor.value = result.next_cursor ?? null
@@ -817,7 +919,7 @@ async function loadMoreCinemaAlbums() {
     const result = await browseAlbums(undefined, 3, {
       kind: 'video',
       limit: PAGE_SIZE,
-      sort: albumSort.value,
+      sort: folderSort.value,
       cursor,
     })
     const seen = new Set(cinemaAlbums.value.map((album) => album.path))
@@ -836,22 +938,30 @@ async function loadMoreCinemaAlbums() {
   }
 }
 
-async function openCinemaAlbum(album: Album) {
+async function openCinemaAlbum(album: Album, options: { silent?: boolean } = {}) {
+  const silent = options.silent === true && cinemaItems.value.length > 0
   activeCinemaAlbum.value = album
-  cinemaLoading.value = true
-  cinemaItems.value = []
-  cinemaCursor.value = null
-  cinemaHasMore.value = false
+  if (!silent) {
+    cinemaLoading.value = true
+    cinemaItems.value = []
+    cinemaCursor.value = null
+    cinemaHasMore.value = false
+  }
+  const sort = gridSort.value
   try {
     // depth=0：只列这一层，与卡片上的 count 口径一致（同照片相册）
-    const result = await browseMedia(album.path, 'video', 0, { limit: PAGE_SIZE })
+    const result = await browseMedia(album.path, 'video', 0, {
+      limit: PAGE_SIZE,
+      sort,
+    })
+    if (sort !== gridSort.value) return
     cinemaItems.value = result.items
     cinemaCursor.value = result.next_cursor ?? null
     cinemaHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
     showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
   } finally {
-    cinemaLoading.value = false
+    if (!silent) cinemaLoading.value = false
   }
 }
 
@@ -861,7 +971,11 @@ async function loadMoreCinemaItems() {
   if (!album || !cinemaHasMore.value || !cursor || loadingMore.value) return
   loadingMore.value = true
   try {
-    const result = await browseMedia(album.path, 'video', 0, { limit: PAGE_SIZE, cursor })
+    const result = await browseMedia(album.path, 'video', 0, {
+      limit: PAGE_SIZE,
+      cursor,
+      sort: gridSort.value,
+    })
     const seen = new Set(cinemaItems.value.map((item) => item.path))
     cinemaItems.value = [...cinemaItems.value, ...result.items.filter((item) => !seen.has(item.path))]
     cinemaCursor.value = result.next_cursor ?? null
@@ -1421,6 +1535,7 @@ async function load(options: { refresh?: boolean } = {}) {
   try {
     const result = await browseMedia(undefined, 'media', 2, {
       limit: PAGE_SIZE,
+      sort: gridSort.value,
       refresh: options.refresh,
       // 时间线的等高行要真实宽高比（v4.6.19），只有这个列表需要
       dims: true,
@@ -1457,6 +1572,7 @@ async function loadMoreMedia() {
     const result = await browseMedia(undefined, 'media', 2, {
       limit: PAGE_SIZE,
       cursor,
+      sort: gridSort.value,
       dims: true,
     })
     appendItems(result.items)
@@ -1470,6 +1586,57 @@ async function loadMoreMedia() {
   } finally {
     loadingMore.value = false
   }
+}
+
+/**
+ * 排序换了：时间线（以及影院的影片流）从第一页重来。
+ *
+ * 不复用 `load()` 是刻意的 —— `load()` 会顺带重拉相册墙并关掉已打开的册子，
+ * 而用户只是换了个排序，不该被踢出当前相册。
+ */
+async function reloadTimeline() {
+  nextCursor.value = null
+  const sort = gridSort.value
+  try {
+    const result = await browseMedia(undefined, 'media', 2, {
+      limit: PAGE_SIZE,
+      sort,
+      dims: true,
+    })
+    if (sort !== gridSort.value) return
+    items.value = []
+    loadedPaths.clear()
+    appendItems(result.items)
+    total.value = result.total
+    counts.value = result.counts
+    nextCursor.value = result.next_cursor ?? null
+    hasMore.value = result.has_more && Boolean(result.next_cursor)
+    saveMediaSnapshot()
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : t('gallery.toolbar.loadFailed'))
+  }
+}
+
+/** 排序换了：正打开着的册子也要按新顺序重铺（照片册与影视册各自独立） */
+async function reloadOpenAlbums() {
+  if (activeAlbum.value) await loadAlbumItems(activeAlbum.value, { silent: true })
+  if (activeCinemaAlbum.value) await openCinemaAlbum(activeCinemaAlbum.value, { silent: true })
+}
+
+function setGridSort(next: SortValue) {
+  if (gridSort.value === next) return
+  gridSort.value = next
+  localStorage.setItem(GRID_SORT_KEY, next)
+  timelineFlip.capture()
+  albumGridFlip.capture()
+  cinemaGridFlip.capture()
+  void Promise.all([reloadTimeline(), reloadOpenAlbums()]).then(() => {
+    // 排序变了，原来的滚动位置在内容坐标里已失去意义，回到顶部再看
+    timelineEl.value?.scrollTo({ top: 0 })
+    void timelineFlip.play()
+    void albumGridFlip.play()
+    void cinemaGridFlip.play()
+  })
 }
 
 /** 触底续接：按当前视图决定续哪条流（媒体列表 / 文件夹卡片 / 册内图片） */
@@ -1777,25 +1944,22 @@ useEventListener(window, 'keydown', onKey)
         </button>
       </div>
 
-      <!-- 文件夹墙排序（v4.6.23，Immich 的排序下拉）：只在「按文件夹」视图里出现 -->
-      <label
-        v-if="
-          (tab === 'photos' && photoView === 'albums') ||
-          (tab === 'cinema' && cinemaView === 'folders')
-        "
-        class="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-xs text-muted"
-        data-testid="album-sort"
-      >
-        <AppIcon name="sort" :size="13" />
-        <select
-          class="cursor-pointer appearance-none bg-transparent text-xs text-ink outline-none"
-          :value="albumSort"
-          @change="setAlbumSort(($event.target as HTMLSelectElement).value as 'path' | 'mtime')"
-        >
-          <option value="path">{{ t('gallery.toolbar.sortPath') }}</option>
-          <option value="mtime">{{ t('gallery.toolbar.sortModified') }}</option>
-        </select>
-      </label>
+      <!-- 排序（v4.9.0）：文件夹墙给「名称/时间/体积/条目数」，网格给「时间/名称/体积」。
+           以前这里是原生 select，只有两项、没有方向、展开也没动画 -->
+      <SortMenu
+        v-if="folderSortVisible"
+        :model-value="folderSort"
+        :keys="FOLDER_SORT_KEYS"
+        data-testid="folder-sort"
+        @update:model-value="setFolderSort"
+      />
+      <SortMenu
+        v-else-if="tab !== 'music'"
+        :model-value="gridSort"
+        :keys="GRID_SORT_KEYS"
+        data-testid="grid-sort"
+        @update:model-value="setGridSort"
+      />
 
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
         <span class="hidden truncate md:inline">{{ t('gallery.toolbar.indexed') }}</span>
@@ -1982,12 +2146,14 @@ useEventListener(window, 'keydown', onKey)
           </div>
           <div
             v-else
+            ref="albumGridEl"
             class="fade-in grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-1.5 md:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:gap-2"
             data-testid="album-photos"
           >
             <PhotoTile
               v-for="(item, index) in albumItems"
               :key="item.path"
+              :data-flip-key="item.path"
               :item="item"
               @click="openPhotoTile(albumItems, index)"
               @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
@@ -2015,6 +2181,7 @@ useEventListener(window, 'keydown', onKey)
            把人骗成「点开能看这组照片」的相册封皮 -->
       <div
         v-else-if="photoView === 'albums'"
+        ref="photoAlbumsEl"
         class="h-full overflow-y-auto p-2 md:p-3"
         data-testid="photo-albums"
       >
@@ -2081,6 +2248,7 @@ useEventListener(window, 'keydown', onKey)
             type="button"
             class="group min-w-0 text-left"
             :data-album="album.name"
+            :data-flip-key="album.path"
             :title="folderPathHint(album) || albumLabel(album)"
             @click="openAlbumCard(album)"
             @contextmenu.prevent="openFolderMenu($event, album, 'photos')"
@@ -2159,7 +2327,9 @@ useEventListener(window, 'keydown', onKey)
               class="pb-1.5"
               :data-day="block.group.key"
             >
+              <!-- 非时间排序时是扁平组（label 为空）：没有「哪一天」可言，标题整行不出现 -->
               <h2
+                v-if="block.group.label"
                 class="sticky top-0 z-10 flex items-baseline gap-2 bg-base/85 px-3 pt-2.5 pb-1.5 text-[13px] font-semibold text-ink backdrop-blur md:px-4 md:text-sm"
               >
                 {{ block.group.label }}
@@ -2172,6 +2342,7 @@ useEventListener(window, 'keydown', onKey)
                   <PhotoTile
                     v-for="cell in row.cells"
                     :key="cell.item.path"
+                    :data-flip-key="cell.item.path"
                     :item="cell.item"
                     :cell-width="cell.width"
                     :cell-height="cell.height"
@@ -2199,7 +2370,7 @@ useEventListener(window, 'keydown', onKey)
 
         <!-- 年份刻度尺（v4.6.21）：贴右边缘的连续年份尺，滚动跟随高亮、点击跳该年 -->
         <aside
-          v-if="photoGroup === 'time' && timelineYears.length > 0"
+          v-if="photoGroup === 'time' && sortKeyOf(gridSort) === 'mtime' && timelineYears.length > 0"
           class="absolute top-1/2 right-1 z-20 hidden -translate-y-1/2 flex-col items-end md:flex"
           :class="timelineYears.length > 24 ? 'gap-0' : 'gap-[3px]'"
           data-testid="timeline-years"
@@ -2270,12 +2441,14 @@ useEventListener(window, 'keydown', onKey)
           </div>
           <div
             v-else
+            ref="cinemaGridEl"
             class="fade-in grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4 md:grid-cols-[repeat(auto-fill,minmax(260px,1fr))]"
             data-testid="cinema-videos"
           >
             <VideoCard
               v-for="video in cinemaItems"
               :key="video.path"
+              :data-flip-key="video.path"
               :video="video"
               :favorite="isFavorite(video.path)"
               :resume-at="resumeAt(video.path)"
@@ -2302,6 +2475,7 @@ useEventListener(window, 'keydown', onKey)
       <!-- 文件夹墙（v4.6.18）：与照片库同一套紧凑卡片，按路径升序 -->
       <div
         v-else-if="cinemaView === 'folders'"
+        ref="cinemaAlbumsEl"
         class="h-full overflow-y-auto px-4 py-4 md:px-6 md:py-6"
         data-testid="cinema-albums"
       >
@@ -2364,6 +2538,7 @@ useEventListener(window, 'keydown', onKey)
             type="button"
             class="group min-w-0 text-left"
             :data-cinema-album="album.name"
+            :data-flip-key="album.path"
             :title="folderPathHint(album) || cinemaAlbumLabel(album)"
             @click="openCinemaCard(album)"
             @contextmenu.prevent="openFolderMenu($event, album, 'cinema')"
@@ -2449,6 +2624,7 @@ useEventListener(window, 'keydown', onKey)
               :data-day="block.group.key"
             >
               <h2
+                v-if="block.group.label"
                 class="sticky top-0 z-10 flex items-baseline gap-2 bg-base/85 pt-2.5 pb-1.5 text-[13px] font-semibold text-ink backdrop-blur md:text-sm"
               >
                 {{ block.group.label }}
@@ -2492,7 +2668,7 @@ useEventListener(window, 'keydown', onKey)
 
         <!-- 年份刻度尺：与照片库同一套（影视库按天分组时才出现） -->
         <aside
-          v-if="cinemaGroup === 'time' && cinemaYears.length > 0"
+          v-if="cinemaGroup === 'time' && sortKeyOf(gridSort) === 'mtime' && cinemaYears.length > 0"
           class="absolute top-1/2 right-1 z-20 hidden -translate-y-1/2 flex-col items-end md:flex"
           :class="cinemaYears.length > 24 ? 'gap-0' : 'gap-[3px]'"
           data-testid="cinema-years"

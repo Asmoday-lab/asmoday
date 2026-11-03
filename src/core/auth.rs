@@ -230,6 +230,7 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
 /// - **v3** 目录快照缓存（`dir_snapshots`，见 `core/dir_cache.rs`）。
 /// - **v4** 媒体库快照（`media_snapshots`，带 size / mtime，见 `core/dir_cache.rs`）。
 /// - **v5** 媒体索引（`media_assets` / `media_dirs` / `media_roots`，见 `core/media_index.rs`）。
+/// - **v6** 名称排序键 `media_assets.sort_name`（自然序，v4.9.0）+ 触发一次索引重建。
 ///
 /// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
 fn migrations() -> Migrations<'static> {
@@ -305,6 +306,18 @@ fn migrations() -> Migrations<'static> {
                 w     INTEGER NOT NULL,
                 h     INTEGER NOT NULL
             );",
+        ),
+        // v6：名称排序键（v4.9.0）。`sort_name` = 小写 + 数字段补零的自然序键，
+        // 让「第2集」排在「第10集」前面，同时仍能走 SQL 索引分页（见 core/media_index.rs）。
+        //
+        // `stamp = -1` 是刻意的：存量行的 sort_name 是空串，只有重新走一遍目录才能填上。
+        // 置 -1 之后后台索引任务会在下一轮逐目录重写（**不清数据**，重建期间浏览照常，
+        // 只是按名称排序的旧行会短暂排在前面）。清表也能达到目的，但会让媒体库空一段时间。
+        M::up(
+            "ALTER TABLE media_assets ADD COLUMN sort_name TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_media_assets_name ON media_assets(sort_name, path);
+            CREATE INDEX IF NOT EXISTS idx_media_assets_size ON media_assets(size);
+            UPDATE media_dirs SET stamp = -1;",
         ),
     ])
 }
@@ -432,9 +445,20 @@ impl AuthStore {
     pub fn init(&self) -> Result<(), String> {
         let mut conn = self.connect()?;
         // 版本化的 schema 升级：每步只跑一次，失败能定位到具体版本（见 `migrations`）
+        let before: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
         migrations()
             .to_latest(&mut conn)
             .map_err(|e| format!("迁移数据库结构失败：{e}"))?;
+        // v6 会把所有目录戳置 -1，逼后台索引重写一遍 `sort_name`。索引是派生数据，
+        // 重建期间浏览照常；但用户若在这时按名称排序会发现顺序「有点乱」，
+        // 启动日志里得有一条能对上号的原因（NAS 上两万条要跑几分钟）。
+        if before < 6 {
+            crate::log_info!(
+                "数据库已升级到 v6：媒体索引将在后台重建（补全名称排序键），期间按时间排序不受影响"
+            );
+        }
         // 数据库文件权限 0600（设计文档 4.1）：里面是密码哈希、TOTP 密钥与会话，
         // 绝不能给同机其他用户可读
         #[cfg(unix)]

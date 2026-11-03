@@ -120,5 +120,22 @@
   "group": {
     "byTime": "By date",
     "byFolder": "By folder"
+  },
+  "sort": {
+    "title": "Sort",
+    "button": "Sort: {key} ({dir})",
+    "flip": "Toggle ascending / descending",
+    "mtime": "Date",
+    "name": "Name",
+    "size": "Size",
+    "count": "Items",
+    "mtimeDesc": "Newest first",
+    "mtimeAsc": "Oldest first",
+    "nameAsc": "A → Z",
+    "nameDesc": "Z → A",
+    "sizeDesc": "Largest first",
+    "sizeAsc": "Smallest first",
+    "countDesc": "Most items",
+    "countAsc": "Fewest items"
   }
 }
