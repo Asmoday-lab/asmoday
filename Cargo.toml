@@ -2,9 +2,10 @@
 name = "asmoday"
 version = "0.1.0"
 edition = "2024"
-# 下限来自 std 的文件锁（`File::try_lock`，1.89 稳定）：单实例锁靠它，
+# 声明跟着实际工具链走（1.99）：这是二进制项目、没有下游要兼容，声明得比实际低
+# 只会掩盖版本漂移。真正用到的标准库下限仍是 1.89 的 `File::try_lock`（单实例锁靠它）。
 # 再低就得引第三方 crate 或退回 SQLite 排他锁的老路。
-rust-version = "1.89"
+rust-version = "1.99"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }

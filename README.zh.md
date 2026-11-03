@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/github/v/release/Asmoday-lab/asmoday?include_prereleases&style=flat-square)](https://github.com/Asmoday-lab/asmoday/releases)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?style=flat-square)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.99%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%2Farm64-lightgrey?style=flat-square)](#快速开始)
 
 [特性](#特性) · [快速开始](#快速开始) · [配置](#配置) · [命令行](#命令行) · [常见问题](#常见问题) · [开发](#开发) · [English](README.md)
@@ -74,7 +74,7 @@ readonly = true
 
 ### 从源码构建
 
-需要 Rust 1.89+、Node.js 20+ 与 pnpm：
+需要 Rust 1.99+、Node.js 20+ 与 pnpm：
 
 ```bash
 cd web && pnpm install && pnpm run build && cd ..
