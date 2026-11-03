@@ -38,7 +38,19 @@
     "columnTitle": "Title",
     "columnSize": "Size",
     "columnFavorite": "Favorite",
-    "folderHint": "Right-click this folder to rename / move / copy / delete it"
+    "folderHint": "Right-click this folder to rename / move / copy / delete it",
+    "play": "Play",
+    "viewSongs": "Songs",
+    "viewAlbums": "Albums",
+    "viewArtists": "Artists",
+    "shuffle": "Shuffle",
+    "backToAll": "All songs",
+    "columnDuration": "Time",
+    "trackCount": "{count} tracks",
+    "albumCount": "{count} albums",
+    "artistCount": "{count} artists",
+    "unknownAlbum": "Unknown album",
+    "unknownArtist": "Unknown artist"
   },
   "toolbar": {
     "favorites": "Favorites",

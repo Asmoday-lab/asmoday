@@ -85,6 +85,9 @@ pub struct MediaItem {
     pub color: Option<String>,
     /// 同目录同名字幕（.vtt / .srt）的路径，没有则为 null
     pub subtitle: Option<String>,
+    /// 音频时长（毫秒，v4.9.5）。只对 `kind == audio` 有意义；算不出来时为 null
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// 图片真实像素宽高（v4.6.19，仅 `dims=1` 时返回）：时间线的等高行要按真实
     /// 宽高比算格子宽度。ThumbHash 里也存了比例，但只量化到 3/5/7 几档，铺出来会失真。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1594,18 +1597,88 @@ fn build_items(
     // 音频 ID3 与视频外挂字幕同样是网盘 IO：一个读几十 KB 标签块，一个对每条
     // 视频做两次 `is_file`（.vtt / .srt）。串行时一页 120 条又是几十秒的量级。
     let probe_started = std::time::Instant::now();
-    let audio_jobs: Vec<(usize, PathBuf)> = raw
+    // 时长（v4.9.5）：先批量问 `media_durations`，没算过的才读盘 —— 与标签在同一个
+    // 并发批次里做，一条音频一页只开一次文件（首次），之后永远命中。
+    let audio_keys: Vec<(String, u64, u64)> = raw
+        .iter()
+        .filter(|entry| entry.kind == "audio")
+        .map(|entry| {
+            (
+                entry.path.to_string_lossy().to_string(),
+                entry.mtime,
+                entry.size,
+            )
+        })
+        .collect();
+    let cached_durations: HashMap<String, u64> = conn
+        .map(|conn| {
+            let borrowed: Vec<(&str, u64, u64)> = audio_keys
+                .iter()
+                .map(|(path, mtime, size)| (path.as_str(), *mtime, *size))
+                .collect();
+            media_index::durations_get_many(conn, &borrowed)
+        })
+        .unwrap_or_default();
+
+    /// 一条音频的探测任务：`(位置, 缓存键, 路径, mtime, size, 是否要算时长)`
+    type AudioJob = (usize, String, PathBuf, u64, u64, bool);
+    let audio_jobs: Vec<AudioJob> = raw
         .iter()
         .enumerate()
         .filter(|(_, entry)| entry.kind == "audio")
-        .map(|(position, entry)| (position, entry.path.clone()))
-        .collect();
-    let tags_by_pos: HashMap<usize, crate::core::audio_tags::TrackTags> =
-        run_parallel(audio_jobs, |(position, path)| {
-            (position, crate::core::audio_tags::read_tags(&path))
+        .map(|(position, entry)| {
+            let key = entry.path.to_string_lossy().to_string();
+            let need_duration = !cached_durations.contains_key(&key);
+            (
+                position,
+                key,
+                entry.path.clone(),
+                entry.mtime,
+                entry.size,
+                need_duration,
+            )
         })
-        .into_iter()
         .collect();
+
+    let probed: Vec<(
+        usize,
+        String,
+        u64,
+        u64,
+        crate::core::audio_tags::TrackTags,
+        Option<u64>,
+    )> = run_parallel(audio_jobs, |(position, key, path, mtime, size, need)| {
+        let tags = crate::core::audio_tags::read_tags(&path);
+        let ms = if need {
+            crate::core::audio_tags::read_duration_ms(&path)
+        } else {
+            None
+        };
+        (position, key, mtime, size, tags, ms)
+    });
+
+    let mut tags_by_pos: HashMap<usize, crate::core::audio_tags::TrackTags> = HashMap::new();
+    let mut duration_by_pos: HashMap<usize, Option<u64>> = HashMap::new();
+    let mut fresh_durations: Vec<(String, u64, u64, u64)> = Vec::new();
+    for (position, key, mtime, size, tags, ms) in probed {
+        tags_by_pos.insert(position, tags);
+        if let Some(hit) = cached_durations.get(&key) {
+            // 0 是「算过但算不出」的负缓存，别再读一遍
+            duration_by_pos.insert(position, (*hit > 0).then_some(*hit));
+        } else {
+            fresh_durations.push((key, mtime, size, ms.unwrap_or(0)));
+            duration_by_pos.insert(position, ms);
+        }
+    }
+    if let Some(conn) = conn
+        && !fresh_durations.is_empty()
+    {
+        let borrowed: Vec<(&str, u64, u64, u64)> = fresh_durations
+            .iter()
+            .map(|(path, mtime, size, ms)| (path.as_str(), *mtime, *size, *ms))
+            .collect();
+        media_index::durations_put_many(conn, &borrowed);
+    }
 
     let video_jobs: Vec<(usize, PathBuf, u64)> = raw
         .iter()
@@ -1651,6 +1724,7 @@ fn build_items(
             hash: None,
             color: None,
             subtitle,
+            duration_ms: duration_by_pos.get(&position).copied().flatten(),
             width: dims_entry.map(|(w, _)| w),
             height: dims_entry.map(|(_, h)| h),
         });

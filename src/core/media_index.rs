@@ -745,6 +745,47 @@ pub fn dims_get_many(
     hits
 }
 
+/// 批量读音频时长（毫秒）；键与 `media_dims` 同构，文件一改就失效
+pub fn durations_get_many(
+    conn: &Connection,
+    keys: &[(&str, u64, u64)],
+) -> std::collections::HashMap<String, u64> {
+    use std::collections::HashMap;
+    let mut hits = HashMap::new();
+    if keys.is_empty() {
+        return hits;
+    }
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT ms FROM media_durations WHERE path = ?1 AND mtime = ?2 AND size = ?3",
+    ) else {
+        return hits;
+    };
+    for (path, mtime, size) in keys {
+        if let Ok(ms) = stmt.query_row(params![path, *mtime as i64, *size as i64], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            hits.insert((*path).to_string(), ms.max(0) as u64);
+        }
+    }
+    hits
+}
+
+/// 写回新读到的时长（只写 miss 的那些）
+pub fn durations_put_many(conn: &Connection, rows: &[(&str, u64, u64, u64)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(mut stmt) = conn.prepare_cached(
+        "INSERT OR REPLACE INTO media_durations (path, mtime, size, ms)
+         VALUES (?1, ?2, ?3, ?4)",
+    ) else {
+        return;
+    };
+    for (path, mtime, size, ms) in rows {
+        let _ = stmt.execute(params![path, *mtime as i64, *size as i64, *ms as i64]);
+    }
+}
+
 /// 写回新读到的像素宽高（只写 miss 的那些，一页最多 120 行）
 pub fn dims_put_many(conn: &Connection, rows: &[(&str, u64, u64, u32, u32)]) {
     if rows.is_empty() {

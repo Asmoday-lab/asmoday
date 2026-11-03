@@ -21,6 +21,7 @@ import AppIcon from '../components/AppIcon.vue'
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu.vue'
 import FileOpsDialogs, { type FileOpDone } from '../components/FileOpsDialogs.vue'
 import PhotoTile from '../components/PhotoTile.vue'
+import MusicTrackRow from '../components/MusicTrackRow.vue'
 import VideoCard from '../components/VideoCard.vue'
 import SortMenu, { type SortKey } from '../components/SortMenu.vue'
 import {
@@ -39,7 +40,7 @@ import {
 } from '../api/media'
 import { filesApi, type MountPoint } from '../api/files'
 import { sharesApi } from '../api/shares'
-import { formatSize } from '../lib/format'
+import { formatDurationLong } from '../lib/format'
 import { triggerDownload } from '../lib/download'
 import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
@@ -266,14 +267,6 @@ const audios = computed(() =>
   items.value.filter((item) => item.kind === 'audio' && (!onlyFavorites.value || isFavorite(item.path))),
 )
 
-/** 音乐展示名：优先内嵌 ID3 标题 */
-function trackTitle(item: MediaItem): string {
-  if (item.title) return item.title
-  // 无 ID3 标签时用「去扩展名的文件名」当歌名（设计文档 3.4.7 第 2 条）
-  const stripped = item.name.replace(/\.[^.]+$/, '')
-  return stripped || item.name
-}
-
 /**
  * 分页进度（头部那枚小标签）：按**当前分区**取分子分母。
  *
@@ -294,21 +287,11 @@ const showProgress = computed(() => {
   return progress.value.loaded < progress.value.total
 })
 
-/** 音乐副标题：歌手 · 专辑；没有标签就留空——目录位置不上桌面（v3.5.5） */
-function trackSubtitle(item: MediaItem): string {
-  const parts = [item.artist, item.album].filter(Boolean) as string[]
-  return parts.join(' · ')
-}
-
 /** 内嵌封面加载失败的曲目（坏标签很常见），记住后不再重复请求 */
 const failedCovers = ref(new Set<string>())
 
 function markCoverFailed(path: string) {
   failedCovers.value.add(path)
-}
-
-function showCover(item: MediaItem): boolean {
-  return Boolean(item.cover) && !failedCovers.value.has(item.path)
 }
 
 /** 把绝对路径裁成「相对挂载根」的展示名，避免界面泄漏服务器真实路径 */
@@ -347,13 +330,130 @@ function groupByFolder(list: MediaItem[]): FolderGroup[] {
     return a.label.localeCompare(b.label, 'zh-Hans-CN')
   })
 }
-const audioGroups = computed(() => groupByFolder(audios.value))
-/** 曲目在完整列表里的行号（分组渲染后仍按全局序号播放） */
-const audioRowIndex = computed(() => {
-  const map = new Map<string, number>()
-  audios.value.forEach((track, index) => map.set(track.path, index))
-  return map
+// ---------------- 音乐库三视图（v4.9.5） ----------------
+//
+// 以前这里只有一个按文件夹分组的平表，连「有哪些专辑 / 哪位艺术家」都看不出来。
+// 现在拆成 歌曲 / 专辑 / 艺术家 三个平级视图（Navidrome 的主干结构）：
+// 专辑与艺术家都由前端聚合 —— 音乐库一次就把全部曲目拉回来了，不必再要接口。
+type MusicView = 'songs' | 'albums' | 'artists'
+const MUSIC_VIEW_KEY = 'asmoday.music.view.v1'
+const musicView = persisted<MusicView>(MUSIC_VIEW_KEY, ['songs', 'albums', 'artists'], 'songs')
+
+/** 从哪张专辑 / 哪位艺术家点进来的（只在歌曲视图里收窄列表） */
+const musicFilter = ref<{ kind: 'album' | 'artist'; value: string } | null>(null)
+
+function albumNameOf(item: MediaItem): string {
+  return item.album?.trim() || t('gallery.music.unknownAlbum')
+}
+function artistNameOf(item: MediaItem): string {
+  return item.artist?.trim() || t('gallery.music.unknownArtist')
+}
+
+interface MusicCollection {
+  key: string
+  name: string
+  sub: string
+  cover: MediaItem | null
+  tracks: MediaItem[]
+}
+
+/** 按某个字段把曲目聚成「一张卡」（专辑 / 艺术家共用） */
+function collectBy(
+  field: (item: MediaItem) => string,
+  sub: (tracks: MediaItem[]) => string,
+): MusicCollection[] {
+  const map = new Map<string, MediaItem[]>()
+  for (const track of audios.value) {
+    const key = field(track)
+    const list = map.get(key)
+    if (list) list.push(track)
+    else map.set(key, [track])
+  }
+  return [...map.entries()]
+    .map(([name, tracks]) => ({
+      key: name,
+      name,
+      sub: sub(tracks),
+      cover: tracks.find((track) => track.cover) ?? null,
+      tracks,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, locale.value))
+}
+
+const musicAlbums = computed<MusicCollection[]>(() =>
+  collectBy(albumNameOf, (tracks) =>
+    `${artistNameOf(tracks[0])} · ${t('gallery.music.trackCount', { count: tracks.length })}`,
+  ),
+)
+
+const musicArtists = computed<MusicCollection[]>(() =>
+  collectBy(artistNameOf, (tracks) => {
+    const albums = new Set(tracks.map((track) => albumNameOf(track)))
+    return `${t('gallery.music.trackCount', { count: tracks.length })} · ${t('gallery.music.albumCount', { count: albums.size })}`
+  }),
+)
+
+/** 歌曲视图实际列出的曲目：从专辑/艺术家点进来时只显示那一组 */
+const visibleTracks = computed(() => {
+  const filter = musicFilter.value
+  if (!filter) return audios.value
+  return audios.value.filter((track) =>
+    filter.kind === 'album'
+      ? albumNameOf(track) === filter.value
+      : artistNameOf(track) === filter.value,
+  )
 })
+
+const musicTotalMs = computed(() =>
+  audios.value.reduce((sum, track) => sum + (track.duration_ms ?? 0), 0),
+)
+
+/** Hero 的封面拼贴：最多四张真封面，凑不满就用渐变兜底 */
+const heroCovers = computed(() =>
+  musicAlbums.value
+    .map((album) => album.cover)
+    .filter((cover): cover is MediaItem => Boolean(cover))
+    .slice(0, 4),
+)
+
+const musicStats = computed(() => {
+  const parts = [
+    t('gallery.music.artistCount', { count: musicArtists.value.length }),
+    t('gallery.music.albumCount', { count: musicAlbums.value.length }),
+  ]
+  const span = formatDurationLong(musicTotalMs.value)
+  if (span) parts.push(span)
+  return parts.join(' · ')
+})
+
+function setMusicView(view: MusicView) {
+  if (musicView.value === view) return
+  musicView.value = view
+  localStorage.setItem(MUSIC_VIEW_KEY, view)
+  if (view !== 'songs') musicFilter.value = null
+}
+
+function openMusicCollection(kind: 'album' | 'artist', value: string) {
+  musicFilter.value = { kind, value }
+  setMusicView('songs')
+}
+
+function clearMusicFilter() {
+  musicFilter.value = null
+}
+
+/** 随机播放当前可见的曲目（Hero 第二个按钮） */
+function playShuffled() {
+  const queue = [...visibleTracks.value]
+  if (!queue.length) return
+  for (let i = queue.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1))
+    const swap = queue[i]!
+    queue[i] = queue[j]!
+    queue[j] = swap
+  }
+  player.play(queue, 0)
+}
 
 /** 时间线的一组（v4.6.19：按天；也用于「按文件夹」分组，此时 year 为 null） */
 interface MediaGroup {
@@ -1220,7 +1320,10 @@ function playTrackAt(track: MediaItem) {
     player.toggle()
     return
   }
-  player.play(audios.value, audioRowIndex.value.get(track.path) ?? 0)
+  // 队列就是屏幕上这一份（从专辑点进来时只播这张专辑）
+  const queue = visibleTracks.value
+  const index = queue.findIndex((item) => item.path === track.path)
+  player.play(queue, index > 0 ? index : 0)
 }
 
 /** 媒体条目 → 变更弹窗的作用对象（媒体库里的条目一律是文件） */
@@ -1362,26 +1465,6 @@ function openAlbumCard(album: Album) {
 function openCinemaCard(album: Album) {
   if (folderPress.takeFired()) return
   void openCinemaAlbum(album)
-}
-
-/** 音乐库按文件夹分区时，分区标题就是那个目录 */
-function openMusicGroupMenu(event: MouseEvent, group: FolderGroup) {
-  if (group.key === '/') return
-  folderMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    album: {
-      name: group.label,
-      path: group.key,
-      count: group.items.length,
-      is_root: false,
-      cover: null,
-      cover_hash: null,
-      cover_color: null,
-      modified: null,
-    },
-    context: 'music',
-  }
 }
 
 /** 目录 → 变更弹窗的作用对象 */
@@ -2795,158 +2878,245 @@ useEventListener(window, 'keydown', onKey)
       </div>
     </div>
 
-    <!-- 音乐库（原型版式：封面头 + 播放全部 + 曲目表） -->
+    <!-- 音乐库（v4.9.5）：歌曲 / 专辑 / 艺术家 三视图，参照 Navidrome 的主干结构 -->
     <div
       v-else
-      class="min-h-0 flex-1 overflow-y-auto px-4 py-4 pb-24 md:px-6 md:py-6"
+      class="min-h-0 flex-1 overflow-y-auto pb-24"
       data-testid="music-library"
     >
-      <div v-if="audios.length === 0" class="grid h-full place-items-center text-center">
-        <div>
-          <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
-            <AppIcon name="audio" :size="22" />
-          </span>
-          <p class="text-sm text-ink">{{ t('gallery.music.empty') }}</p>
-          <p class="mt-1 text-xs text-muted">{{ t('gallery.music.emptyHint') }}</p>
-        </div>
-      </div>
-
-      <div v-else class="mx-auto max-w-4xl">
-        <!-- 库头部 -->
-        <div class="mb-6 flex flex-col items-center gap-4 md:mb-8 md:flex-row md:items-end md:gap-8">
+      <div class="mx-auto max-w-5xl px-4 py-4 md:px-6 md:py-6">
+        <!-- 视图切换 + 排序（音乐库的排序按曲目维度，与图片/影视那套分开） -->
+        <div class="mb-4 flex flex-wrap items-center gap-2">
           <div
-            class="grid size-32 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-xl md:size-40"
+            class="flex items-center gap-0.5 rounded-lg border border-line p-0.5 text-xs"
+            data-testid="music-view-switch"
           >
-            <AppIcon name="audio" :size="44" class="opacity-60" />
-          </div>
-          <div class="text-center md:text-left">
-            <p class="mb-1 text-xs font-bold tracking-wide text-muted uppercase">
-              {{ t('gallery.music.title') }}
-            </p>
-            <h1 class="mb-2 text-2xl font-bold text-ink md:mb-4 md:text-3xl">
-              {{ t('gallery.music.count', { count: counts.audio }) }}
-            </h1>
             <button
-              class="inline-flex items-center rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
-              @click="player.play(audios, 0)"
+              :class="[SEG_CLASS, segActive(musicView === 'songs')]"
+              :data-music-view="'songs'"
+              @click="setMusicView('songs')"
             >
-              <AppIcon name="play" :size="14" class="mr-2" />
-              {{ t('gallery.music.playAll') }}
+              {{ t('gallery.music.viewSongs') }}
+            </button>
+            <button
+              :class="[SEG_CLASS, segActive(musicView === 'albums')]"
+              :data-music-view="'albums'"
+              @click="setMusicView('albums')"
+            >
+              {{ t('gallery.music.viewAlbums') }}
+            </button>
+            <button
+              :class="[SEG_CLASS, segActive(musicView === 'artists')]"
+              :data-music-view="'artists'"
+              @click="setMusicView('artists')"
+            >
+              {{ t('gallery.music.viewArtists') }}
             </button>
           </div>
+          <!-- 排序只对「歌曲」有意义：专辑墙与艺术家列表都是按名称聚合的，
+               放个时间/大小排序在那里只会让人以为它没用 -->
+          <SortMenu
+            v-if="musicView === 'songs'"
+            class="ml-auto"
+            :model-value="gridSort"
+            :keys="GRID_SORT_KEYS"
+            @update:model-value="setGridSort"
+          />
         </div>
 
-        <!-- 曲目表 -->
-        <table class="w-full text-left text-sm">
-          <thead class="border-b border-line text-xs text-muted">
-            <tr>
-              <th class="w-10 px-2 py-2 font-normal md:px-3">
-                {{ t('gallery.music.columnIndex') }}
-              </th>
-              <th class="px-2 py-2 font-normal">{{ t('gallery.music.columnTitle') }}</th>
-              <th class="hidden w-28 px-3 py-2 text-right font-normal md:table-cell">
-                {{ t('gallery.music.columnSize') }}
-              </th>
-              <th class="w-14 px-2 py-2 text-right font-normal">
-                {{ t('gallery.music.columnFavorite') }}
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            <template v-for="group in audioGroups" :key="group.key">
-              <!-- 分组标题：多个文件夹时按文件夹分区（v3.5.5） -->
-              <tr v-if="audioGroups.length > 1">
-                <td
-                  colspan="4"
-                  class="border-b border-line/60 px-2 pb-1.5 pt-4 md:px-3"
-                  :title="t('gallery.music.folderHint')"
-                  @contextmenu.prevent="openMusicGroupMenu($event, group)"
-                >
-                  <span class="text-sm font-semibold text-ink">{{ group.label }}</span>
-                  <span class="ml-2 text-xs text-muted">{{ group.items.length }}</span>
-                </td>
-              </tr>
-              <tr
-                v-for="track in group.items"
-                :key="track.path"
-                class="group cursor-pointer transition-colors hover:bg-elevated/50"
-                :data-track="track.path"
-                @click="playTrackAt(track)"
-                @contextmenu.prevent="openMediaMenu($event, track, 'music')"
-                @touchstart.passive="press.start($event, { item: track, context: 'music' })"
-                @touchmove.passive="press.move"
-                @touchend="press.cancel"
-                @touchcancel="press.cancel"
-              >
-              <td class="px-2 py-3 md:px-3">
-                <span class="group-hover:hidden" :class="player.isCurrent(track.path) ? 'text-accent' : ''">
-                  {{ (audioRowIndex.get(track.path) ?? 0) + 1 }}
-                </span>
-                <AppIcon
-                  v-if="player.isCurrent(track.path) && player.state.playing"
-                  name="pause"
-                  :size="14"
-                  class="hidden text-accent group-hover:block"
+        <div v-if="audios.length === 0" class="grid h-64 place-items-center text-center">
+          <div>
+            <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
+              <AppIcon name="audio" :size="22" />
+            </span>
+            <p class="text-sm text-ink">{{ t('gallery.music.empty') }}</p>
+            <p class="mt-1 text-xs text-muted">{{ t('gallery.music.emptyHint') }}</p>
+          </div>
+        </div>
+
+        <template v-else>
+          <!-- 库头：真实专辑封面 2×2 拼贴 + 统计 + 播放全部 / 随机 -->
+          <div class="mb-6 flex flex-col gap-4 md:flex-row md:items-end md:gap-6">
+            <div
+              v-if="heroCovers.length"
+              class="size-20 shrink-0 overflow-hidden rounded-xl sm:size-28 md:size-32"
+              data-testid="music-hero-covers"
+            >
+              <div class="grid size-full grid-cols-2 grid-rows-2 gap-px">
+                <img
+                  v-for="cover in heroCovers"
+                  :key="cover.path"
+                  :src="coverUrl(cover.path)"
+                  alt=""
+                  class="size-full object-cover"
+                  @error="markCoverFailed(cover.path)"
                 />
-                <AppIcon v-else name="play" :size="14" class="hidden text-accent group-hover:block" />
-              </td>
-              <td class="px-2 py-3">
-                <div class="flex items-center gap-3">
-                  <span
-                    class="relative grid size-10 shrink-0 place-items-center overflow-hidden rounded text-white/80"
-                    :style="{ backgroundColor: placeholderColor(track.path) }"
-                  >
-                    <AppIcon v-if="!showCover(track)" name="audio" :size="16" />
-                    <img
-                      v-else
-                      :src="coverUrl(track.path)"
-                      alt=""
-                      loading="lazy"
-                      class="size-full object-cover"
-                      @error="markCoverFailed(track.path)"
-                    />
-                  </span>
-                  <span class="min-w-0">
-                    <span
-                      class="block truncate font-medium"
-                      :class="player.isCurrent(track.path) ? 'text-accent' : 'text-ink'"
-                    >
-                      {{ trackTitle(track) }}
-                      <span v-if="player.isCurrent(track.path) && player.state.playing" class="playing-wave">
-                        <span /><span /><span />
-                      </span>
-                    </span>
-                    <span v-if="trackSubtitle(track)" class="block truncate text-xs text-muted">
-                      {{ trackSubtitle(track) }}
-                    </span>
-                  </span>
-                </div>
-              </td>
-              <td class="hidden px-3 py-3 text-right text-xs text-muted md:table-cell">
-                {{ formatSize(track.size) }}
-              </td>
-              <td class="px-2 py-3 text-right">
+              </div>
+            </div>
+            <div
+              v-else
+              class="grid size-20 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 text-white sm:size-28 md:size-32"
+            >
+              <AppIcon name="audio" :size="40" class="opacity-60" />
+            </div>
+            <div class="min-w-0">
+              <p class="mb-1 text-[11px] font-bold tracking-wide text-muted uppercase">
+                {{ t('gallery.music.title') }}
+              </p>
+              <h1 class="mb-1 text-2xl font-bold text-ink md:text-3xl">
+                {{ t('gallery.music.count', { count: counts.audio }) }}
+              </h1>
+              <p class="mb-3 text-xs text-muted" data-testid="music-stats">{{ musicStats }}</p>
+              <div class="flex flex-wrap gap-2">
                 <button
-                  class="rounded-md p-1.5 transition-colors"
-                  :class="isFavorite(track.path) ? 'fg-danger' : 'text-muted hover:text-ink'"
-                  :title="isFavorite(track.path) ? t('gallery.favorite.remove') : t('gallery.favorite.add')"
-                  @click.stop="toggleFavorite(track)"
+                  class="inline-flex items-center rounded-full bg-accent px-5 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                  data-testid="music-play-all"
+                  @click="player.play(visibleTracks, 0)"
                 >
-                  <AppIcon name="heart" :size="14" :class="isFavorite(track.path) ? 'fill-current' : ''" />
+                  <AppIcon name="playSolid" :size="12" class="mr-2" />
+                  {{ t('gallery.music.playAll') }}
                 </button>
-              </td>
-            </tr>
-            </template>
-          </tbody>
-        </table>
+                <button
+                  class="inline-flex items-center rounded-full border border-line px-4 py-2 text-sm text-ink transition-colors hover:border-accent/50"
+                  data-testid="music-shuffle"
+                  @click="playShuffled"
+                >
+                  <AppIcon name="shuffle" :size="12" class="mr-2" />
+                  {{ t('gallery.music.shuffle') }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 从专辑/艺术家点进来的返回条 -->
+          <div
+            v-if="musicFilter && musicView === 'songs'"
+            class="mb-2 flex items-center gap-2 text-xs text-muted"
+          >
+            <button
+              class="inline-flex items-center gap-1 rounded px-1.5 py-1 transition-colors hover:bg-elevated hover:text-ink"
+              data-testid="music-filter-back"
+              @click="clearMusicFilter"
+            >
+              <AppIcon name="chevronLeft" :size="12" />
+              {{ t('gallery.music.backToAll') }}
+            </button>
+            <span class="truncate text-ink">{{ musicFilter.value }}</span>
+          </div>
+
+          <!-- 歌曲 -->
+          <div v-if="musicView === 'songs'" data-testid="music-songs">
+            <div class="flex items-center gap-3 px-2 pb-1.5 text-[11px] text-muted">
+              <span class="w-6 text-center">#</span>
+              <span class="size-10 shrink-0"></span>
+              <span class="min-w-0 flex-1">{{ t('gallery.music.columnTitle') }}</span>
+              <span class="w-14 shrink-0 text-right">{{ t('gallery.music.columnDuration') }}</span>
+              <span class="w-7 shrink-0"></span>
+              <span class="hidden w-7 shrink-0 sm:block"></span>
+            </div>
+            <div class="border-t border-line/60">
+              <MusicTrackRow
+                v-for="(track, index) in visibleTracks"
+                :key="track.path"
+                :item="track"
+                :index="index"
+                :active="player.isCurrent(track.path)"
+                :playing="player.state.playing"
+                :favorite="isFavorite(track.path)"
+                :cover-failed="failedCovers.has(track.path)"
+                @play="playTrackAt(track)"
+                @menu="openMediaMenu($event, track, 'music')"
+                @favorite="toggleFavorite(track)"
+                @cover-error="markCoverFailed(track.path)"
+              />
+            </div>
+          </div>
+
+          <!-- 专辑：封面墙，点一张只看这张 -->
+          <div
+            v-else-if="musicView === 'albums'"
+            class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5"
+            data-testid="music-albums"
+          >
+            <button
+              v-for="album in musicAlbums"
+              :key="album.key"
+              type="button"
+              class="group min-w-0 text-left"
+              :data-album-name="album.name"
+              @click="openMusicCollection('album', album.key)"
+            >
+              <div
+                class="relative aspect-square overflow-hidden rounded-xl border border-line bg-elevated"
+                :style="{ backgroundColor: placeholderColor(album.key) }"
+              >
+                <img
+                  v-if="album.cover"
+                  :src="coverUrl(album.cover.path)"
+                  alt=""
+                  loading="lazy"
+                  class="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                  @error="markCoverFailed(album.cover.path)"
+                />
+                <span v-else class="absolute inset-0 grid place-items-center text-muted/60">
+                  <AppIcon name="audio" :size="26" />
+                </span>
+                <span
+                  class="absolute right-2 bottom-2 grid size-9 place-items-center rounded-full bg-accent text-white opacity-0 transition-opacity group-hover:opacity-100"
+                >
+                  <AppIcon name="playSolid" :size="14" />
+                </span>
+              </div>
+              <p class="mt-2 truncate text-[13px] font-medium text-ink">{{ album.name }}</p>
+              <p class="mt-0.5 truncate text-[11px] text-muted">{{ album.sub }}</p>
+            </button>
+          </div>
+
+          <!-- 艺术家：圆形头像行，点一位只看这位 -->
+          <div v-else class="divide-y divide-line/60" data-testid="music-artists">
+            <button
+              v-for="artist in musicArtists"
+              :key="artist.key"
+              type="button"
+              class="flex w-full items-center gap-3 px-2 py-2.5 text-left transition-colors hover:bg-elevated/60"
+              :data-artist="artist.name"
+              @click="openMusicCollection('artist', artist.key)"
+            >
+              <span
+                class="grid size-11 shrink-0 place-items-center overflow-hidden rounded-full bg-elevated text-muted"
+              >
+                <img
+                  v-if="artist.cover"
+                  :src="coverUrl(artist.cover.path)"
+                  alt=""
+                  loading="lazy"
+                  class="size-full object-cover"
+                  @error="markCoverFailed(artist.cover.path)"
+                />
+                <AppIcon v-else name="audio" :size="16" />
+              </span>
+              <span class="min-w-0 flex-1">
+                <span class="block truncate text-[13px] text-ink">{{ artist.name }}</span>
+                <span class="mt-0.5 block truncate text-[11px] text-muted">{{ artist.sub }}</span>
+              </span>
+            </button>
+          </div>
+        </template>
       </div>
-      <!-- 触底续接（游标分页）：滚到这里自动取下一页 -->
-      <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
+
+      <!-- 触底续接（游标分页）：曲目多到一页放不下时接着取 -->
+      <div
+        v-if="loadingMore"
+        class="flex items-center justify-center gap-2 py-4 text-xs text-muted"
+      >
         <span class="size-3 animate-spin rounded-full border-2 border-line border-t-accent" />
         {{ t('gallery.toolbar.loadingMore') }}
       </div>
       <div v-if="hasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
-      <p v-else-if="audios.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+      <p
+        v-else-if="audios.length > 0 && !loadingMore"
+        class="py-4 text-center text-[11px] text-muted"
+      >
         {{ t('gallery.toolbar.allLoaded') }}
       </p>
     </div>

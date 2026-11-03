@@ -319,6 +319,17 @@ fn migrations() -> Migrations<'static> {
             CREATE INDEX IF NOT EXISTS idx_media_assets_size ON media_assets(size);
             UPDATE media_dirs SET stamp = -1;",
         ),
+        // v7：音频时长（v4.9.5 音乐库）。单独一张表而不是往 `media_assets` 加列 ——
+        // `replace_dir` 是「先删后插」，加列会在每次重扫目录时把算好的时长清零。
+        // 键与 `media_dims` 同构：`path + mtime + size`，文件一改就自动失效。
+        M::up(
+            "CREATE TABLE IF NOT EXISTS media_durations (
+                path  TEXT PRIMARY KEY,
+                mtime INTEGER NOT NULL,
+                size  INTEGER NOT NULL,
+                ms    INTEGER NOT NULL
+            );",
+        ),
     ])
 }
 

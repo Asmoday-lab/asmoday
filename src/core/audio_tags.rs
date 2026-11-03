@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use lofty::prelude::{Accessor, TaggedFileExt};
+use lofty::prelude::{Accessor, AudioFile, TaggedFileExt};
 use lofty::tag::Tag;
 
 /// 单张封面的大小上限，超过就当没有（不把几十 MB 的图吐给前端）
@@ -55,6 +55,26 @@ pub fn read_tags(path: &Path) -> TrackTags {
         artist,
         album,
     }
+}
+
+/// 读音频时长（毫秒）。
+///
+/// 与 [`read_tags`] 分开是刻意的：那边 `read_properties(false)`，因为算时长要把音频流
+/// 走一遍（MP3 缺 Xing 头时尤其慢），目录扫描每首歌来一次会拖垮整轮索引。
+/// 这里只在「这一页真的要看时长」时调用，结果按 `(path, mtime, size)` 落
+/// `media_durations` 表，第二次起零成本（见 `api::media::build_items`）。
+pub fn read_duration_ms(path: &Path) -> Option<u64> {
+    use lofty::config::ParseOptions;
+
+    let mut options = ParseOptions::new();
+    options.read_properties(true);
+    let tagged = lofty::probe::Probe::open(path)
+        .ok()?
+        .options(options)
+        .read()
+        .ok()?;
+    let ms = tagged.properties().duration().as_millis() as u64;
+    (ms > 0).then_some(ms)
 }
 
 /// 读取内嵌封面；没有就返回 `None`。
