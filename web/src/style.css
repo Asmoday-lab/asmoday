@@ -497,14 +497,23 @@ body {
 }
 
 /* 路由切换淡入 */
-.route-fade-enter-active,
+/* 页面过渡（v4.6.16）：同帧交叉淡入，不再用 out-in——那会留一帧空白，
+   门户大卡片 → 文件小网格被空白帧串成「从大变小」的错觉；进场也不再带
+   6px 位移，交叉期两层叠加时位移会放大成抖动。离场页绝对定位叠在原位，
+   两个页面才能同帧交叉（#app-scroll 已配 position: relative）。 */
+#app-scroll {
+  position: relative;
+}
+.route-fade-enter-active {
+  transition: opacity 0.16s ease;
+}
 .route-fade-leave-active {
-  transition: opacity 0.18s ease, transform 0.18s ease;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
 }
-.route-fade-enter-from {
-  opacity: 0;
-  transform: translateY(6px);
-}
+.route-fade-enter-from,
 .route-fade-leave-to {
   opacity: 0;
 }

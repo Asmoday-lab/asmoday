@@ -1646,6 +1646,17 @@ GWT-UP-03 Given 会话声明 Upload-Length = N  When PATCH 累计超过 N  Then 
 GWT-UP-04 Given 只读挂载点  When PUT /api/files/upload 或 POST /api/files/upload/tus  Then 403 E_READONLY（v4.6.14 堵住整包上传的只读缺口）
 ```
 
+#### GWT 验收（导航 / 过渡 / 灯箱 / 媒体库视图，v4.6.16）
+
+```
+GWT-NAV-01 Given /files/m0/a/b  When 浏览器返回键  Then 回 /files/m0/a（上一个目录），再退回挂载点根、再退出门户；history.length 随目录导航增长
+GWT-NAV-02 Given 挂载点改指到新路径  When 重新进入 /files  Then 旧位置目录的上一帧被丢弃（快照键带挂载点路径 + 挂载点清单变更即清帧），不出现「旧索引 + 只有转圈」的窗口
+GWT-FADE-01 Given 门户 → 文件管理路由切换  Then 过渡为同帧交叉淡入（#app-scroll 内短暂同时挂两个页面），不再有 out-in 的整页空白帧
+GWT-LBX-01 Given 灯箱显示一张 contain 后有黑边的图  When 鼠标点在黑边（避开箭头/胶囊控件）  Then 灯箱关闭；点在画面内只切 chrome；Esc 始终可关
+GWT-GAL-01 Given 图片库相册视图  When 切「分层」  Then 从挂载根逐层浏览（面包屑 + 子文件夹卡片 + 当前层媒体），点文件夹下钻、Esc 逐层向上；When 切回「平铺」  Then 回到原全库卡片墙
+GWT-GAL-02 Given 时间线  When 切「按文件夹」  Then 分组头为目录名；影视库切「全部影片」  Then 媒体流按文件夹/按时间分组，触底续接走同一条分页流
+```
+
 #### GWT 验收（安全收紧，v4.6.13）
 
 ```gwt

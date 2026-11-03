@@ -13,7 +13,8 @@
     "albumEmpty": "No folders with photos yet",
     "albumEmptyHint": "Photos loose in the root still show up in the timeline",
     "albumStale": "Album list did not load",
-    "albumStaleHint": "{count} photos are indexed but no albums came back — usually the scan has not finished; try rescanning"
+    "albumStaleHint": "{count} photos are indexed but no albums came back — usually the scan has not finished; try rescanning",
+    "folderEmpty": "No folders or photos at this level"
   },
   "cinema": {
     "title": "Cinema",
@@ -109,5 +110,15 @@
   },
   "folder": {
     "rootLocked": "The library root cannot be renamed, moved or deleted — it is the mount point itself"
+  },
+  "view": {
+    "flat": "Flat",
+    "layered": "Layered",
+    "folders": "Folders",
+    "allVideos": "All videos"
+  },
+  "group": {
+    "byTime": "By date",
+    "byFolder": "By folder"
   }
 }

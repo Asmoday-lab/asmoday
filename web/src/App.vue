@@ -234,7 +234,10 @@ const playerSpace = computed(() => {
         <!-- 一次性密码会话：后端只放行改密接口，这里也别把主界面挂起来，
              否则底层页面会连着发一堆 403 请求，弹一堆错误 toast -->
         <RouterView v-if="!mustChangePassword" v-slot="{ Component }">
-          <Transition name="route-fade" mode="out-in">
+          <!-- v4.6.16：去掉 mode="out-in"。out-in 的「先卸载再挂载」必有一帧纯空白，
+               门户大卡片 → 文件管理小网格被这帧空白串成「内容从大变小」的错觉；
+               改成同帧交叉淡入，离场页绝对定位叠在原位（配合 #app-scroll relative）。 -->
+          <Transition name="route-fade">
             <component :is="Component" />
           </Transition>
         </RouterView>

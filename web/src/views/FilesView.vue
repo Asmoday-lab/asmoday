@@ -646,7 +646,9 @@ function pathFromRoute(mount: MountPoint, raw: unknown): string {
  * 把当前目录同步进 URL（设计文档 3.2.1）。
  *
  * 文件管理不允许「原地换目录但不改 URL」——刷新、分享、浏览器前进后退都必须能回到同一目录。
- * 页内跳转默认 replace：避免在一个目录里点十下就压十层历史；从卡片页进入挂载点才 push。
+ * v4.6.16 起用户导航（进目录 / 面包屑 / 返回上级）一律 push：目录层级必须留在历史栈里，
+ * 浏览器返回键才能「回到上一个目录」而不是直接掉出文件管理（v4.6.15 用户反馈）。
+ * replace 只保留给非导航场景：boot 落地、单挂载点跳转、操作完成后的原地刷新。
  */
 function syncUrl(path: string, mode: 'push' | 'replace' = 'replace') {
   const mount = mountForPath(path)
@@ -1340,9 +1342,18 @@ interface RootsSnapshot {
 
 const ROOTS_SNAPSHOT_KEY = 'files:roots'
 
+/**
+ * 目录快照键。
+ *
+ * v4.6.16 起键里带挂载点的真实路径：挂载点 id 是配置序号（m0/m1/…），
+ * 改了挂载点指向的路径后 id 不变——只按 id 存取会把旧位置目录的上一帧
+ * 当成新位置的「上一帧」贴回来（v4.6.15 用户反馈的「换挂载点后旧索引残留」）。
+ */
 function snapshotKey(mountId: string, segments: string[]): string {
+  const mount = roots.value.find((root) => root.id === mountId)
+  const base = mount ? mount.path.replace(/\\/g, '/').replace(/\/+$/, '') : ''
   const flags = `${sortKey.value}${sortDir.value}${showHidden.value ? 'h' : '-'}`
-  return `files:${mountId}/${segments.join('/')}|${flags}`
+  return `files:${mountId}:${base}/${segments.join('/')}|${flags}`
 }
 
 /** 当前 URL 里的挂载点与目录段 */
@@ -1398,6 +1409,7 @@ async function boot() {
   // 上一帧先贴出来（v4.6.8）：重新进入同一个目录时不该先闪一下骨架屏，
   // 面包屑也不该「先只显示末段、再跳成完整路径」，所以挂载点清单一起贴。
   seedRoots()
+  const seededRoots = roots.value.length ? roots.value : null
   const routeLoc = routeTarget()
   // 单挂载点：URL 只是 /files 时必然被 replace 到该挂载点根。与其先画卡片页、
   // 再盖一层跳转遮罩、再等目录接口，不如现在就把那个目录的上一帧贴出来。
@@ -1426,6 +1438,23 @@ async function boot() {
     roots.value = data.mounts
     rootsImplicit.value = data.implicit
     uploadChunkMb.value = data.upload_chunk_size_mb ?? 0
+    // 挂载点清单与上一帧不一致（改过配置 / 挂载点增删 / 掉线恢复）：
+    // 贴回来的旧帧不可信，立刻清掉换骨架——别让旧目录内容顶着右上角转圈
+    // 一直挂到新数据回来（v4.6.15 用户反馈的「换挂载点后旧索引残留」）
+    if (
+      seededRoots &&
+      (seededRoots.length !== data.mounts.length ||
+        seededRoots.some(
+          (seed, index) =>
+            seed.id !== data.mounts[index].id ||
+            seed.path !== data.mounts[index].path ||
+            seed.name !== data.mounts[index].name ||
+            seed.online !== data.mounts[index].online,
+        ))
+    ) {
+      listing.value = null
+      currentPath.value = ''
+    }
     writeCache(ROOTS_SNAPSHOT_KEY, {
       mounts: data.mounts,
       implicit: data.implicit,
@@ -1510,7 +1539,7 @@ async function goHome() {
     if (currentPath.value !== home.path) {
       if (editor.value && !(await closeEditor())) return
       preview.value = null
-      void open(home.path)
+      void open(home.path, 1, { push: true })
       return
     }
     // 已在挂载点根：按文档 3.2.1 单挂载点语义「点第一级回根」，原地不动
@@ -1538,7 +1567,7 @@ async function goUp() {
   const list = crumbs.value
   if (list.length >= 2) {
     if (editor.value && !(await closeEditor())) return
-    void open(list[list.length - 2].path)
+    void open(list[list.length - 2].path, 1, { push: true })
     return
   }
   if (singleMount.value) return
@@ -1756,7 +1785,7 @@ async function activate(entry: EntryInfo) {
   // 目录（含指向挂载点内目录的软链接）直接进入；
   // 后端解析 canonicalize 后归属校验照常生效，越权仍会被拒
   if (entry.is_dir || linkToDir(entry)) {
-    await open(entry.path)
+    await open(entry.path, 1, { push: true })
     return
   }
 
@@ -2026,7 +2055,9 @@ useScrollLock(
   ),
 )
 
-// 浏览器前进/后退或外部改 URL：按新 URL 重新定位，但不反向 sync（否则死循环）
+// 浏览器前进/后退或外部改 URL：按新 URL 重新定位，但不反向 sync（否则死循环）。
+// 后退到看过的目录时先贴会话快照（v4.6.16）：目录导航已改为 push，返回键
+// 高频落在历史目录上，不该每次都从骨架屏开始。
 watch(
   () => [route.params.mountId, route.params.pathMatch] as const,
   async () => {
@@ -2043,9 +2074,16 @@ watch(
     if (redirecting.value) return
     const mount = roots.value.find((root) => root.id === id)
     if (!mount || !mount.online) return
+    const segments = (Array.isArray(route.params.pathMatch)
+      ? route.params.pathMatch
+      : route.params.pathMatch
+        ? [route.params.pathMatch]
+        : []
+    ).map(String)
+    seedListing(id, segments)
     const target = pathFromRoute(mount, route.params.pathMatch)
-    if (target === currentPath.value) return
     activeMount.value = mount
+    // 贴中快照时 open() 自行走静默刷新（listing.path === target）；没贴中就进骨架态
     await open(target, 1, { sync: false })
   },
 )
@@ -2826,7 +2864,7 @@ onBeforeUnmount(() => {
                       v-else
                       class="max-w-[160px] shrink-0 truncate rounded px-1.5 py-1 text-muted transition-colors hover:bg-elevated hover:text-ink"
                       :title="crumb.label"
-                      @click="open(crumb.path)"
+                      @click="open(crumb.path, 1, { push: true })"
                     >
                       {{ crumb.label }}
                     </button>

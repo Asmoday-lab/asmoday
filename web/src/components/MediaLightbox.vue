@@ -129,12 +129,14 @@ const zoom = useImageZoom({
       infoOpen.value = false
       return
     }
-    // 放大状态下点哪儿都只是切工具栏；没放大时点图切工具栏、点黑边直接关
     if (zoom.zoomed.value) {
       toggleChrome()
       return
     }
-    if (downTarget && imgEl.value && downTarget !== imgEl.value) {
+    if (item.value?.kind === 'image' && down && !hitsPicture()) {
+      // 未放大时点在画面外的黑边 / 舞台空白上 → 关闭（v4.6.16 修复：
+      // 原图 <img> 元素盒子是 size-full 铺满舞台的，object-contain 的黑边
+      // 也在元素里，早先 `downTarget !== imgEl` 的判定永远判不中黑边）
       closeLightbox()
       return
     }
@@ -145,10 +147,34 @@ const { style: zoomStyle } = zoom
 
 /** 记录按下时的目标：区分「点图片」与「点黑边」 */
 let downTarget: EventTarget | null = null
+/** 按下时的指针位置（黑边判定用，pointerup 才结算） */
+let downPoint: { x: number; y: number } | null = null
+
+/**
+ * 按下点是否落在图片的**实际渲染矩形**内（object-contain letterbox 几何）。
+ * 元素信息不全（原图还没解码出尺寸）时按「在画面内」处理，宁可切工具栏不误关。
+ */
+function hitsPicture(): boolean {
+  const stage = stageEl.value
+  const down = downPoint
+  if (!stage || !down) return true
+  // 信息层 / 缩略图阶段还没有 natural，退回「元素内即画面内」的保守行为
+  if (!natural.value) return true
+  const rect = stage.getBoundingClientRect()
+  const scale = Math.min(rect.width / natural.value.width, rect.height / natural.value.height)
+  const width = natural.value.width * scale
+  const height = natural.value.height * scale
+  const offsetX = rect.left + (rect.width - width) / 2
+  const offsetY = rect.top + (rect.height - height) / 2
+  return (
+    down.x >= offsetX && down.x <= offsetX + width && down.y >= offsetY && down.y <= offsetY + height
+  )
+}
 
 function onStagePointerDown(event: PointerEvent) {
   if (item.value?.kind !== 'image') return
   downTarget = event.target
+  downPoint = { x: event.clientX, y: event.clientY }
   noteActivity()
   zoom.onPointerDown(event)
 }
