@@ -404,7 +404,10 @@ async fn run_rebuild(state: AppState) {
         if let Ok(mut status) = state.rebuild.lock() {
             match outcome {
                 thumbnail::ThumbOutcome::Ready(_) => status.completed += 1,
-                thumbnail::ThumbOutcome::Placeholder => status.failed += 1,
+                // 拥塞（Busy）与真失败一样算这一轮没出图：重跑一次就补上
+                thumbnail::ThumbOutcome::Busy | thumbnail::ThumbOutcome::Placeholder => {
+                    status.failed += 1
+                }
             }
         }
         // 单线程 + 主动让出：重建期间普通请求仍然能得到响应

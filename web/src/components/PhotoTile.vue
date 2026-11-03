@@ -10,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
 import { placeholderFor, THUMB_WIDTH, thumbUrl, type MediaItem } from '../api/media'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
+import { useThumbSrc } from '../lib/thumb-loader'
 
 const props = withDefaults(
   defineProps<{
@@ -26,8 +27,14 @@ const props = withDefaults(
 
 const { t } = useI18n()
 
-/** 缩略图加载失败（坏文件 / 无权限）时回落图标，别留一块空色块 */
-const failed = ref(false)
+/**
+ * 缩略图装载（v4.6.21）：滚到附近才请求、按行序排队、服务端拥塞时重试。
+ * 以前直接 `<img loading="lazy">`，几十个请求并行 + 服务端按需生成 = 谁先回来谁先亮。
+ */
+const rootEl = ref<HTMLElement | null>(null)
+const { src: thumbSrc, failed } = useThumbSrc(rootEl, () =>
+  thumbUrl(props.item.path, props.width, props.item.modified),
+)
 const placeholder = computed(() => thumbHashToDataUrl(props.item.hash))
 /** 等高行里的格子是确定性尺寸，方格网格里则是 1:1 自适应 */
 const sized = computed(() => props.cellWidth > 0 && props.cellHeight > 0)
@@ -41,6 +48,7 @@ const boxStyle = computed(() => {
 
 <template>
   <button
+    ref="rootEl"
     type="button"
     class="group relative overflow-hidden rounded-lg border border-transparent transition-colors hover:border-line"
     :class="sized ? 'block shrink-0' : 'aspect-square w-full'"
@@ -59,16 +67,16 @@ const boxStyle = computed(() => {
       alt=""
     />
 
-    <!-- 视频同样取后端首帧当封面（v2.8），失败才回落图标 -->
+    <!-- 视频同样取后端首帧当封面（v2.8），失败才回落图标；src 由调度器按行序点亮 -->
     <img
-      v-if="!failed"
-      :src="thumbUrl(item.path, width, item.modified)"
+      v-if="thumbSrc"
+      :src="thumbSrc"
       class="relative size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-      loading="lazy"
+      decoding="async"
       alt=""
-      @error="failed = true"
     />
-    <span v-else class="grid size-full place-items-center text-white/70">
+    <!-- 取不到（坏文件 / 重试用尽）才落图标；还在路上时留 ThumbHash 打底 -->
+    <span v-else-if="failed" class="grid size-full place-items-center text-white/70">
       <AppIcon :name="item.kind === 'video' ? 'video' : 'gallery'" :size="26" />
     </span>
 

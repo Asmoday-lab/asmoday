@@ -366,6 +366,17 @@ pub async fn thumb(
             Body::from(rendered.bytes),
         )
             .into_response(),
+        // 拥塞 / 文件仍在写入：503 让 `<img>` 报错，前端调度器按退避重试；
+        // 回 200 占位图会让浏览器认为「已加载」，那块灰再也不动。
+        ThumbOutcome::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::RETRY_AFTER, "1".to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            Body::empty(),
+        )
+            .into_response(),
         ThumbOutcome::Placeholder => placeholder(),
     }
 }

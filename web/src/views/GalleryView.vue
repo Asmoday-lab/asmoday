@@ -2041,25 +2041,33 @@ useEventListener(window, 'keydown', onKey)
           </p>
         </div>
 
-        <!-- 年份刻度尺（v4.6.19）：滚动时跟随高亮，点击跳到该年第一天 -->
+        <!-- 年份刻度尺（v4.6.21）：贴右边缘的连续年份尺，滚动跟随高亮、点击跳该年 -->
         <aside
-          v-if="photoGroup === 'time' && timelineYears.length > 1"
-          class="absolute top-1/2 right-0.5 z-20 hidden -translate-y-1/2 flex-col items-end gap-0.5 md:flex"
+          v-if="photoGroup === 'time' && timelineYears.length > 0"
+          class="absolute top-1/2 right-1 z-20 hidden -translate-y-1/2 flex-col items-end md:flex"
+          :class="timelineYears.length > 24 ? 'gap-0' : 'gap-[3px]'"
           data-testid="timeline-years"
         >
           <button
             v-for="year in timelineYears"
             :key="year"
             type="button"
-            class="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] transition-colors"
-            :class="activeYear === year ? 'font-semibold text-accent' : 'text-muted/70 hover:text-ink'"
+            class="group/year flex items-center justify-end gap-1 rounded px-1 leading-none transition-colors hover:bg-elevated"
+            :class="[
+              activeYear === year ? 'font-semibold text-accent' : 'text-muted/60 hover:text-ink',
+              timelineYears.length > 24 ? 'py-px text-[9px]' : 'py-0.5 text-[10px]',
+            ]"
             :data-year="year"
             :title="String(year)"
             @click="jumpToYear(year)"
           >
             <span
               class="h-px transition-all"
-              :class="activeYear === year ? 'w-3 bg-accent' : 'w-2 bg-line'"
+              :class="
+                activeYear === year
+                  ? 'w-3.5 bg-accent'
+                  : 'w-2 bg-line group-hover/year:w-3 group-hover/year:bg-muted'
+              "
             />
             {{ year }}
           </button>
@@ -2334,25 +2342,33 @@ useEventListener(window, 'keydown', onKey)
 
         <!-- 年份刻度尺：与照片库同一套（影视库按天分组时才出现） -->
         <aside
-          v-if="cinemaGroup === 'time' && cinemaYears.length > 1"
-          class="absolute top-1/2 right-0.5 z-20 hidden -translate-y-1/2 flex-col items-end gap-0.5 md:flex"
+          v-if="cinemaGroup === 'time' && cinemaYears.length > 0"
+          class="absolute top-1/2 right-1 z-20 hidden -translate-y-1/2 flex-col items-end md:flex"
+          :class="cinemaYears.length > 24 ? 'gap-0' : 'gap-[3px]'"
           data-testid="cinema-years"
         >
           <button
             v-for="year in cinemaYears"
             :key="year"
             type="button"
-            class="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] transition-colors"
-            :class="
-              cinemaActiveYear === year ? 'font-semibold text-accent' : 'text-muted/70 hover:text-ink'
-            "
+            class="group/year flex items-center justify-end gap-1 rounded px-1 leading-none transition-colors hover:bg-elevated"
+            :class="[
+              cinemaActiveYear === year
+                ? 'font-semibold text-accent'
+                : 'text-muted/60 hover:text-ink',
+              cinemaYears.length > 24 ? 'py-px text-[9px]' : 'py-0.5 text-[10px]',
+            ]"
             :data-year="year"
             :title="String(year)"
             @click="jumpToCinemaYear(year)"
           >
             <span
               class="h-px transition-all"
-              :class="cinemaActiveYear === year ? 'w-3 bg-accent' : 'w-2 bg-line'"
+              :class="
+                cinemaActiveYear === year
+                  ? 'w-3.5 bg-accent'
+                  : 'w-2 bg-line group-hover/year:w-3 group-hover/year:bg-muted'
+              "
             />
             {{ year }}
           </button>

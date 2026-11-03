@@ -19,13 +19,25 @@ export function useYearRail<G extends RailGroup>(
   container: Ref<HTMLElement | null>,
   groups: ComputedRef<G[]>,
 ) {
-  /** 去重后的年份（降序，与分组顺序一致） */
+  /**
+   * 刻度尺上的年份：**连续区间**（最早..最晚，降序），不是「只列有照片的年份」。
+   *
+   * Immich 的右边缘刻度是等距年份尺：中间缺照片的年份也占一格，滚动时才有
+   * 「一直在这条时间轴上」的感觉；只列有内容的年份会让刻度忽长忽短。
+   * 点没有内容的年份不跳转（`jump` 找不到目标即 no-op）。
+   */
   const years = computed(() => {
-    const seen: number[] = []
+    let min = Number.POSITIVE_INFINITY
+    let max = Number.NEGATIVE_INFINITY
     for (const group of groups.value) {
-      if (group.year && !seen.includes(group.year)) seen.push(group.year)
+      if (!group.year) continue
+      if (group.year < min) min = group.year
+      if (group.year > max) max = group.year
     }
-    return seen
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return []
+    const out: number[] = []
+    for (let year = max; year >= min; year -= 1) out.push(year)
+    return out
   })
 
   const active = ref<number | null>(null)

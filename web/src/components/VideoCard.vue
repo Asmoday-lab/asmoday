@@ -15,6 +15,7 @@ import type { MediaItem } from '../api/media'
 import { placeholderFor, THUMB_WIDTH, thumbUrl } from '../api/media'
 import { formatSize } from '../lib/format'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
+import { useThumbSrc } from '../lib/thumb-loader'
 
 const props = defineProps<{
   video: MediaItem
@@ -33,8 +34,11 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 
-/** 封面加载失败一次就够：之后再换也会失败，别每次都撞一次 404 */
-const coverFailed = ref(false)
+/** 封面同样走「快到视口才取 + 按行序排队 + 拥塞重试」的调度（v4.6.21） */
+const rootEl = ref<HTMLElement | null>(null)
+const { src: coverSrc, failed: coverFailed } = useThumbSrc(rootEl, () =>
+  thumbUrl(props.video.path, THUMB_WIDTH.tile, props.video.modified),
+)
 const hash = computed(() => thumbHashToDataUrl(props.video.hash))
 const resumeLabel = computed(() => {
   const total = Math.floor(props.resumeAt)
@@ -46,6 +50,7 @@ const resumeLabel = computed(() => {
 
 <template>
   <button
+    ref="rootEl"
     type="button"
     class="group w-full text-left"
     :data-video="video.path"
@@ -64,14 +69,13 @@ const resumeLabel = computed(() => {
         alt=""
       />
       <img
-        v-if="!coverFailed"
-        :src="thumbUrl(video.path, THUMB_WIDTH.tile, video.modified)"
+        v-if="coverSrc"
+        :src="coverSrc"
         class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-        loading="lazy"
+        decoding="async"
         alt=""
-        @error="coverFailed = true"
       />
-      <div v-else class="absolute inset-0 grid place-items-center text-white/40">
+      <div v-else-if="coverFailed" class="absolute inset-0 grid place-items-center text-white/40">
         <AppIcon name="video" :size="30" />
       </div>
       <div class="absolute inset-0 grid place-items-center">

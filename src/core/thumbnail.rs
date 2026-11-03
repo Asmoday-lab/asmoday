@@ -100,7 +100,12 @@ pub struct Rendered {
 pub enum ThumbOutcome {
     /// 生成/命中缓存成功
     Ready(Rendered),
-    /// 队列拥塞或解码失败 → 占位图
+    /// **可重试**：解码队列打满 / 源文件还在写入 → HTTP 503 + Retry-After。
+    ///
+    /// 不能回 200 占位图：`<img>` 认为加载成功，那块灰就永远不会再请求
+    /// （首屏几十张图一起排队时，表现为「随机几块一直是空的」）。
+    Busy,
+    /// 不可重试：解码失败 / 类型不支持 → 占位图（200）
     Placeholder,
 }
 
@@ -343,7 +348,8 @@ impl Thumbnailer {
         // 下载中的大文件先不生成（设计文档 3.4.1）：写盘还没结束，
         // 这一秒生成的图下一秒就因 mtime 变化失效，纯属白烧 CPU。
         if is_fresh_write(path) {
-            return (ThumbOutcome::Placeholder, None);
+            // 还在写盘：等下一轮再取（前端按 Retry-After 退避重试）
+            return (ThumbOutcome::Busy, None);
         }
 
         // 同一源文件串行：320 / 960 同时请求只解码一次
@@ -355,8 +361,8 @@ impl Thumbnailer {
 
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
             Ok(Ok(permit)) => permit,
-            // 队列被打满：立刻回占位图，由前端稍后重试
-            _ => return (ThumbOutcome::Placeholder, None),
+            // 队列被打满：回 503，由前端退避后重新排队
+            _ => return (ThumbOutcome::Busy, None),
         };
 
         let source = path.to_path_buf();
@@ -453,7 +459,7 @@ impl Thumbnailer {
         // 正在下载的影视文件：截帧要拉起 FFmpeg 进程，比解图更贵，
         // 更要等写盘结束（设计文档 3.4.1）。缓存命中已在上面返回。
         if is_fresh_write(path) {
-            return ThumbOutcome::Placeholder;
+            return ThumbOutcome::Busy;
         }
 
         let lock = self.key_lock(&dir);
@@ -465,7 +471,7 @@ impl Thumbnailer {
         // 共享同一个信号量：截帧比解 JPEG 更吃 CPU，绝不允许并发打满
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
             Ok(Ok(permit)) => permit,
-            _ => return ThumbOutcome::Placeholder,
+            _ => return ThumbOutcome::Busy,
         };
 
         let source = path.to_path_buf();
