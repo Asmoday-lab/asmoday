@@ -230,6 +230,7 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
 /// - **v3** 目录快照缓存（`dir_snapshots`，见 `core/dir_cache.rs`）。
 /// - **v4** 媒体库快照（`media_snapshots`，带 size / mtime，见 `core/dir_cache.rs`）。
 /// - **v5** 媒体索引（`media_assets` / `media_dirs` / `media_roots`，见 `core/media_index.rs`）。
+/// - **v7** 音频时长缓存；**v8** 音频标签缓存（两者都按 `path+mtime+size` 失效）。
 /// - **v6** 名称排序键 `media_assets.sort_name`（自然序，v4.9.0）+ 触发一次索引重建。
 ///
 /// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
@@ -328,6 +329,20 @@ fn migrations() -> Migrations<'static> {
                 mtime INTEGER NOT NULL,
                 size  INTEGER NOT NULL,
                 ms    INTEGER NOT NULL
+            );",
+        ),
+        // v8：音频标签缓存（v4.9.8）。音乐库列表原先每页要读 120 次 ID3，
+        // 在 SMB/UNC 上单次 0.5~1 秒 —— 这就是「进音乐库等二三十秒」的来源。
+        // 键与 `media_durations` 同构，文件一改（mtime/size 变）自动失效。
+        M::up(
+            "CREATE TABLE IF NOT EXISTS media_tags (
+                path      TEXT PRIMARY KEY,
+                mtime     INTEGER NOT NULL,
+                size      INTEGER NOT NULL,
+                title     TEXT,
+                artist    TEXT,
+                album     TEXT,
+                has_cover INTEGER NOT NULL
             );",
         ),
     ])

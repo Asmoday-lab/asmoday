@@ -745,6 +745,96 @@ pub fn dims_get_many(
     hits
 }
 
+/// 找出「标签或时长还没缓存」的音频（后台预热用，v4.9.8）。
+///
+/// 音乐库列表只查缓存，缓存冷的时候首开还是慢；索引器每轮把缺的补齐，
+/// 用户重启后几分钟内音乐库就是秒开。
+pub fn audio_missing_meta(conn: &Connection, limit: usize) -> Vec<(String, u64, u64)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT a.path, a.mtime, a.size FROM media_assets a
+         LEFT JOIN media_tags t
+                ON t.path = a.path AND t.mtime = a.mtime AND t.size = a.size
+         LEFT JOIN media_durations d
+                ON d.path = a.path AND d.mtime = a.mtime AND d.size = a.size
+         WHERE a.kind = 'audio' AND (t.path IS NULL OR d.path IS NULL)
+         ORDER BY a.path
+         LIMIT ?1",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(params![limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+            row.get::<_, i64>(2)?.max(0) as u64,
+        ))
+    })
+    .map(|rows| rows.filter_map(Result::ok).collect())
+    .unwrap_or_default()
+}
+
+/// 批量读音频标签缓存（v4.9.8）。
+///
+/// 音乐库列表一页 120 首，每首读一次 ID3 在 SMB/UNC 上要 0.5~1 秒 —— 6 路并发
+/// 也要二三十秒，这是「进音乐库特别卡」的唯一原因。标签是纯元数据，
+/// 按 `path + mtime + size` 缓存后，第二次起一次文件都不用碰。
+pub fn tags_get_many(
+    conn: &Connection,
+    keys: &[(&str, u64, u64)],
+) -> std::collections::HashMap<String, crate::core::audio_tags::TrackTags> {
+    use std::collections::HashMap;
+    let mut hits = HashMap::new();
+    if keys.is_empty() {
+        return hits;
+    }
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT title, artist, album, has_cover FROM media_tags
+         WHERE path = ?1 AND mtime = ?2 AND size = ?3",
+    ) else {
+        return hits;
+    };
+    for (path, mtime, size) in keys {
+        if let Ok(row) = stmt.query_row(params![path, *mtime as i64, *size as i64], |row| {
+            Ok(crate::core::audio_tags::TrackTags {
+                title: row.get(0)?,
+                artist: row.get(1)?,
+                album: row.get(2)?,
+                has_cover: row.get::<_, i64>(3)? != 0,
+            })
+        }) {
+            hits.insert((*path).to_string(), row);
+        }
+    }
+    hits
+}
+
+/// 写回读到的标签（只写 miss 的那些，一页最多 120 行）
+pub fn tags_put_many(
+    conn: &Connection,
+    rows: &[(&str, u64, u64, &crate::core::audio_tags::TrackTags)],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(mut stmt) = conn.prepare_cached(
+        "INSERT OR REPLACE INTO media_tags (path, mtime, size, title, artist, album, has_cover)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    ) else {
+        return;
+    };
+    for (path, mtime, size, tags) in rows {
+        let _ = stmt.execute(params![
+            path,
+            *mtime as i64,
+            *size as i64,
+            tags.title.as_deref(),
+            tags.artist.as_deref(),
+            tags.album.as_deref(),
+            i64::from(tags.has_cover),
+        ]);
+    }
+}
+
 /// 批量读音频时长（毫秒）；键与 `media_dims` 同构，文件一改就失效
 pub fn durations_get_many(
     conn: &Connection,

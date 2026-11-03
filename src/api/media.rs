@@ -1576,6 +1576,47 @@ fn read_dims_parallel(jobs: Vec<DimJob>) -> Vec<DimResult> {
     })
 }
 
+/// 后台预热音频标签与时长（v4.9.8）。
+///
+/// 音乐库列表现在只查缓存，缓存冷的时候首开还是慢（每首要读一次 ID3 + 一遍音频流）。
+/// 索引器每轮顺手补一批，用户重启几分钟后音乐库就是秒开。
+/// 返回补了多少首。
+pub fn warm_audio_meta(index: &MediaIndex) -> usize {
+    const BATCH: usize = 40;
+    let mut done = 0usize;
+    while let Some(rows) = index.with_conn(|conn| Ok(media_index::audio_missing_meta(conn, BATCH)))
+    {
+        if rows.is_empty() {
+            break;
+        }
+        let batch = rows.len();
+        let probed = run_parallel(rows, |(path, mtime, size)| {
+            let file = PathBuf::from(&path);
+            let tags = crate::core::audio_tags::read_tags(&file);
+            let ms = crate::core::audio_tags::read_duration_ms(&file);
+            (path, mtime, size, tags, ms)
+        });
+        let _ = index.with_conn(|conn| {
+            let tags_rows: Vec<(&str, u64, u64, &crate::core::audio_tags::TrackTags)> = probed
+                .iter()
+                .map(|(path, mtime, size, tags, _)| (path.as_str(), *mtime, *size, tags))
+                .collect();
+            media_index::tags_put_many(conn, &tags_rows);
+            let ms_rows: Vec<(&str, u64, u64, u64)> = probed
+                .iter()
+                .map(|(path, mtime, size, _, ms)| (path.as_str(), *mtime, *size, ms.unwrap_or(0)))
+                .collect();
+            media_index::durations_put_many(conn, &ms_rows);
+            Ok(())
+        });
+        done += batch;
+        if batch < BATCH {
+            break;
+        }
+    }
+    done
+}
+
 /// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash 与像素宽高。
 /// `conn` 是索引连接（可能没有）：宽高缓存读写都走它，**不能**在这里再锁一次
 /// `MediaIndex` —— 调用方（`browse_indexed`）已经握着那把锁，重入就是死锁。
@@ -1682,6 +1723,17 @@ fn build_items(
             )
         })
         .collect();
+    // 标签缓存（v4.9.8）：音乐库一页 120 首，每首读一次 ID3 在 UNC 上要 0.5~1 秒，
+    // 6 路并发也要二三十秒。标签是纯元数据，缓存后第二次起一次文件都不用碰。
+    let cached_tags: HashMap<String, crate::core::audio_tags::TrackTags> = conn
+        .map(|conn| {
+            let borrowed: Vec<(&str, u64, u64)> = audio_keys
+                .iter()
+                .map(|(path, mtime, size)| (path.as_str(), *mtime, *size))
+                .collect();
+            media_index::tags_get_many(conn, &borrowed)
+        })
+        .unwrap_or_default();
     let cached_durations: HashMap<String, u64> = conn
         .map(|conn| {
             let borrowed: Vec<(&str, u64, u64)> = audio_keys
@@ -1692,55 +1744,90 @@ fn build_items(
         })
         .unwrap_or_default();
 
-    /// 一条音频的探测任务：`(位置, 缓存键, 路径, mtime, size, 是否要算时长)`
-    type AudioJob = (usize, String, PathBuf, u64, u64, bool);
-    let audio_jobs: Vec<AudioJob> = raw
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.kind == "audio")
-        .map(|(position, entry)| {
-            let key = entry.path.to_string_lossy().to_string();
-            let need_duration = !cached_durations.contains_key(&key);
-            (
-                position,
-                key,
-                entry.path.clone(),
-                entry.mtime,
-                entry.size,
-                need_duration,
-            )
-        })
-        .collect();
+    // 命中缓存的部分先铺好，下面只补缺的
+    let mut tags_by_pos: HashMap<usize, crate::core::audio_tags::TrackTags> = HashMap::new();
+    let mut duration_by_pos: HashMap<usize, Option<u64>> = HashMap::new();
+    for (position, entry) in raw.iter().enumerate() {
+        if entry.kind != "audio" {
+            continue;
+        }
+        let key = entry.path.to_string_lossy().to_string();
+        if let Some(tags) = cached_tags.get(&key) {
+            tags_by_pos.insert(position, tags.clone());
+        }
+        if let Some(hit) = cached_durations.get(&key) {
+            // 0 是「算过但算不出」的负缓存，别再读一遍
+            duration_by_pos.insert(position, (*hit > 0).then_some(*hit));
+        }
+    }
 
-    let probed: Vec<(
+    /// 一条待读盘的音频：`(位置, 缓存键, 路径, mtime, size, 要读标签, 要算时长)`
+    type AudioJob = (usize, String, PathBuf, u64, u64, bool, bool);
+    /// 读盘结果：`(位置, 缓存键, mtime, size, 标签, 时长)`
+    type AudioProbe = (
         usize,
         String,
         u64,
         u64,
-        crate::core::audio_tags::TrackTags,
+        Option<crate::core::audio_tags::TrackTags>,
         Option<u64>,
-    )> = run_parallel(audio_jobs, |(position, key, path, mtime, size, need)| {
-        let tags = crate::core::audio_tags::read_tags(&path);
-        let ms = if need {
-            crate::core::audio_tags::read_duration_ms(&path)
-        } else {
-            None
-        };
-        (position, key, mtime, size, tags, ms)
-    });
+    );
+    let audio_jobs: Vec<AudioJob> = raw
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == "audio")
+        .filter_map(|(position, entry)| {
+            let key = entry.path.to_string_lossy().to_string();
+            let need_tags = !cached_tags.contains_key(&key);
+            let need_duration = !cached_durations.contains_key(&key);
+            // 两者都命中就完全不用碰这个文件
+            (need_tags || need_duration).then(|| {
+                (
+                    position,
+                    key,
+                    entry.path.clone(),
+                    entry.mtime,
+                    entry.size,
+                    need_tags,
+                    need_duration,
+                )
+            })
+        })
+        .collect();
 
-    let mut tags_by_pos: HashMap<usize, crate::core::audio_tags::TrackTags> = HashMap::new();
-    let mut duration_by_pos: HashMap<usize, Option<u64>> = HashMap::new();
+    let probed: Vec<AudioProbe> = run_parallel(
+        audio_jobs,
+        |(position, key, path, mtime, size, need_tags, need_duration)| {
+            let tags = need_tags.then(|| crate::core::audio_tags::read_tags(&path));
+            let ms = if need_duration {
+                crate::core::audio_tags::read_duration_ms(&path)
+            } else {
+                None
+            };
+            (position, key, mtime, size, tags, ms)
+        },
+    );
+
+    let mut fresh_tags: Vec<(String, u64, u64, crate::core::audio_tags::TrackTags)> = Vec::new();
     let mut fresh_durations: Vec<(String, u64, u64, u64)> = Vec::new();
     for (position, key, mtime, size, tags, ms) in probed {
-        tags_by_pos.insert(position, tags);
-        if let Some(hit) = cached_durations.get(&key) {
-            // 0 是「算过但算不出」的负缓存，别再读一遍
-            duration_by_pos.insert(position, (*hit > 0).then_some(*hit));
-        } else {
+        if let Some(tags) = tags {
+            tags_by_pos.insert(position, tags.clone());
+            fresh_tags.push((key.clone(), mtime, size, tags));
+        }
+        if !cached_durations.contains_key(&key) {
             fresh_durations.push((key, mtime, size, ms.unwrap_or(0)));
             duration_by_pos.insert(position, ms);
         }
+    }
+    if let Some(conn) = conn
+        && !fresh_tags.is_empty()
+    {
+        let borrowed: Vec<(&str, u64, u64, &crate::core::audio_tags::TrackTags)> = fresh_tags
+            .iter()
+            .map(|(path, mtime, size, tags)| (path.as_str(), *mtime, *size, tags))
+            .collect();
+        media_index::tags_put_many(conn, &borrowed);
     }
     if let Some(conn) = conn
         && !fresh_durations.is_empty()

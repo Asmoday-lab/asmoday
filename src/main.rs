@@ -828,6 +828,16 @@ fn spawn_media_indexer(state: AppState) {
                     scanned_total,
                     started.elapsed().as_millis()
                 );
+                // 音频标签预热（v4.9.8）：音乐库列表只查缓存，冷缓存首开要读 120 次 ID3，
+                // 网盘上就是二三十秒。这里趁索引刚扫完顺手补掉，用户不用等第一次。
+                let warm_index = Arc::clone(&index);
+                let warmed =
+                    tokio::task::spawn_blocking(move || api::media::warm_audio_meta(&warm_index))
+                        .await
+                        .unwrap_or(0);
+                if warmed > 0 {
+                    crate::log_info!("audio metadata warmed: {} track(s)", warmed);
+                }
             }
 
             // interval=0 时也要睡着，否则变成忙等；配置热重载后下一轮自然生效
