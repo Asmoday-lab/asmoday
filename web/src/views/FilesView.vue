@@ -3002,13 +3002,25 @@ onBeforeUnmount(() => {
                   <div class="relative shrink-0">
                     <button
                       class="touch-chip flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50"
-                      :title="t('files.sort.label')"
+                      :title="sortLabel"
                       data-testid="sort-menu"
                       :aria-expanded="sortMenuOpen"
                       @click="sortMenuOpen = !sortMenuOpen"
                     >
                       <AppIcon name="sort" :size="13" />
-                      <span class="hidden xl:inline">{{ sortLabel }}</span>
+                      <!-- 维度名 + 独立小三角（与媒体库的排序按钮同一套视觉；
+                           以前是把 `名称 ↑` 拼成一个字符串塞进 span，箭头贴着字 -->
+                      <span class="hidden items-center gap-1 xl:inline-flex">
+                        {{ t(`files.sort.${sortKey}`) }}
+                        <svg
+                          class="size-2.5 transition-transform duration-200"
+                          :class="sortDir === 'asc' ? 'rotate-180' : ''"
+                          viewBox="0 0 8 8"
+                          aria-hidden="true"
+                        >
+                          <path d="M4 7 1 3h6z" fill="currentColor" />
+                        </svg>
+                      </span>
                     </button>
                     <div v-if="sortMenuOpen" class="fixed inset-0 z-40" @click="sortMenuOpen = false" />
                     <div
