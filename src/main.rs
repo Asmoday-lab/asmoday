@@ -491,6 +491,27 @@ fn warn_nested_mounts(set: &core::path_guard::MountSet) {
     }
 }
 
+/// 绑定失败时补一句人话（v4.9.5）。
+///
+/// Windows 上 `PermissionDenied`（WSAEACCES 10013）最常见的来源**不是**端口被监听
+/// （那是 `AddrInUse` / 10048），而是端口正好落在系统动态端口范围里、被别的程序的
+/// 出站连接临时占了源端口 —— 浏览器 / WebView2 / 代理动辄几百条长连接，撞上就起不来，
+/// 连接一断又能绑定。用户只看到一句「以一种访问权限不允许的方式做了一个访问套接字的
+/// 尝试」，完全无从下手，所以这里把原因和两条出路直接打出来。
+fn bind_hint(err: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::AddrInUse => {
+            "\n提示：端口已被其它程序监听。关掉那个程序，或改 [server] port 换一个端口。"
+        }
+        ErrorKind::PermissionDenied if cfg!(windows) => {
+            "\n提示：Windows 报「拒绝访问」通常不是没权限，而是这个端口落在系统动态端口范围里，\n             被别的程序（浏览器 / 代理 / WebView）当作临时源端口占用了。可以：\n             · 换一个端口（改 [server] port，比如 42420）；\n             · 或在管理员命令行把动态端口范围改回默认：\n             netsh int ipv4 set dynamicport tcp start=49152 num=16384\n             netsh int ipv6 set dynamicport tcp start=49152 num=16384"
+        }
+        ErrorKind::PermissionDenied => "\n提示：没有权限绑定该端口（1024 以下通常需要 root）。",
+        _ => "",
+    }
+}
+
 async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
@@ -506,7 +527,7 @@ async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, Stri
         socket.listen(1024)?;
         Ok(socket)
     })
-    .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    .map_err(|e| format!("failed to bind {addr}: {e}{}", bind_hint(&e)))?;
     let std_listener: std::net::TcpListener = socket.into();
     tokio::net::TcpListener::from_std(std_listener)
         .map_err(|e| format!("failed to register listener for {addr}: {e}"))
