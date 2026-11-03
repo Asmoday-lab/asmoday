@@ -59,6 +59,8 @@ pub struct AppState {
     pub auth: Arc<AuthStore>,
     /// 目录快照缓存（SQLite，递归搜索用；见 core/dir_cache.rs）
     pub dir_cache: Arc<core::dir_cache::DirCache>,
+    /// 媒体索引（SQLite，媒体库分页 / 计数 / 相册聚合；见 core/media_index.rs）
+    pub media_index: Arc<core::media_index::MediaIndex>,
     /// 登录失败限流
     pub login_guard: Arc<core::auth::LoginGuard>,
     /// 分享口令尝试限流（与登录池**完全隔离**，设计文档 3.1.5）
@@ -298,6 +300,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         ),
         auth: Arc::clone(&auth),
         dir_cache: Arc::new(core::dir_cache::DirCache::new(auth.db_path().clone())),
+        media_index: Arc::new(core::media_index::MediaIndex::new(auth.db_path().clone())),
         login_guard: Arc::new(core::auth::LoginGuard::new()),
         share_guard: Arc::new(core::auth::LoginGuard::new()),
         dav_guard: Arc::new(core::auth::LoginGuard::new()),

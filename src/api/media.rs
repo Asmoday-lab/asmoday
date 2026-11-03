@@ -19,6 +19,7 @@ use serde_json::json;
 use crate::AppState;
 use crate::core::ffmpeg;
 use crate::core::fs::{self, FsError};
+use crate::core::media_index::{self, MediaIndex, Scope};
 use crate::core::thumbnail::{PLACEHOLDER_SVG, ThumbOutcome, Thumbnailer};
 
 /// 单页条目数（游标分页，设计文档 3.4）：只影响「一次返回多少条」，
@@ -453,9 +454,27 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
     let dir_cache = Arc::clone(&state.dir_cache);
+    let index = Arc::clone(&state.media_index);
     let refresh = query.refresh.unwrap_or(false);
     let want_dims = query.dims.unwrap_or(false);
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<BrowsePage, String> {
+        // 首选 SQLite 索引（v4.7.0）：一次扫描入库，之后分页 / 计数全走 SQL，
+        // 窗口期内的请求连树都不用 stat
+        if let Some(page) = browse_indexed(
+            &index,
+            &scan_root,
+            depth,
+            limit,
+            cursor.as_ref(),
+            &wanted,
+            want_dims,
+            refresh,
+            Some(dir_cache.as_ref()),
+            &auth_store,
+        ) {
+            return Ok(page);
+        }
+        // 索引打不开（库坏了 / 被删了）才退回整树内存扫描：功能不降级，只是慢
         let (raw, scanned, counts) = scan_raw(
             &scan_root,
             &wanted,
@@ -476,18 +495,25 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
         let end = start.saturating_add(limit).min(total);
         let has_more = end < total;
         // 只对当前页做重活（ID3 解析、字幕探测、ThumbHash 查询、像素宽高）
-        let items = build_items(&raw[start.min(total)..end], &auth_store, want_dims);
+        // 回退路径没有「已经握着的连接」，单独借一次给宽高缓存用
+        let slice = &raw[start.min(total)..end];
+        let items = match index
+            .with_conn(|conn| Ok(build_items(slice, &auth_store, want_dims, Some(conn))))
+        {
+            Some(items) => items,
+            None => build_items(slice, &auth_store, want_dims, None),
+        };
         let next_cursor = if has_more && end > start {
             Some(encode_cursor(raw[end - 1].mtime, &raw[end - 1].display))
         } else {
             None
         };
-        (items, scanned, total, counts, has_more, next_cursor)
+        Ok((items, scanned, total, counts, has_more, next_cursor))
     })
     .await;
 
     match outcome {
-        Ok((items, scanned, total, counts, has_more, next_cursor)) => Json(BrowseResult {
+        Ok(Ok((items, scanned, total, counts, has_more, next_cursor))) => Json(BrowseResult {
             root: fs::normalize_display(&root),
             items,
             scanned,
@@ -497,8 +523,91 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
             next_cursor,
         })
         .into_response(),
+        Ok(Err(err)) => fs_error(FsError::Io(format!("扫描媒体目录失败：{err}"))),
         Err(err) => fs_error(FsError::Io(format!("扫描媒体目录失败：{err}"))),
     }
+}
+
+/// `browse` 的返回元组：`(items, scanned, total, counts, has_more, next_cursor)`
+type BrowsePage = (
+    Vec<MediaItem>,
+    usize,
+    usize,
+    KindCounts,
+    bool,
+    Option<String>,
+);
+
+/// 索引版 browse：同步（窗口期内跳过）→ SQL 分页 + 计数 → 只对当前页做重活
+#[allow(clippy::too_many_arguments)]
+fn browse_indexed(
+    index: &MediaIndex,
+    root: &Path,
+    depth: usize,
+    limit: usize,
+    cursor: Option<&MediaCursor>,
+    wanted: &[&str],
+    want_dims: bool,
+    refresh: bool,
+    cache: Option<&crate::core::dir_cache::DirCache>,
+    auth: &crate::core::auth::AuthStore,
+) -> Option<BrowsePage> {
+    let scanned = sync_index(index, root, depth, refresh, cache)?;
+    let scope = Scope::new(&fs::normalize_display(root), depth);
+    // 查询本身是毫秒级，先一次性取完（数据库锁只在这一小段里握着）
+    let (assets, has_more, counts, total) = index.with_conn(|conn| {
+        let (image, video, audio) = media_index::totals(conn, &scope)?;
+        let counts = KindCounts {
+            image,
+            video,
+            audio,
+        };
+        let total = wanted
+            .iter()
+            .map(|kind| match *kind {
+                "image" => image,
+                "video" => video,
+                "audio" => audio,
+                _ => 0,
+            })
+            .sum();
+        let key = cursor.map(|cur| (cur.m, cur.p.clone()));
+        let (assets, has_more) = media_index::page(conn, &scope, wanted, key.as_ref(), limit)?;
+        Ok((assets, has_more, counts, total))
+    })?;
+
+    let next_cursor = if has_more {
+        assets
+            .last()
+            .map(|asset| encode_cursor(asset.mtime, &asset.path))
+    } else {
+        None
+    };
+    let raw: Vec<RawMedia> = assets
+        .into_iter()
+        .map(|asset| RawMedia {
+            name: asset.name,
+            path: PathBuf::from(&asset.real),
+            display: asset.path,
+            folder: asset.dir,
+            size: asset.size,
+            mtime: asset.mtime,
+            kind: match asset.kind.as_str() {
+                "video" => "video",
+                "audio" => "audio",
+                _ => "image",
+            },
+            ext: asset.ext,
+        })
+        .collect();
+    // 读图头 / 识字幕是慢 I/O，必须在锁外做：不能让一页把别的请求一起堵住
+    let items = match index.with_conn(|conn| Ok(build_items(&raw, auth, want_dims, Some(conn)))) {
+        Some(items) => items,
+        None => build_items(&raw, auth, want_dims, None),
+    };
+    // 这一页花了几秒也没关系：窗口从「服务完一页」算，连续翻页就不会再走树
+    index.with_conn(|conn| media_index::touch_synced(conn, &scope.root));
+    Some((items, scanned, total, counts, has_more, next_cursor))
 }
 
 /// GET /api/media/albums?path=…&depth=3
@@ -539,8 +648,25 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
     let scan_root = root.clone();
     let auth_store = Arc::clone(&state.auth);
     let dir_cache = Arc::clone(&state.dir_cache);
+    let index = Arc::clone(&state.media_index);
     let refresh = query.refresh.unwrap_or(false);
     let outcome = tokio::task::spawn_blocking(move || {
+        // 相册墙也吃索引（v4.7.0）：`GROUP BY dir` 出卡片，封面取册内最新一条。
+        // 与浏览共用同一份 media_roots 窗口，所以「时间线 → 文件夹墙」不会各扫一遍
+        if let Some(page) = albums_indexed(
+            &index,
+            &scan_root,
+            depth,
+            limit,
+            cursor.as_ref(),
+            &wanted,
+            by_path,
+            refresh,
+            Some(dir_cache.as_ref()),
+            &auth_store,
+        ) {
+            return page;
+        }
         let mut raw = scan_albums(
             &scan_root,
             depth,
@@ -599,6 +725,70 @@ pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQue
     }
 }
 
+/// `albums` 的返回元组：`(items, total, has_more, next_cursor)`
+type AlbumPage = (Vec<Album>, usize, bool, Option<String>);
+
+/// 索引版相册墙：`GROUP BY dir` 出卡片行，本页再各取一张封面
+#[allow(clippy::too_many_arguments)]
+fn albums_indexed(
+    index: &MediaIndex,
+    root: &Path,
+    depth: usize,
+    limit: usize,
+    cursor: Option<&MediaCursor>,
+    wanted: &[&str],
+    by_path: bool,
+    refresh: bool,
+    cache: Option<&crate::core::dir_cache::DirCache>,
+    auth: &crate::core::auth::AuthStore,
+) -> Option<AlbumPage> {
+    sync_index(index, root, depth, refresh, cache)?;
+    let scope = Scope::new(&fs::normalize_display(root), depth);
+    // 聚合 + 本页封面一次性取完（都是小查询），后面拼卡片时不占着数据库锁
+    let (rows, covers, has_more, total) = index.with_conn(|conn| {
+        let key = cursor.map(|cur| (cur.m, cur.p.clone()));
+        let (rows, has_more) =
+            media_index::album_page(conn, &scope, wanted, by_path, key.as_ref(), limit)?;
+        let total = media_index::album_total(conn, &scope, wanted)?;
+        let mut covers = Vec::with_capacity(rows.len());
+        for row in &rows {
+            covers.push(media_index::album_cover(conn, &row.dir, wanted)?);
+        }
+        Ok((rows, covers, has_more, total))
+    })?;
+
+    let raw: Vec<RawAlbum> = rows
+        .iter()
+        .zip(covers.iter())
+        .map(|(row, cover)| RawAlbum {
+            name: Path::new(&row.dir)
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| row.dir.clone()),
+            path: row.dir.clone(),
+            count: row.count,
+            is_root: row.dir == scope.root,
+            // 展示串与真实串在 UNC 上不是一个东西，缩略图键必须用真实串
+            cover_path: cover.as_ref().map(|asset| PathBuf::from(&asset.real)),
+            mtime: row.mtime,
+            first_mtime: row.first_mtime,
+        })
+        .collect();
+    let items = build_albums(&raw, auth);
+    let next_cursor = if has_more {
+        rows.last().map(|row| {
+            if by_path {
+                encode_cursor(0, &row.dir)
+            } else {
+                encode_cursor(row.mtime, &row.dir)
+            }
+        })
+    } else {
+        None
+    };
+    index.with_conn(|conn| media_index::touch_synced(conn, &scope.root));
+    Some((items, total, has_more, next_cursor))
+}
 /// 扫描时要跳过的目录名：应用自身的数据/构建产物不算媒体库
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -619,6 +809,30 @@ fn find_subtitle(video: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// 字幕探测的会话缓存（v4.7.0）：`is_file()` 在网盘上是一次真实 stat，
+/// 一页七个视频就是十几次往返（实测单次 200ms+）。同一路径 + mtime 只探一次。
+/// `路径 -> (mtime, 字幕展示路径)`
+type SubtitleCache = HashMap<PathBuf, (u64, Option<String>)>;
+
+static SUBTITLES: LazyLock<Mutex<SubtitleCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn find_subtitle_cached(video: &Path, mtime: u64) -> Option<String> {
+    if let Ok(cache) = SUBTITLES.lock()
+        && let Some((stamp, hit)) = cache.get(video)
+        && *stamp == mtime
+    {
+        return hit.clone();
+    }
+    let found = find_subtitle(video);
+    if let Ok(mut cache) = SUBTITLES.lock() {
+        if cache.len() >= 20_000 {
+            cache.clear();
+        }
+        cache.insert(video.to_path_buf(), (mtime, found.clone()));
+    }
+    found
 }
 
 /// ThumbHash → 平均色（#rrggbb）。解码失败就当没有，前端回退纯色。
@@ -802,6 +1016,169 @@ fn scan_raw(
     (out, scanned, counts)
 }
 
+/// 把整棵树同步进索引（v4.7.0），返回本次真正 readdir 到的目录项数（诊断用）。
+///
+/// 窗口期（[`media_index::FRESH`] 秒）内直接返回 0 —— 一个目录都不碰，分页与计数
+/// 全走 SQL，这就是「翻页不再越翻越木」的来源。
+///
+/// 窗口期外仍要把树走一遍，但只做「stat 目录 + 读目录快照」：目录 mtime 与索引里
+/// 记的一致就不写库，也不重建两万条 `RawMedia`、不排序，比旧实现便宜一个量级。
+/// （目录 mtime 不会因子目录内容变化而变化，所以想零延迟只能 stat 全树。）
+fn sync_index(
+    index: &MediaIndex,
+    root: &Path,
+    depth: usize,
+    refresh: bool,
+    cache: Option<&crate::core::dir_cache::DirCache>,
+) -> Option<usize> {
+    let scope = Scope::new(&fs::normalize_display(root), depth);
+    index.with_conn(|conn| {
+        if !refresh
+            && let Some((synced_depth, at)) = media_index::synced(conn, &scope.root)?
+            && synced_depth >= depth as i64
+            && (crate::core::auth::now_secs().max(0) as u64).saturating_sub(at)
+                <= media_index::FRESH
+        {
+            crate::log_debug!(
+                "媒体索引命中窗口：{}（{} 层，{}s 前同步）",
+                scope.root,
+                synced_depth,
+                (crate::core::auth::now_secs().max(0) as u64).saturating_sub(at)
+            );
+            return Ok(0);
+        }
+        let started = std::time::Instant::now();
+        let scanned = walk_into_index(conn, root, &scope, refresh, cache)?;
+        media_index::mark_synced(conn, &scope.root, depth)?;
+        crate::log_debug!(
+            "媒体索引同步完成：{} {} 条，{}ms",
+            scope.root,
+            scanned,
+            started.elapsed().as_millis()
+        );
+        Ok(scanned)
+    })
+}
+
+/// 走一遍树并把每个目录的结果写进索引
+///
+/// 与 `scan_raw` 的口径必须完全一致（junk / svg / SKIP_DIRS / 深度 / 分类），
+/// 否则「索引版」和「回退版」会给出两套结果。
+fn walk_into_index(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    scope: &Scope,
+    refresh: bool,
+    cache: Option<&crate::core::dir_cache::DirCache>,
+) -> rusqlite::Result<usize> {
+    use crate::core::dir_cache::{KIND_DIR, KIND_FILE};
+
+    let depth = (scope.max_depth - scope.min_depth).max(0) as usize;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut scanned = 0usize;
+    let mut dirs = 0usize;
+    let mut reused = 0usize;
+    let mut io_time = std::time::Duration::ZERO;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    // 首次建库要写两万行：分块提交，别拿一个长事务把缩略图那边的写锁卡住
+    let mut tx = conn.unchecked_transaction()?;
+    let mut pending = 0usize;
+
+    while let Some((dir, level)) = stack.pop() {
+        let display = if level == 0 {
+            scope.root.clone()
+        } else {
+            fs::normalize_display(&dir)
+        };
+        visited.insert(display.clone());
+        // 目录自己的 mtime：这一层名字集合的版本号
+        let stamp = std::fs::metadata(&dir)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(crate::core::dir_cache::stamp_of);
+        let read_started = std::time::Instant::now();
+        let entries = read_dir_entries(&dir, cache, refresh);
+        io_time += read_started.elapsed();
+        dirs += 1;
+        scanned += entries.len();
+        // 快照命中（戳一致）就认为库里这一目录的行还是对的；`stamp` 取不到时一律重写
+        let unchanged =
+            !refresh && stamp.is_some() && media_index::dir_stamp(&tx, &display)? == stamp;
+        if unchanged {
+            reused += 1;
+        }
+
+        let mut assets: Vec<media_index::Asset> = Vec::new();
+        for entry in entries {
+            let name = entry.name;
+            if crate::core::junk::is_system_junk(&name) {
+                continue;
+            }
+            let path = dir.join(&name);
+
+            if entry.kind == KIND_DIR {
+                if level < depth
+                    && !name.starts_with('.')
+                    && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
+                    && !crate::core::reserved::is_reserved_lexical(&path)
+                {
+                    stack.push((path, level + 1));
+                }
+                continue;
+            }
+            if entry.kind != KIND_FILE {
+                continue;
+            }
+            let ext = fs::extension_of_name(&name);
+            if ext == "svg" {
+                continue;
+            }
+            let (kind, _) = fs::classify_name(&name, &ext, false);
+            if !matches!(kind, "image" | "video" | "audio") || unchanged {
+                continue;
+            }
+            assets.push(media_index::Asset {
+                path: fs::normalize_display(&path),
+                // 展示串是给前端用的（`//server/share`），真实串是给缩略图键和 open 用的
+                real: path.to_string_lossy().to_string(),
+                name,
+                dir: display.clone(),
+                kind: kind.to_string(),
+                ext,
+                size: entry.size,
+                mtime: entry.mtime,
+            });
+        }
+
+        if !unchanged {
+            media_index::replace_dir(
+                &tx,
+                &display,
+                scope.depth_of(level),
+                stamp.unwrap_or(0),
+                &assets,
+            )?;
+            pending += 1;
+            if pending >= media_index::CHUNK {
+                tx.commit()?;
+                tx = conn.unchecked_transaction()?;
+                pending = 0;
+            }
+        }
+    }
+
+    // 这次没走到的目录（外面删掉了）连同条目一起清掉，索引不能留死行
+    media_index::prune(&tx, scope, &visited)?;
+    tx.commit()?;
+    crate::log_debug!(
+        "媒体索引走树：{} 个目录（{} 个命中旧行，跳过写库），读目录耗时 {}ms",
+        dirs,
+        reused,
+        io_time.as_millis()
+    );
+    Ok(scanned)
+}
+
 /// 图片像素宽高的进程内缓存（v4.6.19）。
 ///
 /// 时间线的等高行要按真实宽高比排，`image::image_dimensions` 只读文件头，但一页
@@ -839,33 +1216,88 @@ fn image_dims(path: &Path, mtime: u64, size: u64) -> Option<(u32, u32)> {
 }
 
 /// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash 与像素宽高。
+/// `conn` 是索引连接（可能没有）：宽高缓存读写都走它，**不能**在这里再锁一次
+/// `MediaIndex` —— 调用方（`browse_indexed`）已经握着那把锁，重入就是死锁。
 fn build_items(
     raw: &[RawMedia],
     auth: &crate::core::auth::AuthStore,
     want_dims: bool,
+    conn: Option<&rusqlite::Connection>,
 ) -> Vec<MediaItem> {
     let mut items: Vec<MediaItem> = Vec::with_capacity(raw.len());
     let mut hash_slots: Vec<(usize, &Path)> = Vec::new();
 
-    for entry in raw {
+    // 像素宽高先批量问索引（v4.7.0）：跨会话命中就不必再开图读文件头 ——
+    // 网盘上每张一次 open 是几十毫秒，一页 120 张就是「打开图片库很慢」的大头
+    let mut dim_candidates: Vec<usize> = Vec::new();
+    if want_dims {
+        for (position, entry) in raw.iter().enumerate() {
+            if entry.kind == "image" {
+                dim_candidates.push(position);
+            }
+        }
+    }
+    let mut dims: HashMap<usize, Option<(u32, u32)>> = HashMap::new();
+    if !dim_candidates.is_empty() {
+        let keys: Vec<(String, u64, u64)> = dim_candidates
+            .iter()
+            .map(|&position| {
+                let entry = &raw[position];
+                (
+                    entry.path.to_string_lossy().to_string(),
+                    entry.mtime,
+                    entry.size,
+                )
+            })
+            .collect();
+        let cached = conn
+            .map(|conn| {
+                let borrowed: Vec<(&str, u64, u64)> = keys
+                    .iter()
+                    .map(|(path, mtime, size)| (path.as_str(), *mtime, *size))
+                    .collect();
+                media_index::dims_get_many(conn, &borrowed)
+            })
+            .unwrap_or_default();
+        let mut fresh: Vec<(String, u64, u64, u32, u32)> = Vec::new();
+        for (slot, &position) in dim_candidates.iter().enumerate() {
+            let (key, mtime, size) = &keys[slot];
+            if let Some(pair) = cached.get(key) {
+                dims.insert(position, Some(*pair));
+                continue;
+            }
+            let read = image_dims(&raw[position].path, *mtime, *size);
+            if let Some((w, h)) = read {
+                fresh.push((key.clone(), *mtime, *size, w, h));
+            }
+            dims.insert(position, read);
+        }
+        if let Some(conn) = conn
+            && !fresh.is_empty()
+        {
+            let borrowed: Vec<(&str, u64, u64, u32, u32)> = fresh
+                .iter()
+                .map(|(path, mtime, size, w, h)| (path.as_str(), *mtime, *size, *w, *h))
+                .collect();
+            media_index::dims_put_many(conn, &borrowed);
+        }
+    }
+
+    for (position, entry) in raw.iter().enumerate() {
         let tags = if entry.kind == "audio" {
             crate::core::audio_tags::read_tags(&entry.path)
         } else {
             Default::default()
         };
         let subtitle = if entry.kind == "video" {
-            find_subtitle(&entry.path)
+            find_subtitle_cached(&entry.path, entry.mtime)
         } else {
             None
         };
         if entry.kind == "image" {
             hash_slots.push((items.len(), entry.path.as_path()));
         }
-        let dims = if want_dims && entry.kind == "image" {
-            image_dims(&entry.path, entry.mtime, entry.size)
-        } else {
-            None
-        };
+        let dims_entry = dims.get(&position).copied().flatten();
         items.push(MediaItem {
             name: entry.name.clone(),
             path: entry.display.clone(),
@@ -881,8 +1313,8 @@ fn build_items(
             hash: None,
             color: None,
             subtitle,
-            width: dims.map(|(w, _)| w),
-            height: dims.map(|(_, h)| h),
+            width: dims_entry.map(|(w, _)| w),
+            height: dims_entry.map(|(_, h)| h),
         });
     }
 
@@ -1570,6 +2002,88 @@ mod tests {
                 .map(|(_, size, _)| size)
                 .unwrap_or(0),
             4096
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// 建一个走正式迁移的临时库（媒体索引要用真表）
+    fn index_db(tag: &str) -> (std::path::PathBuf, crate::core::media_index::MediaIndex) {
+        // 名字前缀必须与 `scratch(tag)` 错开，否则会把待扫的目录一起删掉
+        let dir = scratch(&format!("db-{tag}"));
+        let db = dir.join("asmoday.db");
+        let store = crate::core::auth::AuthStore::new(db.clone());
+        store.init().unwrap();
+        let index = crate::core::media_index::MediaIndex::new(db);
+        (dir, index)
+    }
+
+    /// 索引版与内存扫描版必须是同一套口径、同一个顺序（v4.7.0）
+    #[test]
+    fn index_pages_the_same_tree_as_memory_scan() {
+        let root = scratch("index-parity");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for index in 0..5u64 {
+            touch(&root, &format!("a{index}.jpg"), 1_700_000_000 + index);
+        }
+        touch(&root, "clip.mp4", 1_700_000_100);
+        touch(&root, "Thumbs.db", 1_700_000_000);
+        touch(&root, "icon.svg", 1_700_000_000);
+        for index in 0..3u64 {
+            touch(&sub, &format!("s{index}.jpg"), 1_700_000_500 + index);
+        }
+
+        let (db_dir, index) = index_db("parity");
+        // 深度 1：根 + sub，两层的媒体都进索引；系统垃圾与 svg 不进
+        let scanned = sync_index(&index, &root, 1, false, None).expect("索引不可用");
+        assert!(scanned >= 11, "至少要读到根与 sub 两层的条目");
+
+        let scope = Scope::new(&fs::normalize_display(&root), 1);
+        let (assets, more) = index
+            .with_conn(|conn| media_index::page(conn, &scope, &["image", "video"], None, 100))
+            .expect("查询失败");
+        assert!(!more);
+
+        let indexed: Vec<String> = assets.iter().map(|asset| asset.path.clone()).collect();
+        let (mut raw, _, _) = scan_raw(&root, &["image", "video"], 1, None, true);
+        raw.sort_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| a.display.cmp(&b.display))
+        });
+        let expected: Vec<String> = raw.iter().map(|item| item.display.clone()).collect();
+        assert_eq!(indexed, expected, "顺序与内存扫描必须完全一致");
+
+        let counts = index
+            .with_conn(|conn| media_index::totals(conn, &scope))
+            .expect("计数失败");
+        assert_eq!(counts, (8, 1, 0), "五张根图 + 三张 sub 图 + 一个视频");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// 窗口期内不再碰树；refresh 必须穿透（「重新扫描」按钮）
+    #[test]
+    fn index_window_skips_the_walk_until_refreshed() {
+        let root = scratch("index-window");
+        touch(&root, "a.jpg", 1_700_000_000);
+        let (db_dir, index) = index_db("window");
+
+        assert!(
+            sync_index(&index, &root, 1, false, None).unwrap() > 0,
+            "第一次要真扫"
+        );
+        assert_eq!(
+            sync_index(&index, &root, 1, false, None),
+            Some(0),
+            "窗口期内必须一个目录都不碰"
+        );
+        assert!(
+            sync_index(&index, &root, 1, true, None).unwrap() > 0,
+            "refresh 必须穿透窗口"
         );
 
         let _ = std::fs::remove_dir_all(&root);

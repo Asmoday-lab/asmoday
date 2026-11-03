@@ -12,6 +12,7 @@ pub mod instance_lock;
 pub mod junk;
 pub mod locks;
 pub mod logging;
+pub mod media_index;
 pub mod path_guard;
 pub mod prefix;
 pub mod reserved;

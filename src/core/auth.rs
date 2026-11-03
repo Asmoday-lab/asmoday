@@ -229,6 +229,7 @@ const BACKFILL_COLUMNS: &[(&str, &str, &str)] = &[
 /// - **v2** 收藏/播放历史主键升级成 `(mount_id, file_path)`。
 /// - **v3** 目录快照缓存（`dir_snapshots`，见 `core/dir_cache.rs`）。
 /// - **v4** 媒体库快照（`media_snapshots`，带 size / mtime，见 `core/dir_cache.rs`）。
+/// - **v5** 媒体索引（`media_assets` / `media_dirs` / `media_roots`，见 `core/media_index.rs`）。
 ///
 /// 以后加列加表**只往后追加** `M::up(...)`，不要回头改 v1：已经升过级的库不会重跑它。
 fn migrations() -> Migrations<'static> {
@@ -268,6 +269,42 @@ fn migrations() -> Migrations<'static> {
                 used_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_media_snapshots_used_at ON media_snapshots(used_at);",
+        ),
+        // v5：媒体索引（v4.7.0，见 core/media_index.rs）。与 v3/v4 的区别是它不是
+        // 「按目录缓存原始条目」，而是把每个媒体文件摊平成一行 —— 分页、计数、相册
+        // 聚合全走 SQL，翻页不再重扫整棵树
+        M::up(
+            "CREATE TABLE IF NOT EXISTS media_assets (
+                path   TEXT PRIMARY KEY,
+                real   TEXT NOT NULL,
+                dir    TEXT NOT NULL,
+                depth  INTEGER NOT NULL,
+                name   TEXT NOT NULL,
+                kind   TEXT NOT NULL,
+                ext    TEXT NOT NULL,
+                size   INTEGER NOT NULL,
+                mtime  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_assets_dir ON media_assets(dir, mtime DESC);
+            CREATE INDEX IF NOT EXISTS idx_media_assets_time ON media_assets(mtime DESC, path);
+            CREATE TABLE IF NOT EXISTS media_dirs (
+                dir        TEXT PRIMARY KEY,
+                depth      INTEGER NOT NULL,
+                stamp      INTEGER NOT NULL,
+                indexed_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_roots (
+                root      TEXT PRIMARY KEY,
+                depth     INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_dims (
+                path  TEXT PRIMARY KEY,
+                mtime INTEGER NOT NULL,
+                size  INTEGER NOT NULL,
+                w     INTEGER NOT NULL,
+                h     INTEGER NOT NULL
+            );",
         ),
     ])
 }

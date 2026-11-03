@@ -104,7 +104,14 @@ fn fail_code(status: StatusCode, code: &str, message: impl Into<String>) -> Resp
 /// 否则媒体库里那张图的体积与时间会一直是旧的、排序也停在老位置。
 pub(crate) fn forget_parent_snapshot(state: &AppState, path: &std::path::Path) {
     if let Some(parent) = path.parent() {
-        state.dir_cache.forget(&fs::normalize_display(parent));
+        let display = fs::normalize_display(parent);
+        state.dir_cache.forget(&display);
+        // 媒体索引是同一套失效口径（目录 mtime 看不出来原地覆盖），这里补一刀，
+        // 顺手作废「新鲜窗口」：应用自己的写操作必须立刻可见，不等窗口到期
+        state.media_index.with_conn(|conn| {
+            crate::core::media_index::forget_dir(conn, &display)?;
+            crate::core::media_index::invalidate(conn)
+        });
     }
 }
 
