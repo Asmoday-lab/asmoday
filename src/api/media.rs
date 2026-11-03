@@ -357,19 +357,40 @@ pub async fn thumb(
     Query(query): Query<ThumbQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // 排障用（v4.9.7）：网盘上「卡」到底是路径解析、metadata 还是真生成，
+    // 一条日志就能分开 —— 否则只能靠猜。
+    let started = std::time::Instant::now();
     let path = match resolve_default(&state, Some(&query.path)).await {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
+    let resolve_ms = started.elapsed().as_millis();
 
     // .asmoday-part 临时文件不可预览（设计文档 3.2.6.4，v3.4.0）：直接回占位图
     if crate::core::path_guard::is_part_path(&path) {
         return placeholder();
     }
 
-    if path.is_dir() {
+    // 一次异步 metadata 拿全（v4.9.7）。以前这里 `path.is_dir()` 一次、
+    // `effective_width` 里再 open 源图读图头一次、`fingerprint` 又一次、
+    // `mtime_secs` 又一次、`get()` 内部还要重复一遍 —— 每个缩略图请求碰 6 次源文件。
+    // SMB 上单次 100~400ms，一页 120 张就是几十秒，这就是三个库一起「卡」的根因。
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta,
+        // 文件没了 / 无权限：和以前一样给占位图，不要 500
+        Err(_) => return placeholder(),
+    };
+    if meta.is_dir() {
         return placeholder();
     }
+    let meta_ms = started.elapsed().as_millis();
+    let source_len = meta.len();
+    let source_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
 
     let name = path
         .file_name()
@@ -382,7 +403,28 @@ pub async fn thumb(
     // 图片的实体宽度 = min(请求宽度, 源图长边)：小图不放大，所以不同档位请求
     // 拿到的是同一份字节，ETag 也必须跟着落在同一个宽度上（否则同一实体两个 ETag）。
     let effective = if kind == "image" {
-        Thumbnailer::effective_width(&path, width)
+        // 宽高缓存（`media_dims`）里通常已经有这张图 —— 列表接口铺时间线时就写进去了。
+        // 命中就完全不碰源文件；miss 才读一次图头，且放阻塞线程池，不占 runtime。
+        let cache_key = path.to_string_lossy().to_string();
+        let cached = state
+            .media_index
+            .with_conn(|conn| {
+                Ok(crate::core::media_index::dims_get_many(
+                    conn,
+                    &[(cache_key.as_str(), source_mtime, source_len)],
+                ))
+            })
+            .and_then(|map| map.get(&cache_key).copied())
+            .filter(|(w, h)| *w > 0 && *h > 0);
+        match cached {
+            Some((w, h)) => width.clamp(64, 1024).min(w.max(h)),
+            None => {
+                let probe = path.clone();
+                tokio::task::spawn_blocking(move || Thumbnailer::effective_width(&probe, width))
+                    .await
+                    .unwrap_or(width)
+            }
+        }
     } else {
         width
     };
@@ -390,9 +432,9 @@ pub async fn thumb(
     // 内容指纹 → ETag。前端 url 里的 `v` 是源文件的 mtime，**与当前 mtime 一致**说明
     // 这条链接代表的就是这一版字节，可以放心长缓存；不一致（老链接、文件刚改）就每次
     // 回源校验，命中只花一次 304。
-    let fingerprint = crate::core::thumbnail::Thumbnailer::fingerprint(&path);
+    let fingerprint = Thumbnailer::fingerprint_from(source_len, source_mtime);
     let etag = format!("\"{fingerprint}-{effective}\"");
-    let mtime = crate::core::thumbnail::Thumbnailer::mtime_secs(&path);
+    let mtime = source_mtime;
     let versioned = query
         .v
         .as_deref()
@@ -432,16 +474,33 @@ pub async fn thumb(
 
     let (outcome, fresh) = match kind {
         "image" => {
+            let key = crate::core::thumbnail::ThumbKey {
+                width: effective,
+                fingerprint: fingerprint.clone(),
+                fresh_write: crate::core::thumbnail::is_fresh_write_parts(source_len, source_mtime),
+            };
             state
                 .thumbnails
-                .get(&path, width, ffmpeg_bin.as_deref())
+                .get_prepared(&path, key, ffmpeg_bin.as_deref())
                 .await
         }
         "video" => {
             // 影视库封面：靠外部可选 FFmpeg 截首帧（设计文档 3.4）；
             // 未配置或截帧失败一律回占位图，绝不阻塞列表渲染
             let outcome = match ffmpeg_bin {
-                Some(bin) => state.thumbnails.video_poster(&path, &bin, width).await,
+                Some(bin) => {
+                    // 指纹与「正在写盘」都用上面那份 metadata，不再重复 stat
+                    state
+                        .thumbnails
+                        .video_poster_prepared(
+                            &path,
+                            &bin,
+                            width,
+                            Thumbnailer::poster_fingerprint_from(source_len, source_mtime),
+                            crate::core::thumbnail::is_fresh_write_parts(source_len, source_mtime),
+                        )
+                        .await
+                }
                 None => ThumbOutcome::Placeholder,
             };
             (outcome, None)
@@ -449,6 +508,19 @@ pub async fn thumb(
         // 音频/其它：没有可截的帧，统一占位（设计文档 8.3）
         _ => (ThumbOutcome::Placeholder, None),
     };
+
+    // 200ms 以上就值得看一眼：本地盘正常是几毫秒，出现在这里基本就是网盘 IO
+    let total_ms = started.elapsed().as_millis();
+    if total_ms >= 200 {
+        crate::log_warn!(
+            "缩略图偏慢 {}ms（路径解析 {} / 元数据 {} / 取图 {}）{}",
+            total_ms,
+            resolve_ms,
+            meta_ms - resolve_ms,
+            total_ms - meta_ms,
+            path.display()
+        );
+    }
 
     // 新鲜 ThumbHash 入库（v2.8.2：SQLite，不再落 .th 旁路文件）
     if let Some(fresh) = fresh {

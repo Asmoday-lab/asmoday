@@ -63,21 +63,52 @@ const FRESH_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const TEMP_STALE_AFTER: Duration = Duration::from_secs(600);
 
 /// 文件是否可能仍在写盘（mtime 极新且体积可观）。
+///
+/// 生产路径统一走 [`is_fresh_write_parts`]（复用调用方已拿到的那份 metadata），
+/// 这个包装只给测试用 —— 留着它容易让新代码多 stat 一次。
+#[cfg(test)]
 fn is_fresh_write(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    if meta.len() < FRESH_SIZE_BYTES {
-        return false;
-    }
     let Ok(modified) = meta.modified() else {
         return false;
     };
-    // 时钟回拨（mtime 在未来）时不当作新鲜：宁可生成一次，也不要永远回占位图
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age < FRESH_WINDOW)
-        .unwrap_or(false)
+    let mtime = modified
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    is_fresh_write_parts(meta.len(), mtime)
+}
+
+/// 已拿到 `len` / `mtime` 时判断「大文件是否刚写完」。
+///
+/// 时钟回拨（mtime 在未来）时不当作新鲜：宁可生成一次，也不要永远回占位图。
+pub(crate) fn is_fresh_write_parts(len: u64, mtime_secs: u64) -> bool {
+    if len < FRESH_SIZE_BYTES {
+        return false;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.checked_sub(mtime_secs)
+        .is_some_and(|age| age < FRESH_WINDOW.as_secs())
+}
+
+/// 一页缩略图在进入 `get_prepared` 之前就把键算好：一次 `metadata` 出全部三个值。
+///
+/// 拆出来的唯一原因是 IO 次数：`get()` 内部原先各自 stat 一遍，再加上
+/// `effective_width` 的一次 `image_dimensions`（要 open + 读图头），
+/// 每个缩略图请求要碰 6 次源文件。SMB 上那是 1~2 秒/张。
+#[derive(Debug, Clone)]
+pub struct ThumbKey {
+    /// 有效宽度（小图不放大，不同档位落到同一个键）
+    pub width: u32,
+    /// 缓存文件名前缀（源文件长度 + mtime）
+    pub fingerprint: String,
+    /// 源文件是「刚写完的大文件」，先不生成
+    pub fresh_write: bool,
 }
 
 /// 占位图（内联 SVG，1 个请求 0 依赖）
@@ -215,6 +246,14 @@ impl Thumbnailer {
 
     pub fn fingerprint(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
+        Self::fingerprint_from(len, mtime)
+    }
+
+    /// 已拿到 `len` / `mtime`（一次 `metadata`）时的指纹。
+    ///
+    /// `/api/files/thumb` 每页要处理 120 张图，而 `metadata` 在 SMB 上是 100~300ms
+    /// 一次；一次请求里重复 stat 四五遍，就是「图片库比文件管理慢几十倍」的来源。
+    pub fn fingerprint_from(len: u64, mtime: u64) -> String {
         format!("v{}-{len:x}-{mtime:x}", Self::CACHE_VERSION)
     }
 
@@ -240,8 +279,15 @@ impl Thumbnailer {
             .unwrap_or(bound)
     }
 
+    /// 测试用包装：生产路径拿的是已读好的 `len` / `mtime`
+    #[cfg(test)]
     fn poster_fingerprint(path: &Path) -> String {
         let (len, mtime) = Self::source_stamp(path);
+        Self::poster_fingerprint_from(len, mtime)
+    }
+
+    /// 已拿到 `len` / `mtime` 时的海报指纹（省掉一次 SMB `metadata`）
+    pub fn poster_fingerprint_from(len: u64, mtime: u64) -> String {
         format!("p{}-{len:x}-{mtime:x}", Self::POSTER_VERSION)
     }
 
@@ -338,8 +384,32 @@ impl Thumbnailer {
         // 按**有效宽度**入键：比请求宽度小的图不再按 160/320/400 各存一份
         // 字节完全相同的副本（渲染本身早就不放大，浪费的只是这些重复文件）。
         let width = Self::effective_width(path, width);
+        let (len, mtime) = Self::source_stamp(path);
+        let key = ThumbKey {
+            width,
+            fingerprint: Self::fingerprint_from(len, mtime),
+            fresh_write: is_fresh_write_parts(len, mtime),
+        };
+        self.get_prepared(path, key, webp_bin).await
+    }
+
+    /// 已算好「有效宽度 / 指纹 / 是否正在写盘」时的取图路径。
+    ///
+    /// `/api/files/thumb` 走这条：它只在 handler 里做一次 `metadata`，把三个值一次算完
+    /// 传进来，避免 `get()` 内部再 stat 一遍。SMB 上一次 `metadata` 是 100~300ms，
+    /// 一页 120 张图重复几次就是几十秒——这是图片库「卡」的主要来源（v4.9.7）。
+    pub async fn get_prepared(
+        &self,
+        path: &Path,
+        key: ThumbKey,
+        webp_bin: Option<&Path>,
+    ) -> (ThumbOutcome, Option<FreshHash>) {
+        let ThumbKey {
+            width,
+            fingerprint: fp,
+            fresh_write,
+        } = key;
         let dir = self.entry_dir(path);
-        let fp = Self::fingerprint(path);
 
         if let Some(outcome) = Self::cached(&dir, &fp, width).await {
             return (outcome, None);
@@ -347,7 +417,7 @@ impl Thumbnailer {
 
         // 下载中的大文件先不生成（设计文档 3.4.1）：写盘还没结束，
         // 这一秒生成的图下一秒就因 mtime 变化失效，纯属白烧 CPU。
-        if is_fresh_write(path) {
+        if fresh_write {
             // 还在写盘：等下一轮再取（前端按 Retry-After 退避重试）
             return (ThumbOutcome::Busy, None);
         }
@@ -446,11 +516,28 @@ impl Thumbnailer {
     /// 与图片缩略图共用缓存目录、`stamp` 判据、per-key 锁和信号量；
     /// 输出格式优先 WebP → JPEG → PNG，按该构建实际拥有的编码器逐级降级。
     pub async fn video_poster(&self, path: &Path, bin: &Path, width: u32) -> ThumbOutcome {
+        let (len, mtime) = Self::source_stamp(path);
+        self.video_poster_prepared(
+            path,
+            bin,
+            width,
+            Self::poster_fingerprint_from(len, mtime),
+            is_fresh_write_parts(len, mtime),
+        )
+        .await
+    }
+
+    /// 已经算好指纹与「是否正在写盘」时的截帧路径（`/api/files/thumb` 走这条）。
+    pub async fn video_poster_prepared(
+        &self,
+        path: &Path,
+        bin: &Path,
+        width: u32,
+        fp: String,
+        fresh_write: bool,
+    ) -> ThumbOutcome {
         let width = width.clamp(64, 1024);
         let dir = self.entry_dir(path);
-        // 海报用独立的版本号：截帧比解图贵一个数量级，不能跟着图片一起升版
-        // （否则几千个视频要白跑一遍 FFmpeg）
-        let fp = Self::poster_fingerprint(path);
 
         if let Some(outcome) = Self::cached_poster(&dir, &fp, width).await {
             return outcome;
@@ -458,7 +545,7 @@ impl Thumbnailer {
 
         // 正在下载的影视文件：截帧要拉起 FFmpeg 进程，比解图更贵，
         // 更要等写盘结束（设计文档 3.4.1）。缓存命中已在上面返回。
-        if is_fresh_write(path) {
+        if fresh_write {
             return ThumbOutcome::Busy;
         }
 
