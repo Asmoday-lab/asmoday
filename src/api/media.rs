@@ -1111,14 +1111,19 @@ fn read_dir_entries(
     dir: &Path,
     cache: Option<&crate::core::dir_cache::DirCache>,
     refresh: bool,
+    known_stamp: Option<i64>,
 ) -> Vec<crate::core::dir_cache::MediaEntry> {
     use crate::core::dir_cache::{self, KIND_DIR, KIND_FILE, KIND_LINK, MediaEntry};
 
     let display = fs::normalize_display(dir);
-    let stamp = std::fs::metadata(dir)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .and_then(dir_cache::stamp_of);
+    // `known_stamp`：调用方（目录遍历）刚刚并发 stat 过一次，别再白跑一个往返。
+    // 拿不到时（stat 失败）才自己再试一次 —— 那是错误路径，多点开销无所谓。
+    let stamp = known_stamp.or_else(|| {
+        std::fs::metadata(dir)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(dir_cache::stamp_of)
+    });
 
     if !refresh
         && let (Some(cache), Some(stamp)) = (cache, stamp)
@@ -1189,7 +1194,7 @@ fn scan_raw(
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, level)) = queue.pop() {
-        let entries = read_dir_entries(&dir, cache, refresh);
+        let entries = read_dir_entries(&dir, cache, refresh, None);
         scanned += entries.len();
         // 一次 normalize 给这一层的所有条目复用（原来每条都算一次）
         let folder = fs::normalize_display(&dir);
@@ -1375,81 +1380,104 @@ fn walk_into_index(
     // 攒够一批才开一个几毫秒的写事务。
     let mut batch: Vec<PendingDir> = Vec::new();
 
-    while let Some((dir, level)) = stack.pop() {
-        let display = if level == 0 {
-            scope.root.clone()
-        } else {
-            fs::normalize_display(&dir)
-        };
-        visited.insert(display.clone());
-        // 目录自己的 mtime：这一层名字集合的版本号
-        let stamp = std::fs::metadata(&dir)
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(crate::core::dir_cache::stamp_of);
-        let read_started = std::time::Instant::now();
-        let entries = read_dir_entries(&dir, cache, refresh);
-        io_time += read_started.elapsed();
-        dirs += 1;
-        scanned += entries.len();
-        // 快照命中（戳一致）就认为库里这一目录的行还是对的；`stamp` 取不到时一律重写
-        let unchanged =
-            !refresh && stamp.is_some() && media_index::dir_stamp(conn, &display)? == stamp;
-        if unchanged {
-            reused += 1;
-        }
+    // 每批并发探测这么多目录。瓶颈是「每目录一次网络往返」而不是带宽，
+    // 所以重叠延迟几乎线性收益；16 路是 SMB 会话能舒服消化的量级。
+    const WALK_IO: usize = 16;
 
-        let mut assets: Vec<media_index::Asset> = Vec::new();
-        for entry in entries {
-            let name = entry.name;
-            if crate::core::junk::is_system_junk(&name) {
-                continue;
+    while !stack.is_empty() {
+        let take = stack.len().min(WALK_IO);
+        let dir_batch: Vec<(PathBuf, usize)> = stack.split_off(stack.len() - take);
+
+        // 第一步：并发拿目录 mtime（这一层名字集合的版本号）。
+        // 以前是「遍历一个、stat 一个、再 readdir」，三个网络往返串着走；
+        // 现在 stat 这一层 16 路重叠，结果直接喂给 read_dir_entries 复用。
+        // 并发做完「stat + readdir」两件事。同一批 16 路重叠，快照命中时只剩一次 stat。
+        // `DirCache` 内部是 `Mutex<Connection>`，跨线程安全；`conn` 留在主线程，
+        // 因为 rusqlite 的 `Connection` 不是 `Sync`。
+        let fetch_started = std::time::Instant::now();
+        let listings: Vec<(
+            PathBuf,
+            usize,
+            Option<i64>,
+            Vec<crate::core::dir_cache::MediaEntry>,
+        )> = run_parallel_n(dir_batch, WALK_IO, |(dir, level)| {
+            let stamp = std::fs::metadata(&dir)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(crate::core::dir_cache::stamp_of);
+            let entries = read_dir_entries(&dir, cache, refresh, stamp);
+            (dir, level, stamp, entries)
+        });
+        io_time += fetch_started.elapsed();
+
+        for (dir, level, stamp, entries) in listings {
+            let display = if level == 0 {
+                scope.root.clone()
+            } else {
+                fs::normalize_display(&dir)
+            };
+            visited.insert(display.clone());
+            dirs += 1;
+            scanned += entries.len();
+            // 快照命中（戳一致）就认为库里这一目录的行还是对的；`stamp` 取不到时一律重写
+            let unchanged =
+                !refresh && stamp.is_some() && media_index::dir_stamp(conn, &display)? == stamp;
+            if unchanged {
+                reused += 1;
             }
-            let path = dir.join(&name);
 
-            if entry.kind == KIND_DIR {
-                if level < depth
-                    && !name.starts_with('.')
-                    && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
-                    && !crate::core::reserved::is_reserved_lexical(&path)
-                {
-                    stack.push((path, level + 1));
+            let mut assets: Vec<media_index::Asset> = Vec::new();
+            for entry in entries {
+                let name = entry.name;
+                if crate::core::junk::is_system_junk(&name) {
+                    continue;
                 }
-                continue;
-            }
-            if entry.kind != KIND_FILE {
-                continue;
-            }
-            let ext = fs::extension_of_name(&name);
-            if ext == "svg" {
-                continue;
-            }
-            let (kind, _) = fs::classify_name(&name, &ext, false);
-            if !matches!(kind, "image" | "video" | "audio") || unchanged {
-                continue;
-            }
-            assets.push(media_index::Asset {
-                path: fs::normalize_display(&path),
-                // 展示串是给前端用的（`//server/share`），真实串是给缩略图键和 open 用的
-                real: path.to_string_lossy().to_string(),
-                name,
-                dir: display.clone(),
-                kind: kind.to_string(),
-                ext,
-                size: entry.size,
-                mtime: entry.mtime,
-            });
-        }
+                let path = dir.join(&name);
 
-        if !unchanged {
-            batch.push(PendingDir {
-                dir: display,
-                depth: scope.depth_of(level),
-                stamp: stamp.unwrap_or(0),
-                assets,
-            });
-            if batch.len() >= media_index::CHUNK {
-                flush_dirs(conn, &mut batch)?;
+                if entry.kind == KIND_DIR {
+                    if level < depth
+                        && !name.starts_with('.')
+                        && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
+                        && !crate::core::reserved::is_reserved_lexical(&path)
+                    {
+                        stack.push((path, level + 1));
+                    }
+                    continue;
+                }
+                if entry.kind != KIND_FILE {
+                    continue;
+                }
+                let ext = fs::extension_of_name(&name);
+                if ext == "svg" {
+                    continue;
+                }
+                let (kind, _) = fs::classify_name(&name, &ext, false);
+                if !matches!(kind, "image" | "video" | "audio") || unchanged {
+                    continue;
+                }
+                assets.push(media_index::Asset {
+                    path: fs::normalize_display(&path),
+                    // 展示串是给前端用的（`//server/share`），真实串是给缩略图键和 open 用的
+                    real: path.to_string_lossy().to_string(),
+                    name,
+                    dir: display.clone(),
+                    kind: kind.to_string(),
+                    ext,
+                    size: entry.size,
+                    mtime: entry.mtime,
+                });
+            }
+
+            if !unchanged {
+                batch.push(PendingDir {
+                    dir: display,
+                    depth: scope.depth_of(level),
+                    stamp: stamp.unwrap_or(0),
+                    assets,
+                });
+                if batch.len() >= media_index::CHUNK {
+                    flush_dirs(conn, &mut batch)?;
+                }
             }
         }
     }
@@ -1525,6 +1553,18 @@ where
     T: Send,
     R: Send,
 {
+    run_parallel_n(jobs, DIMS_THREADS, worker)
+}
+
+/// 指定并发度的版本。
+///
+/// 目录遍历用 16 路：那里的瓶颈是「每个目录一次网络往返」，重叠延迟几乎线性收益；
+/// 而读文件头是 CPU + 磁盘混合，6 路更稳（并发太高反而把 SMB 会话挤爆）。
+fn run_parallel_n<T, R>(jobs: Vec<T>, threads: usize, worker: impl Fn(T) -> R + Sync) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+{
     let total = jobs.len();
     if total == 0 {
         return Vec::new();
@@ -1536,7 +1576,7 @@ where
     let queue = std::sync::Mutex::new(jobs.into_iter());
     let done = std::sync::Mutex::new(Vec::with_capacity(total));
     std::thread::scope(|scope| {
-        for _ in 0..DIMS_THREADS.min(total) {
+        for _ in 0..threads.max(1).min(total) {
             scope.spawn(|| {
                 loop {
                     // 取任务只锁一瞬间，真正的读盘在锁外
@@ -2002,7 +2042,7 @@ fn scan_albums(
     let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, true)];
 
     while let Some((dir, level, is_root)) = stack.pop() {
-        let entries = read_dir_entries(&dir, cache, refresh);
+        let entries = read_dir_entries(&dir, cache, refresh, None);
         let mut count = 0usize;
         let mut bytes = 0u64;
         // (mtime, path)：相册封面取最新的一张图
