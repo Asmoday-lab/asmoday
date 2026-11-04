@@ -27,7 +27,7 @@
 //! 索引是**派生数据**：库被删、表结构变了、路径换了挂载点，最坏结果只是回到
 //! 「每次请求重扫」，媒体库本身不受影响（调用方全都留了内存扫描兜底）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::types::Value;
@@ -164,6 +164,9 @@ fn flush_digits(out: &mut String, digits: &mut String) {
 pub struct MediaIndex {
     db_path: PathBuf,
     conn: Mutex<Option<Connection>>,
+    /// 缩略图缓存根目录：扫描发现「源文件已消失」时顺手回收对应缓存单元。
+    /// `None` = 不做回收（测试、纯索引场景）。
+    thumb_dir: Option<PathBuf>,
 }
 
 impl MediaIndex {
@@ -171,7 +174,19 @@ impl MediaIndex {
         Self {
             db_path,
             conn: Mutex::new(None),
+            thumb_dir: None,
         }
+    }
+
+    /// 关联缩略图缓存目录（v4.9.18）：外部删除的条目在扫描时就把缓存收掉，
+    /// 不再等闲置 90 天或被容量淘汰。
+    pub fn with_thumb_cache(mut self, thumb_dir: PathBuf) -> Self {
+        self.thumb_dir = Some(thumb_dir);
+        self
+    }
+
+    pub fn thumb_cache(&self) -> Option<&Path> {
+        self.thumb_dir.as_deref()
     }
 
     /// 在索引连接上执行；打开失败返回 `None`（调用方回退内存扫描）。
@@ -307,17 +322,31 @@ pub fn dir_stamp(conn: &Connection, dir: &str) -> rusqlite::Result<Option<i64>> 
     .optional()
 }
 
-/// 整目录替换：先删该目录旧行，再写新行
+/// 某目录在索引里的全部条目路径（缩略图回收要用：删行之前得先知道删掉了谁）
+fn dir_asset_paths(conn: &Connection, dir: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM media_assets WHERE dir = ?1")?;
+    let paths = stmt
+        .query_map(params![dir], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths)
+}
+
+/// 整目录替换：先删该目录旧行，再写新行。返回**这次消失的条目路径**。
 ///
 /// 用「先删后插」而不是逐条 diff：目录内容变了基本是整批变（拷一册照片进来），
 /// diff 的复杂度换不来收益，而且 `DELETE` 走的是 `dir` 索引，代价可控。
+///
+/// 返回值只用于回收缩略图：旧行里不在新列表中的，说明源文件被外部删掉/改名了，
+/// 对应的缓存单元已经没有意义（v4.9.18）。空目录首次建索引时这一步查不到行，
+/// 是一次空 `SELECT`，可以忽略。
 pub fn replace_dir(
     conn: &Connection,
     dir: &str,
     depth: i64,
     stamp: i64,
     assets: &[Asset],
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Vec<String>> {
+    let before = dir_asset_paths(conn, dir)?;
     conn.execute("DELETE FROM media_assets WHERE dir = ?1", params![dir])?;
     if !assets.is_empty() {
         let mut stmt = conn.prepare_cached(
@@ -345,14 +374,20 @@ pub fn replace_dir(
          ON CONFLICT(dir) DO UPDATE SET depth = ?2, stamp = ?3, indexed_at = ?4",
         params![dir, depth, stamp, now_secs()],
     )?;
-    Ok(())
+
+    let kept: std::collections::HashSet<&str> = assets.iter().map(|a| a.path.as_str()).collect();
+    Ok(before
+        .into_iter()
+        .filter(|path| !kept.contains(path.as_str()))
+        .collect())
 }
 
-/// 丢一个目录的索引行（应用自己原地覆盖写之后调用）
-pub fn forget_dir(conn: &Connection, dir: &str) -> rusqlite::Result<()> {
+/// 丢一个目录的索引行（应用自己原地覆盖写之后调用）。返回被丢掉的条目路径。
+pub fn forget_dir(conn: &Connection, dir: &str) -> rusqlite::Result<Vec<String>> {
+    let paths = dir_asset_paths(conn, dir)?;
     conn.execute("DELETE FROM media_assets WHERE dir = ?1", params![dir])?;
     conn.execute("DELETE FROM media_dirs WHERE dir = ?1", params![dir])?;
-    Ok(())
+    Ok(paths)
 }
 
 /// 作废所有「新鲜窗口」标记（任何写操作后调用，下一次请求重新同步）
@@ -361,12 +396,17 @@ pub fn invalidate(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// 删掉作用域内**这次没走到**的目录行（外部删目录后索引不能留死行）
+/// 删掉作用域内**这次没走到**的目录行（外部删目录后索引不能留死行）。
+///
+/// `unreadable` 是这一轮**读不动**的目录（挂载点掉线、权限不足）。这类目录不能当
+/// 「已被外部删除」处理：它们自己连同整棵子树都保持原样，否则网络抖一下就会把
+/// 索引和缩略图缓存全清掉（v4.9.18 的防护）。返回被删掉的条目路径，供调用方回收缓存。
 pub fn prune(
     conn: &Connection,
     scope: &Scope,
     visited: &std::collections::HashSet<String>,
-) -> rusqlite::Result<usize> {
+    unreadable: &[String],
+) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT dir FROM media_dirs
          WHERE (dir = ?1 OR instr(dir, ?2) = 1) AND depth BETWEEN ?3 AND ?4",
@@ -384,13 +424,15 @@ pub fn prune(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
-    let mut removed = 0usize;
+    let mut removed = Vec::new();
     for dir in known {
         if visited.contains(&dir) {
             continue;
         }
-        forget_dir(conn, &dir)?;
-        removed += 1;
+        if unreadable.iter().any(|prefix| under(prefix, &dir)) {
+            continue;
+        }
+        removed.extend(forget_dir(conn, &dir)?);
     }
     Ok(removed)
 }
@@ -1247,11 +1289,52 @@ mod tests {
                     &[asset("/data/gone", "b.jpg", 2)],
                 )?;
 
-                let removed = prune(conn, &scope, &HashSet::from(["/data".to_string()]))?;
-                assert_eq!(removed, 1);
+                let removed = prune(conn, &scope, &HashSet::from(["/data".to_string()]), &[])?;
+                assert_eq!(removed, vec!["/data/gone/b.jpg".to_string()]);
                 let (items, _) = page(conn, &scope, &["image"], NEWEST, None, 10)?;
                 assert_eq!(items.len(), 1, "死目录的条目必须一起走");
                 assert_eq!(items[0].path, "/data/a.jpg");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 读不动的子树必须原地保留（v4.9.18）。
+    ///
+    /// 挂载点掉线时 `readdir` 失败，那一支既走不到、也不该被当成「用户删了」：
+    /// 以前这里会把整棵树的索引行连同缩略图缓存一起清掉，网络恢复后全库重扫。
+    #[test]
+    fn prune_keeps_unreadable_subtree() {
+        let index = index("prune-unreadable");
+        index
+            .with_conn(|conn| {
+                let scope = Scope::new("/data", 2);
+                replace_dir(conn, "/data", scope.min_depth, 1, &[])?;
+                replace_dir(
+                    conn,
+                    "/data/offline",
+                    scope.min_depth + 1,
+                    1,
+                    &[asset("/data/offline", "keep.jpg", 1)],
+                )?;
+                replace_dir(
+                    conn,
+                    "/data/offline/2024",
+                    scope.min_depth + 2,
+                    1,
+                    &[asset("/data/offline/2024", "deep.jpg", 2)],
+                )?;
+
+                // 只有 /data 走到；/data/offline 读不动
+                let removed = prune(
+                    conn,
+                    &scope,
+                    &HashSet::from(["/data".to_string()]),
+                    &["/data/offline".to_string()],
+                )?;
+                assert!(removed.is_empty(), "读不动的子树不能被删：{removed:?}");
+                let (items, _) = page(conn, &scope, &["image"], NEWEST, None, 10)?;
+                assert_eq!(items.len(), 2, "离线子树里的条目要原样保留");
                 Ok(())
             })
             .unwrap();

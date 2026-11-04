@@ -296,11 +296,13 @@ async fn run(cli: Cli) -> Result<(), String> {
     let media = config.media.clone();
     let terminal = config.terminal.clone();
     let listen = (config.server.host.clone(), config.server.ssl.enabled);
+    // 缩略图缓存根：缩略器与索引共用同一个串（索引靠它回收外部删除的缓存单元）
+    let thumb_dir = data_dir.join("thumbnails");
     let state = AppState {
         config_path: config_path.clone(),
         data_dir: data_dir.clone(),
         config: Arc::new(RwLock::new(config)),
-        thumbnails: Arc::new(Thumbnailer::new(data_dir.join("thumbnails"))),
+        thumbnails: Arc::new(Thumbnailer::new(thumb_dir.clone())),
         http: reqwest::Client::builder()
             .user_agent("Asmoday/0.1 (reverse-proxy)")
             .build()
@@ -311,7 +313,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         ),
         auth: Arc::clone(&auth),
         dir_cache: Arc::new(core::dir_cache::DirCache::new(auth.db_path().clone())),
-        media_index: Arc::new(core::media_index::MediaIndex::new(auth.db_path().clone())),
+        media_index: Arc::new(
+            core::media_index::MediaIndex::new(auth.db_path().clone())
+                .with_thumb_cache(thumb_dir.clone()),
+        ),
         login_guard: Arc::new(core::auth::LoginGuard::new()),
         share_guard: Arc::new(core::auth::LoginGuard::new()),
         dav_guard: Arc::new(core::auth::LoginGuard::new()),
@@ -767,9 +772,10 @@ fn spawn_media_indexer(state: AppState) {
     const DEPTH: usize = 3;
 
     tokio::spawn(async move {
-        let index = Arc::new(core::media_index::MediaIndex::new(
-            state.auth.db_path().clone(),
-        ));
+        let index = Arc::new(
+            core::media_index::MediaIndex::new(state.auth.db_path().clone())
+                .with_thumb_cache(state.thumbnails.cache_dir().to_path_buf()),
+        );
         // 先让监听与静态资源就绪：这活一跑就是几十秒的读盘
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 

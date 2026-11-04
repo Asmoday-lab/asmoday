@@ -1107,12 +1107,15 @@ struct RawMedia {
 /// `refresh = true` 时穿透缓存（前端的「重新扫描」按钮），但照样把结果写回。
 ///
 /// 目录自己还是要 `stat` 一次的 —— 快照的失效判定全靠它（`dir_cache::stamp_of`）。
+///
+/// 返回 `None` 表示**读不动**（挂载点掉线、权限不足）。这与「空目录」必须区分开：
+/// 把读失败当成「文件都被删了」，会让索引行和缩略图缓存整片消失（v4.9.18）。
 fn read_dir_entries(
     dir: &Path,
     cache: Option<&crate::core::dir_cache::DirCache>,
     refresh: bool,
     known_stamp: Option<i64>,
-) -> Vec<crate::core::dir_cache::MediaEntry> {
+) -> Option<Vec<crate::core::dir_cache::MediaEntry>> {
     use crate::core::dir_cache::{self, KIND_DIR, KIND_FILE, KIND_LINK, MediaEntry};
 
     let display = fs::normalize_display(dir);
@@ -1129,39 +1132,40 @@ fn read_dir_entries(
         && let (Some(cache), Some(stamp)) = (cache, stamp)
         && let Some(entries) = cache.load_media(&display, stamp)
     {
-        return entries;
+        return Some(entries);
     }
 
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return None;
+    };
     let mut entries: Vec<MediaEntry> = Vec::new();
-    if let Ok(reader) = std::fs::read_dir(dir) {
-        for entry in reader.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let (kind, size, mtime) = if file_type.is_dir() {
-                (KIND_DIR, 0, 0)
-            } else if file_type.is_file() {
-                // 只有文件需要 size / mtime；目录与链接省掉这次 metadata
-                match entry.metadata() {
-                    Ok(meta) => (
-                        KIND_FILE,
-                        meta.len(),
-                        meta.modified()
-                            .ok()
-                            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                            .map(|delta| delta.as_secs())
-                            .unwrap_or(0),
-                    ),
-                    // stat 失败（权限 / 竞态删除）仍保留条目：下一层过滤会丢掉它，
-                    // 但如果这里直接跳过，快照就会「少一条」，比多一条更难查
-                    Err(_) => (KIND_FILE, 0, 0),
-                }
-            } else {
-                (KIND_LINK, 0, 0)
-            };
-            entries.push(MediaEntry::new(name, kind, size, mtime));
-        }
+    for entry in reader.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let (kind, size, mtime) = if file_type.is_dir() {
+            (KIND_DIR, 0, 0)
+        } else if file_type.is_file() {
+            // 只有文件需要 size / mtime；目录与链接省掉这次 metadata
+            match entry.metadata() {
+                Ok(meta) => (
+                    KIND_FILE,
+                    meta.len(),
+                    meta.modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map(|delta| delta.as_secs())
+                        .unwrap_or(0),
+                ),
+                // stat 失败（权限 / 竞态删除）仍保留条目：下一层过滤会丢掉它，
+                // 但如果这里直接跳过，快照就会「少一条」，比多一条更难查
+                Err(_) => (KIND_FILE, 0, 0),
+            }
+        } else {
+            (KIND_LINK, 0, 0)
+        };
+        entries.push(MediaEntry::new(name, kind, size, mtime));
     }
     // 顺序必须自己定死：`readdir` 的顺序不可依赖，快照命中时要复现同一顺序，
     // 相册封面这类「并列取第一个」的逻辑才不会因为缓存而换个结果
@@ -1172,7 +1176,7 @@ fn read_dir_entries(
     {
         cache.store_media(&display, stamp, &entries);
     }
-    entries
+    Some(entries)
 }
 
 /// 走一遍目录树，只做 readdir + 分类 + 一次 metadata。
@@ -1194,7 +1198,10 @@ fn scan_raw(
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, level)) = queue.pop() {
-        let entries = read_dir_entries(&dir, cache, refresh, None);
+        // 读不动就跳过这一支：不能把「离线/无权限」当「文件都被删了」
+        let Some(entries) = read_dir_entries(&dir, cache, refresh, None) else {
+            continue;
+        };
         scanned += entries.len();
         // 一次 normalize 给这一层的所有条目复用（原来每条都算一次）
         let folder = fs::normalize_display(&dir);
@@ -1299,7 +1306,7 @@ pub(crate) fn sync_index(
 ) -> Option<usize> {
     let refresh = mode.refresh();
     let scope = Scope::new(&fs::normalize_display(root), depth);
-    index.with_conn(|conn| {
+    let outcome = index.with_conn(|conn| {
         if mode.honors_window()
             && let Some((synced_depth, at)) = media_index::synced(conn, &scope.root)?
             && synced_depth >= depth as i64
@@ -1312,7 +1319,7 @@ pub(crate) fn sync_index(
                 synced_depth,
                 (crate::core::auth::now_secs().max(0) as u64).saturating_sub(at)
             );
-            return Ok(0);
+            return Ok((0usize, Vec::new()));
         }
         let started = std::time::Instant::now();
         // 用户点「重新扫描」（Force）：连带清掉字幕缓存。给视频补了 .srt 之后
@@ -1320,17 +1327,38 @@ pub(crate) fn sync_index(
         if refresh {
             media_index::subtitles_clear(conn);
         }
-        let scanned = walk_into_index(conn, root, &scope, refresh, cache)?;
+        let outcome = walk_into_index(conn, root, &scope, refresh, cache)?;
         media_index::mark_synced(conn, &scope.root, depth)?;
         crate::log_debug!(
             "媒体索引同步完成：{} {} 条，{}ms",
             scope.root,
-            scanned,
+            outcome.0,
             started.elapsed().as_millis()
         );
-        Ok(scanned)
-    })
+        Ok(outcome)
+    })?;
+
+    // 缓存回收放在数据库锁之外：删目录是纯文件操作，不该占着索引那条连接。
+    // 只处理扫描**确认消失**的条目（外部删除 / 改名）；读不动的子树已在扫描里排除。
+    if let Some(cache_dir) = index.thumb_cache() {
+        let units = crate::core::thumbnail::purge_paths(cache_dir, &outcome.1);
+        if units > 0 {
+            crate::log_debug!("外部删除回收缩略图缓存：{units} 个单元");
+        }
+    }
+    Some(outcome.0)
 }
+
+/// 一批目录的读取结果：`(路径, 层号, 目录 mtime 戳, 读出的条目)`。
+///
+/// 最后一项为 `None` 表示这一层读不动（挂载点掉线 / 权限不足），
+/// 既不能重写它的索引行，也不能让 `prune` 把它当删除（v4.9.18）。
+type DirListing = (
+    PathBuf,
+    usize,
+    Option<i64>,
+    Option<Vec<crate::core::dir_cache::MediaEntry>>,
+);
 
 /// 走一遍树并把每个目录的结果写进索引
 ///
@@ -1345,17 +1373,27 @@ struct PendingDir {
 }
 
 /// 一批目录一个事务。只做写，不夹任何文件系统调用 —— 事务时长直接等于写锁时长。
-fn flush_dirs(conn: &rusqlite::Connection, batch: &mut Vec<PendingDir>) -> rusqlite::Result<()> {
+fn flush_dirs(
+    conn: &rusqlite::Connection,
+    batch: &mut Vec<PendingDir>,
+) -> rusqlite::Result<Vec<String>> {
     if batch.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut removed: Vec<String> = Vec::new();
     let tx = conn.unchecked_transaction()?;
     for item in batch.iter() {
-        media_index::replace_dir(&tx, &item.dir, item.depth, item.stamp, &item.assets)?;
+        removed.extend(media_index::replace_dir(
+            &tx,
+            &item.dir,
+            item.depth,
+            item.stamp,
+            &item.assets,
+        )?);
     }
     tx.commit()?;
     batch.clear();
-    Ok(())
+    Ok(removed)
 }
 
 fn walk_into_index(
@@ -1364,11 +1402,15 @@ fn walk_into_index(
     scope: &Scope,
     refresh: bool,
     cache: Option<&crate::core::dir_cache::DirCache>,
-) -> rusqlite::Result<usize> {
+) -> rusqlite::Result<(usize, Vec<String>)> {
     use crate::core::dir_cache::{KIND_DIR, KIND_FILE};
 
     let depth = (scope.max_depth - scope.min_depth).max(0) as usize;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 这一轮读不动的目录：只保护、不删除（挂载点掉线 ≠ 用户删了文件）
+    let mut unreadable: Vec<String> = Vec::new();
+    // 确认消失的条目路径：扫描结束后统一回收缩略图缓存
+    let mut removed: Vec<String> = Vec::new();
     let mut scanned = 0usize;
     let mut dirs = 0usize;
     let mut reused = 0usize;
@@ -1395,12 +1437,7 @@ fn walk_into_index(
         // `DirCache` 内部是 `Mutex<Connection>`，跨线程安全；`conn` 留在主线程，
         // 因为 rusqlite 的 `Connection` 不是 `Sync`。
         let fetch_started = std::time::Instant::now();
-        let listings: Vec<(
-            PathBuf,
-            usize,
-            Option<i64>,
-            Vec<crate::core::dir_cache::MediaEntry>,
-        )> = run_parallel_n(dir_batch, WALK_IO, |(dir, level)| {
+        let listings: Vec<DirListing> = run_parallel_n(dir_batch, WALK_IO, |(dir, level)| {
             let stamp = std::fs::metadata(&dir)
                 .ok()
                 .and_then(|meta| meta.modified().ok())
@@ -1415,6 +1452,12 @@ fn walk_into_index(
                 scope.root.clone()
             } else {
                 fs::normalize_display(&dir)
+            };
+            // 读不动（挂载点掉线 / 权限不足）：这一支保持原样，既不重写行、
+            // 也不让 prune 把它和它的子孙当成「外部删除」（v4.9.18）
+            let Some(entries) = entries else {
+                unreadable.push(display);
+                continue;
             };
             visited.insert(display.clone());
             dirs += 1;
@@ -1476,16 +1519,17 @@ fn walk_into_index(
                     assets,
                 });
                 if batch.len() >= media_index::CHUNK {
-                    flush_dirs(conn, &mut batch)?;
+                    removed.extend(flush_dirs(conn, &mut batch)?);
                 }
             }
         }
     }
-    flush_dirs(conn, &mut batch)?;
+    removed.extend(flush_dirs(conn, &mut batch)?);
 
-    // 这次没走到的目录（外面删掉了）连同条目一起清掉，索引不能留死行
+    // 这次没走到的目录（外面删掉了）连同条目一起清掉，索引不能留死行；
+    // 读不动的子树原地保留 —— 否则网络抖一下整棵树就被当成删除
     let tx = conn.unchecked_transaction()?;
-    media_index::prune(&tx, scope, &visited)?;
+    removed.extend(media_index::prune(&tx, scope, &visited, &unreadable)?);
     tx.commit()?;
     crate::log_debug!(
         "媒体索引走树：{} 个目录（{} 个命中旧行，跳过写库），读目录耗时 {}ms",
@@ -1493,7 +1537,7 @@ fn walk_into_index(
         reused,
         io_time.as_millis()
     );
-    Ok(scanned)
+    Ok((scanned, removed))
 }
 
 /// 图片像素宽高的进程内缓存（v4.6.19）。
@@ -2042,7 +2086,10 @@ fn scan_albums(
     let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, true)];
 
     while let Some((dir, level, is_root)) = stack.pop() {
-        let entries = read_dir_entries(&dir, cache, refresh, None);
+        // 读不动（挂载点离线 / 权限不足）就跳过这一支，别当成空相册
+        let Some(entries) = read_dir_entries(&dir, cache, refresh, None) else {
+            continue;
+        };
         let mut count = 0usize;
         let mut bytes = 0u64;
         // (mtime, path)：相册封面取最新的一张图
@@ -2684,6 +2731,41 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// 外部删除（不经应用）→ 下一轮扫描把缩略图缓存一起收掉（v4.9.18）。
+    ///
+    /// 这是「尽快回收」的实现路径：索引扫描本来就发现「这个文件没了」，
+    /// 顺手把它的缓存单元删掉，不必等 90 天闲置或容量淘汰，也不用全盘 stat。
+    #[test]
+    fn sync_purges_cache_of_externally_deleted_files() {
+        let root = scratch("thumb-purge-sync");
+        touch(&root, "gone.jpg", 1_700_000_000);
+        touch(&root, "keep.jpg", 1_700_000_001);
+
+        let cache = scratch("thumb-purge-sync-cache");
+        let (db_dir, index) = index_db("thumb-purge-sync");
+        let index = index.with_thumb_cache(cache.clone());
+
+        sync_index(&index, &root, 1, SyncMode::Force, None).expect("索引不可用");
+
+        // 手工造两个缓存单元：路径口径必须与扫描写进索引的展示串一致
+        let gone_unit = crate::core::thumbnail::unit_dir(&cache, &root.join("gone.jpg"));
+        let keep_unit = crate::core::thumbnail::unit_dir(&cache, &root.join("keep.jpg"));
+        std::fs::create_dir_all(&gone_unit).unwrap();
+        std::fs::create_dir_all(&keep_unit).unwrap();
+        std::fs::write(gone_unit.join("v5-1-1-400-jpg"), b"x").unwrap();
+
+        // 外部删掉一个文件，再强制重扫（Force 不受目录快照窗口影响）
+        std::fs::remove_file(root.join("gone.jpg")).unwrap();
+        sync_index(&index, &root, 1, SyncMode::Force, None).expect("索引不可用");
+
+        assert!(!gone_unit.exists(), "外部删除的条目必须回收缓存单元");
+        assert!(keep_unit.exists(), "还在的条目不能误删");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&cache);
         let _ = std::fs::remove_dir_all(&db_dir);
     }
 

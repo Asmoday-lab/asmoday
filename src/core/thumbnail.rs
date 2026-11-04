@@ -158,6 +158,53 @@ pub struct FreshHash {
     pub value: String,
 }
 
+/// 源路径的稳定摘要（sha1 十六进制 40 字符）。
+///
+/// 缓存文件名一律只用它，绝不带源文件名或扩展名 —— FileBrowser 的
+/// diskcache 也是 `sha1(key)` 的无扩展名文件。这样即使缓存目录被误暴露成
+/// 普通目录，也不会被识别成图片、更不会「缓存给自己再缓存一遍」。
+///
+/// 摘要用的是 `normalize_display` 之后的写法：同一个文件可能以
+/// `C:/x/y.jpg`（接口入参）或 `\\?\C://x//y.jpg`（canonicalize 结果）出现，
+/// 不归一化就会算出两个键、缓存和 ThumbHash 全都对不上。
+fn digest_of(path: &Path) -> String {
+    let display = crate::core::fs::normalize_display(path);
+    // Windows 文件系统大小写不敏感：同一个文件可能以 `C:/Photos/A.JPG`（接口入参）
+    // 和 `c:/photos/a.jpg`（系统回读）两种形态出现，不归一就会算出两个单元目录。
+    // 口径与 `path_guard::find_by_path_text` 的 `to_lowercase` 保持一致。
+    #[cfg(windows)]
+    let display = display.to_lowercase();
+    let mut hasher = Sha1::new();
+    hasher.update(display.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 单个源文件的缓存单元目录：`<cache>/<digest[..2]>/<digest>`。
+///
+/// 一级两字符扇出（同 FileBrowser）：几十万张图也不会让单目录堆到上百万项；
+/// 删除一个源文件的缓存也只需要删掉这一个目录。
+///
+/// 单独抽成自由函数是为了让扫描侧（`api::media` 的孤儿回收）能复用同一套
+/// 摘要口径 —— 索引里存的是展示串，两边各算一次摘要必须完全一致。
+pub fn unit_dir(cache_dir: &Path, path: &Path) -> PathBuf {
+    let digest = digest_of(path);
+    cache_dir.join(&digest[..2]).join(digest)
+}
+
+/// 批量回收缓存单元（扫描确认源文件/目录已消失后调用）。
+///
+/// 只删整个单元目录：同一张图的各档位同生共死，留下单个文件就是永远命不中的孤儿。
+/// 单元不存在（从没生成过缩略图）时 `rmdir` 失败，直接跳过 —— 这个接口必须幂等。
+pub fn purge_paths(cache_dir: &Path, sources: &[String]) -> usize {
+    let mut removed = 0usize;
+    for source in sources {
+        if std::fs::remove_dir_all(unit_dir(cache_dir, Path::new(source))).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub struct Thumbnailer {
     semaphore: Arc<Semaphore>,
     cache_dir: PathBuf,
@@ -198,42 +245,12 @@ impl Thumbnailer {
         self.max_age_secs.store(max_age_secs, Ordering::Relaxed);
     }
 
-    /// 源路径的稳定摘要（sha1 十六进制 40 字符）。
-    ///
-    /// 缓存文件名一律只用它，绝不带源文件名或扩展名 —— FileBrowser 的
-    /// diskcache 也是 `sha1(key)` 的无扩展名文件。这样即使缓存目录被误暴露成
-    /// 普通目录，也不会被识别成图片、更不会「缓存给自己再缓存一遍」。
-    ///
-    /// 摘要用的是 `normalize_display` 之后的写法：同一个文件可能以
-    /// `C:/x/y.jpg`（接口入参）或 `\\?\C://x//y.jpg`（canonicalize 结果）出现，
-    /// 不归一化就会算出两个键、缓存和 ThumbHash 全都对不上。
-    fn digest(path: &Path) -> String {
-        let display = crate::core::fs::normalize_display(path);
-        // Windows 文件系统大小写不敏感：同一个文件可能以 `C:/Photos/A.JPG`（接口入参）
-        // 和 `c:/photos/a.jpg`（系统回读）两种形态出现，不归一就会算出两个单元目录。
-        // 口径与 `path_guard::find_by_path_text` 的 `to_lowercase` 保持一致。
-        #[cfg(windows)]
-        let display = display.to_lowercase();
-        let mut hasher = Sha1::new();
-        hasher.update(display.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// 单个源文件的缓存单元目录：`<cache>/<digest[..2]>/<digest>`。
-    ///
-    /// 一级两字符扇出（同 FileBrowser）：几十万张图也不会让单目录堆到上百万项；
-    /// 删除一个源文件的缓存也只需要删掉这一个目录。
-    fn entry_dir(&self, path: &Path) -> PathBuf {
-        let digest = Self::digest(path);
-        self.cache_dir.join(&digest[..2]).join(digest)
-    }
-
     /// ThumbHash 的库键：**只跟路径有关，不含 mtime**。
     ///
     /// 旧实现把 mtime 混进键里，改一次图就多一行，库随编辑次数膨胀；
     /// 现在键稳定，值由每次成功生成覆盖（缩略图本身靠 `stamp` 判过期）。
     pub fn hash_key(path: &Path) -> String {
-        Self::digest(path)
+        digest_of(path)
     }
 
     /// 源文件的**内容指纹**：`v4-<长度>-<mtime秒>`。既进缓存文件名，也做 HTTP ETag。
@@ -452,7 +469,7 @@ impl Thumbnailer {
             fingerprint: fp,
             fresh_write,
         } = key;
-        let dir = self.entry_dir(path);
+        let dir = unit_dir(&self.cache_dir, path);
 
         if let Some(outcome) = Self::cached(&dir, &fp, width).await {
             return (outcome, None);
@@ -552,7 +569,7 @@ impl Thumbnailer {
     /// 删除 / 改名 / 移动后调用：FileBrowser 在 `delThumbs` 里做同样的事，
     /// 否则被删掉的文件会永远留一份缓存，只能等 LRU 慢慢淘汰。
     pub fn purge(&self, path: &Path) -> bool {
-        std::fs::remove_dir_all(self.entry_dir(path)).is_ok()
+        std::fs::remove_dir_all(unit_dir(&self.cache_dir, path)).is_ok()
     }
 
     /// 视频首帧封面（设计文档 3.4：影视库不联网刮削，靠外部 FFmpeg 截首帧）。
@@ -581,7 +598,7 @@ impl Thumbnailer {
         fresh_write: bool,
     ) -> ThumbOutcome {
         let width = width.clamp(64, 1024);
-        let dir = self.entry_dir(path);
+        let dir = unit_dir(&self.cache_dir, path);
 
         if let Some(outcome) = Self::cached_poster(&dir, &fp, width).await {
             return outcome;
@@ -1189,11 +1206,10 @@ mod tests {
         fs::write(&file, b"x").unwrap();
 
         let cache = scratch_dir("thumb-entry-cache");
-        let thumbnails = Thumbnailer::new(cache.clone());
-        let first = thumbnails.entry_dir(&file);
+        let first = unit_dir(&cache, &file);
         // 改了内容（长度 / mtime 变化）之后仍是同一个目录：覆盖写，不新增
         fs::write(&file, b"xxxx").unwrap();
-        assert_eq!(first, thumbnails.entry_dir(&file));
+        assert_eq!(first, unit_dir(&cache, &file));
 
         let unit = first.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(unit.len(), 40, "sha1 十六进制应为 40 字符：{unit}");
@@ -1225,10 +1241,9 @@ mod tests {
     #[test]
     fn entry_dir_ignores_path_case_on_windows() {
         let cache = scratch_dir("thumb-case");
-        let thumbnails = Thumbnailer::new(cache.clone());
         assert_eq!(
-            thumbnails.entry_dir(Path::new("C:/Photos/A.JPG")),
-            thumbnails.entry_dir(Path::new("c:/photos/a.jpg")),
+            unit_dir(&cache, Path::new("C:/Photos/A.JPG")),
+            unit_dir(&cache, Path::new("c:/photos/a.jpg")),
             "大小写不同也是同一个文件，必须落到同一个单元目录"
         );
         let _ = fs::remove_dir_all(&cache);
@@ -1717,8 +1732,8 @@ mod tests {
         let thumbnails = Thumbnailer::new(cache.clone());
         let keep = PathBuf::from("C:/photos/keep.jpg");
         let gone = PathBuf::from("C:/photos/gone.jpg");
-        let keep_unit = thumbnails.entry_dir(&keep);
-        let gone_unit = thumbnails.entry_dir(&gone);
+        let keep_unit = unit_dir(&cache, &keep);
+        let gone_unit = unit_dir(&cache, &gone);
         fs::create_dir_all(&keep_unit).unwrap();
         fs::create_dir_all(&gone_unit).unwrap();
         fs::write(gone_unit.join("320-jpg"), b"x").unwrap();

@@ -990,6 +990,7 @@ GWT-UP-07 Given 全部上传完成  When 5 秒  Then 面板自动收起
 - 优先 WebP，降级 JPEG。
 - FFmpeg 路径热重载 + 探活；未配置 404。
 - 缓存键 `mount_id + path + mtime + size` 哈希，按「最久未访问」淘汰（命中即刷 mtime 续期）。
+- 外部删除由索引扫描回收缓存；读不动的目录（离线 / 无权限）视为未知，不重写也不清除。
 - ThumbHash 存 `thumb_metadata` 表。
 
 #### 状态机
@@ -1044,6 +1045,8 @@ GWT-THUMB-04 Given 已生成过缩略图  When 再次请求  Then 直接命中�
 GWT-THUMB-05 Given ThumbHash 存在  When 列表渲染  Then 先显示 ThumbHash 模糊，加载后替换
 GWT-THUMB-06 Given 缩略图缓存超 LRU 上限  When 请求  Then 最久未访问的条目被淘汰
 GWT-THUMB-07 Given 某缩略图天天被打开  When 闲置天数超过 thumb_cache_max_age_days  Then 命中时已续期，不被淘汰
+GWT-THUMB-08 Given 源文件被应用外删除  When 下一轮索引扫描  Then 其缓存单元整目录回收
+GWT-THUMB-09 Given 挂载点离线（readdir 失败）  When 扫描  Then 该子树索引与缓存原样保留
 ```
 
 #### 依赖红线
