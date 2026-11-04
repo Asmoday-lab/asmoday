@@ -85,7 +85,9 @@ user_header = "Remote-User"
 # referer_allowlist = ["example.com", "cdn.example.org"]
 
 [media]
-# Thumbnail cache ceiling (MiB) and retention (days).
+# Thumbnail cache ceiling (MiB) and idle retention (days). A unit is touched on
+# every hit; the least recently used ones are evicted once it has been idle for
+# `thumb_cache_max_age_days`, or when the cache exceeds the ceiling.
 thumb_cache_max_size_mb = 1024
 thumb_cache_max_age_days = 90
 # Optional FFmpeg path for video posters. Empty = env ASMODAY_FFMPEG_PATH, then PATH.
@@ -186,13 +188,13 @@ pub struct SafetyIssue {
     pub code: &'static str,
 }
 
-/// `[media]`：缩略图缓存的容量与过期策略 + 外部 FFmpeg 位置。
+/// `[media]`：缩略图缓存的容量与**闲置**过期策略 + 外部 FFmpeg 位置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MediaConfig {
     /// 缓存总容量上限（MiB）
     pub thumb_cache_max_size_mb: u64,
-    /// 缩略图最长保留天数
+    /// 缓存单元最长闲置天数（mtime = 最后访问时间，命中即续期；不是「生成后固定过期」）
     pub thumb_cache_max_age_days: u64,
     /// 预生成缩略图的时间窗（天）。0 = 不限，只处理最近这么多天的图片
     #[serde(default = "default_preheat_days")]
@@ -245,7 +247,7 @@ impl MediaConfig {
         self.thumb_cache_max_size_mb.saturating_mul(1024 * 1024)
     }
 
-    /// 换算成秒，供过期逻辑使用
+    /// 换算成秒，供闲置过期逻辑使用
     pub fn max_age_secs(&self) -> u64 {
         self.thumb_cache_max_age_days.saturating_mul(24 * 60 * 60)
     }

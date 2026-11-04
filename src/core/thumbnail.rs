@@ -3,7 +3,8 @@
 //! - 并发上限 2（信号量），拿不到就回占位图，绝不让数千张图一起解码把 CPU 打满；
 //! - 结果落磁盘缓存，键 = 路径 + 修改时间 + 大小 + 有效宽度（源文件 mtime 变了自动失效；
 //!   有效宽度 = min(请求宽度, 源图长边)，小图的各档位请求因此归并成同一份字节）；
-//! - 容量上限与过期天数来自 `config.toml` 的 `[media]`，按 LRU + 过期天数淘汰；
+//! - 容量上限与闲置天数来自 `config.toml` 的 `[media]`：命中即把 mtime 顶到当前时间，
+//!   淘汰按「最久未访问」先删（闲置超期或超容量，谁先到算谁）；
 //! - 生成时顺带算一枚 ThumbHash（约 25 字节），供前端做「主色调模糊占位」防抖动；
 //!   **v2.8.2 起存 SQLite `thumb_hashes` 表**，不再落盘旁路文件 —— 几十万张图的
 //!   场景下碎文件会撑爆低功耗设备的 inode，Base64 文本进库零 inode 成本。
@@ -61,6 +62,13 @@ const FRESH_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 /// 并发生成中的临时文件绝不能删：删了之后 rename 找不到源文件，那次落盘白做。
 /// 一次缩略图生成是毫秒到秒级，10 分钟足够宽松。
 const TEMP_STALE_AFTER: Duration = Duration::from_secs(600);
+
+/// 命中缓存后刷新「最后访问时间」的最小间隔。
+///
+/// 每次命中都 `set_times` 等于给 inode 记一笔写，热图一页 120 张毫无意义；
+/// 但间隔必须远小于 `thumb_cache_max_age_days`（默认 90 天），否则天天在看的图
+/// 也会因为「一天只续一次」被算成闲置。1 小时是两者的平衡点。
+const TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// 文件是否可能仍在写盘（mtime 极新且体积可观）。
 ///
@@ -156,7 +164,7 @@ pub struct Thumbnailer {
     generated: AtomicUsize,
     /// 缓存总容量上限（字节），由 `[media].thumb_cache_max_size_mb` 决定
     limit_bytes: AtomicU64,
-    /// 缩略图最长保留秒数，由 `[media].thumb_cache_max_age_days` 决定
+    /// 缓存单元最长**闲置**秒数（mtime 即最后访问时间），由 `[media].thumb_cache_max_age_days` 决定
     max_age_secs: AtomicU64,
     /// FFmpeg 编码能力缓存（键 = 可执行文件路径），避免每张缩略图都跑一次 `-encoders`
     caps: Arc<Mutex<Option<(PathBuf, Capabilities)>>>,
@@ -296,13 +304,43 @@ impl Thumbnailer {
         format!("p{}-{len:x}-{mtime:x}", Self::POSTER_VERSION)
     }
 
+    /// 命中即续期：把缓存文件的 mtime 顶到当前时间。
+    ///
+    /// LRU 淘汰只认 mtime（`cleanup_cache` / `unit_stats` 都是取单元内最新 mtime），
+    /// 所以「有没有人看」必须落在这一个字段上。旧实现是
+    /// `OpenOptions::new().write(true).open(&file)` —— **只打开不写入不会改 mtime**，
+    /// 等于什么也没做，`thumb_cache_max_age_days` 实际退化成「生成后无条件过期」：
+    /// 天天在看的图也会在第 90 天被删掉重生成。真正续期必须走 `File::set_times`。
+    ///
+    /// 距上次触碰不足 [`TOUCH_INTERVAL`] 的直接跳过：只花一次 `metadata`，
+    /// 不写 inode（本地盘微秒级，SMB 上缓存目录也不在共享里）。
+    fn touch_access(path: &Path) {
+        let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+            return;
+        };
+        let now = SystemTime::now();
+        // 时钟回拨（mtime 在未来）也按「该续期」处理，否则这个文件永远不再刷
+        let idle = now.duration_since(modified).unwrap_or(TOUCH_INTERVAL);
+        if idle < TOUCH_INTERVAL {
+            return;
+        }
+        // Windows 上 SetFileTime 需要 FILE_WRITE_ATTRIBUTES，只读句柄会 ACCESS_DENIED
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) else {
+            return;
+        };
+        let _ = file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(now)
+                .set_modified(now),
+        );
+    }
+
     /// 取某个缓存单元里已生成好的图（文件名前缀就是当前内容的指纹）。
     async fn cached(dir: &Path, fp: &str, width: u32) -> Option<ThumbOutcome> {
         for (codec, mime) in [("webp", "image/webp"), ("jpg", "image/jpeg")] {
             let file = dir.join(format!("{fp}-{width}-{codec}"));
             if let Ok(bytes) = tokio::fs::read(&file).await {
-                // 触碰 mtime，参与 LRU 排序
-                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
+                Self::touch_access(&file);
                 return Some(ThumbOutcome::Ready(Rendered { bytes, mime }));
             }
         }
@@ -314,7 +352,7 @@ impl Thumbnailer {
         for format in ffmpeg::POSTER_FORMATS {
             let file = dir.join(format!("{fp}-{width}p-{}", format.extension()));
             if let Ok(bytes) = tokio::fs::read(&file).await {
-                let _ = tokio::fs::OpenOptions::new().write(true).open(&file).await;
+                Self::touch_access(&file);
                 return Some(ThumbOutcome::Ready(Rendered {
                     bytes,
                     mime: format.mime(),
@@ -622,7 +660,7 @@ impl Thumbnailer {
         }
     }
 
-    /// 后台/手动清理：按「过期天数 + LRU 容量」淘汰，返回释放的字节数。
+    /// 后台/手动清理：按「闲置天数 + LRU 容量」淘汰，返回释放的字节数。
     pub fn run_cleanup(&self) -> std::io::Result<u64> {
         let limit = self.limit_bytes.load(Ordering::Relaxed);
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
@@ -935,7 +973,7 @@ fn capabilities(cache: &Arc<Mutex<Option<(PathBuf, Capabilities)>>>, bin: &Path)
     caps
 }
 
-/// 统计一个缓存单元目录里的文件数、总字节、最近一次写入时间。
+/// 统计一个缓存单元目录里的文件数、总字节、最近一次访问时间（mtime，命中即续期）。
 fn unit_stats(dir: &Path) -> (u64, u64, SystemTime) {
     let mut files = 0u64;
     let mut bytes = 0u64;
@@ -951,29 +989,32 @@ fn unit_stats(dir: &Path) -> (u64, u64, SystemTime) {
             let (sub_files, sub_bytes, sub_newest) = unit_stats(&entry.path());
             files += sub_files;
             bytes += sub_bytes;
-            oldest(&mut newest, sub_newest);
+            keep_latest(&mut newest, sub_newest);
             continue;
         }
         files += 1;
         bytes += meta.len();
-        oldest(&mut newest, meta.modified().unwrap_or(UNIX_EPOCH));
+        keep_latest(&mut newest, meta.modified().unwrap_or(UNIX_EPOCH));
     }
     (files, bytes, newest)
 }
 
-fn oldest(current: &mut SystemTime, candidate: SystemTime) {
+/// 取两者中较新的时间（函数名原来叫 `oldest`，与实现正好相反）
+fn keep_latest(current: &mut SystemTime, candidate: SystemTime) {
     if candidate > *current {
         *current = candidate;
     }
 }
 
-/// 先按过期天数删，再按最久未访问淘汰，直到低于容量上限。
+/// 先按**闲置天数**删，再按最久未访问淘汰，直到低于容量上限。
 ///
 /// 淘汰单位是「一个源文件的缓存单元目录」（`<digest>`），不是单个文件 ——
 /// 同一张图的多个宽度必须同生共死，否则会留下永远命不中的孤儿。
 /// 旧版扁平布局（`<hash>-320.webp` / `<sha>.th`）一律直接删：新版不会在
 /// 顶层放文件，留着只会占空间。
 ///
+/// 「闲置」= 单元内**最新** mtime 距今多久；命中缓存会 `set_times` 续期，
+/// 所以常看的图不会被天数阈值扫掉，只有真正没人碰的单元才会过期。
 /// `max_age_secs == 0` 表示不做过期淘汰（仅测试用）。
 pub fn cleanup_cache(dir: &Path, limit: u64, max_age_secs: u64) -> std::io::Result<u64> {
     // 缓存目录还没建（刚部署、还没生成过缩略图）时视为「已干净」，
@@ -1461,7 +1502,56 @@ mod tests {
         let _ = fs::remove_dir_all(&cache);
     }
 
-    /// 单元目录里的 `.tmp-` 残片必须被清理任务收走。
+    /// 命中必须**真的**续期（v4.9.17 回归）。
+    ///
+    /// 旧实现命中时只 `OpenOptions::open()` 不写入 —— 打开文件不会改 mtime，
+    /// 于是 `thumb_cache_max_age_days` 退化成「生成后无条件过期」：天天在看的图
+    /// 也会在第 90 天整单元被删、下次打开重新解码。这里直接断言 mtime 被顶新，
+    /// 并验证续期后的单元不会再被闲置阈值扫掉。
+    #[test]
+    fn cache_hit_renews_last_access_time() {
+        let cache = scratch_dir("thumb-touch");
+        let unit = put_unit(&cache, "ac1", &[("v5-1-1-400-jpg", 64)]);
+        let file = unit.join("v5-1-1-400-jpg");
+        set_mtime(&file, SystemTime::now() - 3 * TOUCH_INTERVAL);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hit = rt.block_on(Thumbnailer::cached(&unit, "v5-1-1", 400));
+        assert!(hit.is_some(), "文件名与指纹对得上就该命中");
+
+        let idle = SystemTime::now()
+            .duration_since(fs::metadata(&file).unwrap().modified().unwrap())
+            .unwrap();
+        assert!(
+            idle < Duration::from_secs(60),
+            "命中后 mtime 必须刷新，实际闲置 {idle:?}"
+        );
+
+        // 60 秒闲置阈值：刚看过就不该被淘汰（旧实现这里必然删掉）
+        let removed = cleanup_cache(&cache, 10 * 1024 * 1024, 60).unwrap();
+        assert_eq!(removed, 0, "刚访问过的单元不能判过期");
+        assert!(unit.exists());
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// 闲置单元照旧被清：续期只对「真的有人看」的单元生效。
+    #[test]
+    fn cleanup_still_drops_idle_unit_after_others_were_touched() {
+        let cache = scratch_dir("thumb-touch-idle");
+        let hot = put_unit(&cache, "ad1", &[("v5-1-1-400-jpg", 100)]);
+        let cold = put_unit(&cache, "ae1", &[("v5-1-1-400-jpg", 100)]);
+        backdate(&cold, Duration::from_secs(3 * 24 * 3600));
+        // 热单元刚被写过（put_unit），闲置阈值设为 1 天
+        let removed = cleanup_cache(&cache, 10 * 1024 * 1024, 24 * 3600).unwrap();
+        assert_eq!(removed, 100, "只有闲置的那个单元该被删");
+        assert!(!cold.exists());
+        assert!(hot.exists());
+        let _ = fs::remove_dir_all(&cache);
+    }
+
     ///
     /// 旧实现只扫顶层与 bucket 层，单元里的残片要等「整个单元被 LRU 淘汰」才顺带删，
     /// 期间还被 `unit_stats` 算进用量。但正在写的那份（新鲜的）绝不能动 ——

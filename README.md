@@ -118,7 +118,7 @@ Configuration is TOML. Resolution order: `-c` flag → `ASMODAY_CONFIG_PATH` →
 | `[server]` | Listen address and port, TLS, proxy compatibility, batch limits |
 | `[auth]` | Local login switch, proxy trust (SSO) |
 | `[system]` | Mounts (`[[system.mounts]]`), symlink policy |
-| `[media]` | Thumbnail cache size and age, FFmpeg path, upload size limit, upload chunk size |
+| `[media]` | Thumbnail cache size and idle retention, FFmpeg path, upload size limit, upload chunk size |
 | `[terminal]` | Custom shell and args, idle keep-alive, concurrent sessions |
 | `[log]` | Console and file levels, access log, text or JSON output |
 | `[[services]]` | External services on the home page and their proxy options |
