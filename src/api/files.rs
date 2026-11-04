@@ -1063,6 +1063,14 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
 /// DELETE /api/files/raw?path=…：删除文件或目录（目录递归）
 pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let set = roots_for(&state).await;
+    // 只读拦截与 `POST /api/files/delete` 同口径（安全审查 2026-11-04）：
+    // 这条老口子此前绕过了 readonly —— 只读挂载不能删，与不能写是同一个承诺。
+    let mounts = mounts_for(&state).await;
+    if let Some(mount) = mounts.find_by_path_text(query.path.trim())
+        && let Err(err) = mount.ensure_writable()
+    {
+        return fs_error(err);
+    }
     // 最后一段**不跟随**：软链接本身才是删除目标。若对整条路径 canonicalize，
     // 指向目录的链接会被解析成目标实体，下面 remove_dir_all 就把目标整个删掉了
     // （设计文档 3.2.7 红线：删链接严禁递归删目标）。
@@ -1093,6 +1101,12 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
     let meta = match tokio::fs::symlink_metadata(&target).await {
         Ok(meta) => meta,
         Err(e) => return fs_error(FsError::Io(format!("读取目标信息失败：{e}"))),
+    };
+
+    // per-path 锁与 mutate 版同口径：删同名目标时不能和复制/移动交叉
+    let _guard = match state.path_locks.acquire(std::slice::from_ref(&target)) {
+        Ok(guard) => guard,
+        Err(err) => return fs_error(err),
     };
 
     let result = if meta.file_type().is_symlink() {

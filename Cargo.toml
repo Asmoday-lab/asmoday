@@ -76,7 +76,7 @@ tower = "0.5"
 # 这里只多开两个压缩特性，不引入第二份 tower-http。
 # 自写 Content-Encoding 要自己处理分块、Vary、ETag 弱化、Content-Length 移除，
 # 漏一个就是线上事故，交给社区实现更划算。
-tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "catch-panic"] }
 # tower-http 的 Predicate::should_compress 签名里带 http_body::Body，
 # 实现自定义判定必须能写出这个 trait 路径（本来就在依赖树里）。
 # 注意 crate 名带连字符、lib 名是 http_body
@@ -133,9 +133,12 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
 
+# panic = "unwind"（2026-11-04 审查）：abort 会让任意一个 handler 的 panic
+# 变成整进程 SIGABRT——所有连接断开、不优雅关闭、日志不 flush。
+# unwind + 最外层 CatchPanicLayer 把爆炸半径收到单连接 500。
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true

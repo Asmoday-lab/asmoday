@@ -1205,15 +1205,42 @@ static SELF_WRITE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 /// 只在内容真的变化时写盘（设计文档 3.5「内容没变坚决不写盘」）。
 ///
 /// 返回 `true` 表示确实写了。调用方不用再自己挂起监听器——这里已经处理。
+///
+/// 并发保存曾有三个洞（安全审查 2026-11-04），这里一起收口：
+/// 1. 两条保存路径共用固定临时名 `config.toml.tmp`，并发 `write` 互相 truncate，
+///    交错内容被 rename 固化成损坏的 config.toml —— 而启动对解析失败零容忍，
+///    等于一次双击保存让服务再也起不来。现在整段写盘由全局互斥串行化；
+/// 2. 写前用真正的解析器自校验一遍：解析不过就拒绝落盘，坏内容到不了磁盘；
+/// 3. `sync_all` 后再 rename，掉电最多回到旧配置，不会出现半截文件。
+static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn write_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
     if let Ok(existing) = tokio::fs::read_to_string(path).await
         && existing == body
     {
         return Ok(false);
     }
+    let _lock = SAVE_LOCK.lock().await;
+    // 拿到锁后再比一次：锁外那次读取看到的可能是别人刚写入的旧内容
+    if let Ok(existing) = tokio::fs::read_to_string(path).await
+        && existing == body
+    {
+        return Ok(false);
+    }
+    if let Err(err) = toml::from_str::<Config>(body) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("拒绝写入不合法的配置（rename 前自校验失败）: {err}"),
+        ));
+    }
     let _guard = suspend_watch();
-    let tmp = path.with_extension("toml.tmp");
-    tokio::fs::write(&tmp, body.as_bytes()).await?;
+    // 临时名带随机后缀：即便将来有人绕过锁并发写，也不会互相 truncate
+    let tmp = path.with_extension(format!("toml.{}.tmp", crate::core::auth::random_token()));
+    use tokio::io::AsyncWriteExt as _;
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(body.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
     tokio::fs::rename(&tmp, path).await?;
     if let Ok(mut slot) = SELF_WRITE.lock() {
         *slot = Some(body.to_string());

@@ -156,6 +156,23 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), String> {
     let started = Instant::now();
 
+    // panic hook（2026-11-04 审查）：panic=unwind 后单连接可恢复，
+    // 但没有 hook 的话 panic 是无声的——客户端只看到连接重置，日志里一片空白。
+    // 打进 error 通道（含文件），keep-alive 的连接不背这个锅，谁 panic 谁自己 500。
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        crate::log_error!("panic at {location}: {message}");
+    }));
+
     // ---- 配置 ----
     let config_path = cli
         .config
@@ -647,27 +664,9 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/files/measure", post(api::files_mutate::measure))
         .route("/api/files/stat", get(api::files_mutate::stat))
         .route("/api/files/hash", post(api::files_mutate::hash))
-        .route(
-            "/api/files/raw",
-            get(api::files::raw)
-                .put(api::files::write_text)
-                .delete(api::files::delete),
-        )
         .route("/api/files/text", get(api::files::read_text))
         .route("/api/files/thumb", get(api::media::thumb))
         .route("/api/files/archive", get(api::files::archive))
-        .route("/api/files/upload", axum::routing::put(api::files::upload))
-        // tus 1.0.0 子集：分块上传与断点续传（设计文档 3.2.3.1）
-        .route(
-            "/api/files/upload/tus",
-            axum::routing::post(api::upload_tus::tus_init),
-        )
-        .route(
-            "/api/files/upload/tus/{id}",
-            axum::routing::head(api::upload_tus::tus_head)
-                .patch(api::upload_tus::tus_patch)
-                .delete(api::upload_tus::tus_delete),
-        )
         .route("/api/files/search", get(api::files::search))
         .route("/api/files/subtitle", get(api::files::subtitle))
         .route("/api/media/browse", get(api::media::browse))
@@ -693,9 +692,6 @@ fn protected_routes() -> Router<AppState> {
             "/api/terminal/sessions/{id}",
             axum::routing::delete(api::terminal::kill_session),
         )
-        .route("/proxy/{service_id}", any(api::proxy::handle_root))
-        .route("/proxy/{service_id}/", any(api::proxy::handle_root))
-        .route("/proxy/{service_id}/{*rest}", any(api::proxy::handle_rest))
         .route(
             "/api/tokens",
             get(api::tokens::list).post(api::tokens::create),
@@ -718,6 +714,36 @@ fn dav_routes() -> Router<AppState> {
         .nest("/dav", Router::new().fallback(any(api::webdav::handle)))
 }
 
+/// 大请求体路由（2026-11-04 审查）：上传 / tus 分块 / 编辑器保存 / 代理转发。
+///
+/// 全局默认上限收紧到 2 MiB（见 `build_router`）后，这几类是仅有的合法大 body
+/// 消费者，单独挂在 `upload_limit_mb` 的上限下——登录、配置、媒体收藏这类
+/// JSON 接口从此与「4 GiB 请求」绝缘。
+fn big_body_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/files/raw",
+            get(api::files::raw)
+                .put(api::files::write_text)
+                .delete(api::files::delete),
+        )
+        .route("/api/files/upload", axum::routing::put(api::files::upload))
+        // tus 1.0.0 子集：分块上传与断点续传（设计文档 3.2.3.1）
+        .route(
+            "/api/files/upload/tus",
+            axum::routing::post(api::upload_tus::tus_init),
+        )
+        .route(
+            "/api/files/upload/tus/{id}",
+            axum::routing::head(api::upload_tus::tus_head)
+                .patch(api::upload_tus::tus_patch)
+                .delete(api::upload_tus::tus_delete),
+        )
+        .route("/proxy/{service_id}", any(api::proxy::handle_root))
+        .route("/proxy/{service_id}/", any(api::proxy::handle_root))
+        .route("/proxy/{service_id}/{*rest}", any(api::proxy::handle_rest))
+}
+
 async fn build_router(state: AppState) -> Router {
     // 请求体上限跟 `[media].upload_max_size_mb` 对齐（安全审查 2026-11-02）：
     // 「0 = 不限制」不再被写死的 64 MiB 卡住；未配置时维持 64 MiB。
@@ -734,13 +760,25 @@ async fn build_router(state: AppState) -> Router {
         state.clone(),
         api::auth::require_auth,
     ));
+    // 大 body 路由同样要过鉴权，只是限额不同（安全审查 2026-11-04：
+    // 全局 4 GiB 曾对未登录接口敞开——登录/配置这类接口现在被默认 2 MiB 罩住）。
+    // 内层 limit 会覆盖外层：axum 的 DefaultBodyLimit 只往 extensions 插值，
+    // 谁后插入谁生效，所以这里的大上限能压过下面的全局 2 MiB。
+    let big_body = big_body_routes()
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::auth::require_auth,
+        ))
+        .layer(DefaultBodyLimit::max(body_limit));
 
     public_routes()
         .merge(protected)
-        // WebDAV 自带 Basic 认证，不经 Cookie 中间件
-        .merge(dav_routes())
-        // 上传/代理大文件：放宽请求体上限
-        .layer(DefaultBodyLimit::max(body_limit))
+        .merge(big_body)
+        // WebDAV 自带 Basic 认证，不经 Cookie 中间件；PUT/PROPPATCH 是真大 body
+        .merge(dav_routes().layer(DefaultBodyLimit::max(body_limit)))
+        // 其余接口（登录 / 配置 / 媒体收藏……）的 body 都是 KB 级 JSON：
+        // 2 MiB 足够宽裕，但足以让「4 GiB 打内存」这类请求在进入 handler 前被拒
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .fallback(api::static_files::serve)
         // HTTP 访问日志（设计文档 3.7：独立 api_level 通道，只记方法/路径/状态码/耗时/IP）
         .layer(middleware::from_fn_with_state(
@@ -755,6 +793,16 @@ async fn build_router(state: AppState) -> Router {
         // 传输层压缩（设计文档 2.4）：最外层，前端产物 / JSON / SVG 都压。
         // 必须包在路由之后、安全头之外，才能把 index.html 回落也覆盖到。
         .layer(api::compress::layer())
+        // panic 隔离（2026-11-04 审查）：最外层兜底，单个 handler / 中间件
+        // panic 只影响当前连接（500），不再随 panic=unwind 波及进程。
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            |_: Box<dyn std::any::Any + Send>| {
+                crate::api::error::detail(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error, check server logs",
+                )
+            },
+        ))
         .with_state(state)
 }
 
