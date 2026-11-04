@@ -692,9 +692,12 @@ async function loadAlbums(refresh = false) {
 async function loadMoreAlbums() {
   const cursor = albumsCursor.value
   if (!albumsHasMore.value || !cursor || albumsLoading.value || loadingMore.value) return
+  const sort = folderSort.value
   loadingMore.value = true
   try {
-    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort: folderSort.value, cursor })
+    const result = await browseAlbums(undefined, 3, { limit: PAGE_SIZE, sort, cursor })
+    // 切排序会把游标置 null 重拉：回来的还是旧游标就属于旧的流，丢弃
+    if (sort !== folderSort.value || albumsCursor.value !== cursor) return
     const seen = new Set(albums.value.map((album) => album.path))
     albums.value = [...albums.value, ...result.items.filter((album) => !seen.has(album.path))]
     albumsTotal.value = result.total
@@ -945,13 +948,18 @@ async function loadMoreAlbumItems() {
   const album = activeAlbum.value
   const cursor = albumCursor.value
   if (!album || !albumHasMore.value || !cursor || loadingMore.value) return
+  const sort = gridSort.value
   loadingMore.value = true
   try {
     const result = await browseMedia(album.path, 'image', 0, {
       limit: PAGE_SIZE,
       cursor,
-      sort: gridSort.value,
+      sort,
     })
+    // 册被关掉/换册、或排序已换 → 这页属于旧的上下文，丢弃（v4.9.13 审查修复）
+    if (sort !== gridSort.value || activeAlbum.value !== album || albumCursor.value !== cursor) {
+      return
+    }
     const seen = new Set(albumItems.value.map((item) => item.path))
     albumItems.value = [...albumItems.value, ...result.items.filter((item) => !seen.has(item.path))]
     albumCursor.value = result.next_cursor ?? null
@@ -1036,14 +1044,16 @@ async function loadCinemaAlbums(refresh = false) {
 async function loadMoreCinemaAlbums() {
   const cursor = cinemaAlbumsCursor.value
   if (!cinemaAlbumsHasMore.value || !cursor || cinemaAlbumsLoading.value || loadingMore.value) return
+  const sort = folderSort.value
   loadingMore.value = true
   try {
     const result = await browseAlbums(undefined, 3, {
       kind: 'video',
       limit: PAGE_SIZE,
-      sort: folderSort.value,
+      sort,
       cursor,
     })
+    if (sort !== folderSort.value || cinemaAlbumsCursor.value !== cursor) return
     const seen = new Set(cinemaAlbums.value.map((album) => album.path))
     cinemaAlbums.value = [
       ...cinemaAlbums.value,
@@ -1091,13 +1101,21 @@ async function loadMoreCinemaItems() {
   const album = activeCinemaAlbum.value
   const cursor = cinemaCursor.value
   if (!album || !cinemaHasMore.value || !cursor || loadingMore.value) return
+  const sort = gridSort.value
   loadingMore.value = true
   try {
     const result = await browseMedia(album.path, 'video', 0, {
       limit: PAGE_SIZE,
       cursor,
-      sort: gridSort.value,
+      sort,
     })
+    if (
+      sort !== gridSort.value ||
+      activeCinemaAlbum.value !== album ||
+      cinemaCursor.value !== cursor
+    ) {
+      return
+    }
     const seen = new Set(cinemaItems.value.map((item) => item.path))
     cinemaItems.value = [...cinemaItems.value, ...result.items.filter((item) => !seen.has(item.path))]
     cinemaCursor.value = result.next_cursor ?? null
@@ -1680,14 +1698,18 @@ async function loadMoreMedia() {
   // 分区刚切过来、这条流还没换好时不能续页：旧游标配新 kind 会拉出错位的数据
   if (kind !== streamKind.value) return
   if (!hasMore.value || !cursor || loading.value || loadingMore.value) return
+  // 请求时快照排序：回来时排序已换（切排序）或游标已被重拉覆盖（刷新），
+  // 这页就属于旧的流，append 进去是错序数据（v4.9.13 审查修复）
+  const sort = gridSort.value
   loadingMore.value = true
   try {
     const result = await browseMedia(undefined, kind, 2, {
       limit: PAGE_SIZE,
       cursor,
-      sort: gridSort.value,
+      sort,
       dims: true,
     })
+    if (sort !== gridSort.value || nextCursor.value !== cursor) return
     appendItems(result.items)
     total.value = result.total
     counts.value = result.counts

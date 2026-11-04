@@ -651,15 +651,17 @@ async fn run_rebuild(state: AppState) {
         .filter(|bin| bin.is_file());
 
     for (path, is_video) in candidates {
+        // 400 = 前端 `THUMB_WIDTH.tile`（v4.9.13 对齐：以前按 320 生成，
+        // 而前端只请求 160/400 两档，产物一档都命中不到）
         let (outcome, fresh) = if is_video {
             match ffmpeg_bin.as_deref() {
-                Some(bin) => (state.thumbnails.video_poster(&path, bin, 320).await, None),
+                Some(bin) => (state.thumbnails.video_poster(&path, bin, 400).await, None),
                 None => (thumbnail::ThumbOutcome::Placeholder, None),
             }
         } else {
             state
                 .thumbnails
-                .get(&path, 320, ffmpeg_bin.as_deref())
+                .get(&path, 400, ffmpeg_bin.as_deref())
                 .await
         };
 
