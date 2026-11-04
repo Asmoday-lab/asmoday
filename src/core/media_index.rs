@@ -765,14 +765,18 @@ pub struct PreheatCandidate {
 /// 用**索引**而不是再走一遍文件系统 —— 索引里已经有 `real`（真实路径）、
 /// `mtime`、`size`，够算缓存键了。`since` 为 0 表示不按时间过滤。
 ///
-/// 排除 `preheated` 台账里已生成过的（键 = path + mtime + size）：否则库没变
-/// 时每轮扫描都把最新的同一批白跑一遍（全是缓存命中），且窗口内图片超过
-/// LIMIT 时旧图永远排不进来（v4.9.16）。
+/// 排除 `preheated` 台账里 `PREHEAT_LEDGER_TTL` 内已生成过的（键 = path +
+/// mtime + size）：否则库没变时每轮扫描都把最新的同一批白跑一遍（全是缓存
+/// 命中），且窗口内图片超过 LIMIT 时旧图永远排不进来（v4.9.16）。台账带
+/// 保鲜期：janitor 按 `thumb_cache_max_age_days` 淘汰缩略图时**不清**台账，
+/// 没有 TTL 的话被淘汰的那批缩略图永远不再补（v4.9.16 审查修复）。
 ///
 /// 顺带带出已缓存的像素宽高（`media_dims`，浏览时顺手填的）：预生成必须按
 /// **有效宽度**入键，否则一张 200×150 的图会按 400 存一份浏览时永远命中不到
 /// 的副本，等于白跑一遍（v4.9.12）。宽高未知时由调用方现读图头。
 pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<PreheatCandidate> {
+    let cutoff =
+        (crate::core::auth::now_secs().max(0) as u64).saturating_sub(PREHEAT_LEDGER_TTL_SECS);
     let Ok(mut stmt) = conn.prepare(
         "SELECT a.path, a.real, a.mtime, a.size, d.w, d.h FROM media_assets a
          LEFT JOIN media_dims d
@@ -781,13 +785,14 @@ pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<Pr
            AND NOT EXISTS (
                SELECT 1 FROM preheated p
                 WHERE p.path = a.path AND p.mtime = a.mtime AND p.size = a.size
+                  AND p.at >= ?3
            )
          ORDER BY a.mtime DESC
          LIMIT ?2",
     ) else {
         return Vec::new();
     };
-    stmt.query_map(params![since as i64, limit as i64], |row| {
+    stmt.query_map(params![since as i64, limit as i64, cutoff as i64], |row| {
         let w = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
         let h = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
         Ok(PreheatCandidate {
@@ -802,16 +807,22 @@ pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<Pr
     .unwrap_or_default()
 }
 
+/// 台账保鲜期（7 天）：过期后允许重新入列。janitor 淘汰掉的缩略图最迟一周
+/// 内由预生成补回；缓存文件被手删/损坏同理。全库重刷是幂等的小批量涓流
+/// （每轮 LIMIT 200 张），一周一轮完全可接受。
+pub const PREHEAT_LEDGER_TTL_SECS: u64 = 7 * 24 * 3600;
+
 /// 记入预生成台账：只有 `Ready`（真生成或缓存命中，缓存里确实有了）才记。
 /// 失败的不记 —— 下一轮还会重试；坏了的图每轮多试一次是可接受的代价。
 pub fn preheated_put_many(conn: &Connection, rows: &[(&str, u64, u64)]) {
     if rows.is_empty() {
         return;
     }
+    let at = crate::core::auth::now_secs();
     let _ = rows.iter().try_for_each(|(path, mtime, size)| {
         conn.execute(
-            "INSERT OR REPLACE INTO preheated (path, mtime, size) VALUES (?1, ?2, ?3)",
-            params![path, *mtime as i64, *size as i64],
+            "INSERT OR REPLACE INTO preheated (path, mtime, size, at) VALUES (?1, ?2, ?3, ?4)",
+            params![path, *mtime as i64, *size as i64, at],
         )
         .map(|_| ())
     });
@@ -1599,6 +1610,36 @@ mod tests {
             .expect("查候选");
         assert_eq!(after.len(), 1, "wide 已记台账，只剩 tiny");
         assert_eq!(after[0].real, tiny.real);
+
+        // 台账保鲜期（v4.9.16 审查修复）：janitor 淘汰缩略图时不清台账，
+        // 记录过期（at 早于 now - 7 天）后必须重新入列，否则被淘汰的缩略图永不补回
+        index
+            .with_conn(|conn| {
+                let stale =
+                    (crate::core::auth::now_secs().max(0) as u64) - PREHEAT_LEDGER_TTL_SECS - 1;
+                conn.execute(
+                    "UPDATE preheated SET at = ?1 WHERE path = ?2",
+                    params![stale as i64, wide.path],
+                )?;
+                Ok(())
+            })
+            .expect("把 wide 的台账改过期");
+        let expired = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 0, 10)))
+            .expect("查候选");
+        assert_eq!(expired.len(), 2, "台账过期后 wide 重新入列");
+
+        // 把 wide 的台账改回新鲜，确认排除恢复（排除条件确实在比对 at）
+        index
+            .with_conn(|conn| {
+                preheated_put_many(conn, &[(&wide.path, wide.mtime, wide.size)]);
+                Ok(())
+            })
+            .expect("重新记台账");
+        let fresh = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 0, 10)))
+            .expect("查候选");
+        assert_eq!(fresh.len(), 1, "新鲜台账重新生效");
 
         let touched = asset(dir, "wide.jpg", 9000);
         index

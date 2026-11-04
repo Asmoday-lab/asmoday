@@ -408,8 +408,9 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
 /// 不再每张都从网盘读原图（那是图片库卡顿的唯一原因）。
 ///
 /// 候选直接从**索引**取，不再走一遍文件系统；生成成功的记入 `preheated` 台账，
-/// 之后的候选自动排除它们（文件一改 mtime/size 失配就重新入列）。所以重复
-/// 调用是安全的：库没变时候选为空，直接秒退（v4.9.16）。
+/// 之后的候选自动排除它们（文件一改 mtime/size 失配就重新入列；台账还有
+/// 7 天保鲜期，janitor 淘汰掉的缩略图最迟一周补回）。所以重复调用是安全的：
+/// 库没变时候选为空，直接秒退（v4.9.16）。
 pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
     // 与「全量重建」共用一条互斥位：两边都想跑时，谁先谁跑，另一个直接返回
     let Some(job) = state.thumb_jobs.try_claim() else {
@@ -604,7 +605,8 @@ async fn run_preheat_inner(state: &AppState, limit: Option<usize>) {
 
                 if ok {
                     // 记台账（v4.9.16）：Ready = 缓存里确实有了（真生成或之前已生成过），
-                    // 候选排除靠这张表；文件一改 mtime/size 失配，自动重新入列。
+                    // 候选排除靠这张表；文件一改 mtime/size 失配自动重新入列，
+                    // 台账另有 7 天保鲜期（janitor 淘汰掉的缩略图最迟一周补回）。
                     let index = Arc::clone(&worker.media_index);
                     let record = job.path.clone();
                     let mtime = job.mtime;

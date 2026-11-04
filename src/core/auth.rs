@@ -364,11 +364,14 @@ fn migrations() -> Migrations<'static> {
         // 21 次 `preheat started: 6/6 generated` 全是缓存命中），且窗口内图片超过
         // N 张时旧图永远排不进来。记录「这条文件已经预生成过」，键与
         // `media_dims` 同构：文件一改（mtime/size 变）自动重新入列。
+        // `at` 给台账保鲜期（7 天）：janitor 按 max_age 淘汰缩略图时不清台账，
+        // 没有 TTL 的话被淘汰的那批永远不再补（v4.9.16 审查修复）。
         M::up(
             "CREATE TABLE IF NOT EXISTS preheated (
                 path  TEXT PRIMARY KEY,
                 mtime INTEGER NOT NULL,
-                size  INTEGER NOT NULL
+                size  INTEGER NOT NULL,
+                at    INTEGER NOT NULL
             );",
         ),
     ])
