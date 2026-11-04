@@ -628,6 +628,8 @@ GWT-LIST-11 Given 只读挂载点  When 用户右键  Then "重命名/移动/复
 GWT-LIST-12 Given 面包屑  When 挂载点数量 ≥2  Then 展示 [🏠] / 挂载点 / 目录…
 GWT-LIST-13 Given 面包屑  When 挂载点数量 =1  Then 展示 [🏠 挂载点] / 目录…
 GWT-LIST-14 Given 网络盘挂载点  When 10 秒内连续请求 /api/files/mounts  Then 只有第一次真正 canonicalize + is_dir，其余命中缓存；配置改动后 revision +1 立即刷新（v4.9.21）
+GWT-LIST-15 Given 挂载点离线（SMB 掉线）  When 打开缩略图 / 播放 Range / 播放进度  Then 不再每个请求都重扫挂载点，响应时间不随「挂载点数量 × 超时」累加（v4.9.22）
+GWT-LIST-16 Given 同一目录同时存在 `A.txt` 与 `a.txt`（Linux/macOS）  When 按名称翻页  Then 两条都能被翻到，不出现「列表少一条」（游标键 = 小写名 + 原名，v4.9.22）
 ```
 
 #### 依赖红线
@@ -1370,6 +1372,9 @@ GWT-MUSIC-08 Given 标签内容为 GBK、帧头声明 ISO-8859-1（EAC/LAME 抓�
 GWT-MUSIC-09 Given 一首曲目连续请求封面两次  When 第二次  Then 命中内存缓存、不再打开源文件；无内嵌封面也缓存负结果（v4.9.21）
 GWT-MUSIC-10 Given 目录里没有 `<同名>.lrc`  When 音乐库返回该曲目  Then `has_lyrics=false`，前端不发歌词请求（此前每次换歌都是一次 SMB 404，0.3~3.8s）
 GWT-MUSIC-11 Given 列表页 120 首  When 分页探测  Then 标签/时长/字幕/歌词四类缓存键都是展示路径（`C:/…`、`//srv/…`），同一首歌只有一行（v4.9.21）
+GWT-MUSIC-12 Given 一页 120 条混有音频 / 视频 / 图片，挂在 SMB 上  When browse 正在读 ID3 与图头（几十秒）  Then 缩略图 / 相册 / 计数请求不被索引锁挡住，站点仍可响应（`PageMeta` 锁内只查库，v4.9.22）
+GWT-MUSIC-13 Given 一张图解码超时  When 结果未知  Then 不写 30 分钟负缓存，回 503 让前端退避重试；并发许可在解码真正结束后才归还（v4.9.22）
+GWT-MUSIC-14 Given 删除 `IMG_1234.jpg`  When 级联清理收藏/历史/分享  Then 同目录 `IMG-1234.jpg` 的记录原样保留（前缀匹配不用 LIKE 通配符，v4.9.22）
 ```
 
 #### 依赖红线
@@ -1448,6 +1453,9 @@ GWT-TERM-09 Given PowerShell  When 启动  Then `-NoProfile` 可选，纯净模�
 GWT-TERM-10 Given 活动会话面板  When 强制关闭某条会话  Then 占用它的标签一并关闭，且 5 秒内不再自动新建等价 PTY
 GWT-TERM-11 Given 两个独立浏览器窗口各开终端  When 任一窗口执行命令或新建标签  Then 另一边画面与 session_id 不变，且所有会话尺寸不被压到 20×5
 GWT-TERM-12 Given 用户在 Linux 上反复开关终端（exit / 强制关闭 / 闲置回收）  When 检查进程表  Then 无 defunct 僵尸项累积（会话结束路径统一 wait 回收，v4.9.20）
+GWT-TERM-13 Given 前台进程不读 stdin（`sleep 600`）且用户粘贴大段文本  When 主端缓冲写满  Then 写入阻塞发生在阻塞池里，同会话的 resize / Ping / 其它连接照常响应（v4.9.22）
+GWT-TERM-14 Given 刷新页面两次（两个回收定时器在排）  When 最后一次断线后 2 分钟  Then 会话仍在；满 3 分钟才回收（`reap_epoch` 让旧定时器失效，v4.9.22）
+GWT-TERM-15 Given 回收定时器恰好与重连同刻唤醒  When 新连接已 `attach`  When 检查  Then 会话不被杀掉（`attach` 与 `take_if_idle` 共用同一把 map 锁，v4.9.22）
 ```
 
 #### 依赖红线
@@ -1676,6 +1684,9 @@ GWT-UP-04 Given 只读挂载点  When PUT /api/files/upload 或 POST /api/files/
 GWT-UP-05 Given 两个并发 PATCH 打同一会话同一 Upload-Offset  When 第二个抢到会话锁  Then 重新读偏移后 409 E_OFFSET_MISMATCH，不产出交错字节（v4.9.20）
 GWT-UP-06 Given 整包 PUT 4GiB（upload_max_size_mb=0）  When 传输中  Then 服务端内存占用恒为单帧 chunk，边写边限流（v4.9.20 起 `body: Bytes` 整包缓冲已删）
 GWT-UP-07 Given 同名并发整包上传 / 两标签页同时保存同一文本  When 落盘  Then 各自使用带随机后缀的唯一临时文件，不互相覆盖（v4.9.20）
+GWT-UP-08 Given 分片总长 5 字节（远小于一个 TCP 段）  When PATCH 收满  Then 204 且 `upload-offset: 5`，立即落位；不得出现 offset 恒为 0、客户端重发同 offset 吃 409 的死循环（v4.9.22）
+GWT-UP-09 Given 数据目录与挂载点不同盘（跨设备回退路径）  When 落位  Then 目标目录里是 `原文件名`，不得出现隐藏的 `.asmoday-tus-<name>`；conflict=fail/rename/overwrite 三策略照常生效（v4.9.22）
+GWT-UP-10 Given 上传临时文件命名  When 进程被强杀后重启  Then 残留名字匹配 `.asmoday-part.<8位>`，被启动清理回收，且不进列表、不进 ZIP、`/raw` 不可读（v4.9.22）
 ```
 
 #### GWT 验收（导航 / 过渡 / 灯箱 / 媒体库视图，v4.6.16）

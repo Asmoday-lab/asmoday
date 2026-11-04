@@ -494,7 +494,13 @@ pub fn copy_entry(
     if is_dir {
         let target = dest_dir.join(&first_name);
         std::fs::create_dir(&target).map_err(|e| FsError::Io(format!("创建目标目录失败：{e}")))?;
-        copy_dir_contents(src, &target)?;
+        if let Err(err) = copy_dir_contents(src, &target) {
+            // 半截目录的名字、层级与完整复制一模一样，用户根本看不出少了什么；
+            // 重试时 `NameBook` 还会把它当成已占用 → 生成「相册 (1)」「相册 (2)」。
+            // 只删本次创建的那个（create_dir 成功即证明是我们建的），v4.9.22
+            let _ = std::fs::remove_dir_all(&target);
+            return Err(err);
+        }
         return Ok(Some(target));
     }
 
@@ -506,6 +512,45 @@ pub fn copy_entry(
     }
 
     copy_file_with_retry(src, dest_dir, &name, &first_name, overwrite, conflict, book)
+}
+
+/// 按**指定目标名**把单个文件复制落位（v4.9.22）。
+///
+/// 与 `copy_entry` 的唯一区别：目标名由调用方给定，不从源路径推导。
+/// 上传落位必须用这个 —— 源是暂存文件（`.asmoday-tus-<name>`），
+/// 沿用源名会把暂存前缀当成正式文件名写进用户目录，`on_conflict` 也一并失效。
+///
+/// 仍然是「流式复制到 `.part` → 长度校验 → 占位改名」，源文件不动（失败可重试）。
+pub fn copy_file_to(src: &Path, target: &Path, overwrite: bool) -> Result<u64, FsError> {
+    let dir = target
+        .parent()
+        .ok_or_else(|| FsError::BadRequest("目标父目录缺失".to_string()))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| FsError::BadRequest("目标路径没有文件名".to_string()))?;
+    let before = std::fs::metadata(src)
+        .map_err(|e| map_io_error(e, "读取源文件信息失败", src))?
+        .len();
+    let part = dir.join(part_name(&name));
+    let copied = stream_copy(src, &part)?;
+    if copied != before {
+        let _ = std::fs::remove_file(&part);
+        return Err(FsError::Io(format!(
+            "复制长度不一致（期望 {before} 字节，实际 {copied} 字节）"
+        )));
+    }
+    if overwrite {
+        rename_replace(&part, target).inspect_err(|_| {
+            let _ = std::fs::remove_file(&part);
+        })?;
+    } else {
+        // 目标被抢：复制结果作废，别在用户目录里留一份临时副本
+        rename_no_replace(&part, target).inspect_err(|_| {
+            let _ = std::fs::remove_file(&part);
+        })?;
+    }
+    Ok(copied)
 }
 
 /// 文件复制：**一次**流式复制到 `.part`，再反复尝试占位改名。
@@ -1031,6 +1076,33 @@ mod tests {
         // 正常改名
         let renamed = rename_entry(&a, "c.txt").unwrap();
         assert!(renamed.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_file_to_ignores_source_name() {
+        // tus 跨盘落位：源是暂存文件，落位名必须由调用方给（v4.9.22）
+        let dir = scratch("copy-to");
+        std::fs::create_dir(dir.join("dest")).unwrap();
+        let staged = dir.join(".asmoday-tus-movie.mp4");
+        std::fs::write(&staged, b"payload").unwrap();
+        let target = dir.join("dest").join("movie.mp4");
+
+        copy_file_to(&staged, &target, false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+        assert!(staged.exists(), "源文件不动，失败才能重试");
+        assert!(
+            !dir.join("dest").join(".asmoday-tus-movie.mp4").exists(),
+            "绝不能把暂存名当成正式文件名落进用户目录"
+        );
+        // 目标已存在且不覆盖 → 冲突，且不留下临时文件
+        assert!(copy_file_to(&staged, &target, false).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("dest"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "只该有 movie.mp4：{leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -119,6 +119,13 @@ pub struct Session {
     pub output: broadcast::Sender<Vec<u8>>,
     /// 当前挂着的 WebSocket 连接数
     pub clients: AtomicUsize,
+    /// 断线代数（v4.9.22）：每次有连接离开就 +1。
+    ///
+    /// 回收定时器在排队时记住当时的代数，醒来时代数变了就说明「期间重连过、
+    /// 或者又断了一次（有更新的定时器在排）」——直接放弃本轮回收。
+    /// 否则刷新两次页面，第一次断线排的那个定时器会在最后一次断线后 60 秒
+    /// 就把会话收掉，所谓「断线保活 3 分钟」名不副实。
+    pub reap_epoch: AtomicUsize,
     pub size: Mutex<(u16, u16)>,
 }
 
@@ -138,6 +145,17 @@ impl Session {
             .write_all(data)
             .and_then(|_| writer.flush())
             .map_err(|e| format!("写入 PTY 失败：{e}"))
+    }
+
+    /// 新连接接入：计数 +1（与 `take_if_idle` 在同一把 map 锁下，见 `attach`）。
+    pub fn client_join(&self) {
+        self.clients.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 连接离开：计数 -1，并推进回收代数（让旧定时器失效）。
+    pub fn client_leave(&self) {
+        self.clients.fetch_sub(1, Ordering::SeqCst);
+        self.reap_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
@@ -707,6 +725,7 @@ impl TerminalManager {
             buffer: Mutex::new(VecDeque::with_capacity(8 * 1024)),
             output: tx.clone(),
             clients: AtomicUsize::new(0),
+            reap_epoch: AtomicUsize::new(0),
             size: Mutex::new((cols, rows)),
         });
 
@@ -758,24 +777,58 @@ impl TerminalManager {
         self.inner.lock().ok()?.get(id).cloned()
     }
 
+    /// 重连接入：在**同一把 map 锁**下完成「查到会话 + 计数 +1」。
+    ///
+    /// 必须和 `take_if_idle` 共用这把锁（v4.9.22）：以前是 `get` 之后再
+    /// `fetch_add`，中间隔着一段窗口，回收定时器恰好在这时看到 `clients == 0`
+    /// 就把会话收了 —— 用户重连上来立刻黑屏。
+    ///
+    /// `no_profile` 不匹配时返回 `None` 且不加计数（纯净模式是进程启动期决定的）。
+    pub fn attach(&self, id: &str, no_profile: bool) -> Option<Arc<Session>> {
+        let map = self.inner.lock().ok()?;
+        let session = map.get(id)?.clone();
+        if session.no_profile != no_profile {
+            return None;
+        }
+        session.client_join();
+        Some(session)
+    }
+
+    /// 取走一条**确实没有连接**的会话（与 `attach` 互斥）。有连接时返回 `None`。
+    pub fn take_if_idle(&self, id: &str) -> Option<Arc<Session>> {
+        let mut map = self.inner.lock().ok()?;
+        if map.get(id)?.clients.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        map.remove(id)
+    }
+
     /// 连接数归零后安排回收：到期仍无连接才真正结束进程。
     pub fn schedule_reap(&self, id: String) {
         let manager = self.clone();
+        // 排队时记下代数；醒来时对不上就说明期间重连过 / 又断过一次
+        let Some(epoch) = manager
+            .get(&id)
+            .map(|s| s.reap_epoch.load(Ordering::SeqCst))
+        else {
+            return;
+        };
         tokio::spawn(async move {
             tokio::time::sleep(manager.reap_delay).await;
-            let should_kill = match manager.get(&id) {
-                Some(session) => session.clients.load(Ordering::SeqCst) == 0,
-                None => false,
-            };
-            if should_kill && let Some(session) = manager.take(&id) {
-                // 回收走优雅退出：给 shell 留保存历史、收尾子进程的机会。
-                // close_graceful 末尾会 kill；这里再兜一次（幂等）并完成 wait 回收。
-                let session_for_close = Arc::clone(&session);
-                tokio::task::spawn_blocking(move || session_for_close.close_graceful())
-                    .await
-                    .ok();
-                kill_and_reap(&session);
+            match manager.get(&id) {
+                Some(session) if session.reap_epoch.load(Ordering::SeqCst) == epoch => {}
+                _ => return,
             }
+            let Some(session) = manager.take_if_idle(&id) else {
+                return;
+            };
+            // 回收走优雅退出：给 shell 留保存历史、收尾子进程的机会。
+            // close_graceful 末尾会 kill；这里再兜一次（幂等）并完成 wait 回收。
+            let session_for_close = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || session_for_close.close_graceful())
+                .await
+                .ok();
+            kill_and_reap(&session);
         });
     }
 

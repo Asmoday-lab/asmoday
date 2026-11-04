@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::AppState;
 use crate::core::config::Config;
@@ -25,6 +26,11 @@ use crate::core::path_guard;
 
 /// 编辑器单次保存上限（8 MiB）
 const MAX_EDIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// 上传 / 分块上传的**空闲**超时：连续这么久没有新数据就当客户端已放弃。
+///
+/// 不是总时长限制——大文件慢速上传只要还在出数据就不会被打断。
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -71,13 +77,18 @@ pub struct SaveQuery {
     pub encoding: Option<String>,
 }
 
+/// 允许根集合：复用 `mounts_for` 的 10 秒缓存（v4.9.22）。
+///
+/// `path_guard::load` 对每个挂载点做 `canonicalize` + `is_dir`，离线 SMB 上单次
+/// 可达十几秒；而列表、raw、上传、缩略图**每个请求**都要这份根集合。
+/// 挂载点配置一改 `mounts_revision` 就 +1，缓存立即失效，不会读到旧视图。
 async fn roots_for(state: &AppState) -> RootSet {
-    let config = state.config.read().await;
-    fs::load_roots(&config, &state.cwd)
+    let set = mounts_for(state).await;
+    let follow_symlinks = state.config.read().await.system.follow_symlinks;
+    fs::root_set_from_mounts(&set, follow_symlinks)
 }
 
-/// 挂载点集合（带 readonly / online，唯一真源在 core::path_guard）
-/// 挂载点集合的进程内缓存（v4.9.21）。
+/// 挂载点集合的进程内缓存（v4.9.21）；唯一真源仍是 `core::path_guard`。
 pub struct MountsCache {
     pub revision: u64,
     pub at: std::time::Instant,
@@ -88,7 +99,11 @@ pub struct MountsCache {
 /// 但不必为每个请求都付一次 SMB 往返。
 const MOUNTS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-async fn mounts_for(state: &AppState) -> path_guard::MountSet {
+/// 挂载点集合（带 readonly / online），带 10 秒进程内缓存。
+///
+/// `pub(crate)`：媒体库的路径解析（缩略图 / 封面 / 播放进度）也走这里 ——
+/// 它自己每请求重扫一遍挂载点，一个离线 SMB 就能把 worker 拖死（v4.9.22）。
+pub(crate) async fn mounts_for(state: &AppState) -> path_guard::MountSet {
     let revision = state
         .mounts_revision
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -850,16 +865,17 @@ pub async fn write_text(
     };
 
     // 原子替换：同目录临时文件 + rename，避免写一半断电导致文件损坏。
-    // 临时名带随机后缀：固定名在两个标签页同时保存同一文件时会互相覆盖
-    // 再 rename，产物是两次写入交错的字节汤（v4.9.20）
+    //
+    // 临时名统一走 `part_name`（`<name>.asmoday-part.<8位随机>`，v4.9.22）：
+    // 自带随机后缀所以并发唯一（两个标签页同时保存不会互相覆盖），而且
+    // 列表过滤 / 启动清理 / 打包排除 / raw 拦截全都认这个标记 —— 以前用
+    // 自定义的 `.xxx.asmoday-save.tmp`，进程被强杀后那个半截文件会永久
+    // 留在用户目录里，还能被下载成 zip 的一部分。
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(
-        ".{file_name}.{}.asmoday-save.tmp",
-        crate::core::auth::random_token()
-    ));
+    let tmp = path.with_file_name(crate::core::path_guard::part_name(&file_name));
 
     if let Err(e) = tokio::fs::write(&tmp, &encoded).await {
         return fs_error(FsError::Io(format!("写入临时文件失败：{e}")));
@@ -986,12 +1002,10 @@ pub async fn upload(
         Err(err) => return fs_error(err),
     };
 
-    // 唯一临时名：固定名 `.{name}.asmoday-upload.tmp` 在同名并发上传时
-    // 会互相覆盖再 rename，产物是两个请求交错的字节汤（v4.9.20）
-    let tmp = dir.join(format!(
-        ".{name}.{}.asmoday-upload.tmp",
-        crate::core::auth::random_token()
-    ));
+    // 唯一临时名：`part_name` 自带 8 位随机后缀，同名并发上传不会互相覆盖；
+    // 且带 `.asmoday-part.` 标记 → 列表过滤、启动清理、打包排除、raw 拦截全都认它
+    // （v4.9.22 起统一命名，不再自造 `.xxx.asmoday-upload.tmp`）
+    let tmp = dir.join(crate::core::path_guard::part_name(name));
 
     // 流式写盘：内存占用 = 单帧 chunk，与文件大小无关
     let mut file = match tokio::fs::File::create(&tmp).await {
@@ -1001,7 +1015,21 @@ pub async fn upload(
     let mut written: u64 = 0;
     let mut body = body;
     loop {
-        match body.frame().await {
+        // 空闲超时（v4.9.22）：客户端断网 / 半开时 `frame()` 会一直等下去，
+        // 而这段全程持着 per-path 锁 —— 用户重试同名上传只会拿到 E_BUSY，
+        // 临时文件也永远留着。120 秒没有新数据就当作放弃（不是总时长限制）。
+        let next = match tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, body.frame()).await {
+            Ok(next) => next,
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return fail_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "E_UPLOAD_STALLED",
+                    "upload stalled: no data received for 120s",
+                );
+            }
+        };
+        match next {
             Some(Ok(frame)) => {
                 let mut chunk = match frame.into_data() {
                     Ok(chunk) => chunk,
@@ -1243,8 +1271,18 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
 
     match result {
         Ok(()) => {
-            // 与 /api/files/delete 同口径：缩略图缓存与色值一起清
-            crate::api::files_mutate::purge_thumb_cache(&state, &fs::normalize_display(&target));
+            // 与 /api/files/delete 同口径：缩略图缓存、色值、收藏/历史/分享一起清。
+            // 只清缓存不联动数据库会留下「DB 说有、磁盘没有」的死记录：
+            // 分享不会转 tombstone（访客拿到 404 而不是 410），收藏点开即 404，
+            // 30 天 tombstone 清理也永远不会触发（v4.9.22）。
+            let display = fs::normalize_display(&target);
+            crate::api::files_mutate::purge_thumb_cache(&state, &display);
+            if let Err(err) = state
+                .auth
+                .forget_meta_paths(&display, crate::core::auth::now_secs())
+            {
+                crate::log_error!("failed to purge metadata after delete: {err}");
+            }
             Json(json!({ "status": "ok" })).into_response()
         }
         Err(e) => fs_error(FsError::Io(format!("删除失败：{e}"))),

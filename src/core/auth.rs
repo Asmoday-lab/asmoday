@@ -619,7 +619,11 @@ impl AuthStore {
         let conn = self.connect()?;
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM shares WHERE deleted_at IS NULL AND (file_path = ?1 OR file_path LIKE ?1 || '/%')",
+                // 前缀匹配用 substr 而不是 `LIKE ?1 || '/%'`（v4.9.22）：
+                // LIKE 里 `_` 匹配任意单字符、`%` 匹配任意串，用户路径里的
+                // `IMG_1234` / `2024%` 会连带命中 `IMG-1234` 之类的无关路径。
+                "SELECT COUNT(*) FROM shares WHERE deleted_at IS NULL \
+                 AND (file_path = ?1 OR substr(file_path, 1, length(?1) + 1) = ?1 || '/')",
                 [path],
                 |row| row.get(0),
             )
@@ -637,17 +641,22 @@ impl AuthStore {
             .transaction()
             .map_err(|e| format!("开启事务失败：{e}"))?;
         // OR REPLACE：目标路径可能已有旧记录（用户以前收藏过），直接覆盖掉
+        //
+        // 前缀判断统一用 substr（v4.9.22）：`LIKE ?1 || '/%'` 会把路径里的
+        // `_`（任意单字符）和 `%`（任意串）当通配符，删一个 `IMG_1234.jpg`
+        // 会顺手清掉 `IMG-1234.jpg` 的收藏与分享，且不报任何错。
         for table in ["favorites", "play_history"] {
             let sql = format!(
                 "UPDATE OR REPLACE {table} SET file_path = ?2 || substr(file_path, length(?1) + 1)
-                 WHERE file_path = ?1 OR file_path LIKE ?1 || '/%'"
+                 WHERE file_path = ?1 OR substr(file_path, 1, length(?1) + 1) = ?1 || '/'"
             );
             tx.execute(&sql, params![old, new])
                 .map_err(|e| format!("更新 {table} 失败：{e}"))?;
         }
         tx.execute(
             "UPDATE shares SET file_path = ?2 || substr(file_path, length(?1) + 1)
-             WHERE (file_path = ?1 OR file_path LIKE ?1 || '/%') AND deleted_at IS NULL",
+             WHERE (file_path = ?1 OR substr(file_path, 1, length(?1) + 1) = ?1 || '/')
+               AND deleted_at IS NULL",
             params![old, new],
         )
         .map_err(|e| format!("更新 shares 失败：{e}"))?;
@@ -662,14 +671,17 @@ impl AuthStore {
             .transaction()
             .map_err(|e| format!("开启事务失败：{e}"))?;
         for table in ["favorites", "play_history"] {
-            let sql =
-                format!("DELETE FROM {table} WHERE file_path = ?1 OR file_path LIKE ?1 || '/%'");
+            let sql = format!(
+                "DELETE FROM {table} WHERE file_path = ?1 \
+                 OR substr(file_path, 1, length(?1) + 1) = ?1 || '/'"
+            );
             tx.execute(&sql, [path])
                 .map_err(|e| format!("清理 {table} 失败：{e}"))?;
         }
         tx.execute(
             "UPDATE shares SET deleted_at = ?2
-             WHERE (file_path = ?1 OR file_path LIKE ?1 || '/%') AND deleted_at IS NULL",
+             WHERE (file_path = ?1 OR substr(file_path, 1, length(?1) + 1) = ?1 || '/')
+               AND deleted_at IS NULL",
             params![path, now],
         )
         .map_err(|e| format!("标记 shares tombstone 失败：{e}"))?;
@@ -1337,6 +1349,51 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM favorites", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn meta_path_prefix_does_not_treat_underscore_as_wildcard() {
+        // `_` 在 SQL LIKE 里是「任意单字符」：删 `IMG_1234.jpg` 不能顺手把
+        // 同目录 `IMG-1234.jpg` 的收藏/分享一起清掉（v4.9.22 回归）
+        let store = temp_store("meta-prefix");
+        let conn = store.connect().unwrap();
+        for path in [
+            "/m/IMG_1234.jpg",
+            "/m/IMG-1234.jpg",
+            "/m/IMG_1234.jpg/inside.mp4",
+        ] {
+            conn.execute(
+                "INSERT INTO favorites (mount_id, file_path, created_at) VALUES ('', ?1, 1)",
+                [path],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO shares (token, file_path, is_folder, created_at) VALUES ('t1', '/m/IMG-1234.jpg', 0, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        store.forget_meta_paths("/m/IMG_1234.jpg", 100).unwrap();
+
+        let conn = store.connect().unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT file_path FROM favorites ORDER BY file_path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(left, vec!["/m/IMG-1234.jpg".to_string()], "只该删掉自己");
+        let alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive, 1, "无关分享不能被置 tombstone");
     }
 
     #[test]

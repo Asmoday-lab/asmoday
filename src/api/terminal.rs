@@ -8,7 +8,7 @@
 //! 用 Binary/Text 分流而不是给键盘数据加前缀，避免用户输入 `{` 被误判成控制帧。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -273,16 +273,20 @@ async fn handle_socket(
     let manager = state.terminals.clone();
 
     // 重连优先复用；但模式变了（普通 ↔ 纯净）必须重建：profile 是进程启动时
-    // 加载的，已经跑起来的 shell 变不回去
+    // 加载的，已经跑起来的 shell 变不回去。
+    // `attach` 在 map 锁内完成「查会话 + 计数 +1」，与回收器的 `take_if_idle` 互斥。
     let existing = session_id
         .as_deref()
-        .and_then(|id| manager.get(id))
-        .filter(|session| session.no_profile == options.no_profile);
+        .and_then(|id| manager.attach(id, options.no_profile));
     let reconnected = existing.is_some();
     let session = match existing {
         Some(session) => session,
         None => match manager.create(&cwd, cols, rows, options, &env) {
-            Ok(session) => session,
+            Ok(session) => {
+                // 新建会话的计数从 0 起，首个连接自己登记
+                session.client_join();
+                session
+            }
             Err(message) => {
                 let mut socket = socket;
                 // 带上错误码：并发打满时前端要能精准打开「活动会话」面板，
@@ -298,7 +302,6 @@ async fn handle_socket(
         },
     };
 
-    session.clients.fetch_add(1, Ordering::SeqCst);
     let _ = session.resize(cols, rows);
 
     let (mut sink, mut stream) = socket.split();
@@ -321,7 +324,7 @@ async fn handle_socket(
         .await
         .is_err()
     {
-        session.clients.fetch_sub(1, Ordering::SeqCst);
+        session.client_leave();
         return;
     }
 
@@ -349,9 +352,17 @@ async fn handle_socket(
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
-                        if let Err(message) = session.write_all(&data) {
-                            let _ = sink.send(Message::Text(json!({"type":"error","message":message}).to_string().into())).await;
-                            break;
+                        // 写 PTY 是**阻塞**调用：前台进程不读 stdin 时 `write_all`
+                        // 会一直等，放在 select 分支里等于把一个 runtime worker 钉死，
+                        // 同会话的 resize / Ping 全部排队（v4.9.22）。
+                        let writer = Arc::clone(&session);
+                        match tokio::task::spawn_blocking(move || writer.write_all(&data)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(message)) => {
+                                let _ = sink.send(Message::Text(json!({"type":"error","message":message}).to_string().into())).await;
+                                break;
+                            }
+                            Err(_) => break,
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -368,10 +379,18 @@ async fn handle_socket(
                                 let _ = session.resize(next_cols, next_rows);
                             }
                             _ => {
-                                // 非控制帧：当作用户输入
-                                if let Err(message) = session.write_all(text.as_bytes()) {
-                                    let _ = sink.send(Message::Text(json!({"type":"error","message":message}).to_string().into())).await;
-                                    break;
+                                // 非控制帧：当作用户输入（同样走阻塞池，见上）
+                                let writer = Arc::clone(&session);
+                                let text = text.as_bytes().to_vec();
+                                match tokio::task::spawn_blocking(move || writer.write_all(&text))
+                                    .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(message)) => {
+                                        let _ = sink.send(Message::Text(json!({"type":"error","message":message}).to_string().into())).await;
+                                        break;
+                                    }
+                                    Err(_) => break,
                                 }
                             }
                         }
@@ -388,7 +407,7 @@ async fn handle_socket(
     }
 
     // 断开：连接数归零则 3 分钟后回收（期间重连可续命）
-    session.clients.fetch_sub(1, Ordering::SeqCst);
+    session.client_leave();
     manager.schedule_reap(session.id.clone());
 }
 

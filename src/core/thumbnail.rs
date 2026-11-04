@@ -535,11 +535,14 @@ impl Thumbnailer {
             return (ThumbOutcome::Placeholder, None);
         }
 
-        let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
-            Ok(Ok(permit)) => permit,
-            // 队列被打满：回 503，由前端退避后重新排队
-            _ => return (ThumbOutcome::Busy, None),
-        };
+        let permit =
+            match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.clone().acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                // 队列被打满：回 503，由前端退避后重新排队
+                _ => return (ThumbOutcome::Busy, None),
+            };
 
         let source = path.to_path_buf();
         let hash_key = Self::hash_key(&source);
@@ -548,25 +551,37 @@ impl Thumbnailer {
         let webp_bin = webp_bin.map(Path::to_path_buf);
 
         // 渲染 + 编码放阻塞线程池；**落盘不在这条链路上**（见下）。
-        // 整链路限时：ffmpeg 卡死/慢盘不能无限占坑（超时后线程自行结束）。
-        let ffmpeg_for_decode = webp_bin.clone();
-        let generated = match tokio::time::timeout(
-            GENERATE_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
+        //
+        // 并发许可必须活到解码**真正结束**（v4.9.22）：`spawn_blocking` 不可取消，
+        // 超时只是不再等它。以前超时点一到就 drop(permit)，慢盘上被放弃的解码会越积
+        // 越多，并发闸等于不存在（每个新请求都能领到空出来的槽，继续堆线程）。
+        // 现在 permit 移进外层任务，任务自然结束时才归还。
+        let work = tokio::spawn(async move {
+            let ffmpeg_for_decode = webp_bin.clone();
+            let produced = tokio::task::spawn_blocking(move || {
                 let (thumb, hash) = render_thumbnail(&source, width, ffmpeg_for_decode.as_deref())?;
                 let (bytes, mime, codec) =
                     encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &work_dir)?;
                 Some((bytes, mime, codec, hash))
-            }),
-        )
-        .await
-        {
-            // 任务失败与超时同途：都记负缓存
-            Ok(Ok(value)) => value,
-            _ => None,
-        };
+            })
+            .await
+            .ok()
+            .flatten();
+            drop(permit);
+            produced
+        });
 
-        drop(permit);
+        // 整链路限时：ffmpeg 卡死 / 慢盘不能无限等（超时后线程自己跑完就结束）。
+        let generated = match tokio::time::timeout(GENERATE_TIMEOUT, work).await {
+            Ok(Ok(value)) => value,
+            // 任务 panic 与渲染失败同途：都记负缓存
+            Ok(Err(_)) => None,
+            Err(_) => {
+                // 超时：解码线程还活着，结果未知。**不能**写负缓存，否则这张图
+                // 半小时内恒为占位图；回 503 让前端退避重试才是对的。
+                return (ThumbOutcome::Busy, None);
+            }
+        };
 
         let Some((bytes, mime, codec, hash)) = generated else {
             mark_failed(&dir, &fp);
@@ -577,17 +592,18 @@ impl Thumbnailer {
 
         // 字节已经在手上了，客户端不必等磁盘：FileBrowser 的 `createPreview` 也是先回
         // 响应、再 `go func()` 落缓存。写失败最多下次重做，没有要回滚的状态。
+        //
+        // 这里**只**清自己这一格（`prune_stale`），全树淘汰交给 `count_generated`
+        // 的「每 25 次一次」（v4.9.22）。以前每生成一张都无条件 `cleanup_cache`，
+        // 一次翻页 120 张 = 120 个并发全树扫描（3 万文件时是几百万次 stat），
+        // 把 blocking 池占满后上传、浏览、DB 查询全部停摆。
         let target_dir = dir.clone();
         let target = target_dir.join(format!("{fp}-{width}-{codec}"));
         let keep = format!("{fp}-");
-        let cache_dir = self.cache_dir.clone();
-        let limit = self.limit_bytes.load(Ordering::Relaxed);
-        let max_age = self.max_age_secs.load(Ordering::Relaxed);
         let stored = bytes.clone();
         tokio::task::spawn_blocking(move || {
             let _ = write_atomic(&target, &stored);
             Self::prune_stale(&target_dir, &keep);
-            let _ = cleanup_cache(&cache_dir, limit, max_age);
         });
 
         let fresh = FreshHash {
@@ -677,25 +693,25 @@ impl Thumbnailer {
             return ThumbOutcome::Placeholder;
         }
 
-        // 共享同一个信号量：截帧比解 JPEG 更吃 CPU，绝不允许并发打满
-        let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
-            Ok(Ok(permit)) => permit,
-            _ => return ThumbOutcome::Busy,
-        };
+        // 共享同一个信号量：截帧比解 JPEG 更吃 CPU，绝不允许并发打满。
+        // 同 `get_prepared`：许可交给持有任务，截帧真正结束才归还（v4.9.22）。
+        let permit =
+            match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.clone().acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => return ThumbOutcome::Busy,
+            };
 
         let source = path.to_path_buf();
         let target_dir = dir.clone();
-        let cache_dir = self.cache_dir.clone();
         let fp_for_task = fp.clone();
         let ffmpeg_bin = bin.to_path_buf();
-        let limit = self.limit_bytes.load(Ordering::Relaxed);
-        let max_age = self.max_age_secs.load(Ordering::Relaxed);
         let caps = Arc::clone(&self.caps);
 
-        // 截帧链路限时：ffmpeg 卡在坏文件/慢盘上不能永远占着信号量
-        let generated = match tokio::time::timeout(
-            GENERATE_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
+        // 截帧链路限时：ffmpeg 卡在坏文件/慢盘上不能永远等
+        let work = tokio::spawn(async move {
+            let produced = tokio::task::spawn_blocking(move || {
                 let supports = capabilities(&caps, &ffmpeg_bin);
                 std::fs::create_dir_all(&target_dir).ok()?;
                 for format in ffmpeg::POSTER_FORMATS {
@@ -721,21 +737,25 @@ impl Thumbnailer {
                     }
                     let keep = format!("{fp_for_task}-");
                     Self::prune_stale(&target_dir, &keep);
-                    let _ = cleanup_cache(&cache_dir, limit, max_age);
                     if let Ok(bytes) = std::fs::read(&final_path) {
                         return Some((bytes, format.mime()));
                     }
                 }
                 None
-            }),
-        )
-        .await
-        {
-            Ok(Ok(value)) => value,
-            _ => None,
-        };
+            })
+            .await
+            .ok()
+            .flatten();
+            drop(permit);
+            produced
+        });
 
-        drop(permit);
+        let generated = match tokio::time::timeout(GENERATE_TIMEOUT, work).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => None,
+            // 超时：截帧进程可能还在跑，结果未知 —— 不写负缓存，让前端重试
+            Err(_) => return ThumbOutcome::Busy,
+        };
 
         match generated {
             Some((bytes, mime)) => {

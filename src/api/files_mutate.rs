@@ -56,9 +56,12 @@ pub type DeleteTickets = Mutex<HashMap<String, DeleteTicket>>;
 // 公共小工具
 // ---------------------------------------------------------------------------
 
+/// 挂载点集合：与文件页共用同一份 10 秒缓存（v4.9.22）。
+///
+/// 以前每个删除/移动/复制请求都重扫一遍挂载点（每点一次 `canonicalize`），
+/// 挂载点离线时会把请求线程卡在 SMB 超时上。
 async fn mounts_of(state: &AppState) -> MountSet {
-    let config = state.config.read().await;
-    path_guard::load(&config, &state.cwd)
+    crate::api::files::mounts_for(state).await
 }
 
 /// `[server.limits]` → 运行期闸门（`0` 表示不限）。

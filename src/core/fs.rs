@@ -130,7 +130,18 @@ impl RootSet {
 /// 这里只是把它投影成旧接口用的形状，避免两处各写一套扫描逻辑。
 pub fn load_roots(config: &Config, cwd: &Path) -> RootSet {
     let set = crate::core::path_guard::load(config, cwd);
+    root_set_from_mounts(&set, config.system.follow_symlinks)
+}
 
+/// 由已扫描好的挂载点集合投影出 `RootSet`（v4.9.22）。
+///
+/// 拆出来是为了让调用方复用 `MountsCache`：`path_guard::load` 对每个挂载点做一次
+/// `canonicalize` + `is_dir`，离线 SMB 上单次可达 10~30 秒。以前缩略图、封面、
+/// 播放进度这些**每请求**都走一遍，一个挂载点掉线就会把 worker 全部占死。
+pub fn root_set_from_mounts(
+    set: &crate::core::path_guard::MountSet,
+    follow_symlinks: bool,
+) -> RootSet {
     let roots: Vec<RootEntry> = set
         .mounts
         .iter()
@@ -147,7 +158,7 @@ pub fn load_roots(config: &Config, cwd: &Path) -> RootSet {
         roots,
         allowed,
         implicit: set.implicit,
-        follow_symlinks: config.system.follow_symlinks,
+        follow_symlinks,
     }
 }
 
@@ -407,7 +418,8 @@ fn encode_cursor(sort: ListSort, order: ListOrder, item: &RawEntry) -> String {
         order: order_name(order).to_string(),
         is_dir: item.is_dir,
         key: item.key,
-        name: item.name.to_lowercase(),
+        // 存原名（v4.9.22）：小写名不足以区分 `A.txt` / `a.txt`
+        name: item.name.clone(),
     };
     let json = serde_json::to_vec(&cursor).unwrap_or_default();
     data_encoding::BASE64URL_NOPAD.encode(&json)
@@ -440,7 +452,12 @@ fn cursor_cmp(item: &RawEntry, order: ListOrder, cursor: &Cursor) -> std::cmp::O
     if key_cmp != Ordering::Equal {
         return key_cmp;
     }
-    item.name.to_lowercase().cmp(&cursor.name)
+    // 与排序键同构：先比小写名，再用原名决出仅大小写不同的两条（v4.9.22）
+    let by_lower = item.name.to_lowercase().cmp(&cursor.name.to_lowercase());
+    if by_lower != Ordering::Equal {
+        return by_lower;
+    }
+    item.name.cmp(&cursor.name)
 }
 
 /// 并发补全排序键（`size` / `mtime` 排序才需要；`name` 排序不 stat，省一次遍历）。
@@ -611,17 +628,27 @@ pub async fn list_dir(
 
     // 目录在前；同组内按指定键排序，并列以名称（大小写不敏感）兜底。
     // 名称小写只算一次（sort_by_cached_key），否则十万条目录光比较就要百万次分配。
+    //
+    // 末位必须再带**原名**（v4.9.22）：Linux/macOS 上同一目录可以同时有 `A.txt`
+    // 和 `a.txt`，只按小写比较时两者完全相等，游标翻页会把其中一条判成「不在游标
+    // 之后」而永久跳过（列表凭空少一条，无任何报错）。
     match order {
         ListOrder::Desc => items.sort_by_cached_key(|item| {
             (
                 !item.is_dir,
                 std::cmp::Reverse(item.key),
                 item.name.to_lowercase(),
+                item.name.clone(),
             )
         }),
-        ListOrder::Asc => {
-            items.sort_by_cached_key(|item| (!item.is_dir, item.key, item.name.to_lowercase()))
-        }
+        ListOrder::Asc => items.sort_by_cached_key(|item| {
+            (
+                !item.is_dir,
+                item.key,
+                item.name.to_lowercase(),
+                item.name.clone(),
+            )
+        }),
     }
 
     let total = items.len();
@@ -1103,13 +1130,37 @@ mod tests {
         let item = plain("Photo.PNG", false);
         let raw = encode_cursor(ListSort::Name, ListOrder::Asc, &item);
         let decoded = decode_cursor(&raw, ListSort::Name, ListOrder::Asc).unwrap();
-        assert_eq!(decoded.name, "photo.png");
+        // 存原名（v4.9.22）：仅大小写不同的两条不能退化成同一个游标位置
+        assert_eq!(decoded.name, "Photo.PNG");
         assert!(!decoded.is_dir);
         // 换了排序口径 → 游标作废，退回第一页而不是乱切
         assert!(decode_cursor(&raw, ListSort::Name, ListOrder::Desc).is_none());
         assert!(decode_cursor(&raw, ListSort::Size, ListOrder::Asc).is_none());
         // 乱码输入也不 panic
         assert!(decode_cursor("not-a-cursor", ListSort::Name, ListOrder::Asc).is_none());
+    }
+
+    #[test]
+    fn cursor_distinguishes_names_differing_only_in_case() {
+        use std::cmp::Ordering;
+        // Linux/macOS 上 `A.txt` 与 `a.txt` 可以并存：按小写名翻页时它们曾判为
+        // 完全相等，游标会把其中一条永久跳过（v4.9.22 回归）
+        let cur = Cursor {
+            sort: "name".into(),
+            order: "asc".into(),
+            is_dir: false,
+            key: 0,
+            name: "A.txt".into(),
+        };
+        assert_eq!(
+            cursor_cmp(&plain("a.txt", false), ListOrder::Asc, &cur),
+            Ordering::Greater,
+            "`a.txt` 排在 `A.txt` 之后，下一页必须能取到"
+        );
+        assert_eq!(
+            cursor_cmp(&plain("A.txt", false), ListOrder::Asc, &cur),
+            Ordering::Equal
+        );
     }
 
     #[test]

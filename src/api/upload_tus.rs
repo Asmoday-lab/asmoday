@@ -41,6 +41,10 @@ use crate::core::path_guard;
 /// 断点续传的窗口期——客户端重传间隔（浏览器标签页恢复）远小于该值。
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// 分块上传的空闲超时：连续这么久没有新分片数据就当客户端已放弃。
+/// 大文件只要还在传就不会被打断（不是总时长限制）。
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 分块上传会话表 + 临时目录。
 pub struct TusStore {
     tmp_dir: PathBuf,
@@ -341,7 +345,16 @@ pub async fn tus_patch(
         Err(err) => return fs_error(FsError::Io(format!("打开分块临时文件失败：{err}"))),
     };
     let mut body = body;
-    while let Some(frame) = body.frame().await {
+    let mut written: u64 = 0;
+    loop {
+        // 空闲超时（v4.9.22）：会话锁与会话本身都在这段临界区里，
+        // 客户端半开（拔网线 / 休眠）时 `frame()` 会永远等下去，
+        // 同一 id 的 DELETE 也会跟着卡死 —— 用户点取消毫无反应。
+        let frame = match tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, body.frame()).await {
+            Ok(frame) => frame,
+            Err(_) => return fail(StatusCode::REQUEST_TIMEOUT, "upload stalled"),
+        };
+        let Some(frame) = frame else { break };
         let mut chunk = match frame {
             // 非数据帧（trailers 等）直接跳过
             Ok(f) => match f.into_data() {
@@ -353,15 +366,24 @@ pub async fn tus_patch(
                 return fail(StatusCode::BAD_REQUEST, "request body aborted");
             }
         };
+        // 长度必须在写之前取：`write_all_buf` 会推进 Buf，写完后
+        // `chunk.len()` 恒为 0（v4.9.22 的 off-by-chunk）
+        let received = chunk.len() as u64;
         if let Err(err) = tokio::io::AsyncWriteExt::write_all_buf(&mut file, &mut chunk).await {
             return fs_error(FsError::Io(format!("写入分块失败：{err}")));
         }
+        written += received;
     }
     drop(file);
 
-    let size = std::fs::metadata(&session.temp_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // 偏移必须用**写入计数**，不能写完立刻 `metadata`（v4.9.22）。
+    //
+    // Windows 上 `write_all_buf` 返回后紧接着 stat 有时仍读到旧长度：传完 5 字节
+    // 的请求会回 `upload-offset: 0` 且不落位，客户端以为没写进去，再次 PATCH
+    // 同一 offset 直接吃 409 —— 小文件分块上传卡死在一个永远填不满的循环里。
+    // 本次请求内 `claimed` 已与落盘长度核对过，`claimed + written` 就是权威值。
+    let size = claimed.saturating_add(written);
+
     if size > session.length {
         // 超过声明长度：会话作废重来（防计数器漂移导致的无限增长）
         state.tus.remove(&id);
@@ -375,7 +397,18 @@ pub async fn tus_patch(
         // finalize 失败时**保留会话**：临时文件完好，客户端修掉冲突
         // （比如删掉同名文件）后再 PATCH 一次即可重新落位；
         // 会话由 24h TTL 兜底清理。
-        return match finalize_upload(&state, &id, &session) {
+        //
+        // 落位是**同步**整文件复制（跨盘时几十 GB 也能跑几分钟），必须挪出
+        // runtime：直接在 handler 里调会独占一个 worker，期间全站请求排队。
+        let state_for_finalize = state.clone();
+        let id_for_finalize = id.clone();
+        let session_for_finalize = session.clone();
+        let finalized = tokio::task::spawn_blocking(move || {
+            finalize_upload(&state_for_finalize, &id_for_finalize, &session_for_finalize)
+        })
+        .await
+        .unwrap_or_else(|_| Err(FsError::Io("落位任务异常结束".to_string())));
+        return match finalized {
             Ok(target) => {
                 if let Some(target) = target {
                     crate::api::files::forget_parent_snapshot(&state, &target);
@@ -447,24 +480,14 @@ fn finalize_upload(
         return Ok(Some(target));
     }
 
-    // 跨设备回退：临时目录里先改成正式名，再走 move_entry（复制 + 校验 + 删源）
-    let staged = session
-        .temp_path
-        .with_file_name(format!(".asmoday-tus-{final_name}"));
-    std::fs::rename(&session.temp_path, &staged)
-        .map_err(|err| FsError::Io(format!("暂存待移动文件失败：{err}")))?;
-    let mut book2 = NameBook::new(&session.target_dir);
-    let moved = fs_ops::move_entry(
-        &staged,
-        &session.target_dir,
-        &mut book2,
-        session.conflict,
-        false,
-    )?;
-    if moved.is_none() {
-        // Skip 冲突且复制路径没动源文件：别把暂存文件留成孤儿
-        let _ = std::fs::remove_file(&staged);
-    }
+    // 跨设备回退：按**已解析的 final_name** 直接复制落位（v4.9.22）。
+    //
+    // 这里不能用 `move_entry`：它按源文件名落位，而源是临时文件，改名后叫
+    // `.asmoday-tus-<name>` —— 结果就是接口回 204、目标目录里却只有一个
+    // 隐藏的暂存名文件，`conflict=fail/rename` 也全部失效。
+    // 顺带保住了「finalize 失败保留会话」的前提：源文件从头到尾没被移动。
+    fs_ops::copy_file_to(&session.temp_path, &target, overwrite)?;
+    let _ = std::fs::remove_file(&session.temp_path);
     state.tus.sessions.lock().ok().map(|mut map| map.remove(id));
-    Ok(moved)
+    Ok(Some(target))
 }

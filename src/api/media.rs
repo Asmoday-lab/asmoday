@@ -319,9 +319,15 @@ fn fs_error(err: FsError) -> Response {
     crate::api::error::fs_error(&err)
 }
 
+/// 允许根集合：走 `mounts_for` 的 10 秒缓存（v4.9.22）。
+///
+/// 以前每请求 `fs::load_roots` 都会对每个挂载点做 `canonicalize` + `is_dir`；
+/// 缩略图一页 120 个请求、播放器一次播放几十个 Range 请求，全都在 async worker
+/// 上同步付这个代价 —— 一个离线 SMB 挂载点就能让整个站点打不开。
 async fn roots_for(state: &AppState) -> crate::core::fs::RootSet {
-    let config = state.config.read().await;
-    fs::load_roots(&config, &state.cwd)
+    let set = crate::api::files::mounts_for(state).await;
+    let follow_symlinks = state.config.read().await.system.follow_symlinks;
+    fs::root_set_from_mounts(&set, follow_symlinks)
 }
 
 /// 路径所属挂载点的 id（收藏 / 播放历史的分区键，设计文档 4.1）。
@@ -329,8 +335,8 @@ async fn roots_for(state: &AppState) -> crate::core::fs::RootSet {
 /// 找不到归属时回空串 —— 那代表「进程 cwd 兜底」的隐式根，也是老库迁移过来的
 /// 记录的取值，两者必须一致，否则同一个路径会分裂成两条记录。
 async fn mount_of(state: &AppState, display: &str) -> String {
-    let config = state.config.read().await;
-    crate::core::path_guard::load(&config, &state.cwd)
+    crate::api::files::mounts_for(state)
+        .await
         .find_by_path_text(display)
         .map(|mount| mount.info.id.clone())
         .unwrap_or_default()
@@ -409,17 +415,27 @@ pub async fn thumb(
     let effective = if kind == "image" {
         // 宽高缓存（`media_dims`）里通常已经有这张图 —— 列表接口铺时间线时就写进去了。
         // 命中就完全不碰源文件；miss 才读一次图头，且放阻塞线程池，不占 runtime。
+        //
+        // 查询本身也必须进阻塞池（v4.9.22）：`MediaIndex` 用的是 std Mutex，
+        // 而 browse 会在持锁期间做整页网盘 IO（几秒到几十秒）。缩略图一页 120 个
+        // 请求，直接在 worker 上抢这把锁，几个核就全被钉死，整个站点失去响应。
         let cache_key = path.to_string_lossy().to_string();
-        let cached = state
-            .media_index
-            .with_conn(|conn| {
-                Ok(crate::core::media_index::dims_get_many(
-                    conn,
-                    &[(cache_key.as_str(), source_mtime, source_len)],
-                ))
-            })
-            .and_then(|map| map.get(&cache_key).copied())
-            .filter(|(w, h)| *w > 0 && *h > 0);
+        let index = state.media_index.clone();
+        let probe_key = cache_key.clone();
+        let cached = tokio::task::spawn_blocking(move || {
+            index
+                .with_conn(|conn| {
+                    Ok(crate::core::media_index::dims_get_many(
+                        conn,
+                        &[(probe_key.as_str(), source_mtime, source_len)],
+                    ))
+                })
+                .and_then(|map| map.get(&probe_key).copied())
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|(w, h)| *w > 0 && *h > 0);
         match cached {
             Some((w, h)) => width.clamp(64, 1024).min(w.max(h)),
             None => {
@@ -527,8 +543,12 @@ pub async fn thumb(
     }
 
     // 新鲜 ThumbHash 入库（v2.8.2：SQLite，不再落 .th 旁路文件）
+    //
+    // 也放阻塞池（v4.9.22）：写库要新开连接，busy 时最长等 5 秒；一页 120 张
+    // 缩略图就是 120 次，直接在 worker 上做会和「整页都在等」叠加成卡顿。
     if let Some(fresh) = fresh {
-        state.auth.thumb_hash_set(&fresh.key, &fresh.value);
+        let auth = Arc::clone(&state.auth);
+        tokio::task::spawn_blocking(move || auth.thumb_hash_set(&fresh.key, &fresh.value));
     }
 
     match outcome {
@@ -586,14 +606,53 @@ pub async fn cover(State(state): State<AppState>, Query(query): Query<CoverQuery
         return cover_response(hit);
     }
 
-    // 一屏十几行封面同时打 SMB 会把共享拖到十秒级，过闸再读（v4.9.21）
-    let permit = state.covers.acquire().await;
+    // 一屏十几行封面同时打 SMB 会把共享拖到十秒级，过闸再读（v4.9.21）。
+    //
+    // 等闸必须限时（v4.9.22）：许可只 4 个，共享盘一旦有 4 个读卡住，
+    // 之后所有封面请求都会无限期挂起（连浏览器都在等）。
+    let permit = match tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        state.covers.acquire(),
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::RETRY_AFTER, "1".to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                Body::empty(),
+            )
+                .into_response();
+        }
+    };
     // 等闸期间别人可能已经填好了
     if let Some(hit) = state.covers.lookup(&key) {
         return cover_response(hit);
     }
-    let read =
-        tokio::task::spawn_blocking(move || crate::core::audio_tags::read_cover(&path)).await;
+    // 读盘同样限时：坏文件 / 离线共享上 read_cover 没有自己的超时
+    let read = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || crate::core::audio_tags::read_cover(&path)),
+    )
+    .await
+    {
+        Ok(read) => read,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::RETRY_AFTER, "2".to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                Body::empty(),
+            )
+                .into_response();
+        }
+    };
     drop(permit);
 
     let cover = match read {
@@ -705,14 +764,8 @@ pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQue
         let end = start.saturating_add(limit).min(total);
         let has_more = end < total;
         // 只对当前页做重活（ID3 解析、字幕探测、ThumbHash 查询、像素宽高）
-        // 回退路径没有「已经握着的连接」，单独借一次给宽高缓存用
         let slice = &raw[start.min(total)..end];
-        let items = match index
-            .with_conn(|conn| Ok(build_items(slice, &auth_store, want_dims, Some(conn))))
-        {
-            Some(items) => items,
-            None => build_items(slice, &auth_store, want_dims, None),
-        };
+        let items = build_page_items(&index, slice, &auth_store, want_dims);
         let next_cursor = if has_more && end > start {
             let last = &raw[end - 1];
             Some(encode_cursor(
@@ -826,11 +879,9 @@ fn browse_indexed(
             ext: asset.ext,
         })
         .collect();
-    // 读图头 / 识字幕是慢 I/O，必须在锁外做：不能让一页把别的请求一起堵住
-    let items = match index.with_conn(|conn| Ok(build_items(&raw, auth, want_dims, Some(conn)))) {
-        Some(items) => items,
-        None => build_items(&raw, auth, want_dims, None),
-    };
+    // 读图头 / 识字幕是慢 I/O：锁内只查缓存，几十秒的 IO 全部在锁外做，
+    // 不能让一页把别的请求一起堵住（v4.9.22）
+    let items = build_page_items(index, &raw, auth, want_dims);
     // 这一页花了几秒也没关系：窗口从「服务完一页」算，连续翻页就不会再走树
     index.with_conn(|conn| media_index::touch_synced(conn, &scope.root));
     Some((items, scanned, total, counts, has_more, next_cursor))
@@ -1774,14 +1825,126 @@ pub fn warm_audio_meta(index: &MediaIndex) -> usize {
     done
 }
 
+/// 一页媒体元数据的**待写回记录**（v4.9.22）。
+///
+/// `build_items` 在锁外读盘后把新结果攒在这里，由调用方在锁内一次性写回。
+#[derive(Default)]
+struct MetaWrites {
+    dims: Vec<(String, u64, u64, u32, u32)>,
+    tags: Vec<(String, u64, u64, crate::core::audio_tags::TrackTags)>,
+    durations: Vec<(String, u64, u64, u64)>,
+    subtitles: Vec<(String, u64, Option<String>)>,
+    lyrics: Vec<(String, u64, Option<String>)>,
+}
+
+impl MetaWrites {
+    fn is_empty(&self) -> bool {
+        self.dims.is_empty()
+            && self.tags.is_empty()
+            && self.durations.is_empty()
+            && self.subtitles.is_empty()
+            && self.lyrics.is_empty()
+    }
+}
+
+/// 一页媒体元数据的缓存快照：**锁内查一次，锁外做 IO，锁内写一次**。
+///
+/// 拆出来的原因（v4.9.22）：`build_items` 要为一页 120 条做 ID3 解析、图头读取、
+/// 目录枚举，在 SMB 上是几十秒级的 IO。以前这些全在 `MediaIndex::with_conn` 里跑，
+/// 等于**持着索引的 std Mutex 做网络 IO** —— 期间缩略图、相册、计数、保存配置
+/// 全部排在同一把锁后面；再叠加 async handler 直接同步抢锁，几个核就被钉死，
+/// 表现为「打开一个大相册，整个站点打不开」。
+#[derive(Default)]
+struct PageMeta {
+    /// 索引可用时才有值：false 表示不读也不写缓存（纯内存回退路径）
+    enabled: bool,
+    dims: HashMap<String, (u32, u32)>,
+    tags: HashMap<String, crate::core::audio_tags::TrackTags>,
+    durations: HashMap<String, u64>,
+    subtitles: HashMap<String, Option<String>>,
+    lyrics: HashMap<String, Option<String>>,
+    writes: MetaWrites,
+}
+
+impl PageMeta {
+    /// 锁内执行：把这一页会用到的缓存一次性取出来（只查库，不碰磁盘）
+    fn prefetch(conn: &rusqlite::Connection, raw: &[RawMedia]) -> Self {
+        let mut image_keys: Vec<(&str, u64, u64)> = Vec::new();
+        let mut audio_keys: Vec<(&str, u64, u64)> = Vec::new();
+        let mut sub_keys: Vec<(&str, u64)> = Vec::new();
+        let mut lyric_keys: Vec<(&str, u64)> = Vec::new();
+        for entry in raw {
+            match entry.kind {
+                "image" => image_keys.push((entry.display.as_str(), entry.mtime, entry.size)),
+                "audio" => {
+                    audio_keys.push((entry.display.as_str(), entry.mtime, entry.size));
+                    // 歌词表与字幕表同结构但语义不同：音频查歌词，视频查字幕，
+                    // 不能拿视频路径去问歌词表（会把「确认没有」写进错误的表）
+                    lyric_keys.push((entry.display.as_str(), entry.mtime));
+                }
+                "video" => sub_keys.push((entry.display.as_str(), entry.mtime)),
+                _ => {}
+            }
+        }
+
+        Self {
+            enabled: true,
+            dims: media_index::dims_get_many(conn, &image_keys),
+            tags: media_index::tags_get_many(conn, &audio_keys),
+            durations: media_index::durations_get_many(conn, &audio_keys),
+            subtitles: media_index::subtitles_get_many(conn, &sub_keys),
+            lyrics: media_index::lyrics_get_many(conn, &lyric_keys),
+            writes: MetaWrites::default(),
+        }
+    }
+
+    /// 锁内执行：把锁外探测到的新结果一次性写回
+    fn flush(conn: &rusqlite::Connection, writes: &MetaWrites) {
+        if writes.is_empty() {
+            return;
+        }
+        let dims: Vec<(&str, u64, u64, u32, u32)> = writes
+            .dims
+            .iter()
+            .map(|(path, mtime, size, w, h)| (path.as_str(), *mtime, *size, *w, *h))
+            .collect();
+        media_index::dims_put_many(conn, &dims);
+        let tags: Vec<(&str, u64, u64, &crate::core::audio_tags::TrackTags)> = writes
+            .tags
+            .iter()
+            .map(|(path, mtime, size, tags)| (path.as_str(), *mtime, *size, tags))
+            .collect();
+        media_index::tags_put_many(conn, &tags);
+        let durations: Vec<(&str, u64, u64, u64)> = writes
+            .durations
+            .iter()
+            .map(|(path, mtime, size, ms)| (path.as_str(), *mtime, *size, *ms))
+            .collect();
+        media_index::durations_put_many(conn, &durations);
+        let subs: Vec<(&str, u64, Option<&str>)> = writes
+            .subtitles
+            .iter()
+            .map(|(path, mtime, sub)| (path.as_str(), *mtime, sub.as_deref()))
+            .collect();
+        media_index::subtitles_put_many(conn, &subs);
+        let lyrics: Vec<(&str, u64, Option<&str>)> = writes
+            .lyrics
+            .iter()
+            .map(|(path, mtime, lrc)| (path.as_str(), *mtime, lrc.as_deref()))
+            .collect();
+        media_index::lyrics_put_many(conn, &lyrics);
+    }
+}
+
 /// 给当前页的条目补上「贵」的字段：音频 ID3、视频外挂字幕、图片 ThumbHash 与像素宽高。
-/// `conn` 是索引连接（可能没有）：宽高缓存读写都走它，**不能**在这里再锁一次
-/// `MediaIndex` —— 调用方（`browse_indexed`）已经握着那把锁，重入就是死锁。
+///
+/// 索引读写走 `PageMeta`（锁内毫秒级），中间整段网盘 IO 在锁外。**不要**在
+/// 这里再锁 `MediaIndex` —— 调用方可能正握着那把锁，重入就是死锁。
 fn build_items(
     raw: &[RawMedia],
     auth: &crate::core::auth::AuthStore,
     want_dims: bool,
-    conn: Option<&rusqlite::Connection>,
+    page: &mut PageMeta,
 ) -> Vec<MediaItem> {
     let mut items: Vec<MediaItem> = Vec::with_capacity(raw.len());
     let mut hash_slots: Vec<(usize, &Path)> = Vec::new();
@@ -1805,15 +1968,7 @@ fn build_items(
                 (entry.display.clone(), entry.mtime, entry.size)
             })
             .collect();
-        let cached = conn
-            .map(|conn| {
-                let borrowed: Vec<(&str, u64, u64)> = keys
-                    .iter()
-                    .map(|(path, mtime, size)| (path.as_str(), *mtime, *size))
-                    .collect();
-                media_index::dims_get_many(conn, &borrowed)
-            })
-            .unwrap_or_default();
+        let cached = &page.dims;
         let mut jobs: Vec<DimJob> = Vec::new();
         for (slot, &position) in dim_candidates.iter().enumerate() {
             let (key, mtime, size) = &keys[slot];
@@ -1841,14 +1996,8 @@ fn build_items(
                 fresh.push((key, mtime, size, w, h));
                 dims.insert(position, read);
             }
-            if let Some(conn) = conn
-                && !fresh.is_empty()
-            {
-                let borrowed: Vec<(&str, u64, u64, u32, u32)> = fresh
-                    .iter()
-                    .map(|(path, mtime, size, w, h)| (path.as_str(), *mtime, *size, *w, *h))
-                    .collect();
-                media_index::dims_put_many(conn, &borrowed);
+            if page.enabled && !fresh.is_empty() {
+                page.writes.dims.extend(fresh);
             }
             crate::log_debug!(
                 "像素宽高：{} 张图（缓存命中 {}，读盘 {}）耗时 {}ms",
@@ -1863,33 +2012,11 @@ fn build_items(
     // 音频 ID3 与视频外挂字幕同样是网盘 IO：一个读几十 KB 标签块，一个对每条
     // 视频做两次 `is_file`（.vtt / .srt）。串行时一页 120 条又是几十秒的量级。
     let probe_started = std::time::Instant::now();
-    // 时长（v4.9.5）：先批量问 `media_durations`，没算过的才读盘 —— 与标签在同一个
-    // 并发批次里做，一条音频一页只开一次文件（首次），之后永远命中。
-    let audio_keys: Vec<(String, u64, u64)> = raw
-        .iter()
-        .filter(|entry| entry.kind == "audio")
-        .map(|entry| (entry.display.clone(), entry.mtime, entry.size))
-        .collect();
     // 标签缓存（v4.9.8）：音乐库一页 120 首，每首读一次 ID3 在 UNC 上要 0.5~1 秒，
     // 6 路并发也要二三十秒。标签是纯元数据，缓存后第二次起一次文件都不用碰。
-    let cached_tags: HashMap<String, crate::core::audio_tags::TrackTags> = conn
-        .map(|conn| {
-            let borrowed: Vec<(&str, u64, u64)> = audio_keys
-                .iter()
-                .map(|(path, mtime, size)| (path.as_str(), *mtime, *size))
-                .collect();
-            media_index::tags_get_many(conn, &borrowed)
-        })
-        .unwrap_or_default();
-    let cached_durations: HashMap<String, u64> = conn
-        .map(|conn| {
-            let borrowed: Vec<(&str, u64, u64)> = audio_keys
-                .iter()
-                .map(|(path, mtime, size)| (path.as_str(), *mtime, *size))
-                .collect();
-            media_index::durations_get_many(conn, &borrowed)
-        })
-        .unwrap_or_default();
+    // v4.9.22 起这两个查询在锁内一次取齐（`PageMeta::prefetch`），这里只做内存查找。
+    let cached_tags = &page.tags;
+    let cached_durations = &page.durations;
 
     // 命中缓存的部分先铺好，下面只补缺的
     let mut tags_by_pos: HashMap<usize, crate::core::audio_tags::TrackTags> = HashMap::new();
@@ -1967,23 +2094,11 @@ fn build_items(
             duration_by_pos.insert(position, ms);
         }
     }
-    if let Some(conn) = conn
-        && !fresh_tags.is_empty()
-    {
-        let borrowed: Vec<(&str, u64, u64, &crate::core::audio_tags::TrackTags)> = fresh_tags
-            .iter()
-            .map(|(path, mtime, size, tags)| (path.as_str(), *mtime, *size, tags))
-            .collect();
-        media_index::tags_put_many(conn, &borrowed);
+    if page.enabled && !fresh_tags.is_empty() {
+        page.writes.tags.extend(fresh_tags);
     }
-    if let Some(conn) = conn
-        && !fresh_durations.is_empty()
-    {
-        let borrowed: Vec<(&str, u64, u64, u64)> = fresh_durations
-            .iter()
-            .map(|(path, mtime, size, ms)| (path.as_str(), *mtime, *size, *ms))
-            .collect();
-        media_index::durations_put_many(conn, &borrowed);
+    if page.enabled && !fresh_durations.is_empty() {
+        page.writes.durations.extend(fresh_durations);
     }
 
     // 外挂字幕（v4.9.9）：原先每条视频两次 `is_file`（.vtt / .srt）。4002 个视频
@@ -2003,15 +2118,7 @@ fn build_items(
             )
         })
         .collect();
-    let cached_subs: HashMap<String, Option<String>> = conn
-        .map(|conn| {
-            let borrowed: Vec<(&str, u64)> = video_rows
-                .iter()
-                .map(|(_, key, _, mtime)| (key.as_str(), *mtime))
-                .collect();
-            media_index::subtitles_get_many(conn, &borrowed)
-        })
-        .unwrap_or_default();
+    let cached_subs = &page.subtitles;
 
     let mut subtitle_by_pos: HashMap<usize, Option<String>> = HashMap::new();
     let mut pending_subs: Vec<(usize, String, PathBuf, u64)> = Vec::new();
@@ -2030,15 +2137,7 @@ fn build_items(
             )
         })
         .collect();
-    let cached_lyrics: HashMap<String, Option<String>> = conn
-        .map(|conn| {
-            let borrowed: Vec<(&str, u64)> = audio_rows
-                .iter()
-                .map(|(_, key, _, mtime)| (key.as_str(), *mtime))
-                .collect();
-            media_index::lyrics_get_many(conn, &borrowed)
-        })
-        .unwrap_or_default();
+    let cached_lyrics = &page.lyrics;
     let mut lyrics_by_pos: HashMap<usize, bool> = HashMap::new();
     let mut pending_lyrics: Vec<(usize, String, PathBuf, u64)> = Vec::new();
     for (position, key, path, mtime) in audio_rows {
@@ -2094,17 +2193,9 @@ fn build_items(
             lyrics_by_pos.insert(position, found.is_some());
             fresh_lyrics.push((key, mtime, found));
         }
-        if let Some(conn) = conn {
-            let borrowed: Vec<(&str, u64, Option<&str>)> = fresh_subs
-                .iter()
-                .map(|(path, mtime, sub)| (path.as_str(), *mtime, sub.as_deref()))
-                .collect();
-            media_index::subtitles_put_many(conn, &borrowed);
-            let borrowed: Vec<(&str, u64, Option<&str>)> = fresh_lyrics
-                .iter()
-                .map(|(path, mtime, lrc)| (path.as_str(), *mtime, lrc.as_deref()))
-                .collect();
-            media_index::lyrics_put_many(conn, &borrowed);
+        if page.enabled {
+            page.writes.subtitles.extend(fresh_subs);
+            page.writes.lyrics.extend(fresh_lyrics);
         }
     }
 
@@ -2165,6 +2256,31 @@ fn build_items(
         }
     }
 
+    items
+}
+
+/// 一页条目的完整组装：**锁内取缓存 → 锁外做 IO → 锁内写回**（v4.9.22）。
+///
+/// 这是 `build_items` 的唯一入口。把「持锁」压缩成两次毫秒级查询，是为了让
+/// 一页 120 条的网盘 IO（ID3、图头、readdir，SMB 上能到几十秒）不再把索引锁
+/// 交给同一个进程里所有需要它的请求排队。
+fn build_page_items(
+    index: &crate::core::media_index::MediaIndex,
+    raw: &[RawMedia],
+    auth: &crate::core::auth::AuthStore,
+    want_dims: bool,
+) -> Vec<MediaItem> {
+    let mut page = index
+        .with_conn(|conn| Ok(PageMeta::prefetch(conn, raw)))
+        .unwrap_or_default();
+    let items = build_items(raw, auth, want_dims, &mut page);
+    if page.enabled && !page.writes.is_empty() {
+        let writes = std::mem::take(&mut page.writes);
+        index.with_conn(|conn| {
+            PageMeta::flush(conn, &writes);
+            Ok(())
+        });
+    }
     items
 }
 
@@ -2366,24 +2482,26 @@ pub async fn progress(State(state): State<AppState>, Json(body): Json<ProgressBo
     let display = fs::normalize_display(&target);
     let mount_id = mount_of(&state, &display).await;
 
-    let conn = match state.auth_connection() {
-        Ok(conn) => conn,
-        Err(err) => return fs_error(FsError::Io(err)),
-    };
-    let result = conn.execute(
-        "INSERT INTO play_history (mount_id, file_path, last_played_at, progress)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(mount_id, file_path) DO UPDATE SET last_played_at = ?3, progress = ?4",
-        rusqlite::params![
-            mount_id,
-            display,
-            crate::core::auth::now_secs(),
-            body.progress.max(0)
-        ],
-    );
+    // 写库放阻塞池（v4.9.22）：播放中每几秒一次，而 `auth_connection` 要新开
+    // 连接，busy 时最长等 5 秒（busy_timeout）—— 占着 runtime worker 不划算。
+    let progress = body.progress.max(0);
+    let state_for_write = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = state_for_write.auth_connection()?;
+        conn.execute(
+            "INSERT INTO play_history (mount_id, file_path, last_played_at, progress)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mount_id, file_path) DO UPDATE SET last_played_at = ?3, progress = ?4",
+            rusqlite::params![mount_id, display, crate::core::auth::now_secs(), progress],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+    .await;
     match result {
-        Ok(_) => Json(json!({ "status": "ok" })).into_response(),
-        Err(err) => fs_error(FsError::Io(format!("写入播放进度失败：{err}"))),
+        Ok(Ok(())) => Json(json!({ "status": "ok" })).into_response(),
+        Ok(Err(err)) => fs_error(FsError::Io(format!("写入播放进度失败：{err}"))),
+        Err(_) => fs_error(FsError::Io("写入播放进度失败：任务异常结束".to_string())),
     }
 }
 
@@ -2425,24 +2543,32 @@ pub async fn favorite(State(state): State<AppState>, Json(body): Json<FavoriteBo
     let display = fs::normalize_display(&target);
     let mount_id = mount_of(&state, &display).await;
 
-    let conn = match state.auth_connection() {
-        Ok(conn) => conn,
-        Err(err) => return fs_error(FsError::Io(err)),
-    };
-    let result = if body.favorite {
-        conn.execute(
-            "INSERT OR IGNORE INTO favorites (mount_id, file_path, created_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![mount_id, display, crate::core::auth::now_secs()],
-        )
-    } else {
-        conn.execute(
-            "DELETE FROM favorites WHERE mount_id = ?1 AND file_path = ?2",
-            rusqlite::params![mount_id, display],
-        )
-    };
+    // 与 progress 同理：写库新开连接，放阻塞池（v4.9.22）
+    let favorite = body.favorite;
+    let state_for_write = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = state_for_write.auth_connection()?;
+        if favorite {
+            conn.execute(
+                "INSERT OR IGNORE INTO favorites (mount_id, file_path, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![mount_id, display, crate::core::auth::now_secs()],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        } else {
+            conn.execute(
+                "DELETE FROM favorites WHERE mount_id = ?1 AND file_path = ?2",
+                rusqlite::params![mount_id, display],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        }
+    })
+    .await;
     match result {
-        Ok(_) => Json(json!({ "status": "ok", "favorite": body.favorite })).into_response(),
-        Err(err) => fs_error(FsError::Io(format!("更新收藏失败：{err}"))),
+        Ok(Ok(())) => Json(json!({ "status": "ok", "favorite": favorite })).into_response(),
+        Ok(Err(err)) => fs_error(FsError::Io(format!("更新收藏失败：{err}"))),
+        Err(_) => fs_error(FsError::Io("更新收藏失败：任务异常结束".to_string())),
     }
 }
 
