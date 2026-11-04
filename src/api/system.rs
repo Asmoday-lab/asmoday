@@ -29,7 +29,10 @@ use crate::core::{ffmpeg, fs, fs_ops, media_index, path_guard, thumbnail};
 pub struct RebuildStatus {
     pub is_running: bool,
     pub total: usize,
+    /// 跑完的条数（含缓存命中）
     pub completed: usize,
+    /// 其中真解码出新图的条数；命中缓存的只算 completed 不算 generated（v4.9.16）
+    pub generated: usize,
     pub failed: usize,
 }
 
@@ -182,7 +185,18 @@ pub async fn cleanup_thumbnails(State(state): State<AppState>) -> Response {
         let config = state.config.read().await;
         thumbnails.apply_limits(config.media.limit_bytes(), config.media.max_age_secs());
     }
-    match tokio::task::spawn_blocking(move || thumbnails.run_cleanup()).await {
+    let result = tokio::task::spawn_blocking(move || thumbnails.run_cleanup()).await;
+    // 缓存被清了，预生成台账也得跟着清：否则候选永远为空，被清掉的
+    // 缩略图再也不补（v4.9.16）。清理是「从头再来」的语义。
+    let index = Arc::clone(&state.media_index);
+    let _ = tokio::task::spawn_blocking(move || {
+        index.with_conn(|conn| {
+            media_index::preheated_clear(conn);
+            Ok(())
+        })
+    })
+    .await;
+    match result {
         Ok(Ok(bytes)) => Json(json!({ "status": "ok", "removed_bytes": bytes })).into_response(),
         Ok(Err(err)) => crate::api::error::detail(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -393,8 +407,9 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
 /// 预生成缩略图：把「最近 N 天的图片」提前渲好，之后浏览就是直接命中本地缓存，
 /// 不再每张都从网盘读原图（那是图片库卡顿的唯一原因）。
 ///
-/// 候选直接从**索引**取，不再走一遍文件系统；已生成的在 `get_prepared` 里
-/// 先查缓存就返回，所以重复调用是安全的（幂等）。
+/// 候选直接从**索引**取，不再走一遍文件系统；生成成功的记入 `preheated` 台账，
+/// 之后的候选自动排除它们（文件一改 mtime/size 失配就重新入列）。所以重复
+/// 调用是安全的：库没变时候选为空，直接秒退（v4.9.16）。
 pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
     // 与「全量重建」共用一条互斥位：两边都想跑时，谁先谁跑，另一个直接返回
     let Some(job) = state.thumb_jobs.try_claim() else {
@@ -581,14 +596,33 @@ async fn run_preheat_inner(state: &AppState, limit: Option<usize>) {
                     ),
                     fresh_write: false,
                 };
-                let (outcome, _) = worker
+                let (outcome, fresh) = worker
                     .thumbnails
                     .get_prepared(&path, key, ffmpeg_bin.as_deref())
                     .await;
                 let ok = matches!(outcome, crate::core::thumbnail::ThumbOutcome::Ready(_));
 
+                if ok {
+                    // 记台账（v4.9.16）：Ready = 缓存里确实有了（真生成或之前已生成过），
+                    // 候选排除靠这张表；文件一改 mtime/size 失配，自动重新入列。
+                    let index = Arc::clone(&worker.media_index);
+                    let record = job.path.clone();
+                    let mtime = job.mtime;
+                    let size = job.size;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        index.with_conn(|conn| {
+                            media_index::preheated_put_many(conn, &[(&record, mtime, size)]);
+                            Ok(())
+                        })
+                    })
+                    .await;
+                }
+
                 if let Ok(mut status) = worker.preheat.lock() {
                     status.completed += 1;
+                    if fresh.is_some() {
+                        status.generated += 1;
+                    }
                     if !ok {
                         status.failed += 1;
                     }
@@ -602,18 +636,16 @@ async fn run_preheat_inner(state: &AppState, limit: Option<usize>) {
         let _ = handle.await;
     }
 
-    let (completed, failed) = match state.preheat.lock() {
+    let (completed, generated, failed) = match state.preheat.lock() {
         Ok(mut status) => {
             status.is_running = false;
-            (status.completed, status.failed)
+            (status.completed, status.generated, status.failed)
         }
-        Err(_) => (0, 0),
+        Err(_) => (0, 0, 0),
     };
     crate::log_info!(
-        "thumbnail preheat finished: {}/{} generated, {} failed",
-        completed.saturating_sub(failed),
-        total,
-        failed
+        "thumbnail preheat finished: {generated} generated, {} cached, {failed} failed (of {total})",
+        completed.saturating_sub(generated),
     );
 }
 
@@ -664,11 +696,15 @@ async fn run_rebuild(state: AppState) {
         };
 
         // 新鲜 ThumbHash 入库（v2.8.2：SQLite，不再落 .th 旁路文件）
+        let fresh_write = fresh.is_some();
         if let Some(fresh) = fresh {
             state.auth.thumb_hash_set(&fresh.key, &fresh.value);
         }
 
         if let Ok(mut status) = state.rebuild.lock() {
+            if fresh_write {
+                status.generated += 1;
+            }
             match outcome {
                 thumbnail::ThumbOutcome::Ready(_) => status.completed += 1,
                 // 拥塞（Busy）与真失败一样算这一轮没出图：重跑一次就补上

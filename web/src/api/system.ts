@@ -21,6 +21,8 @@ export interface PreheatStatus {
   is_running: boolean
   total: number
   completed: number
+  /** 其中真解码出新图的条数；缓存命中只算 completed（v4.9.16） */
+  generated: number
   failed: number
 }
 

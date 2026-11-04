@@ -96,7 +96,8 @@ upload_max_size_mb = 0
 upload_chunk_size_mb = 10
 # Media index background scan interval (seconds). It only stats directory mtimes
 # and rewrites the directories that changed; this is also how long an external
-# file copy can take to show up (unless you hit Rescan). 0 = disable.
+# file copy can take to show up (unless you hit Rescan). 0 = disable;
+# any value between 1 and 29 is rejected (minimum 30).
 index_scan_interval_secs = 300
 # Thumbnail pre-generation. Right after a scan the server renders a small batch
 # so the next browse hits the disk cache instead of re-reading the source file

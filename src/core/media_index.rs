@@ -748,6 +748,8 @@ pub fn dims_get_many(
 /// 预生成的一条候选：算缓存键所需的全部输入。
 #[derive(Debug, Clone)]
 pub struct PreheatCandidate {
+    /// 索引键路径（预生成台账用；台账键与其它 media_* 表同构）
+    pub path: String,
     /// 扫描时的真实路径（取图用）
     pub real: String,
     /// 源文件 mtime（秒）
@@ -763,32 +765,62 @@ pub struct PreheatCandidate {
 /// 用**索引**而不是再走一遍文件系统 —— 索引里已经有 `real`（真实路径）、
 /// `mtime`、`size`，够算缓存键了。`since` 为 0 表示不按时间过滤。
 ///
+/// 排除 `preheated` 台账里已生成过的（键 = path + mtime + size）：否则库没变
+/// 时每轮扫描都把最新的同一批白跑一遍（全是缓存命中），且窗口内图片超过
+/// LIMIT 时旧图永远排不进来（v4.9.16）。
+///
 /// 顺带带出已缓存的像素宽高（`media_dims`，浏览时顺手填的）：预生成必须按
 /// **有效宽度**入键，否则一张 200×150 的图会按 400 存一份浏览时永远命中不到
 /// 的副本，等于白跑一遍（v4.9.12）。宽高未知时由调用方现读图头。
 pub fn images_for_preheat(conn: &Connection, since: u64, limit: usize) -> Vec<PreheatCandidate> {
     let Ok(mut stmt) = conn.prepare(
-        "SELECT a.real, a.mtime, a.size, d.w, d.h FROM media_assets a
+        "SELECT a.path, a.real, a.mtime, a.size, d.w, d.h FROM media_assets a
          LEFT JOIN media_dims d
                 ON d.path = a.path AND d.mtime = a.mtime AND d.size = a.size
          WHERE a.kind = 'image' AND a.mtime >= ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM preheated p
+                WHERE p.path = a.path AND p.mtime = a.mtime AND p.size = a.size
+           )
          ORDER BY a.mtime DESC
          LIMIT ?2",
     ) else {
         return Vec::new();
     };
     stmt.query_map(params![since as i64, limit as i64], |row| {
-        let w = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
-        let h = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+        let w = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+        let h = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
         Ok(PreheatCandidate {
-            real: row.get::<_, String>(0)?,
-            mtime: row.get::<_, i64>(1)?.max(0) as u64,
-            size: row.get::<_, i64>(2)?.max(0) as u64,
+            path: row.get::<_, String>(0)?,
+            real: row.get::<_, String>(1)?,
+            mtime: row.get::<_, i64>(2)?.max(0) as u64,
+            size: row.get::<_, i64>(3)?.max(0) as u64,
             dims: (w > 0 && h > 0).then_some((w as u32, h as u32)),
         })
     })
     .map(|rows| rows.filter_map(Result::ok).collect())
     .unwrap_or_default()
+}
+
+/// 记入预生成台账：只有 `Ready`（真生成或缓存命中，缓存里确实有了）才记。
+/// 失败的不记 —— 下一轮还会重试；坏了的图每轮多试一次是可接受的代价。
+pub fn preheated_put_many(conn: &Connection, rows: &[(&str, u64, u64)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let _ = rows.iter().try_for_each(|(path, mtime, size)| {
+        conn.execute(
+            "INSERT OR REPLACE INTO preheated (path, mtime, size) VALUES (?1, ?2, ?3)",
+            params![path, *mtime as i64, *size as i64],
+        )
+        .map(|_| ())
+    });
+}
+
+/// 清空预生成台账。缩略图缓存被手动清掉（`cleanup/thumbnails`）时调用：
+/// 台账还留着的话，候选会一直为空，被清掉的缩略图再也补不回来。
+pub fn preheated_clear(conn: &Connection) {
+    let _ = conn.execute("DELETE FROM preheated", []);
 }
 
 /// 找出「标签或时长还没缓存」的音频（后台预热用，v4.9.8）。
@@ -1554,5 +1586,40 @@ mod tests {
             .expect("查候选");
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].real, wide.real);
+
+        // 台账排除（v4.9.16）：记过的不再出现在候选里；文件一改（mtime 变）重新入列
+        index
+            .with_conn(|conn| {
+                preheated_put_many(conn, &[(&wide.path, wide.mtime, wide.size)]);
+                Ok(())
+            })
+            .expect("记台账");
+        let after = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 0, 10)))
+            .expect("查候选");
+        assert_eq!(after.len(), 1, "wide 已记台账，只剩 tiny");
+        assert_eq!(after[0].real, tiny.real);
+
+        let touched = asset(dir, "wide.jpg", 9000);
+        index
+            .with_conn(|conn| replace_dir(conn, dir, 0, 1, &[touched.clone(), tiny.clone()]))
+            .expect("改写索引");
+        let again = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 0, 10)))
+            .expect("查候选");
+        assert_eq!(again.len(), 2, "mtime 变了，wide 重新入列");
+        assert_eq!(again[0].real, touched.real);
+
+        // 清空台账（缓存清理入口调用）：全部重新入列
+        index
+            .with_conn(|conn| {
+                preheated_clear(conn);
+                Ok(())
+            })
+            .expect("清台账");
+        let all = index
+            .with_conn(|conn| Ok(images_for_preheat(conn, 0, 10)))
+            .expect("查候选");
+        assert_eq!(all.len(), 2);
     }
 }

@@ -359,6 +359,18 @@ fn migrations() -> Migrations<'static> {
                 checked_at INTEGER NOT NULL DEFAULT 0
             );",
         ),
+        // v10：缩略图预生成台账（v4.9.16）。此前候选只按 `mtime DESC LIMIT N` 取，
+        // 不管有没有生成过 —— 库没变时每轮扫描都把最新的同一批白跑一遍（日志里
+        // 21 次 `preheat started: 6/6 generated` 全是缓存命中），且窗口内图片超过
+        // N 张时旧图永远排不进来。记录「这条文件已经预生成过」，键与
+        // `media_dims` 同构：文件一改（mtime/size 变）自动重新入列。
+        M::up(
+            "CREATE TABLE IF NOT EXISTS preheated (
+                path  TEXT PRIMARY KEY,
+                mtime INTEGER NOT NULL,
+                size  INTEGER NOT NULL
+            );",
+        ),
     ])
 }
 
