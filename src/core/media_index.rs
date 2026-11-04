@@ -382,12 +382,15 @@ pub fn replace_dir(
         .collect())
 }
 
-/// 丢一个目录的索引行（应用自己原地覆盖写之后调用）。返回被丢掉的条目路径。
-pub fn forget_dir(conn: &Connection, dir: &str) -> rusqlite::Result<Vec<String>> {
-    let paths = dir_asset_paths(conn, dir)?;
+/// 丢一个目录的索引行（应用自己原地覆盖写之后调用）。
+///
+/// 不返回被删的条目路径：这是上传/覆盖写的热路径，目录里可能有几千条，
+/// 为了回收缩略图白读一遍没有意义（原地覆盖的源文件还在，缓存键自己会失效）。
+/// 需要路径的调用方先 [`dir_asset_paths`] 再删。
+pub fn forget_dir(conn: &Connection, dir: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM media_assets WHERE dir = ?1", params![dir])?;
     conn.execute("DELETE FROM media_dirs WHERE dir = ?1", params![dir])?;
-    Ok(paths)
+    Ok(())
 }
 
 /// 作废所有「新鲜窗口」标记（任何写操作后调用，下一次请求重新同步）
@@ -432,7 +435,8 @@ pub fn prune(
         if unreadable.iter().any(|prefix| under(prefix, &dir)) {
             continue;
         }
-        removed.extend(forget_dir(conn, &dir)?);
+        removed.extend(dir_asset_paths(conn, &dir)?);
+        forget_dir(conn, &dir)?;
     }
     Ok(removed)
 }
