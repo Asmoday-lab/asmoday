@@ -201,8 +201,3 @@ export function detectLanguage(fileName: string): LanguageKey {
   if (ext && BY_EXT[ext]) return BY_EXT[ext]
   return 'plain'
 }
-
-/** 语言键 → 下拉框展示名（找不到时回退原始 key） */
-export function languageLabel(key: LanguageKey): string {
-  return LANGUAGES.find((item) => item.key === key)?.label ?? key
-}

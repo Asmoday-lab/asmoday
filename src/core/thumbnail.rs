@@ -160,7 +160,7 @@ pub struct Thumbnailer {
     max_age_secs: AtomicU64,
     /// FFmpeg 编码能力缓存（键 = 可执行文件路径），避免每张缩略图都跑一次 `-encoders`
     caps: Arc<Mutex<Option<(PathBuf, Capabilities)>>>,
-    /// 每个缓存单元一把异步锁：同一张图被 320 / 960 同时请求时只解码一次，
+    /// 每个缓存单元一把异步锁：同一张图被 160 / 400 同时请求时只解码一次，
     /// 也避免两个线程同时写同一份 stamp（FileBrowser 的 scoped lock 同思路）。
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }

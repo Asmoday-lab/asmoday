@@ -1707,7 +1707,8 @@ async function loadMoreMedia() {
       limit: PAGE_SIZE,
       cursor,
       sort,
-      dims: true,
+      // 与 load() 同口径：音乐是列表，省下这批文件头（v4.9.14 审查补齐）
+      dims: kind !== 'audio',
     })
     if (sort !== gridSort.value || nextCursor.value !== cursor) return
     appendItems(result.items)
@@ -1727,7 +1728,7 @@ async function loadMoreMedia() {
 //
 // 配置热重载只换后端内存里的那份配置，浏览器这边毫无感知：用户改完挂载点回到页面，
 // 看到的还是旧库，只能去「更多 → 重新扫描」碰运气 —— 而那个按钮藏得连入口都找不到。
-// 现在每 15s 轻量拉一次 `/api/files/mounts` 比对 `revision`（几十字节的响应），
+// 现在每 10s 轻量拉一次 `/api/files/mounts` 比对 `revision`（几十字节的响应），
 // 一变就作废快照、重拉清单与列表；后端那边收到配置变更会同时唤醒索引器，
 // 所以用户看到的不是「等 5 分钟」，而是「几秒后新挂载点的内容自己出现」。
 const MOUNT_POLL_MS = 10_000

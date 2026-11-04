@@ -629,8 +629,6 @@ pub async fn rebuild_status(State(state): State<AppState>) -> Response {
 
 async fn run_rebuild(state: AppState) {
     let roots = mount_roots(&state).await;
-    let desktop_only = false;
-    let _ = desktop_only;
 
     let candidates = tokio::task::spawn_blocking(move || collect_candidates(&roots))
         .await
