@@ -57,6 +57,28 @@ local_enabled = true
 enabled = false
 user_header = "Remote-User"
 
+# Mount points. `name` is optional: when omitted it is derived from the last
+# path segment. Set it only when two mounts would otherwise look the same.
+# Duplicate paths are rejected; nested mounts are allowed and warn on startup.
+# [[system.mounts]]
+# path = "D:/Media"
+# readonly = false
+
+# Follow symlinks that point outside a mount point. Traversal stays on the link
+# path; writes never follow the final segment.
+# [system]
+# follow_symlinks = true
+
+# External services proxied by the built-in gateway.
+# [[services]]
+# id = "grafana"
+# name = "Dashboard"
+# icon = "chart"
+# type = "external"
+# target_url = "http://192.168.1.50:3000"
+# strip_prefix = true
+# rewrite_html = false
+
 # Hotlink protection for public shares: a request whose Referer host is not in
 # this list gets 403. Requests without a Referer are allowed.
 # [shares]
@@ -84,14 +106,6 @@ index_scan_interval_secs = 300
 thumb_preheat_days = 365
 thumb_preheat_per_scan = 200
 
-# Terminal PTY overrides. Both empty = auto-detect (pwsh then powershell on
-# Windows; $SHELL, zsh, bash, sh elsewhere).
-# [terminal]
-# shell = ""
-# args = []
-# idle_kill_seconds = 180
-# max_sessions = 10
-
 [log]
 # debug | info | warn | error | off
 console_level = "info"
@@ -100,27 +114,13 @@ api_level = "info"
 # text | json
 format = "text"
 
-# Mount points. `name` is optional: when omitted it is derived from the last
-# path segment. Set it only when two mounts would otherwise look the same.
-# Duplicate paths are rejected; nested mounts are allowed and warn on startup.
-# [[system.mounts]]
-# path = "D:/Media"
-# readonly = false
-
-# Follow symlinks that point outside a mount point. Traversal stays on the link
-# path; writes never follow the final segment.
-# [system]
-# follow_symlinks = true
-
-# External services proxied by the built-in gateway.
-# [[services]]
-# id = "grafana"
-# name = "Dashboard"
-# icon = "chart"
-# type = "external"
-# target_url = "http://192.168.1.50:3000"
-# strip_prefix = true
-# rewrite_html = false
+# Terminal PTY overrides. Both empty = auto-detect (pwsh then powershell on
+# Windows; $SHELL, zsh, bash, sh elsewhere).
+# [terminal]
+# shell = ""
+# args = []
+# idle_kill_seconds = 180
+# max_sessions = 10
 "#;
 
 // ---------------------------------------------------------------------------
@@ -782,7 +782,107 @@ fn render_preserving_comments(existing: Option<&str>, config: &Config) -> Result
     };
 
     merge_table(doc.as_table_mut(), fresh_doc.as_table(), "");
+    renumber_positions(&mut doc);
+    relocate_mount_notes(&mut doc);
     Ok(doc.to_string())
+}
+
+/// 旧模板把 `[[system.mounts]]` 的说明写在文件最末尾。
+///
+/// 配置里一旦真有挂载点，这段说明就悬在最后一个段后面，跟它描述的
+/// `[[system.mounts]]` 隔着 shares / terminal / media / log 好几段 ——
+/// 用户看到的就是「挂载点段孤零零在前面，说明孤零零在后面」（v4.9.13）。
+///
+/// 保存时把它搬回挂载点段之前。只认**逐字匹配**的整块：用户把说明改过一个
+/// 字，或者本来就没有挂载点段，都原样不动。
+fn relocate_mount_notes(doc: &mut toml_edit::DocumentMut) {
+    /// 与 `DEFAULT_CONFIG_TOML` 里的 system 段说明保持一致
+    const BLOCK: &str = "\
+# Mount points. `name` is optional: when omitted it is derived from the last
+# path segment. Set it only when two mounts would otherwise look the same.
+# Duplicate paths are rejected; nested mounts are allowed and warn on startup.
+# [[system.mounts]]
+# path = \"D:/Media\"
+# readonly = false
+
+# Follow symlinks that point outside a mount point. Traversal stays on the link
+# path; writes never follow the final segment.
+# [system]
+# follow_symlinks = true";
+
+    let trailing = doc.trailing().as_str().unwrap_or_default().to_string();
+    if !trailing.contains(BLOCK) {
+        return;
+    }
+    // 没有挂载点段时不搬：这时它本来就在教用户「怎么加」
+    let has_mounts = doc
+        .as_table()
+        .get("system")
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|system| system.get("mounts"))
+        .is_some_and(|item| item.as_array_of_tables().is_some_and(|a| !a.is_empty()));
+    if !has_mounts {
+        return;
+    }
+
+    let rest = trailing.replacen(BLOCK, "", 1);
+    doc.set_trailing(rest.trim_end());
+
+    let notes = BLOCK.to_string();
+    let Some(mounts) = doc
+        .as_table_mut()
+        .get_mut("system")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|system| system.get_mut("mounts"))
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .and_then(|tables| tables.get_mut(0))
+    else {
+        return;
+    };
+    // 条目原本可能带自己的行前注释，接在说明块后面，不能覆盖掉
+    let own = mounts
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .unwrap_or("")
+        .to_string();
+    mounts
+        .decor_mut()
+        .set_prefix(format!("\n{notes}\n\n{}", own.trim_start_matches('\n')));
+}
+
+/// 按「最终遍历顺序」重排每一张表在文档里的位置（v4.9.13）。
+///
+/// `Table::doc_position` 是**解析时按文本顺序**给的序号，`DocumentMut::fmt`
+/// 用它做一次稳定排序来决定段落顺序。问题出在 merge：新表是从 `fresh`
+/// 文档里 clone 过来的，**连它在 fresh 里的序号一起搬了进来**，于是新表带着
+/// 「另一套编号」插进 existing。表现是段落跑到八竿子打不着的地方——
+/// `[server.proxy]` 落到 `[auth]` 后面、`[auth.proxy_trust]` 落到 `[terminal]`
+/// 后面，同一张父表的子段被拆得七零八落。
+///
+/// 这里按当前的 items 顺序（= 原文件顺序，新表 append 在父表末尾）重新编号，
+/// 让排序依据只剩一个：先出现的先输出。用户手写的段序因此原样保留。
+fn renumber_positions(doc: &mut toml_edit::DocumentMut) {
+    let mut next = 0usize;
+    renumber_table(doc.as_table_mut(), &mut next);
+}
+
+fn renumber_table(table: &mut toml_edit::Table, next: &mut usize) {
+    if !table.is_dotted() {
+        table.set_position(*next);
+        *next += 1;
+    }
+    for (_, item) in table.iter_mut() {
+        match item {
+            toml_edit::Item::Table(sub) => renumber_table(sub, next),
+            toml_edit::Item::ArrayOfTables(tables) => {
+                for entry in tables.iter_mut() {
+                    renumber_table(entry, next);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Config {
@@ -1384,6 +1484,166 @@ thumb_cache_max_size_mb = 512
         assert!(text.contains("port = 8080"), "{text}");
         assert!(text.contains("thumb_cache_max_size_mb = 2048"), "{text}");
         assert_eq!(parsed(&text), config);
+    }
+
+    /// 新插入的段必须紧跟在父段之后（v4.9.13）。
+    ///
+    /// 回归用例来自实测：一份手写的精简配置（缺 ssl / proxy / limits /
+    /// proxy_trust 等段）保存一次后，`[server.proxy]` 跑到 `[auth]` 后面、
+    /// `[auth.proxy_trust]` 跑到 `[terminal]` 后面 —— 根因是 clone 进来的新表
+    /// 带着 **fresh 文档** 的 `doc_position`，和 existing 的编号混在一起排序。
+    #[test]
+    fn new_tables_land_next_to_their_parent() {
+        let source = r#"[server]
+host = "0.0.0.0"
+port = 4242
+
+[auth]
+local_enabled = true
+
+[[system.mounts]]
+path = 'Z:\'
+readonly = false
+
+[shares]
+referer_allowlist = []
+
+[terminal]
+shell = ""
+args = []
+idle_kill_seconds = 180
+max_sessions = 10
+"#;
+        let config = parsed(source);
+        let text = render_preserving_comments(Some(source), &config).unwrap();
+        let pos = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("渲染结果里缺少 {needle}:\n{text}"))
+        };
+
+        // 同一父表的子段必须连续
+        assert!(pos("[server]") < pos("[server.ssl]"), "{text}");
+        assert!(pos("[server.ssl]") < pos("[server.proxy]"), "{text}");
+        assert!(pos("[server.proxy]") < pos("[server.limits]"), "{text}");
+        assert!(pos("[server.limits]") < pos("[auth]"), "{text}");
+        assert!(pos("[auth]") < pos("[auth.proxy_trust]"), "{text}");
+        // 原有段序保持：mounts 在 auth 之后、shares 之前
+        assert!(
+            pos("[auth.proxy_trust]") < pos("[[system.mounts]]"),
+            "{text}"
+        );
+        assert!(pos("[[system.mounts]]") < pos("[shares]"), "{text}");
+        assert!(pos("[shares]") < pos("[terminal]"), "{text}");
+        assert!(pos("[terminal]") < pos("[media]"), "{text}");
+        assert!(pos("[media]") < pos("[log]"), "{text}");
+        assert_eq!(parsed(&text), config);
+    }
+
+    /// 旧文件里悬在末尾的挂载点说明，保存时要搬回挂载点段之前（v4.9.13）。
+    #[test]
+    fn legacy_mount_notes_move_next_to_the_mounts() {
+        let source = r#"[server]
+host = "127.0.0.1"
+port = 4242
+
+[auth]
+local_enabled = true
+
+[[system.mounts]]
+path = 'Z:\'
+readonly = false
+
+[shares]
+referer_allowlist = []
+
+[terminal]
+shell = ""
+args = []
+idle_kill_seconds = 180
+max_sessions = 10
+
+# Mount points. `name` is optional: when omitted it is derived from the last
+# path segment. Set it only when two mounts would otherwise look the same.
+# Duplicate paths are rejected; nested mounts are allowed and warn on startup.
+# [[system.mounts]]
+# path = "D:/Media"
+# readonly = false
+
+# Follow symlinks that point outside a mount point. Traversal stays on the link
+# path; writes never follow the final segment.
+# [system]
+# follow_symlinks = true
+"#;
+        let config = parsed(source);
+        let text = render_preserving_comments(Some(source), &config).unwrap();
+
+        // 只留一份，且就在真段之前
+        assert_eq!(text.matches("# Mount points.").count(), 1, "{text}");
+        let notes = text.find("# Mount points.").unwrap();
+        let section = text.find("[[system.mounts]]\npath").unwrap();
+        assert!(notes < section, "{text}");
+        let gap = &text[notes..section];
+        assert!(
+            gap.contains("# follow_symlinks = true"),
+            "说明块要完整，不能只剩标题:\n{text}"
+        );
+        assert!(gap.ends_with("\n\n"), "说明与段之间要有空行:\n{text}");
+
+        // 文件末尾不再挂着一份
+        assert!(
+            !text.trim_end().ends_with("# follow_symlinks = true"),
+            "{text}"
+        );
+        // 幂等
+        let again = render_preserving_comments(Some(&text), &config).unwrap();
+        assert_eq!(again, text);
+    }
+
+    ///
+    /// 判断依据是 `DocumentMut` 的 `doc_position` —— 它来自文本顺序。模板把
+    /// `system` / `services` 放在文件末尾时，`[[system.mounts]]` 的说明块就和
+    /// 实际段落隔着 media/log 好几段，用户看到的注释跟它描述的东西完全脱节。
+    #[test]
+    fn template_orders_sections_like_the_struct() {
+        /// 按出现顺序收集表头（含注释掉的形式），重复的只留第一次
+        fn headers(text: &str) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for line in text.lines() {
+                let line = line.trim_start_matches('#').trim_start();
+                let name = line
+                    .strip_prefix("[[")
+                    .and_then(|rest| rest.split("]]").next())
+                    .or_else(|| {
+                        line.strip_prefix('[')
+                            .and_then(|rest| rest.split(']').next())
+                    });
+                if let Some(name) = name
+                    && !name.is_empty()
+                    && !out.iter().any(|seen| seen == name)
+                {
+                    out.push(name.to_string());
+                }
+            }
+            out
+        }
+
+        let order = headers(DEFAULT_CONFIG_TOML);
+        let first = |section: &str| {
+            order
+                .iter()
+                .position(|name| name == section || name.starts_with(&format!("{section}.")))
+                .unwrap_or_else(|| panic!("模板里找不到 [{section}]: {order:?}"))
+        };
+
+        // 与 `pub struct Config` 的字段顺序逐一对应
+        let expected = [
+            "server", "auth", "system", "services", "shares", "media", "log", "terminal",
+        ];
+        let positions: Vec<usize> = expected.iter().map(|s| first(s)).collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "模板段序与结构体不一致：{order:?}"
+        );
     }
 
     #[test]
