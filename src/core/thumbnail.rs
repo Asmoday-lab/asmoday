@@ -70,6 +70,47 @@ const TEMP_STALE_AFTER: Duration = Duration::from_secs(600);
 /// 也会因为「一天只续一次」被算成闲置。1 小时是两者的平衡点。
 const TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// 单张图解码的边长上限（2026-11-04 审查）：挡住尺寸炸弹。
+///
+/// 一张「压缩后几百 KB、解开后 100000×100000」的 PNG 会吃掉数十 GB 内存；
+/// image crate 默认不限制宽高，只有单次分配 512MB 的兜底。边长 16384 对
+/// 正经照片/截图绰绰有余，超限交给 ffmpeg 分支在解码阶段直接降采样。
+const MAX_IMAGE_SIDE: u32 = 16384;
+/// 一次「解码 + 编码」的总超时：坏文件不能永远占着信号量（8 个卡死 = 缩略图全线 503）。
+const GENERATE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 负缓存 TTL：同一指纹解码/截帧失败后，这么长时间内直接回占位图不再重试。
+/// 没有它，目录里一个坏文件会让每次翻页都白烧一轮解码、每次都拉起 6 个 ffmpeg。
+const FAIL_TTL_SECS: u64 = 30 * 60;
+
+/// 负缓存：这个内容指纹最近是否失败过（单元目录下的 `fail-<fp>` 标记文件）。
+///
+/// 指纹含 mtime + size，内容一变就是新指纹，标记天然失效，不会错杀改过的图。
+fn recently_failed(dir: &Path, fp: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(dir.join(format!("fail-{fp}"))) else {
+        return false;
+    };
+    // 时钟回拨（mtime 在未来）也按「刚失败过」处理，与 touch_access 同口径
+    meta.modified()
+        .map(|t| {
+            t.elapsed()
+                .map(|d| d.as_secs() < FAIL_TTL_SECS)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
+/// 记一次失败（存在即有效，mtime 即时间戳）。
+fn mark_failed(dir: &Path, fp: &str) {
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::write(dir.join(format!("fail-{fp}")), b"");
+    }
+}
+
+/// 生成成功后清掉失败标记（偶发失败下次不再被负缓存挡住）。
+fn clear_failed(dir: &Path, fp: &str) {
+    let _ = std::fs::remove_file(dir.join(format!("fail-{fp}")));
+}
+
 /// 文件是否可能仍在写盘（mtime 极新且体积可观）。
 ///
 /// 生产路径统一走 [`is_fresh_write_parts`]（复用调用方已拿到的那份 metadata），
@@ -488,6 +529,11 @@ impl Thumbnailer {
         if let Some(outcome) = Self::cached(&dir, &fp, width).await {
             return (outcome, None);
         }
+        // 负缓存（2026-11-04 审查）：这个指纹最近失败过，30 分钟内直接占位。
+        // 必须在抢信号量之前——坏文件的每次重试都在浪费一个并发槽。
+        if recently_failed(&dir, &fp) {
+            return (ThumbOutcome::Placeholder, None);
+        }
 
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
             Ok(Ok(permit)) => permit,
@@ -501,21 +547,32 @@ impl Thumbnailer {
         let caps = Arc::clone(&self.caps);
         let webp_bin = webp_bin.map(Path::to_path_buf);
 
-        // 渲染 + 编码放阻塞线程池；**落盘不在这条链路上**（见下）
+        // 渲染 + 编码放阻塞线程池；**落盘不在这条链路上**（见下）。
+        // 整链路限时：ffmpeg 卡死/慢盘不能无限占坑（超时后线程自行结束）。
         let ffmpeg_for_decode = webp_bin.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let (thumb, hash) = render_thumbnail(&source, width, ffmpeg_for_decode.as_deref())?;
-            let (bytes, mime, codec) =
-                encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &work_dir)?;
-            Some((bytes, mime, codec, hash))
-        })
-        .await;
+        let generated = match tokio::time::timeout(
+            GENERATE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let (thumb, hash) = render_thumbnail(&source, width, ffmpeg_for_decode.as_deref())?;
+                let (bytes, mime, codec) =
+                    encode_thumbnail(&thumb, webp_bin.as_deref(), &caps, &work_dir)?;
+                Some((bytes, mime, codec, hash))
+            }),
+        )
+        .await
+        {
+            // 任务失败与超时同途：都记负缓存
+            Ok(Ok(value)) => value,
+            _ => None,
+        };
 
         drop(permit);
 
-        let Ok(Some((bytes, mime, codec, hash))) = result else {
+        let Some((bytes, mime, codec, hash)) = generated else {
+            mark_failed(&dir, &fp);
             return (ThumbOutcome::Placeholder, None);
         };
+        clear_failed(&dir, &fp);
         self.count_generated();
 
         // 字节已经在手上了，客户端不必等磁盘：FileBrowser 的 `createPreview` 也是先回
@@ -615,6 +672,10 @@ impl Thumbnailer {
         if let Some(outcome) = Self::cached_poster(&dir, &fp, width).await {
             return outcome;
         }
+        // 负缓存：ffprobe 都不认的文件每次翻页都会白拉 6 个 ffmpeg，必须挡住
+        if recently_failed(&dir, &fp) {
+            return ThumbOutcome::Placeholder;
+        }
 
         // 共享同一个信号量：截帧比解 JPEG 更吃 CPU，绝不允许并发打满
         let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.acquire()).await {
@@ -631,49 +692,61 @@ impl Thumbnailer {
         let max_age = self.max_age_secs.load(Ordering::Relaxed);
         let caps = Arc::clone(&self.caps);
 
-        let result = tokio::task::spawn_blocking(move || {
-            let supports = capabilities(&caps, &ffmpeg_bin);
-            std::fs::create_dir_all(&target_dir).ok()?;
-            for format in ffmpeg::POSTER_FORMATS {
-                // 没有 libwebp 就别浪费一次进程启动
-                if format == PosterFormat::Webp && !supports.webp {
-                    continue;
+        // 截帧链路限时：ffmpeg 卡在坏文件/慢盘上不能永远占着信号量
+        let generated = match tokio::time::timeout(
+            GENERATE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let supports = capabilities(&caps, &ffmpeg_bin);
+                std::fs::create_dir_all(&target_dir).ok()?;
+                for format in ffmpeg::POSTER_FORMATS {
+                    // 没有 libwebp 就别浪费一次进程启动
+                    if format == PosterFormat::Webp && !supports.webp {
+                        continue;
+                    }
+                    // FFmpeg 靠扩展名判封装格式：只能先写带扩展名的临时文件，成功后再改名成
+                    // 无扩展名的缓存名（`960p-webp`），避免缓存文件被当成图片再次缩略。
+                    let tmp = temp_path(&target_dir, format.extension());
+                    // 先试 1 秒（避开片头黑帧），极短视频截不到就退回第 0 帧
+                    let ok = ffmpeg::extract_poster(&ffmpeg_bin, &source, &tmp, 1, width, format)
+                        || ffmpeg::extract_poster(&ffmpeg_bin, &source, &tmp, 0, width, format);
+                    if !ok {
+                        let _ = std::fs::remove_file(&tmp);
+                        continue;
+                    }
+                    let final_path =
+                        target_dir.join(format!("{fp_for_task}-{width}p-{}", format.extension()));
+                    if std::fs::rename(&tmp, &final_path).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                        continue;
+                    }
+                    let keep = format!("{fp_for_task}-");
+                    Self::prune_stale(&target_dir, &keep);
+                    let _ = cleanup_cache(&cache_dir, limit, max_age);
+                    if let Ok(bytes) = std::fs::read(&final_path) {
+                        return Some((bytes, format.mime()));
+                    }
                 }
-                // FFmpeg 靠扩展名判封装格式：只能先写带扩展名的临时文件，成功后再改名成
-                // 无扩展名的缓存名（`960p-webp`），避免缓存文件被当成图片再次缩略。
-                let tmp = temp_path(&target_dir, format.extension());
-                // 先试 1 秒（避开片头黑帧），极短视频截不到就退回第 0 帧
-                let ok = ffmpeg::extract_poster(&ffmpeg_bin, &source, &tmp, 1, width, format)
-                    || ffmpeg::extract_poster(&ffmpeg_bin, &source, &tmp, 0, width, format);
-                if !ok {
-                    let _ = std::fs::remove_file(&tmp);
-                    continue;
-                }
-                let final_path =
-                    target_dir.join(format!("{fp_for_task}-{width}p-{}", format.extension()));
-                if std::fs::rename(&tmp, &final_path).is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                    continue;
-                }
-                let keep = format!("{fp_for_task}-");
-                Self::prune_stale(&target_dir, &keep);
-                let _ = cleanup_cache(&cache_dir, limit, max_age);
-                if let Ok(bytes) = std::fs::read(&final_path) {
-                    return Some((bytes, format.mime()));
-                }
-            }
-            None
-        })
-        .await;
+                None
+            }),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            _ => None,
+        };
 
         drop(permit);
 
-        match result {
-            Ok(Some((bytes, mime))) => {
+        match generated {
+            Some((bytes, mime)) => {
+                clear_failed(&dir, &fp);
                 self.count_generated();
                 ThumbOutcome::Ready(Rendered { bytes, mime })
             }
-            _ => ThumbOutcome::Placeholder,
+            None => {
+                mark_failed(&dir, &fp);
+                ThumbOutcome::Placeholder
+            }
         }
     }
 
@@ -732,10 +805,21 @@ fn register_heif_hook() {
 /// 解码成 RGBA 原始像素。返回 `(宽, 高, RGBA 缓冲)`。
 fn decode_rgba(path: &Path, bound: u32, ffmpeg_bin: Option<&Path>) -> Option<(u32, u32, Vec<u8>)> {
     register_heif_hook();
-    if let Ok(reader) = image::ImageReader::open(path)
-        && let Ok(reader) = reader.with_guessed_format()
-        && let Ok(decoded) = reader.decode()
-    {
+    // 尺寸上限（2026-11-04 审查）：image crate 默认不限宽高，一张压缩后
+    // 几百 KB 的 PNG 可以展开成数十 GB 内存。超限走下面的 ffmpeg 分支，
+    // 让它在解码阶段就降采样，不经历「先解全图」。
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    let decoded = image::ImageReader::open(path)
+        .ok()
+        .and_then(|reader| reader.with_guessed_format().ok())
+        .map(|mut reader| {
+            reader.limits(limits);
+            reader
+        })
+        .and_then(|reader| reader.decode().ok());
+    if let Some(decoded) = decoded {
         let rgba = decoded.to_rgba8();
         let (w, h) = rgba.dimensions();
         return Some((w, h, rgba.into_raw()));
@@ -752,24 +836,25 @@ fn ffmpeg_decode_scaled(path: &Path, bound: u32, bin: &Path) -> Option<(u32, u32
 
     // `min(bound, iw)`：不放大；`-2` 让高度自动取偶数（多数编码器要求）
     let filter = format!("scale='min({},iw)':-2", bound.max(1));
-    let out = Command::new(bin)
-        .args(["-v", "error", "-nostdin", "-i"])
-        .arg(path)
-        .args([
-            "-vf",
-            &filter,
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "-",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let out = ffmpeg::run_with_timeout(
+        Command::new(bin)
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(path)
+            .args([
+                "-vf",
+                &filter,
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null()),
+        ffmpeg::POSTER_TIMEOUT,
+    )?;
     if !out.status.success() || out.stdout.is_empty() {
         return None;
     }
@@ -1754,6 +1839,22 @@ mod tests {
         let _ = fs::remove_dir_all(&missing);
         assert_eq!(cleanup_cache(&missing, 1024, 3600).unwrap(), 0);
         assert_eq!(clear_cache(&missing).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn fail_marker_blocks_until_cleared() {
+        // 负缓存（2026-11-04 审查）：失败后 30 分钟内不再重试同一指纹，
+        // 生成成功要清掉标记，否则偶发失败会把好图挡半个钟头
+        let dir = scratch_dir("thumb-fail-marker");
+        let fp = "abc123";
+        assert!(!recently_failed(&dir, fp), "没失败过不能拦截");
+        mark_failed(&dir, fp);
+        assert!(recently_failed(&dir, fp), "失败标记必须生效");
+        // 指纹含 mtime+size：内容一变就是新指纹，旧标记不波及
+        assert!(!recently_failed(&dir, "other-fp"));
+        clear_failed(&dir, fp);
+        assert!(!recently_failed(&dir, fp), "清除后必须放行");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

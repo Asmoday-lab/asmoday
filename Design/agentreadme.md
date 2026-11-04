@@ -1047,7 +1047,17 @@ GWT-THUMB-06 Given 缩略图缓存超 LRU 上限  When 请求  Then 最久未访
 GWT-THUMB-07 Given 某缩略图天天被打开  When 闲置天数超过 thumb_cache_max_age_days  Then 命中时已续期，不被淘汰
 GWT-THUMB-08 Given 源文件被应用外删除  When 下一轮索引扫描  Then 其缓存单元整目录回收
 GWT-THUMB-09 Given 挂载点离线（readdir 失败）  When 扫描  Then 该子树索引与缓存原样保留
+GWT-THUMB-10 Given 同一内容指纹解码失败过  When 30 分钟内再次请求  Then 直接回占位图，不再重试
+GWT-THUMB-11 Given 超大尺寸图片（>16384 边）  When 生成缩略图  Then image 分支拒绝，交 ffmpeg 解码期降采样
+GWT-THUMB-12 Given FFmpeg 卡死  When 超过探测 5s / 截帧 15s / 编码 10s  Then 进程被 kill，信号量按时释放
 ```
+
+#### 安全审查落地（2026-11-04）
+- `DELETE /api/files/raw` 与 mutate 版删除同口径：只读拦截 + per-path 锁；
+- 请求体上限拆分：JSON/配置/登录类路由 2 MiB，上传/tus/编辑保存/代理/WebDAV 仍按 `upload_max_size_mb`；
+- `panic = "unwind"` + 最外层 `CatchPanicLayer` + panic hook：单连接 500，不再全进程崩溃；
+- 配置写盘串行化（全局锁 + 随机临时名 + rename 前自校验 + fsync）；
+- FFmpeg 全链路带超时（探测 5s / 截帧 15s / 编码 10s），`status()` 死锁坑改 `wait_with_output`。
 
 #### 依赖红线
 - 红线 1（不内置转码，只调用外部 FFmpeg）

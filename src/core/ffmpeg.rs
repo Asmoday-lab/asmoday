@@ -10,6 +10,64 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+/// 探测类调用（version / encoders / -i）的超时。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 截首帧的超时：NAS 上读大文件头 + 定位关键帧可以很慢，但不能无限慢。
+pub(crate) const POSTER_TIMEOUT: Duration = Duration::from_secs(15);
+/// WebP 编码（stdin 喂 RGBA）的超时。
+const ENCODE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 带超时地跑命令并收集输出（stdout/stderr 全量回收）。
+///
+/// 轮询 `try_wait` 而不是直接 `wait()`：管道写满而子进程还活着时，
+/// `wait()` / `status()` 会永远等下去（v4.9.19 之前 `extract_poster` 的
+/// `status()` 正是这个坑——stdout/stderr 都是 piped 却从不读）。
+/// 超时即 kill 并回收，不留僵尸进程。
+pub(crate) fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let started = Instant::now();
+    let mut child = cmd.spawn().ok()?;
+    loop {
+        match child.try_wait() {
+            // 子进程已退出：管道里剩下的数据由 wait_with_output 收尾
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            // spawn 失败等 IO 错误：按超时路径杀掉并放弃
+            Err(_) if started.elapsed() >= timeout => return None,
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
+/// 等待已接管 stdin 的子进程退出（`encode_webp_rgba` 用：stdout/stderr 不需要读）。
+fn wait_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) if started.elapsed() >= timeout => return None,
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
 
 /// 环境变量名（优先级 2）
 pub const ENV_FFMPEG_PATH: &str = "ASMODAY_FFMPEG_PATH";
@@ -140,7 +198,7 @@ pub fn probe_version(bin: &Path) -> Option<String> {
     if !bin.is_file() {
         return None;
     }
-    let output = command(bin).arg("-version").output().ok()?;
+    let output = run_with_timeout(command(bin).arg("-version"), PROBE_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }
@@ -178,12 +236,10 @@ pub fn probe_video_size(bin: &Path, input: &Path) -> Option<(u32, u32)> {
     if !bin.is_file() {
         return None;
     }
-    let output = command(bin)
-        .arg("-hide_banner")
-        .arg("-i")
-        .arg(input)
-        .output()
-        .ok()?;
+    let output = run_with_timeout(
+        command(bin).arg("-hide_banner").arg("-i").arg(input),
+        PROBE_TIMEOUT,
+    )?;
     let text = String::from_utf8_lossy(&output.stderr);
     parse_video_size(&text)
 }
@@ -267,9 +323,12 @@ pub fn probe_capabilities(bin: &Path) -> Capabilities {
     if !bin.is_file() {
         return Capabilities::default();
     }
-    let output = match command(bin).arg("-hide_banner").arg("-encoders").output() {
-        Ok(output) => output,
-        Err(_) => return Capabilities::default(),
+    let output = match run_with_timeout(
+        command(bin).arg("-hide_banner").arg("-encoders"),
+        PROBE_TIMEOUT,
+    ) {
+        Some(output) => output,
+        None => return Capabilities::default(),
     };
     if !output.status.success() {
         return Capabilities::default();
@@ -341,7 +400,9 @@ pub fn encode_webp_rgba(
         let _ = std::fs::remove_file(output);
         return false;
     }
-    let ok = matches!(child.wait(), Ok(status) if status.success());
+    let ok = wait_timeout(&mut child, ENCODE_TIMEOUT)
+        .map(|status| status.success())
+        .unwrap_or(false);
     let written = ok
         && std::fs::metadata(output)
             .map(|m| m.len() > 0)
@@ -400,10 +461,12 @@ pub fn extract_poster(
         }
     }
 
-    let status = cmd.arg(output).status().ok();
+    // run_with_timeout 替代此前的 status()：status 不读管道，stderr 写满 64KB
+    // 会把子进程卡死在 write 上（我们也卡在 status 上），双向死锁
+    let result = run_with_timeout(&mut cmd, POSTER_TIMEOUT);
 
-    match status {
-        Some(status) if status.success() => std::fs::metadata(output)
+    match result {
+        Some(out) if out.status.success() => std::fs::metadata(output)
             .map(|m| m.len() > 0)
             .unwrap_or(false),
         _ => {
