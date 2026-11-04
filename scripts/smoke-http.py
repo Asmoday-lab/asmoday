@@ -140,11 +140,14 @@ def main() -> int:
     print("[1] 登录")
     status, payload = c.json("POST", "/api/auth/login", {"username": args.user, "password": args.password})
     if status != 200 and args.setup_token:
-        status, payload = c.json(
+        # 首次启动：服务端把一次性令牌打印在控制台（不落日志），必须带在头里
+        status, payload, _ = c.request(
             "POST",
             "/api/auth/setup",
-            {"username": args.user, "password": args.password},
+            json.dumps({"username": args.user, "password": args.password}).encode(),
+            {"Content-Type": "application/json", "X-Setup-Token": args.setup_token},
         )
+        payload = payload.decode(errors="replace")[:200]
     check("登录 / 初始化", status == 200, f"{status} {payload}")
 
     print("[2] 找挂载点")

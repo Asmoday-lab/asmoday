@@ -877,7 +877,23 @@ pub async fn write_text(
         .unwrap_or_else(|| "file".to_string());
     let tmp = path.with_file_name(crate::core::path_guard::part_name(&file_name));
 
-    if let Err(e) = tokio::fs::write(&tmp, &encoded).await {
+    // 先落盘再改名，并且**同步刷盘**（v4.9.22）：rename 只保证「名字指向的文件是
+    // 刚写的那个」，不保证数据已离开页缓存。断电/宿主强杀时会出现最终名指向
+    // 空文件的经典场景——比没有文件更糟：用户看到过「保存成功」，旧内容也没了。
+    // 文本都是 KB 级、一次 fsync 几毫秒，这个代价换的是「保存过就是保存过」。
+    let written = tokio::fs::File::create(&tmp).await;
+    let written = match written {
+        Ok(file) => {
+            let mut file = file;
+            match tokio::io::AsyncWriteExt::write_all(&mut file, &encoded).await {
+                Ok(()) => file.sync_all().await,
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    };
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
         return fs_error(FsError::Io(format!("写入临时文件失败：{e}")));
     }
     if let Err(e) = tokio::fs::rename(&tmp, &path).await {

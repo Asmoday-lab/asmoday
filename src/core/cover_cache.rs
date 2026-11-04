@@ -85,6 +85,11 @@ impl CoverCache {
             .unwrap_or(0)
             .saturating_add(ENTRY_OVERHEAD);
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        // 单条就超预算：插进去会立刻被自己的插入触发淘汰，还会顺带清空整张表
+        // （每次请求都 miss + 每次插入全表扫描）。直接不缓存才是对的。
+        if cost > self.budget {
+            return;
+        }
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
