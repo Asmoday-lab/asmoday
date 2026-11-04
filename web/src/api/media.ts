@@ -25,6 +25,8 @@ export interface MediaItem {
   color?: string | null
   /** 同目录同名外挂字幕（.vtt / .srt，视频才有） */
   subtitle?: string | null
+  /** 同目录同名歌词是否存在（v4.9.21，音频才有）；false 时不必再发注定 404 的请求 */
+  has_lyrics?: boolean | null
   /** 音频时长（毫秒，v4.9.5）；算不出来时缺省 */
   duration_ms?: number | null
   /** 图片真实像素宽高（v4.6.19，仅 `dims` 请求时返回）：等高行按它算格子宽度 */

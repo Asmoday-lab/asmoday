@@ -4,6 +4,7 @@ pub mod archive;
 pub mod audio_tags;
 pub mod auth;
 pub mod config;
+pub mod cover_cache;
 pub mod dir_cache;
 pub mod ffmpeg;
 pub mod fs;

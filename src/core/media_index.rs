@@ -999,6 +999,64 @@ pub fn subtitles_put_many(conn: &Connection, rows: &[(&str, u64, Option<&str>)])
     }
 }
 
+/// 批量读歌词探测缓存（v4.9.21）。`None` 表示「查过了，这首没有 .lrc」。
+///
+/// 和字幕同样的口径：负缓存有保鲜期（用户后来补了歌词，音频本身 mtime 不变）。
+pub fn lyrics_get_many(
+    conn: &Connection,
+    keys: &[(&str, u64)],
+) -> std::collections::HashMap<String, Option<String>> {
+    use std::collections::HashMap;
+    let mut hits = HashMap::new();
+    if keys.is_empty() {
+        return hits;
+    }
+    let fresh_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - NEGATIVE_TTL_SECS;
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT lrc_path FROM media_lyrics
+         WHERE path = ?1 AND mtime = ?2 AND (lrc_path IS NOT NULL OR checked_at >= ?3)",
+    ) else {
+        return hits;
+    };
+    for (path, mtime) in keys {
+        if let Ok(lrc) = stmt.query_row(params![path, *mtime as i64, fresh_after], |row| {
+            row.get::<_, Option<String>>(0)
+        }) {
+            hits.insert((*path).to_string(), lrc);
+        }
+    }
+    hits
+}
+
+/// 清空歌词缓存（用户点「重新扫描」时用）。
+pub fn lyrics_clear(conn: &Connection) {
+    let _ = conn.execute("DELETE FROM media_lyrics", []);
+}
+
+/// 写回歌词探测结果（`lrc` 为 `None` 表示确认没有歌词）
+pub fn lyrics_put_many(conn: &Connection, rows: &[(&str, u64, Option<&str>)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let Ok(mut stmt) = conn.prepare_cached(
+        "INSERT OR REPLACE INTO media_lyrics (path, mtime, lrc_path, checked_at)
+         VALUES (?1, ?2, ?3, ?4)",
+    ) else {
+        return;
+    };
+    for (path, mtime, lrc) in rows {
+        let _ = stmt.execute(params![path, *mtime as i64, *lrc, now]);
+    }
+}
+
 /// 批量读音频标签缓存（v4.9.8）。
 ///
 /// 音乐库列表一页 120 首，每首读一次 ID3 在 SMB/UNC 上要 0.5~1 秒 —— 6 路并发

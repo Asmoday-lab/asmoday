@@ -374,6 +374,34 @@ fn migrations() -> Migrations<'static> {
                 at    INTEGER NOT NULL
             );",
         ),
+        // v11：标签解码口径变了（v4.9.21 起对「GBK 内容 + ISO-8859-1 声明」做回退）。
+        // 缓存键是 `path + mtime + size`，解码逻辑变了文件本身却没变，不清一次的话
+        // 修好的解码器永远读不到老行 —— 用户重启后界面照旧乱码。
+        M::up("DELETE FROM media_tags;"),
+        // v12：清掉历史遗留的 `\\?\UNC\…` 键。早期版本用 `real`（verbatim 路径）当
+        // 标签/时长缓存的键，后来统一成展示路径，这批行再也读不到，白占库还干扰排查。
+        // 展示路径一律是 `/` 分隔，含反斜杠的一定是旧键。
+        M::up("DELETE FROM media_durations WHERE instr(path, '\\') > 0;"),
+        // v13：歌词探测缓存（v4.9.21）。音乐库每首按名字猜 `<文件名>.lrc`，
+        // 没有就是一次 SMB 404（实测 0.3~3.8 秒）。这里记「查过了、有没有」：
+        // `lrc_path` 为 NULL = 确认没有，`checked_at` 给负缓存兜保鲜期 ——
+        // 用户后来补了 .lrc，音频自身的 mtime 不会变。
+        M::up(
+            "CREATE TABLE IF NOT EXISTS media_lyrics (
+                path       TEXT PRIMARY KEY,
+                mtime      INTEGER NOT NULL,
+                lrc_path   TEXT,
+                checked_at INTEGER NOT NULL DEFAULT 0
+            );",
+        ),
+        // v14：字幕缓存里同样是「verbatim 路径」当键（v4.9.21 之前 `build_items`
+        // 用 `entry.path` 而不是展示路径）。现在两条探测路径统一成展示路径，
+        // 旧键读不到也永远不会被覆盖，清掉重探一遍最省事。
+        M::up("DELETE FROM media_subtitles WHERE instr(path, '\\') > 0;"),
+        M::up("DELETE FROM media_lyrics WHERE instr(path, '\\') > 0;"),
+        // v15：同理清掉标签缓存里的 verbatim 键。v11 是整表清空，但已经跑过 v11 的库
+        // 不会重跑，只有这一条能保证「开发机中途升级」也不会留双份。
+        M::up("DELETE FROM media_tags WHERE instr(path, '\\') > 0;"),
     ])
 }
 

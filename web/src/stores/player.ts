@@ -45,6 +45,12 @@ export const usePlayerStore = defineStore('player', () => {
     lyricError.value = ''
     const track = currentTrack.value
     if (!track) return
+    // 后端在浏览时顺手探过「有没有 .lrc」（v4.9.21）：没有就别发这一枪 ——
+    // 在 SMB 上一次 404 要 0.3~3.8 秒，换首歌就卡一下，纯属白等。
+    if (track.has_lyrics === false) {
+      lyricError.value = i18n.global.t('gallery.player.noLyrics')
+      return
+    }
     try {
       const res = await fetch(lrcUrl(track.path))
       if (!res.ok) {

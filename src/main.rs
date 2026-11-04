@@ -53,6 +53,12 @@ pub struct AppState {
     pub terminals: TerminalManager,
     /// 缩略图生成器（信号量 + 磁盘缓存）
     pub thumbnails: Arc<Thumbnailer>,
+    /// 音乐封面缓存（v4.9.21）：SMB 上每读一次 ID3 要几秒，而封面几乎不变
+    pub covers: Arc<core::cover_cache::CoverCache>,
+    /// 挂载点集合缓存（v4.9.21）：`path_guard::load` 每次都要对每个挂载点做
+    /// canonicalize + is_dir，网络盘上一次几百毫秒；前端 10 秒一轮轮询，不缓存
+    /// 就等于常驻一条 SMB 往返。
+    pub mounts_cache: Arc<tokio::sync::Mutex<Option<api::files::MountsCache>>>,
     /// 反代网关的 HTTP 客户端（连接池复用）
     pub http: reqwest::Client,
     /// 用户/会话存储（SQLite）
@@ -326,6 +332,12 @@ async fn run(cli: Cli) -> Result<(), String> {
         data_dir: data_dir.clone(),
         config: Arc::new(RwLock::new(config)),
         thumbnails: Arc::new(Thumbnailer::new(thumb_dir.clone())),
+        covers: Arc::new(core::cover_cache::CoverCache::new(
+            96 * 1024 * 1024,
+            4096,
+            4,
+        )),
+        mounts_cache: Arc::new(tokio::sync::Mutex::new(None)),
         http: reqwest::Client::builder()
             .user_agent("Asmoday/0.1 (reverse-proxy)")
             .build()

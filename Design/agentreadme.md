@@ -627,6 +627,7 @@ GWT-LIST-10 Given 单个文件 stat 失败（权限/消失）  When 请求列表
 GWT-LIST-11 Given 只读挂载点  When 用户右键  Then "重命名/移动/复制/删除"项置灰 + tooltip "只读挂载点"
 GWT-LIST-12 Given 面包屑  When 挂载点数量 ≥2  Then 展示 [🏠] / 挂载点 / 目录…
 GWT-LIST-13 Given 面包屑  When 挂载点数量 =1  Then 展示 [🏠 挂载点] / 目录…
+GWT-LIST-14 Given 网络盘挂载点  When 10 秒内连续请求 /api/files/mounts  Then 只有第一次真正 canonicalize + is_dir，其余命中缓存；配置改动后 revision +1 立即刷新（v4.9.21）
 ```
 
 #### 依赖红线
@@ -1365,6 +1366,10 @@ GWT-MUSIC-04 Given 音量调整  When 关闭后重开  Then 从 localStorage 恢
 GWT-MUSIC-05 Given 列表含 100 首  When 加载  Then 只有播放条一个 `<audio>` 元素（禁用列表循环生成）
 GWT-MUSIC-06 Given 桌面窗口  When 播放条出现  Then 宽度≈70%（min 660 / max 1180）且水平居中，播放键落在条几何中心
 GWT-MUSIC-07 Given 移动端  When 播放条出现  Then 铺满底部、单行、无圆角，进度用顶端 2px 线表示
+GWT-MUSIC-08 Given 标签内容为 GBK、帧头声明 ISO-8859-1（EAC/LAME 抓轨常见）  When 读取  Then 显示「林肯公园」而不是「ÁÖ¿Ï¹«Ô°」；升级后首次启动由迁移清空标签缓存重读（v4.9.21）
+GWT-MUSIC-09 Given 一首曲目连续请求封面两次  When 第二次  Then 命中内存缓存、不再打开源文件；无内嵌封面也缓存负结果（v4.9.21）
+GWT-MUSIC-10 Given 目录里没有 `<同名>.lrc`  When 音乐库返回该曲目  Then `has_lyrics=false`，前端不发歌词请求（此前每次换歌都是一次 SMB 404，0.3~3.8s）
+GWT-MUSIC-11 Given 列表页 120 首  When 分页探测  Then 标签/时长/字幕/歌词四类缓存键都是展示路径（`C:/…`、`//srv/…`），同一首歌只有一行（v4.9.21）
 ```
 
 #### 依赖红线

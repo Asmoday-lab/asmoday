@@ -132,14 +132,87 @@ fn pick_cover(tag: &Tag) -> Option<(String, Vec<u8>)> {
     Some((mime, data.to_vec()))
 }
 
-/// 去掉首尾空白与 NUL，空串按「没有」处理。
+/// 去掉首尾空白与 NUL，空串按「没有」处理；顺手修历史乱码。
 fn clean(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim_matches('\0').trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(repair_mojibake(trimmed).unwrap_or_else(|| trimmed.to_string()))
     }
+}
+
+/// 修复「内容按 GBK/UTF-8 写、帧头却声明 ISO-8859-1」的历史标签（v4.9.21）。
+///
+/// 国产抓轨/转换工具（EAC + LAME、千千静听之类）会把中文按 GBK 塞进 ID3v2
+/// 文本帧，编码字节却填 `0x00`（规范含义是 ISO-8859-1）。lofty 严格按声明解码，
+/// 于是「林肯公园」显示成「ÁÖ¿Ï¹«Ô°」—— 实测就是这么来的。
+///
+/// 这里只做**有把握**的回退：原串不含 CJK、每个字符都落在单字节范围、非 ASCII
+/// 部分能按 GBK 双字节成对消费。`Motörhead` / `Café` 这类真·西欧文本过不了
+/// 成对校验，不会被误伤；`Björk` 这种高字节不足两个的也直接放过。
+fn repair_mojibake(text: &str) -> Option<String> {
+    if text.chars().any(is_cjk) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut high = 0usize;
+    for ch in text.chars() {
+        let code = ch as u32;
+        // 超出 U+00FF 说明不是「按 latin1 读错」，别自作聪明
+        if code > 0xFF {
+            return None;
+        }
+        if code > 0x7F {
+            high += 1;
+        }
+        bytes.push(code as u8);
+    }
+    if high < 2 {
+        return None;
+    }
+
+    // 情形一：UTF-8 被当 latin1 读（`ä¸­æ–‡` → 中文）
+    if let Ok(utf8) = std::str::from_utf8(&bytes)
+        && utf8 != text
+        && utf8.chars().any(is_cjk)
+    {
+        return Some(utf8.to_string());
+    }
+
+    // 情形二：GBK/GB18030 被当 latin1 读（本项目的实况）
+    if !gbk_pairs(&bytes) {
+        return None;
+    }
+    let (decoded, _, had_errors) = encoding_rs::GBK.decode(&bytes);
+    if had_errors || !decoded.chars().any(is_cjk) {
+        return None;
+    }
+    Some(decoded.into_owned())
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+/// 非 ASCII 段必须是合法 GBK 双字节对：首字节 0x81-0xFE，尾字节 0x40-0xFE 且非 0x7F。
+fn gbk_pairs(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] < 0x80 {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            return false;
+        }
+        let (lead, trail) = (bytes[i], bytes[i + 1]);
+        if !(0x81..=0xFE).contains(&lead) || !(0x40..=0xFE).contains(&trail) || trail == 0x7F {
+            return false;
+        }
+        i += 2;
+    }
+    true
 }
 
 /// 标签里的 MIME 经常写错（`image/jpg`、空串、`jpeg`），按文件魔数兜底。
@@ -303,5 +376,56 @@ mod tests {
         assert_eq!(normalize_mime("", &[0x89, b'P', b'N', b'G']), "image/png");
         assert_eq!(normalize_mime("", b"GIF89a"), "image/gif");
         assert_eq!(normalize_mime("", b"????"), "application/octet-stream");
+    }
+
+    /// ID3v2.3 文本帧：显式指定编码字节 + 原始字节（构造历史乱码样本用）
+    fn raw_text_frame(id: &[u8; 4], encoding: u8, bytes: &[u8]) -> Vec<u8> {
+        let mut payload = vec![encoding];
+        payload.extend_from_slice(bytes);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(id);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    #[test]
+    fn repairs_gbk_declared_as_latin1() {
+        // 实况：EAC + LAME 压的 MP3，TPE1 声明 ISO-8859-1，内容是 GBK 的「林肯公园」
+        let mut body = raw_text_frame(b"TIT2", 0, b"Numb");
+        body.extend(raw_text_frame(
+            b"TPE1",
+            0,
+            &[0xC1, 0xD6, 0xBF, 0xCF, 0xB9, 0xAB, 0xD4, 0xB0],
+        ));
+        let path = write_mp3("tags-gbk.mp3", &body);
+        let tags = read_tags(&path);
+        assert_eq!(tags.artist.as_deref(), Some("林肯公园"));
+        // LATIN-1 的纯 ASCII 帧不受影响
+        assert_eq!(tags.title.as_deref(), Some("Numb"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repairs_utf8_declared_as_latin1() {
+        // UTF-8 被当 latin1 读：`ä¸­æ–‡` 这种形态
+        let body = raw_text_frame(b"TPE1", 0, "中文".as_bytes());
+        let path = write_mp3("tags-utf8-latin1.mp3", &body);
+        let tags = read_tags(&path);
+        assert_eq!(tags.artist.as_deref(), Some("中文"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keeps_western_accents_intact() {
+        // 真·西欧文本必须原样保留：成对校验过不了，不能瞎修
+        let mut body = raw_text_frame(b"TPE1", 0, b"Mot\xF6rhead");
+        body.extend(raw_text_frame(b"TALB", 0, b"Caf\xE9"));
+        let path = write_mp3("tags-latin1.mp3", &body);
+        let tags = read_tags(&path);
+        assert_eq!(tags.artist.as_deref(), Some("Motörhead"));
+        assert_eq!(tags.album.as_deref(), Some("Café"));
+        let _ = std::fs::remove_file(&path);
     }
 }

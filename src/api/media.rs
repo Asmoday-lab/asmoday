@@ -85,6 +85,10 @@ pub struct MediaItem {
     pub color: Option<String>,
     /// 同目录同名字幕（.vtt / .srt）的路径，没有则为 null
     pub subtitle: Option<String>,
+    /// 是否有同目录同名歌词（.lrc，v4.9.21）。只对音频有意义；`false` 时前端
+    /// 不必再发一次注定 404 的请求 —— SMB 上那次 404 要几百毫秒到几秒。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_lyrics: Option<bool>,
     /// 音频时长（毫秒，v4.9.5）。只对 `kind == audio` 有意义；算不出来时为 null
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -567,19 +571,52 @@ pub async fn cover(State(state): State<AppState>, Query(query): Query<CoverQuery
         Err(err) => return fs_error(err),
     };
 
+    // 缓存键带文件指纹：标签一改 mtime 就变，不会读到旧封面
+    let meta = tokio::fs::metadata(&path).await.ok();
+    let mtime = meta
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    let size = meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
+    let key = crate::core::cover_cache::key(path.to_string_lossy().to_string(), mtime, size);
+
+    if let Some(hit) = state.covers.lookup(&key) {
+        return cover_response(hit);
+    }
+
+    // 一屏十几行封面同时打 SMB 会把共享拖到十秒级，过闸再读（v4.9.21）
+    let permit = state.covers.acquire().await;
+    // 等闸期间别人可能已经填好了
+    if let Some(hit) = state.covers.lookup(&key) {
+        return cover_response(hit);
+    }
     let read =
         tokio::task::spawn_blocking(move || crate::core::audio_tags::read_cover(&path)).await;
-    match read {
-        Ok(Some(cover)) => (
+    drop(permit);
+
+    let cover = match read {
+        Ok(Some(cover)) => Some(Arc::new(cover)),
+        _ => None,
+    };
+    state.covers.store(key, cover.clone());
+    cover_response(cover)
+}
+
+/// 封面响应：正式结果与负缓存走同一出口，头信息只写一处
+fn cover_response(cover: Option<Arc<crate::core::audio_tags::Cover>>) -> Response {
+    match cover {
+        Some(cover) => (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, cover.mime.as_str()),
-                (header::CACHE_CONTROL, "private, max-age=86400"),
+                (header::CONTENT_TYPE, cover.mime.clone()),
+                (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
             ],
-            Body::from(cover.data),
+            Body::from(cover.data.clone()),
         )
             .into_response(),
-        _ => crate::api::error::api_error(
+        None => crate::api::error::api_error(
             StatusCode::NOT_FOUND,
             "COVER_NOT_FOUND",
             "this track has no embedded cover",
@@ -1055,14 +1092,15 @@ const SKIP_DIRS: &[&str] = &[
 ///
 /// `listings` 是 `目录 -> (小写文件名 -> 磁盘上的真实文件名)`。优先级与旧实现一致：
 /// `.vtt` 先于 `.srt`。
-fn subtitle_from_listing(
+fn sibling_from_listing(
     listings: &HashMap<PathBuf, HashMap<String, String>>,
-    video: &Path,
+    file: &Path,
+    extensions: &[&str],
 ) -> Option<String> {
-    let dir = video.parent()?;
+    let dir = file.parent()?;
     let names = listings.get(dir)?;
-    let stem = video.file_stem()?.to_string_lossy().to_lowercase();
-    for ext in ["vtt", "srt"] {
+    let stem = file.file_stem()?.to_string_lossy().to_lowercase();
+    for ext in extensions {
         if let Some(actual) = names.get(&format!("{stem}.{ext}")) {
             return Some(fs::normalize_display(&dir.join(actual)));
         }
@@ -1328,6 +1366,7 @@ pub(crate) fn sync_index(
         // 视频自身的 mtime 不变，不清负缓存就要等 7 天 TTL 才看得见。
         if refresh {
             media_index::subtitles_clear(conn);
+            media_index::lyrics_clear(conn);
         }
         Ok(false)
     })?;
@@ -1763,11 +1802,7 @@ fn build_items(
             .iter()
             .map(|&position| {
                 let entry = &raw[position];
-                (
-                    entry.path.to_string_lossy().to_string(),
-                    entry.mtime,
-                    entry.size,
-                )
+                (entry.display.clone(), entry.mtime, entry.size)
             })
             .collect();
         let cached = conn
@@ -1833,13 +1868,7 @@ fn build_items(
     let audio_keys: Vec<(String, u64, u64)> = raw
         .iter()
         .filter(|entry| entry.kind == "audio")
-        .map(|entry| {
-            (
-                entry.path.to_string_lossy().to_string(),
-                entry.mtime,
-                entry.size,
-            )
-        })
+        .map(|entry| (entry.display.clone(), entry.mtime, entry.size))
         .collect();
     // 标签缓存（v4.9.8）：音乐库一页 120 首，每首读一次 ID3 在 UNC 上要 0.5~1 秒，
     // 6 路并发也要二三十秒。标签是纯元数据，缓存后第二次起一次文件都不用碰。
@@ -1869,7 +1898,7 @@ fn build_items(
         if entry.kind != "audio" {
             continue;
         }
-        let key = entry.path.to_string_lossy().to_string();
+        let key = entry.display.clone();
         if let Some(tags) = cached_tags.get(&key) {
             tags_by_pos.insert(position, tags.clone());
         }
@@ -1895,7 +1924,7 @@ fn build_items(
         .enumerate()
         .filter(|(_, entry)| entry.kind == "audio")
         .filter_map(|(position, entry)| {
-            let key = entry.path.to_string_lossy().to_string();
+            let key = entry.display.clone();
             let need_tags = !cached_tags.contains_key(&key);
             let need_duration = !cached_durations.contains_key(&key);
             // 两者都命中就完全不用碰这个文件
@@ -1968,7 +1997,7 @@ fn build_items(
         .map(|(position, entry)| {
             (
                 position,
-                entry.path.to_string_lossy().to_string(),
+                entry.display.clone(),
                 entry.path.clone(),
                 entry.mtime,
             )
@@ -1986,6 +2015,39 @@ fn build_items(
 
     let mut subtitle_by_pos: HashMap<usize, Option<String>> = HashMap::new();
     let mut pending_subs: Vec<(usize, String, PathBuf, u64)> = Vec::new();
+    // 歌词（v4.9.21）：和字幕同一套打法。音频每首按名字猜一个 `<文件名>.lrc`，
+    // 猜错就是一次 SMB 404（实测 0.3~3.8 秒），而目录列表本来就在手上。
+    let audio_rows: Vec<(usize, String, PathBuf, u64)> = raw
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == "audio")
+        .map(|(position, entry)| {
+            (
+                position,
+                entry.display.clone(),
+                entry.path.clone(),
+                entry.mtime,
+            )
+        })
+        .collect();
+    let cached_lyrics: HashMap<String, Option<String>> = conn
+        .map(|conn| {
+            let borrowed: Vec<(&str, u64)> = audio_rows
+                .iter()
+                .map(|(_, key, _, mtime)| (key.as_str(), *mtime))
+                .collect();
+            media_index::lyrics_get_many(conn, &borrowed)
+        })
+        .unwrap_or_default();
+    let mut lyrics_by_pos: HashMap<usize, bool> = HashMap::new();
+    let mut pending_lyrics: Vec<(usize, String, PathBuf, u64)> = Vec::new();
+    for (position, key, path, mtime) in audio_rows {
+        if let Some(found) = cached_lyrics.get(&key) {
+            lyrics_by_pos.insert(position, found.is_some());
+        } else {
+            pending_lyrics.push((position, key, path, mtime));
+        }
+    }
     for (position, key, path, mtime) in video_rows {
         // 注意用 contains_key：值是 None 也是「查过了，没有字幕」
         if cached_subs.contains_key(&key) {
@@ -1995,10 +2057,11 @@ fn build_items(
         }
     }
 
-    if !pending_subs.is_empty() {
-        // 同一目录只枚举一次；一页 120 条视频通常散在几十个目录里
+    if !pending_subs.is_empty() || !pending_lyrics.is_empty() {
+        // 同一目录只枚举一次；一页 120 条通常散在几十个目录里
         let mut dirs: Vec<PathBuf> = pending_subs
             .iter()
+            .chain(pending_lyrics.iter())
             .filter_map(|(_, _, path, _)| path.parent().map(Path::to_path_buf))
             .collect();
         dirs.sort();
@@ -2021,9 +2084,15 @@ fn build_items(
 
         let mut fresh_subs: Vec<(String, u64, Option<String>)> = Vec::new();
         for (position, key, path, mtime) in pending_subs {
-            let found = subtitle_from_listing(&listings, &path);
+            let found = sibling_from_listing(&listings, &path, &["vtt", "srt"]);
             subtitle_by_pos.insert(position, found.clone());
             fresh_subs.push((key, mtime, found));
+        }
+        let mut fresh_lyrics: Vec<(String, u64, Option<String>)> = Vec::new();
+        for (position, key, path, mtime) in pending_lyrics {
+            let found = sibling_from_listing(&listings, &path, &["lrc"]);
+            lyrics_by_pos.insert(position, found.is_some());
+            fresh_lyrics.push((key, mtime, found));
         }
         if let Some(conn) = conn {
             let borrowed: Vec<(&str, u64, Option<&str>)> = fresh_subs
@@ -2031,14 +2100,20 @@ fn build_items(
                 .map(|(path, mtime, sub)| (path.as_str(), *mtime, sub.as_deref()))
                 .collect();
             media_index::subtitles_put_many(conn, &borrowed);
+            let borrowed: Vec<(&str, u64, Option<&str>)> = fresh_lyrics
+                .iter()
+                .map(|(path, mtime, lrc)| (path.as_str(), *mtime, lrc.as_deref()))
+                .collect();
+            media_index::lyrics_put_many(conn, &borrowed);
         }
     }
 
     if !tags_by_pos.is_empty() || !subtitle_by_pos.is_empty() {
         crate::log_debug!(
-            "音频标签 / 字幕探测：{} 条音频、{} 条视频，耗时 {}ms",
+            "音频标签 / 字幕歌词探测：{} 条音频、{} 条视频、{} 条歌词，耗时 {}ms",
             tags_by_pos.len(),
             subtitle_by_pos.len(),
+            lyrics_by_pos.values().filter(|found| **found).count(),
             probe_started.elapsed().as_millis()
         );
     }
@@ -2046,6 +2121,7 @@ fn build_items(
     for (position, entry) in raw.iter().enumerate() {
         let tags = tags_by_pos.get(&position).cloned().unwrap_or_default();
         let subtitle = subtitle_by_pos.get(&position).cloned().flatten();
+        let has_lyrics = lyrics_by_pos.get(&position).copied();
         if entry.kind == "image" {
             hash_slots.push((items.len(), entry.path.as_path()));
         }
@@ -2065,6 +2141,7 @@ fn build_items(
             hash: None,
             color: None,
             subtitle,
+            has_lyrics,
             duration_ms: duration_by_pos.get(&position).copied().flatten(),
             width: dims_entry.map(|(w, _)| w),
             height: dims_entry.map(|(_, h)| h),
@@ -2430,6 +2507,8 @@ pub async fn clear_cache(State(state): State<AppState>) -> Response {
     let result = tokio::task::spawn_blocking(move || thumbnails.clear()).await;
     // 缓存图都删了，ThumbHash 色值也没意义了，一并清表（下次生成会重建）
     state.auth.thumb_hashes_clear();
+    // 封面是「源文件还在就永远有效」的内存缓存，清理动作语义上就该一起清
+    state.covers.clear();
     match result {
         Ok(Ok((files, bytes))) => {
             Json(json!({ "status": "ok", "files": files, "bytes": bytes })).into_response()

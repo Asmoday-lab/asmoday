@@ -77,9 +77,43 @@ async fn roots_for(state: &AppState) -> RootSet {
 }
 
 /// 挂载点集合（带 readonly / online，唯一真源在 core::path_guard）
+/// 挂载点集合的进程内缓存（v4.9.21）。
+pub struct MountsCache {
+    pub revision: u64,
+    pub at: std::time::Instant,
+    pub set: path_guard::MountSet,
+}
+
+/// 保鲜期与前端轮询周期一致（`GalleryView` 10s）：在线/掉线状态最多滞后一拍，
+/// 但不必为每个请求都付一次 SMB 往返。
+const MOUNTS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn mounts_for(state: &AppState) -> path_guard::MountSet {
-    let config = state.config.read().await;
-    path_guard::load(&config, &state.cwd)
+    let revision = state
+        .mounts_revision
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // 缓存命中判断单独一小段：**不要**握着这把锁去读 config，
+    // 否则「配置写锁 → 挂载点缓存」和这里的方向相反就成了死锁隐患。
+    {
+        let cached = state.mounts_cache.lock().await;
+        if let Some(cached) = cached.as_ref()
+            && cached.revision == revision
+            && cached.at.elapsed() < MOUNTS_TTL
+        {
+            return cached.set.clone();
+        }
+    }
+
+    let set = {
+        let config = state.config.read().await;
+        path_guard::load(&config, &state.cwd)
+    };
+    *state.mounts_cache.lock().await = Some(MountsCache {
+        revision,
+        at: std::time::Instant::now(),
+        set: set.clone(),
+    });
+    set
 }
 
 fn fs_error(err: FsError) -> Response {
