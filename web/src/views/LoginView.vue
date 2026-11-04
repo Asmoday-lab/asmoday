@@ -20,6 +20,7 @@ const route = useRoute()
 const username = ref('')
 const password = ref('')
 const confirm = ref('')
+const setupToken = ref('')
 const totp = ref('')
 const showTotp = ref(false)
 const error = ref('')
@@ -51,6 +52,7 @@ const canSubmit = computed(() => {
       password.value.length >= 8 &&
       !/^\d+$/.test(password.value) &&
       password.value === confirm.value &&
+      setupToken.value.trim().length > 0 &&
       !submitting.value
     )
   }
@@ -69,7 +71,7 @@ async function submit() {
   submitting.value = true
   try {
     if (isSetup.value) {
-      await authApi.setup(username.value.trim(), password.value)
+      await authApi.setup(username.value.trim(), password.value, setupToken.value)
     } else {
       await authApi.login(username.value.trim(), password.value, totp.value.trim())
     }
@@ -174,6 +176,21 @@ function changeLocale(event: Event) {
           />
           <span v-if="confirmMismatch" class="mt-1 block text-[11px] fg-danger">
             {{ t('auth.login.confirmMismatch') }}
+          </span>
+        </label>
+
+        <label v-if="isSetup" class="block">
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.setupToken') }}</span>
+          <input
+            v-model="setupToken"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 font-mono text-sm text-ink outline-none focus:border-accent"
+            :placeholder="t('auth.login.setupTokenPlaceholder')"
+          />
+          <span class="mt-1 block text-[11px] text-muted">
+            {{ t('auth.login.setupTokenHint') }}
           </span>
         </label>
 

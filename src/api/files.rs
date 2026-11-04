@@ -815,12 +815,17 @@ pub async fn write_text(
         }
     };
 
-    // 原子替换：同目录临时文件 + rename，避免写一半断电导致文件损坏
+    // 原子替换：同目录临时文件 + rename，避免写一半断电导致文件损坏。
+    // 临时名带随机后缀：固定名在两个标签页同时保存同一文件时会互相覆盖
+    // 再 rename，产物是两次写入交错的字节汤（v4.9.20）
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".{file_name}.asmoday-save.tmp"));
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.{}.asmoday-save.tmp",
+        crate::core::auth::random_token()
+    ));
 
     if let Err(e) = tokio::fs::write(&tmp, &encoded).await {
         return fs_error(FsError::Io(format!("写入临时文件失败：{e}")));
@@ -885,26 +890,37 @@ pub struct UploadQuery {
     pub overwrite: bool,
 }
 
-/// PUT /api/files/upload：单文件上传（前端对每个文件发一次请求，便于独立进度）
+/// PUT /api/files/upload：单文件上传（前端对每个文件发一次请求，便于独立进度）。
+///
+/// v4.9.20 起逐帧流式落盘：旧实现的 `body: Bytes` 会把整个请求体（上限
+/// `upload_max_size_mb`，0 = 4 GiB）先整包缓冲进内存再写盘，并发几个大
+/// 上传就是成 GiB 的堆占用。`Content-Length` 可用时先做空间预检；客户端
+/// 没带就边写边累计，超限即停（临时文件一并清掉）。
 pub async fn upload(
     State(state): State<AppState>,
     Query(query): Query<UploadQuery>,
-    body: Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> Response {
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncWriteExt;
+
     // 单文件上限来自 `[media].upload_max_size_mb`，0 = 不限制（设计文档 3.2.3）
     let limit = {
         let config = state.config.read().await;
         config.media.upload_max_size_mb
     };
-    if limit > 0 {
-        let max_bytes = limit.saturating_mul(1024 * 1024);
-        if body.len() as u64 > max_bytes {
-            return fail_code(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "E_TOO_LARGE",
-                format!("File exceeds the configured {limit} MiB upload limit"),
-            );
-        }
+    let max_bytes = limit.saturating_mul(1024 * 1024);
+    let declared: Option<u64> = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    if limit > 0 && declared.is_some_and(|size| size > max_bytes) {
+        return fail_code(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "E_TOO_LARGE",
+            format!("File exceeds the configured {limit} MiB upload limit"),
+        );
     }
 
     // 文件名统一走 path_guard::validate_name：单层校验之外还拒 Windows
@@ -915,7 +931,7 @@ pub async fn upload(
     }
 
     // 路径 / 只读 / 剩余空间 / 授权根：与 tus 分块上传共用同一套校验
-    let dir = match resolve_upload_dir(&state, &query.dir, body.len() as u64).await {
+    let dir = match resolve_upload_dir(&state, &query.dir, declared.unwrap_or(0)).await {
         Ok(path) => path,
         Err(resp) => return resp,
     };
@@ -929,13 +945,80 @@ pub async fn upload(
         );
     }
 
-    let tmp = dir.join(format!(".{name}.asmoday-upload.tmp"));
-    if let Err(e) = tokio::fs::write(&tmp, &body).await {
+    // 目标路径纳入 per-path 锁：覆盖「存在性检查 → rename」整段，
+    // 上传与删除/移动同名文件不再互踩（v4.9.20）。fail-fast，不排队。
+    let _path_guard = match state.path_locks.acquire(std::slice::from_ref(&target)) {
+        Ok(guard) => guard,
+        Err(err) => return fs_error(err),
+    };
+
+    // 唯一临时名：固定名 `.{name}.asmoday-upload.tmp` 在同名并发上传时
+    // 会互相覆盖再 rename，产物是两个请求交错的字节汤（v4.9.20）
+    let tmp = dir.join(format!(
+        ".{name}.{}.asmoday-upload.tmp",
+        crate::core::auth::random_token()
+    ));
+
+    // 流式写盘：内存占用 = 单帧 chunk，与文件大小无关
+    let mut file = match tokio::fs::File::create(&tmp).await {
+        Ok(file) => file,
+        Err(e) => return fs_error(FsError::Io(format!("写入上传临时文件失败：{e}"))),
+    };
+    let mut written: u64 = 0;
+    let mut body = body;
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let mut chunk = match frame.into_data() {
+                    Ok(chunk) => chunk,
+                    // 非数据帧（trailers 等）直接跳过
+                    Err(_) => continue,
+                };
+                written += chunk.len() as u64;
+                if limit > 0 && written > max_bytes {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return fail_code(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "E_TOO_LARGE",
+                        format!("File exceeds the configured {limit} MiB upload limit"),
+                    );
+                }
+                if let Err(e) = file.write_all_buf(&mut chunk).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return fs_error(FsError::Io(format!("写入上传临时文件失败：{e}")));
+                }
+            }
+            Some(Err(_)) => {
+                // 客户端断开：半成品没有意义，清掉
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return fail(StatusCode::BAD_REQUEST, "request body aborted");
+            }
+            None => break,
+        }
+    }
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(&tmp).await;
         return fs_error(FsError::Io(format!("写入上传临时文件失败：{e}")));
     }
-    if let Err(e) = tokio::fs::rename(&tmp, &target).await {
+    drop(file);
+
+    // 落盘走 path_guard 的原子改名：no_replace 消除「检查后被人抢先创建」
+    // 的 TOCTOU，replace 兼顾 Windows（std::fs::rename 在目标存在时失败）
+    let overwrite = query.overwrite;
+    let tmp_for_rename = tmp.clone();
+    let target_for_rename = target.clone();
+    let attempt = tokio::task::spawn_blocking(move || {
+        if overwrite {
+            path_guard::rename_replace(&tmp_for_rename, &target_for_rename)
+        } else {
+            path_guard::rename_no_replace(&tmp_for_rename, &target_for_rename)
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err(FsError::Io("rename task failed".to_string())));
+    if let Err(e) = attempt {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return fs_error(FsError::Io(format!("落盘失败：{e}")));
+        return fs_error(e);
     }
     // 覆盖上传（同名替换）同样不推进目录 mtime，必须主动失效；
     // 新建文件的场景目录 mtime 本来就会变，这一刀只是顺手，没有副作用
@@ -945,7 +1028,7 @@ pub async fn upload(
         "status": "ok",
         "name": name,
         "path": fs::normalize_display(&target),
-        "size": body.len(),
+        "size": written,
     }))
     .into_response()
 }

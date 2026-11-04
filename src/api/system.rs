@@ -28,6 +28,8 @@ use crate::core::{ffmpeg, fs, fs_ops, media_index, path_guard, thumbnail};
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RebuildStatus {
     pub is_running: bool,
+    /// 收到过停止请求、还没真正退出（前端可显示「正在停止」）
+    pub cancel_requested: bool,
     pub total: usize,
     /// 跑完的条数（含缓存命中）
     pub completed: usize,
@@ -51,7 +53,7 @@ pub type RebuildState = Mutex<RebuildStatus>;
 pub struct ThumbJobSlot(AtomicBool);
 
 impl ThumbJobSlot {
-    fn try_claim(self: &Arc<Self>) -> Option<ThumbJobGuard> {
+    pub fn try_claim(self: &Arc<Self>) -> Option<ThumbJobGuard> {
         self.0
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()
@@ -179,6 +181,12 @@ pub async fn health(State(state): State<AppState>) -> Response {
 
 /// POST /api/system/cleanup/thumbnails
 pub async fn cleanup_thumbnails(State(state): State<AppState>) -> Response {
+    // 清理与重建/预生成互斥（v4.9.20）：清理会 remove_dir_all 整个缩略图
+    // 单元目录，撞上正在 write_atomic/rename 的生成任务会把「解码成功」
+    // 变成「落盘失败 + 负缓存 30 分钟」。
+    let Some(_job) = state.thumb_jobs.try_claim() else {
+        return Json(json!({ "status": "already_running" })).into_response();
+    };
     let thumbnails = state.thumbnails.clone();
     // 先按当前配置刷新一次上限，避免用旧配置淘汰
     {
@@ -188,14 +196,17 @@ pub async fn cleanup_thumbnails(State(state): State<AppState>) -> Response {
     let result = tokio::task::spawn_blocking(move || thumbnails.run_cleanup()).await;
     // 缓存被清了，预生成台账也得跟着清：否则候选永远为空，被清掉的
     // 缩略图再也不补（v4.9.16）。清理是「从头再来」的语义。
-    let index = Arc::clone(&state.media_index);
-    let _ = tokio::task::spawn_blocking(move || {
-        index.with_conn(|conn| {
-            media_index::preheated_clear(conn);
-            Ok(())
+    // 只在清理成功时清——失败时「图还在、台账没了」同样会让候选漏补。
+    if matches!(&result, Ok(Ok(_))) {
+        let index = Arc::clone(&state.media_index);
+        let _ = tokio::task::spawn_blocking(move || {
+            index.with_conn(|conn| {
+                media_index::preheated_clear(conn);
+                Ok(())
+            })
         })
-    })
-    .await;
+        .await;
+    }
     match result {
         Ok(Ok(bytes)) => Json(json!({ "status": "ok", "removed_bytes": bytes })).into_response(),
         Ok(Err(err)) => crate::api::error::detail(
@@ -661,12 +672,52 @@ pub async fn rebuild_status(State(state): State<AppState>) -> Response {
     Json(status).into_response()
 }
 
+/// POST /api/system/thumbnails/rebuild/stop
+///
+/// 只置取消标志：正在生成的那张会跑完，扫描阶段每 64 个条目检查一次。
+/// 没在跑时调用是无害的 no-op（标志随后由下一次启动重置）。
+pub async fn rebuild_stop(State(state): State<AppState>) -> Response {
+    if let Ok(mut status) = state.rebuild.lock()
+        && status.is_running
+    {
+        status.cancel_requested = true;
+    }
+    Json(json!({ "status": "stopping" })).into_response()
+}
+
 async fn run_rebuild(state: AppState) {
     let roots = mount_roots(&state).await;
 
-    let candidates = tokio::task::spawn_blocking(move || collect_candidates(&roots))
-        .await
-        .unwrap_or_default();
+    // 取消信号：重建是小时级长任务（REBUILD_SCAN_LIMIT=5000），没有取消
+    // 意味着「点错了也只能等它跑完」（2026-11-04 审查）。扫描阶段与生成
+    // 阶段共用同一个标志，扫描也能被打断。
+    let cancelled = || {
+        state
+            .rebuild
+            .lock()
+            .map(|status| status.cancel_requested)
+            .unwrap_or(false)
+    };
+    let scan_state = state.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        collect_candidates(&roots, || {
+            scan_state
+                .rebuild
+                .lock()
+                .map(|status| status.cancel_requested)
+                .unwrap_or(false)
+        })
+    })
+    .await
+    .unwrap_or_default();
+
+    if cancelled() {
+        if let Ok(mut status) = state.rebuild.lock() {
+            *status = RebuildStatus::default();
+        }
+        crate::log_info!("thumbnail rebuild cancelled during scan");
+        return;
+    }
 
     {
         if let Ok(mut status) = state.rebuild.lock() {
@@ -683,6 +734,15 @@ async fn run_rebuild(state: AppState) {
         .filter(|bin| bin.is_file());
 
     for (path, is_video) in candidates {
+        // 取消检查点：每张之间看一次，正在生成的那张会跑完
+        if cancelled() {
+            if let Ok(mut status) = state.rebuild.lock() {
+                let completed = status.completed;
+                *status = RebuildStatus::default();
+                crate::log_info!("thumbnail rebuild cancelled at {completed} item(s)");
+            }
+            return;
+        }
         // 400 = 前端 `THUMB_WIDTH.tile`（v4.9.13 对齐：以前按 320 生成，
         // 而前端只请求 160/400 两档，产物一档都命中不到）
         let (outcome, fresh) = if is_video {
@@ -720,23 +780,27 @@ async fn run_rebuild(state: AppState) {
     }
 
     if let Ok(mut status) = state.rebuild.lock() {
-        status.is_running = false;
+        *status = RebuildStatus::default();
     }
     crate::log_info!("thumbnail rebuild finished");
 }
 
-/// 收集需要重建的图片/视频（跳过已有有效缓存的项由 `get` 内部处理）
-fn collect_candidates(roots: &[PathBuf]) -> Vec<(PathBuf, bool)> {
+/// 收集需要重建的图片/视频（跳过已有有效缓存的项由 `get` 内部处理）。
+/// `cancelled` 每处理一批目录问一次，停止请求不必等整棵树扫完。
+fn collect_candidates(roots: &[PathBuf], cancelled: impl Fn() -> bool) -> Vec<(PathBuf, bool)> {
     let mut out: Vec<(PathBuf, bool)> = Vec::new();
     for root in roots {
-        walk_candidates(root, &mut out);
+        walk_candidates(root, &mut out, &cancelled);
+        if cancelled() {
+            break;
+        }
     }
     out.truncate(REBUILD_SCAN_LIMIT);
     out
 }
 
-fn walk_candidates(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
-    if out.len() >= REBUILD_SCAN_LIMIT {
+fn walk_candidates(dir: &Path, out: &mut Vec<(PathBuf, bool)>, cancelled: &impl Fn() -> bool) {
+    if out.len() >= REBUILD_SCAN_LIMIT || cancelled() {
         return;
     }
     let Ok(reader) = std::fs::read_dir(dir) else {
@@ -744,6 +808,10 @@ fn walk_candidates(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
     };
     for entry in reader.flatten() {
         if out.len() >= REBUILD_SCAN_LIMIT {
+            return;
+        }
+        // 每 64 个条目问一次取消：目录遍历本身也可能在 NAS 上耗时几十秒
+        if out.len().is_multiple_of(64) && cancelled() {
             return;
         }
         let name = entry.file_name().to_string_lossy().to_string();
@@ -755,7 +823,7 @@ fn walk_candidates(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
             continue;
         };
         if file_type.is_dir() {
-            walk_candidates(&path, out);
+            walk_candidates(&path, out, cancelled);
             continue;
         }
         if !file_type.is_file() {

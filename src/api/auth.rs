@@ -327,15 +327,33 @@ pub(crate) fn pick_client_ip(
         return peer_ip.to_string();
     }
 
+    // XFF 语义是「客户端 → 各跳代理」从左往右依次追加：最左是客户端自己写的
+    // （可任意伪造），最右是最后一跳代理补的真实来源。取值必须**从右往左**
+    // 跳过命中 trusted_ips 的代理跳，第一个不可信地址才是真实客户端——
+    // 否则反代场景下 `X-Forwarded-For: 1.2.3.4` 一句话就能换掉防爆破池的
+    // 计数键并把访问日志的来源 IP 改成假的。
+    let mut leftmost: Option<String> = None;
     if let Some(forwarded) = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
     {
-        let forwarded = forwarded_ip_candidate(forwarded);
-        if !forwarded.is_empty() {
-            return forwarded;
+        for candidate in forwarded.split(',').rev() {
+            let ip = forwarded_ip_candidate(candidate);
+            if ip.is_empty() {
+                continue;
+            }
+            // 逐跳覆盖，循环走完时留下的就是最左（客户端自报）的那个
+            leftmost = Some(ip.clone());
+            // 命中可信清单的跳是代理自己追加的标记，继续往左找真实客户端；
+            // 整条链全是可信地址时（局域网客户端本身在 trusted 里）回落最左值。
+            if trusted.iter().any(|rule| ip_matches(&ip, rule)) {
+                continue;
+            }
+            return ip;
         }
+    }
+    if let Some(leftmost) = leftmost {
+        return leftmost;
     }
     if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
         let real = forwarded_ip_candidate(real);
@@ -654,28 +672,72 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 /// POST /api/auth/setup（公开，仅首次）
+///
+/// 防抢注三道闸（设计文档 3.1.1，2026-11-04 审查补齐）：
+/// 1. 一次性初始化令牌——启动时打印到控制台，缺失/错误 403；
+/// 2. 按 IP 限流——复用登录池（错误令牌 5 次封禁），防止在线穷举令牌；
+/// 3. 原子创建——`create_first_user` 在同一个 IMMEDIATE 事务里
+///    「查 count + 插入」，两个并发 setup 只有一个能成功。
 pub async fn setup(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<SetupRequest>,
 ) -> Response {
-    match state.auth.user_count() {
-        Ok(0) => {}
-        Ok(_) => {
+    let ip = client_ip(&state, &headers, Some(peer)).await;
+    let key = format!("setup|{ip}");
+    if let Err(remaining) = state.login_guard.check(&key) {
+        return json_error_code(
+            StatusCode::TOO_MANY_REQUESTS,
+            "AUTH_RATE_LIMITED",
+            format!("Too many attempts, retry in {remaining}s"),
+        );
+    }
+
+    let expected = state
+        .setup_token
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let provided = headers
+        .get("x-setup-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    // 令牌校验必须常数时间：直接 == 会漏出逐字符计时侧信道（对 64 位随机
+    // 令牌收益有限，但成本为零，顺手做对）。
+    let token_ok = match (&expected, provided) {
+        (Some(expected), Some(provided)) => {
+            constant_time_eq(expected.as_bytes(), provided.as_bytes())
+        }
+        _ => false,
+    };
+    if !token_ok {
+        state.login_guard.record_failure(&key);
+        return json_error_code(
+            StatusCode::FORBIDDEN,
+            "AUTH_SETUP_TOKEN_INVALID",
+            "Setup token missing or invalid (see the server console)",
+        );
+    }
+
+    let user = match state.auth.create_first_user(&body.username, &body.password) {
+        Ok(user) => user,
+        Err(err) if err == "ALREADY_INITIALIZED" => {
             return json_error_code(
                 StatusCode::CONFLICT,
                 "AUTH_ALREADY_INITIALIZED",
                 "Already initialized",
             );
         }
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    }
-
-    let user = match state.auth.create_user(&body.username, &body.password) {
-        Ok(user) => user,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
     };
+    state.login_guard.record_success(&key);
+    // 令牌一次性：初始化成功即作废（重启会重新生成——但那时已有用户，不会再走 setup）
+    if let Ok(mut guard) = state.setup_token.lock() {
+        *guard = None;
+    }
 
     let token = match state.auth.create_session(user.id) {
         Ok(token) => token,
@@ -705,6 +767,17 @@ fn record_login_failure(guard: &crate::core::auth::LoginGuard, keys: &[String; 2
     for key in keys {
         guard.record_failure(key);
     }
+}
+
+/// 常数时间字节比较（防逐字符计时侧信道；用于令牌这类明文比对）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn clear_login_failures(guard: &crate::core::auth::LoginGuard, keys: &[String; 2]) {
@@ -1233,6 +1306,29 @@ mod tests {
         let map = proxy_headers(&[("x-forwarded-for", "198.51.100.7, 172.16.0.2")]);
         let ip = super::pick_client_ip(true, &["172.16.0.0/12".to_string()], "172.16.5.9", &map);
         assert_eq!(ip, "198.51.100.7");
+    }
+
+    #[test]
+    fn forwarded_ip_takes_rightmost_untrusted() {
+        // 客户端伪造最左值 + 可信反代在右侧追加真实来源：必须取右边的真实 IP，
+        // 否则每次换一个伪造 IP 就能换一个防爆破计数桶（2026-11-04 审查）。
+        let map = proxy_headers(&[("x-forwarded-for", "1.2.3.4, 203.0.113.9")]);
+        let ip = super::pick_client_ip(true, &["127.0.0.1".to_string()], "127.0.0.1", &map);
+        assert_eq!(ip, "203.0.113.9");
+    }
+
+    #[test]
+    fn forwarded_ip_falls_back_to_leftmost_when_all_trusted() {
+        // 局域网客户端本身也在 trusted 清单里：整条链全可信时回落最左值，
+        // 而不是把所有客户端都归并到反代地址上。
+        let map = proxy_headers(&[("x-forwarded-for", "192.168.1.5, 10.0.0.2")]);
+        let ip = super::pick_client_ip(
+            true,
+            &["192.168.0.0/16".to_string(), "10.0.0.0/8".to_string()],
+            "10.0.0.2",
+            &map,
+        );
+        assert_eq!(ip, "192.168.1.5");
     }
 
     #[test]

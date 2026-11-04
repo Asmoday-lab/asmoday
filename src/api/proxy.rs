@@ -2,7 +2,11 @@
 //!
 //! `/proxy/{service_id}/…` → `[[services]].target_url/…`
 //!
-//! - 自动剥离 `X-Frame-Options` / `CSP`，允许 iframe 内嵌；
+//! - 自动剥离 `X-Frame-Options`；上游 CSP 只剥 `frame-ancestors` 指令后透传
+//!   （整条丢弃会让第三方页面在本站 origin 上裸奔，2026-11-04 审查），
+//!   上游没有 CSP 时补 `frame-ancestors 'self'` 兜底防点击劫持；
+//! - 转发前重建 `X-Forwarded-For` / `X-Real-IP` 为真实客户端来源
+//!   （客户端伪造的 XFF 不能原样交给上游做审计/限流）；
 //! - 支持 WebSocket Upgrade 透传（双向桥接）；
 //! - 支持 `inject_headers` 注入（实现服务间免登录）；
 //! - `rewrite_html` 打开时，把目标站点的绝对地址改写为代理路径（兼容老旧后台）；
@@ -10,11 +14,12 @@
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
+use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -38,15 +43,40 @@ const HOP_BY_HOP: &[&str] = &[
     "accept-encoding",
 ];
 
-/// 需要从响应里剔除的头（含允许 iframe 内嵌的两项）
+/// 需要从响应里剔除的头（含允许 iframe 内嵌的项）。
+///
+/// CSP **不再整条丢弃**：只剥掉 `frame-ancestors` 指令（见
+/// `strip_frame_ancestors`），其余指令原样透传——上游的 CSP 是它页面
+/// XSS 防线的一部分，剥光了等于把第三方应用在本站 origin 上解除武装。
 const DROP_RESPONSE: &[&str] = &[
     "x-frame-options",
-    "content-security-policy",
-    "content-security-policy-report-only",
     "transfer-encoding",
     "connection",
     "keep-alive",
 ];
+
+/// 从 CSP 值里剥掉 `frame-ancestors` 指令，允许本站 iframe 内嵌。
+/// 剥完为空（上游 CSP 只声明了 frame-ancestors）时返回 None。
+fn strip_frame_ancestors(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(';')
+        .filter(|directive| {
+            let directive = directive.trim();
+            let name = directive
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            name != "frame-ancestors"
+        })
+        .collect();
+    let joined = kept.join("; ");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
 
 /// 细节型错误（4xx 参数类）
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -172,8 +202,10 @@ fn is_session_cookie(value: &HeaderValue) -> bool {
 }
 
 /// `/proxy/{service_id}`
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_root(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(service_id): Path<String>,
     method: Method,
     uri: Uri,
@@ -183,6 +215,7 @@ pub async fn handle_root(
 ) -> Response {
     dispatch(
         state,
+        peer,
         service_id,
         String::new(),
         method,
@@ -195,8 +228,10 @@ pub async fn handle_root(
 }
 
 /// `/proxy/{service_id}/{*rest}`
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_rest(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((service_id, rest)): Path<(String, String)>,
     method: Method,
     uri: Uri,
@@ -204,12 +239,16 @@ pub async fn handle_rest(
     ws: MaybeWs,
     body: Bytes,
 ) -> Response {
-    dispatch(state, service_id, rest, method, uri, headers, ws, body).await
+    dispatch(
+        state, peer, service_id, rest, method, uri, headers, ws, body,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: AppState,
+    peer: SocketAddr,
     service_id: String,
     rest: String,
     method: Method,
@@ -249,6 +288,26 @@ async fn dispatch(
     }
 
     // ---- 普通 HTTP 透传 ----
+    // 客户端真实来源（2026-11-04 审查）：转发前重建 XFF / X-Real-IP。
+    // 浏览器发出的 XFF 是客户端自己写的、可任意伪造；照原样转发的话，
+    // 上游应用按 XFF 做的审计/限流一样中招。取值口径与登录限流一致
+    // （可信反代场景从右往左取第一个不可信地址，否则用 socket 地址）。
+    let real_ip = {
+        let (trust, trusted) = {
+            let config = state.config.read().await;
+            (
+                config.server.proxy.trust_proxy_headers,
+                config.server.proxy.trusted_ips.clone(),
+            )
+        };
+        crate::api::auth::pick_client_ip(
+            trust,
+            &trusted,
+            &crate::api::auth::peer_ip(peer),
+            &headers,
+        )
+    };
+
     let client = if service.insecure_skip_verify {
         match reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -273,6 +332,10 @@ async fn dispatch(
         if HOP_BY_HOP.contains(&lower.as_str()) {
             continue;
         }
+        // 来源头不透传，转发前用 real_ip 重建（见上方 real_ip 注释）
+        if lower == "x-forwarded-for" || lower == "x-real-ip" {
+            continue;
+        }
         // 本站会话 Cookie 绝不下发给上游：Cookie 是浏览器自动带上的，
         // 上游哪怕只记一条访问日志，也等于把 asmoday 的 session token 交了出去。
         // 上游自己的 Cookie 照常转发（只摘掉 `asmoday_session` 这一条）。
@@ -287,6 +350,9 @@ async fn dispatch(
     for (name, value) in &service.inject_headers {
         request = request.header(name.as_str(), value.as_str());
     }
+    request = request
+        .header("x-forwarded-for", real_ip.as_str())
+        .header("x-real-ip", real_ip.as_str());
 
     if !body.is_empty() {
         request = request.body(body);
@@ -306,9 +372,20 @@ async fn dispatch(
     let upstream_headers = upstream.headers().clone();
 
     let mut builder = Response::builder().status(status);
+    let mut saw_csp = false;
     for (name, value) in upstream_headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
         if DROP_RESPONSE.contains(&lower.as_str()) {
+            continue;
+        }
+        // CSP 只剥 frame-ancestors（允许 iframe），其余指令透传
+        if lower == "content-security-policy" || lower == "content-security-policy-report-only" {
+            saw_csp = saw_csp || lower == "content-security-policy";
+            if let Some(stripped) = value.to_str().ok().and_then(strip_frame_ancestors)
+                && let Ok(stripped) = HeaderValue::from_str(&stripped)
+            {
+                builder = builder.header(name, stripped);
+            }
             continue;
         }
         // 上游同名 Set-Cookie 会把浏览器的 asmoday 会话顶掉（等于被上游登出），
@@ -320,6 +397,11 @@ async fn dispatch(
             continue;
         }
         builder = builder.header(name, value);
+    }
+    // 上游没有任何 CSP 时补一条只管 frame-ancestors 的兜底：第三方页面与本站
+    // 同源，不能既没有上游 CSP 又没有防点击劫持声明。
+    if !saw_csp {
+        builder = builder.header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'self'");
     }
 
     // 老旧后台的绝对路径改写
@@ -452,5 +534,22 @@ mod tests {
         assert!(!is_session_cookie(&HeaderValue::from_static(
             "grafana_session=ok; Path=/"
         )));
+    }
+
+    #[test]
+    fn csp_keeps_xss_defenses_without_frame_ancestors() {
+        // 只剥 frame-ancestors，其余指令（XSS 防线）必须保留
+        let csp = "default-src 'self'; frame-ancestors 'none'; script-src 'self'";
+        let stripped = strip_frame_ancestors(csp).expect("非空 CSP 应保留");
+        assert!(!stripped.contains("frame-ancestors"), "{stripped}");
+        assert!(stripped.contains("default-src 'self'"), "{stripped}");
+        assert!(stripped.contains("script-src 'self'"), "{stripped}");
+
+        // 大小写不敏感 + 无空格写法
+        let stripped = strip_frame_ancestors("default-src *;FRAME-ANCESTORS *").unwrap();
+        assert!(!stripped.contains("ANCESTORS"), "{stripped}");
+
+        // 整条 CSP 只有 frame-ancestors：剥完为空，交给兜底逻辑
+        assert!(strip_frame_ancestors("frame-ancestors 'self'").is_none());
     }
 }

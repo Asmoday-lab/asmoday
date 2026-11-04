@@ -1297,6 +1297,11 @@ impl SyncMode {
     }
 }
 
+/// 同步串行闸（v4.9.20）：旧实现整棵树都握着索引连接的 `Mutex`，两轮扫描
+/// 天然互斥；拆成短锁后必须自己保证「请求触发的 Force」与「后台轮询」不
+/// 交错重写同一目录。全进程一把，等待语义与旧版（排在 DB Mutex 后面）一致。
+static SYNC_SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+
 pub(crate) fn sync_index(
     index: &MediaIndex,
     root: &Path,
@@ -1304,39 +1309,43 @@ pub(crate) fn sync_index(
     mode: SyncMode,
     cache: Option<&crate::core::dir_cache::DirCache>,
 ) -> Option<usize> {
+    let _serial = SYNC_SERIAL.lock().ok()?;
     let refresh = mode.refresh();
     let scope = Scope::new(&fs::normalize_display(root), depth);
-    let outcome = index.with_conn(|conn| {
+
+    // 阶段 1（短锁，毫秒级）：窗口判定 + Force 时清字幕负缓存。
+    // 命中窗口直接返回 —— 常规浏览路径一步 IO 都不做，这条必须先于走树。
+    let window_hit = index.with_conn(|conn| {
         if mode.honors_window()
             && let Some((synced_depth, at)) = media_index::synced(conn, &scope.root)?
             && synced_depth >= depth as i64
             && (crate::core::auth::now_secs().max(0) as u64).saturating_sub(at)
                 <= media_index::FRESH
         {
-            crate::log_debug!(
-                "媒体索引命中窗口：{}（{} 层，{}s 前同步）",
-                scope.root,
-                synced_depth,
-                (crate::core::auth::now_secs().max(0) as u64).saturating_sub(at)
-            );
-            return Ok((0usize, Vec::new()));
+            return Ok(true);
         }
-        let started = std::time::Instant::now();
         // 用户点「重新扫描」（Force）：连带清掉字幕缓存。给视频补了 .srt 之后
         // 视频自身的 mtime 不变，不清负缓存就要等 7 天 TTL 才看得见。
         if refresh {
             media_index::subtitles_clear(conn);
         }
-        let outcome = walk_into_index(conn, root, &scope, refresh, cache)?;
-        media_index::mark_synced(conn, &scope.root, depth)?;
-        crate::log_debug!(
-            "媒体索引同步完成：{} {} 条，{}ms",
-            scope.root,
-            outcome.0,
-            started.elapsed().as_millis()
-        );
-        Ok(outcome)
+        Ok(false)
     })?;
+    if window_hit {
+        crate::log_debug!("媒体索引命中窗口：{}", scope.root);
+        return Some(0);
+    }
+
+    let started = std::time::Instant::now();
+    // 阶段 2 + 3：走树（锁外纯 IO）+ 每批两次短锁（查戳 / 写行），
+    // 末尾一个短事务收尾（尾批 flush + prune + mark_synced）。
+    let outcome = walk_into_index(index, root, &scope, refresh, cache)?;
+    crate::log_debug!(
+        "媒体索引同步完成：{} {} 条，{}ms",
+        scope.root,
+        outcome.0,
+        started.elapsed().as_millis()
+    );
 
     // 缓存回收放在数据库锁之外：删目录是纯文件操作，不该占着索引那条连接。
     // 只处理扫描**确认消失**的条目（外部删除 / 改名）；读不动的子树已在扫描里排除。
@@ -1396,14 +1405,24 @@ fn flush_dirs(
     Ok(removed)
 }
 
+/// 走一遍树并把每个目录的结果写进索引（v4.9.20 起不再整树持锁）。
+///
+/// 与 `scan_raw` 的口径必须完全一致（junk / svg / SKIP_DIRS / 深度 / 分类），
+/// 否则「索引版」和「回退版」会给出两套结果。
+///
+/// 锁的形态：走树与构建 `Asset` 全程不碰索引连接；每批 `WALK_IO` 个目录
+/// 只拿两次短锁 —— 一次批量查目录戳（毫秒级 SELECT），一次写行
+/// （`flush_dirs` 的事务时长 = 写锁时长）。整树扫描期间其他请求的阻塞
+/// 从「秒到分钟」降到「单批几毫秒」。
 fn walk_into_index(
-    conn: &rusqlite::Connection,
+    index: &MediaIndex,
     root: &Path,
     scope: &Scope,
     refresh: bool,
     cache: Option<&crate::core::dir_cache::DirCache>,
-) -> rusqlite::Result<(usize, Vec<String>)> {
+) -> Option<(usize, Vec<String>)> {
     use crate::core::dir_cache::{KIND_DIR, KIND_FILE};
+    use std::collections::HashMap;
 
     let depth = (scope.max_depth - scope.min_depth).max(0) as usize;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1434,10 +1453,10 @@ fn walk_into_index(
         // 以前是「遍历一个、stat 一个、再 readdir」，三个网络往返串着走；
         // 现在 stat 这一层 16 路重叠，结果直接喂给 read_dir_entries 复用。
         // 并发做完「stat + readdir」两件事。同一批 16 路重叠，快照命中时只剩一次 stat。
-        // `DirCache` 内部是 `Mutex<Connection>`，跨线程安全；`conn` 留在主线程，
+        // `DirCache` 内部是 `Mutex<Connection>`，跨线程安全；索引连接留在调用方，
         // 因为 rusqlite 的 `Connection` 不是 `Sync`。
         let fetch_started = std::time::Instant::now();
-        let listings: Vec<DirListing> = run_parallel_n(dir_batch, WALK_IO, |(dir, level)| {
+        let mut listings: Vec<DirListing> = run_parallel_n(dir_batch, WALK_IO, |(dir, level)| {
             let stamp = std::fs::metadata(&dir)
                 .ok()
                 .and_then(|meta| meta.modified().ok())
@@ -1447,12 +1466,26 @@ fn walk_into_index(
         });
         io_time += fetch_started.elapsed();
 
-        for (dir, level, stamp, entries) in listings {
-            let display = if level == 0 {
-                scope.root.clone()
-            } else {
-                fs::normalize_display(&dir)
-            };
+        // 先算好展示串（短锁内外都要用），再拿一次短锁批量查这批目录的库里戳
+        let displays: Vec<String> = listings
+            .iter()
+            .map(|(dir, level, _, _)| {
+                if *level == 0 {
+                    scope.root.clone()
+                } else {
+                    fs::normalize_display(dir)
+                }
+            })
+            .collect();
+        let stamps: HashMap<String, Option<i64>> = index.with_conn(|conn| {
+            let mut map = HashMap::with_capacity(displays.len());
+            for display in &displays {
+                map.insert(display.clone(), media_index::dir_stamp(conn, display)?);
+            }
+            Ok(map)
+        })?;
+
+        for ((dir, level, stamp, entries), display) in listings.drain(..).zip(displays) {
             // 读不动（挂载点掉线 / 权限不足）：这一支保持原样，既不重写行、
             // 也不让 prune 把它和它的子孙当成「外部删除」（v4.9.18）
             let Some(entries) = entries else {
@@ -1464,7 +1497,7 @@ fn walk_into_index(
             scanned += entries.len();
             // 快照命中（戳一致）就认为库里这一目录的行还是对的；`stamp` 取不到时一律重写
             let unchanged =
-                !refresh && stamp.is_some() && media_index::dir_stamp(conn, &display)? == stamp;
+                !refresh && stamp.is_some() && stamps.get(&display).copied().flatten() == stamp;
             if unchanged {
                 reused += 1;
             }
@@ -1518,26 +1551,38 @@ fn walk_into_index(
                     stamp: stamp.unwrap_or(0),
                     assets,
                 });
-                if batch.len() >= media_index::CHUNK {
-                    removed.extend(flush_dirs(conn, &mut batch)?);
-                }
             }
         }
-    }
-    removed.extend(flush_dirs(conn, &mut batch)?);
 
+        // 这一批的写行进短锁（事务时长 = 写锁时长，毫秒级）
+        if batch.len() >= media_index::CHUNK {
+            removed.extend(index.with_conn(|conn| flush_dirs(conn, &mut batch))?);
+        }
+    }
+    // 收尾短事务：尾批 flush + prune + mark_synced。
+    // 批与批之间目录可能被并发改动（上传失效 / 另一轮扫描），与旧版
+    // 「整树持锁 = 快照」相比这是可接受的弱化：prune 已用 `unreadable`
+    // 保护挂载点掉线，漏网的死行由下一轮自愈。
     // 这次没走到的目录（外面删掉了）连同条目一起清掉，索引不能留死行；
-    // 读不动的子树原地保留 —— 否则网络抖一下整棵树就被当成删除
-    let tx = conn.unchecked_transaction()?;
-    removed.extend(media_index::prune(&tx, scope, &visited, &unreadable)?);
-    tx.commit()?;
+    // 读不动的子树原地保留 —— 否则网络抖一下整棵树就被当成删除。
+    index.with_conn(|conn| {
+        let tail = flush_dirs(conn, &mut batch)?;
+        let tx = conn.unchecked_transaction()?;
+        let pruned = media_index::prune(&tx, scope, &visited, &unreadable)?;
+        tx.commit()?;
+        media_index::mark_synced(conn, &scope.root, depth)?;
+        removed.extend(tail);
+        removed.extend(pruned);
+        Ok(())
+    })?;
+
     crate::log_debug!(
         "媒体索引走树：{} 个目录（{} 个命中旧行，跳过写库），读目录耗时 {}ms",
         dirs,
         reused,
         io_time.as_millis()
     );
-    Ok((scanned, removed))
+    Some((scanned, removed))
 }
 
 /// 图片像素宽高的进程内缓存（v4.6.19）。
@@ -2377,6 +2422,10 @@ pub async fn cache_stats(State(state): State<AppState>) -> Response {
 
 /// POST /api/media/cache/clear：清空缩略图缓存（源文件不受影响）
 pub async fn clear_cache(State(state): State<AppState>) -> Response {
+    // 最具破坏性的清理入口（remove_dir_all 整个缓存树），同样要抢互斥位
+    let Some(_job) = state.thumb_jobs.try_claim() else {
+        return Json(json!({ "status": "already_running" })).into_response();
+    };
     let thumbnails = Arc::clone(&state.thumbnails);
     let result = tokio::task::spawn_blocking(move || thumbnails.clear()).await;
     // 缓存图都删了，ThumbHash 色值也没意义了，一并清表（下次生成会重建）

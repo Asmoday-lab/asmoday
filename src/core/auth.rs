@@ -736,6 +736,54 @@ impl AuthStore {
         })
     }
 
+    /// 创建首个用户（setup 专用，设计文档 3.1.1）。
+    ///
+    /// 「是否已有用户」的检查与插入放在同一个 IMMEDIATE 事务里，
+    /// 消除 `setup` 处理器「两次独立数据库操作」的抢注竞态——
+    /// 两个并发 POST 否则都能读到 count=0 并各自 INSERT 成功。
+    /// 已有用户时返回 `Err("ALREADY_INITIALIZED")`（调用方映射为 409）。
+    pub fn create_first_user(&self, username: &str, password: &str) -> Result<User, String> {
+        use rusqlite::TransactionBehavior;
+
+        let username = username.trim();
+        if username.len() < 2 {
+            return Err("用户名至少 2 个字符".to_string());
+        }
+        check_password_strength(password)?;
+
+        let hash = hash_password(password)?;
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("开启事务失败：{e}"))?;
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .map_err(|e| format!("查询用户失败：{e}"))?;
+        if count != 0 {
+            return Err("ALREADY_INITIALIZED".to_string());
+        }
+        tx.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+            params![username, hash, now_secs()],
+        )
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE") {
+                "用户名已存在".to_string()
+            } else {
+                format!("创建用户失败：{e}")
+            }
+        })?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(|e| format!("提交事务失败：{e}"))?;
+
+        Ok(User {
+            id,
+            username: username.to_string(),
+            totp_enabled: false,
+            must_change_password: false,
+        })
+    }
+
     pub fn find_user(
         &self,
         username: &str,
@@ -919,7 +967,7 @@ impl AuthStore {
         conn.execute(
             "INSERT INTO sessions (token, user_id, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![token, user_id, now, now + SESSION_TTL],
+            params![session_digest(&token), user_id, now, now + SESSION_TTL],
         )
         .map_err(|e| format!("创建会话失败：{e}"))?;
         Ok(token)
@@ -930,12 +978,16 @@ impl AuthStore {
     /// 滑动续期（设计文档 3.1.3）：剩余不足半个 TTL 时把过期时间往后推，
     /// 但**不超过** `created_at + SESSION_ABSOLUTE_TTL`（绝对上限 30 天）。
     /// 只在临近过期时写库，避免每个请求都产生一次 UPDATE。
+    ///
+    /// 入库的 token 是 SHA-256 摘要（见 `session_digest`）：查库 / 删库 /
+    /// 续期全部按摘要走，明文只存在于浏览器 Cookie 里。
     pub fn session_state(&self, token: &str) -> Result<Option<SessionState>, String> {
         let conn = self.connect()?;
+        let digest = session_digest(token);
         let row: Option<(i64, i64, i64)> = conn
             .query_row(
                 "SELECT user_id, expires_at, created_at FROM sessions WHERE token = ?1",
-                params![token],
+                params![digest],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -950,14 +1002,14 @@ impl AuthStore {
                     if renewed > expires_at {
                         let _ = conn.execute(
                             "UPDATE sessions SET expires_at = ?1 WHERE token = ?2",
-                            params![renewed, token],
+                            params![renewed, digest],
                         );
                     }
                 }
                 Ok(Some(SessionState { user_id }))
             }
             Some(_) => {
-                let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);
+                let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![digest]);
                 Ok(None)
             }
             None => Ok(None),
@@ -971,8 +1023,11 @@ impl AuthStore {
 
     pub fn delete_session(&self, token: &str) -> Result<(), String> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])
-            .map_err(|e| format!("删除会话失败：{e}"))?;
+        conn.execute(
+            "DELETE FROM sessions WHERE token = ?1",
+            params![session_digest(token)],
+        )
+        .map_err(|e| format!("删除会话失败：{e}"))?;
         Ok(())
     }
 
@@ -987,7 +1042,7 @@ impl AuthStore {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE sessions SET verified_at = ?1 WHERE token = ?2",
-            params![now_secs(), token],
+            params![now_secs(), session_digest(token)],
         )
         .map_err(|e| format!("更新验证时间失败：{e}"))?;
         Ok(())
@@ -1000,7 +1055,7 @@ impl AuthStore {
         };
         conn.query_row(
             "SELECT verified_at FROM sessions WHERE token = ?1",
-            params![token],
+            params![session_digest(token)],
             |row| row.get::<_, i64>(0),
         )
         .map(|verified_at| {
@@ -1057,7 +1112,22 @@ pub fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 一次性高强度密码（CLI --init / --reset-password 用）
+/// 会话 token 的入库摘要（SHA-256 hex，2026-11-04 审查）。
+///
+/// `sessions.token` 列**只存摘要**，明文只存在于浏览器 Cookie 里——
+/// 数据库文件被拷走（备份外泄 / 挂载点被读）也拿不到可直接使用的会话。
+/// token 本身是 256 位随机值，等值查询走索引与明文同速。
+pub(crate) fn session_digest(token: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// 敏感值的指纹（用于「同一个 ASMODAY_RESET_PASSWORD 只生效一次」，不落明文）
 pub fn fingerprint(secret: &str) -> String {
     use sha1::{Digest, Sha1};
@@ -1408,7 +1478,7 @@ mod tests {
             .unwrap()
             .execute(
                 "UPDATE sessions SET created_at = ?1, expires_at = ?2 WHERE token = ?3",
-                params![now - 29 * 86_400, now + 60, token],
+                params![now - 29 * 86_400, now + 60, session_digest(&token)],
             )
             .unwrap();
         assert!(store.session_user(&token).unwrap().is_some());
@@ -1417,7 +1487,7 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT created_at, expires_at FROM sessions WHERE token = ?1",
-                params![token],
+                params![session_digest(&token)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();

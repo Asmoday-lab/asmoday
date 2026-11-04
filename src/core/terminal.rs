@@ -167,18 +167,73 @@ impl Session {
         }
     }
 
+    /// 进程是否已退出（`try_wait` 一次；锁中毒 / 出错按未退出处理）。
+    fn exited(&self) -> bool {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok().flatten())
+            .is_some()
+    }
+
     /// 先礼貌退场再强杀（对齐本地 shell 关闭体验）。
     ///
     /// 直接 kill 会跳过 shell 的退出流程：PSReadLine 不保存收尾历史、
     /// conda/npm 这类前台子进程被连坐成孤儿。这里先敲一个 `exit\r`
     /// （空闲 shell 正常退出；若正跑着前台进程，这几个键只会落进它的
-    /// stdin，随后照样强杀，不会挂起），短暂等待后兜底 kill。
+    /// stdin，随后照样强杀，不会挂起），宽限窗口里轮询 `try_wait`——
+    /// 正常退出的 shell 不必补一刀 SIGKILL（v4.9.20 前是固定睡 700ms
+    /// 然后无条件 kill，掩盖了「其实已经优雅退出」），超时才兜底 kill。
+    /// 调用方随后必须 `spawn_reaper` 完成 wait（见其注释）。
     pub fn close_graceful(&self) {
         if self.write_all(b"exit\r").is_ok() {
-            std::thread::sleep(Duration::from_millis(700));
+            let deadline = Instant::now() + Duration::from_millis(700);
+            while Instant::now() < deadline {
+                if self.exited() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         self.kill();
     }
+}
+
+/// 回收 PTY 子进程（2026-11-04 审查）。
+///
+/// `Box<dyn Child>` 的 Drop **不做 waitpid**：类 Unix 上无论用户 `exit`、
+/// 优雅关闭还是强杀，只要没人 `wait`，进程就变僵尸——长期驻留的守护
+/// 进程会单调积累 defunct 项，最终 `spawn` 因 EAGAIN 失败。专用线程
+/// 「短轮询 + 兜底阻塞 wait」：不占会话锁、不在调用线程上无限等待；
+/// EOF 与 kill 两条路径都触发时，后到的 `wait` 返回 ECHILD，只记日志。
+fn spawn_reaper(session: Arc<Session>) {
+    let id = session.id.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("pty-reaper-{id}"))
+        .spawn(move || {
+            // kill 是异步的：SIGKILL / TerminateProcess 返回 ≠ 进程对象已消失，
+            // 最多给 2 秒确认窗口，之后靠阻塞 wait 收尾（专用线程，挂多久都行）
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !session.exited() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if let Ok(mut child) = session.child.lock() {
+                match child.wait() {
+                    Ok(status) => {
+                        crate::log_debug!("pty session {id} reaped (exit {:?})", status.exit_code())
+                    }
+                    // ECHILD = 已被别处回收（EOF 路径先到），正常
+                    Err(err) => crate::log_debug!("pty session {id} wait: {err}"),
+                }
+            }
+        });
+}
+
+/// kill + 回收的组合。所有「结束会话」的路径都必须走这里
+/// （进程自行退出的 EOF 路径只调 `spawn_reaper`，不再 kill）。
+fn kill_and_reap(session: &Arc<Session>) {
+    session.kill();
+    spawn_reaper(Arc::clone(session));
 }
 
 /// 会话池。
@@ -250,14 +305,20 @@ impl TerminalManager {
 
     /// 强制关闭指定会话（设计文档 3.3.6）。返回该会话是否存在。
     pub fn force_close(&self, id: &str) -> bool {
-        let removed = self.inner.lock().ok().and_then(|mut map| map.remove(id));
+        let removed = self.take(id);
         match removed {
             Some(session) => {
-                session.kill();
+                kill_and_reap(&session);
                 true
             }
             None => false,
         }
+    }
+
+    /// 从池里摘掉会话（不 kill）。回收路径统一「先摘、再杀、再 wait」，
+    /// 避免会话还在池里时子进程就已经死亡带来的二次处理。
+    fn take(&self, id: &str) -> Option<Arc<Session>> {
+        self.inner.lock().ok().and_then(|mut map| map.remove(id))
     }
 }
 
@@ -673,6 +734,10 @@ impl TerminalManager {
                             Err(_) => break,
                         }
                     }
+                    // EOF = pty 从设备全部关闭 = 进程（正在）退出。
+                    // 这里是唯一的「进程已结束」信号源，必须 wait 回收，
+                    // 否则类 Unix 上留僵尸（2026-11-04 审查）。
+                    spawn_reaper(session);
                 })
                 .map_err(|e| format!("启动 PTY 读取线程失败：{e}"))?;
         }
@@ -702,21 +767,21 @@ impl TerminalManager {
                 Some(session) => session.clients.load(Ordering::SeqCst) == 0,
                 None => false,
             };
-            if should_kill && let Some(session) = manager.get(&id) {
-                // 回收走优雅退出：给 shell 留保存历史、收尾子进程的机会
+            if should_kill && let Some(session) = manager.take(&id) {
+                // 回收走优雅退出：给 shell 留保存历史、收尾子进程的机会。
+                // close_graceful 末尾会 kill；这里再兜一次（幂等）并完成 wait 回收。
                 let session_for_close = Arc::clone(&session);
                 tokio::task::spawn_blocking(move || session_for_close.close_graceful())
                     .await
                     .ok();
-                manager.kill(&id);
+                kill_and_reap(&session);
             }
         });
     }
 
     pub fn kill(&self, id: &str) {
-        let removed = self.inner.lock().ok().and_then(|mut map| map.remove(id));
-        if let Some(session) = removed {
-            session.kill();
+        if let Some(session) = self.take(id) {
+            kill_and_reap(&session);
         }
     }
 
@@ -732,7 +797,7 @@ impl TerminalManager {
             })
             .unwrap_or_default();
         for (_, session) in sessions {
-            session.kill();
+            kill_and_reap(&session);
         }
         if let Ok(mut map) = self.inner.lock() {
             map.clear();

@@ -376,6 +376,9 @@ GWT-AUTH-05 Given 登录页  When 密码错误  Then 行内错误"用户名或�
 GWT-AUTH-06 Given 登录页  When 密码正确但 TOTP 开启  Then 弹出 6 位 TOTP 输入，输入错误回登录页
 GWT-AUTH-07 Given 已登录  When 密码重置成功（CLI --reset-password）  Then 前端下一个请求返回 401 E_UNAUTHORIZED → 跳登录
 GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任意页面  Then 401 跳登录，返回后回到原路径
+GWT-AUTH-09 Given 初始化完成  When 用同一令牌再 POST /api/auth/setup  Then 403（令牌一次性，成功即作废；重启后重新生成）
+GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问日志  Then 无初始化令牌、无一次性密码明文（两者只打 stdout）
+GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When 客户端连发登录失败  Then 防爆破池按「最右不可信地址」计数，伪造值换不动桶
 ```
 
 #### 依赖红线
@@ -471,6 +474,7 @@ GWT-SESSION-07 Given 浏览器发写请求  When Origin 与 Referer 都缺失  T
 GWT-SESSION-08 Given 写请求带 Bearer Token  When Origin 缺失  Then 放行
 GWT-SESSION-09 Given 用户在 A 设备改密  When B 设备发起任意请求  Then 401（全部 session 行已删）
 GWT-SESSION-10 Given WebSocket /api/terminal/ws  When Origin 与 Host 不同源  Then 拒绝握手（403）
+GWT-SESSION-11 Given 拖走 data/*.db 文件  When 检索 sessions 表  Then 只见 token 的 SHA-256 摘要，无可直接使用的会话凭据
 ```
 
 #### 依赖红线
@@ -1050,6 +1054,9 @@ GWT-THUMB-09 Given 挂载点离线（readdir 失败）  When 扫描  Then 该子
 GWT-THUMB-10 Given 同一内容指纹解码失败过  When 30 分钟内再次请求  Then 直接回占位图，不再重试
 GWT-THUMB-11 Given 超大尺寸图片（>16384 边）  When 生成缩略图  Then image 分支拒绝，交 ffmpeg 解码期降采样
 GWT-THUMB-12 Given FFmpeg 卡死  When 超过探测 5s / 截帧 15s / 编码 10s  Then 进程被 kill，信号量按时释放
+GWT-THUMB-13 Given 全量重建进行中  When 手动清理 / janitor 到点 / 清空缓存  Then 409 already_running，互斥位保证清理不撞正在 rename 的生成（v4.9.20）
+GWT-THUMB-14 Given 全量重建进行中  When POST /api/system/thumbnails/rebuild/stop  Then 扫描与生成循环按检查点退出，状态归零，互斥位释放（v4.9.20）
+GWT-THUMB-15 Given 更换挂载点  When 下一轮索引扫描 retain_roots  Then 旧根条目的缩略图缓存单元与 ThumbHash 行一并回收，不再挤占 LRU（v4.9.20）
 ```
 
 #### 安全审查落地（2026-11-04）
@@ -1435,6 +1442,7 @@ GWT-TERM-08 Given 用户在终端执行 `history`  When 命令  Then 不写入�
 GWT-TERM-09 Given PowerShell  When 启动  Then `-NoProfile` 可选，纯净模式可用
 GWT-TERM-10 Given 活动会话面板  When 强制关闭某条会话  Then 占用它的标签一并关闭，且 5 秒内不再自动新建等价 PTY
 GWT-TERM-11 Given 两个独立浏览器窗口各开终端  When 任一窗口执行命令或新建标签  Then 另一边画面与 session_id 不变，且所有会话尺寸不被压到 20×5
+GWT-TERM-12 Given 用户在 Linux 上反复开关终端（exit / 强制关闭 / 闲置回收）  When 检查进程表  Then 无 defunct 僵尸项累积（会话结束路径统一 wait 回收，v4.9.20）
 ```
 
 #### 依赖红线
@@ -1660,6 +1668,9 @@ GWT-UP-01 Given 一个大于 upload_chunk_size_mb 的文件  When 前端上传  
 GWT-UP-02 Given 传到一半断开  When 重新上传同一文件（或点「重试」）  Then 先 HEAD 问服务端偏移，从断点继续 PATCH，不重传已落盘字节；服务重启后（会话丢失）HEAD 404，客户端从头 init
 GWT-UP-03 Given 会话声明 Upload-Length = N  When PATCH 累计超过 N  Then 400 并销毁会话与临时文件；When 上传同名文件  Then conflict=fail 得 409 E_CONFLICT / overwrite 覆盖 / rename 落 `名称 (n).扩展名`
 GWT-UP-04 Given 只读挂载点  When PUT /api/files/upload 或 POST /api/files/upload/tus  Then 403 E_READONLY（v4.6.14 堵住整包上传的只读缺口）
+GWT-UP-05 Given 两个并发 PATCH 打同一会话同一 Upload-Offset  When 第二个抢到会话锁  Then 重新读偏移后 409 E_OFFSET_MISMATCH，不产出交错字节（v4.9.20）
+GWT-UP-06 Given 整包 PUT 4GiB（upload_max_size_mb=0）  When 传输中  Then 服务端内存占用恒为单帧 chunk，边写边限流（v4.9.20 起 `body: Bytes` 整包缓冲已删）
+GWT-UP-07 Given 同名并发整包上传 / 两标签页同时保存同一文本  When 落盘  Then 各自使用带随机后缀的唯一临时文件，不互相覆盖（v4.9.20）
 ```
 
 #### GWT 验收（导航 / 过渡 / 灯箱 / 媒体库视图，v4.6.16）

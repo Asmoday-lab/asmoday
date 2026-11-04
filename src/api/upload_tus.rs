@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -45,6 +45,14 @@ const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct TusStore {
     tmp_dir: PathBuf,
     sessions: Mutex<HashMap<String, TusSession>>,
+    /// 每个上传会话一把异步锁（v4.9.20）：同一 id 的 PATCH / DELETE 串行。
+    ///
+    /// 两个并发 PATCH 同一 offset 是典型的 TOCTOU：都读到 current=N 都通过
+    /// 校验，O_APPEND 只保证单次 write 不覆盖、不保证多个 chunk 不交错——
+    /// 长度恰好凑满 Upload-Length 时会静默产出损坏文件。锁住整个
+    /// 「校验偏移 → 流式写 → 落位/删除」临界区后，后来的 PATCH 会看到
+    /// 已推进的 offset 并按规范吃 409。
+    op_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Clone)]
@@ -68,7 +76,17 @@ impl TusStore {
         Self {
             tmp_dir,
             sessions: Mutex::new(HashMap::new()),
+            op_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 取某个会话的操作锁（不存在也会建：调用方随后 re-get 会话判 404）。
+    pub(crate) fn op_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.op_locks
+            .lock()
+            .ok()
+            .map(|mut map| map.entry(id.to_string()).or_default().clone())
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())))
     }
 
     fn sweep_expired(&self) {
@@ -117,6 +135,11 @@ impl TusStore {
         let session = self.sessions.lock().ok().and_then(|mut map| map.remove(id));
         if let Some(session) = session {
             let _ = std::fs::remove_file(&session.temp_path);
+        }
+        // 操作锁一并摘除：会话没了，等待中的锁条目是垃圾。
+        // 还持着锁的调用方与等待者各自持有 Arc，串行语义不受影响。
+        if let Ok(mut map) = self.op_locks.lock() {
+            map.remove(id);
         }
     }
 
@@ -270,9 +293,6 @@ pub async fn tus_patch(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(session) = state.tus.get(&id) else {
-        return fail(StatusCode::NOT_FOUND, "upload session not found");
-    };
     if !headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -290,6 +310,15 @@ pub async fn tus_patch(
     {
         Some(v) => v,
         None => return fail(StatusCode::BAD_REQUEST, "missing Upload-Offset header"),
+    };
+
+    // 同会话操作串行（v4.9.20）：锁住「校验偏移 → 流式写 → 落位/删除」
+    // 整段临界区。抢到锁后必须重新 get —— 等待期间会话可能已被并发
+    // DELETE / 并发 PATCH 落位删除。
+    let lock = state.tus.op_lock(&id);
+    let _serial = lock.lock().await;
+    let Some(session) = state.tus.get(&id) else {
+        return fail(StatusCode::NOT_FOUND, "upload session not found");
     };
 
     let current = std::fs::metadata(&session.temp_path)
@@ -342,7 +371,10 @@ pub async fn tus_patch(
         );
     }
     if size == session.length {
-        // 收满即落位（tus Sync 语义），不需要单独的 complete 请求
+        // 收满即落位（tus Sync 语义），不需要单独的 complete 请求。
+        // finalize 失败时**保留会话**：临时文件完好，客户端修掉冲突
+        // （比如删掉同名文件）后再 PATCH 一次即可重新落位；
+        // 会话由 24h TTL 兜底清理。
         return match finalize_upload(&state, &id, &session) {
             Ok(target) => {
                 if let Some(target) = target {
@@ -354,10 +386,7 @@ pub async fn tus_patch(
                 )
                     .into_response()
             }
-            Err(err) => {
-                state.tus.remove(&id);
-                fs_error(err)
-            }
+            Err(err) => fs_error(err),
         };
     }
 
@@ -369,7 +398,12 @@ pub async fn tus_patch(
 }
 
 /// DELETE /api/files/upload/tus/{id}：取消上传并清理临时文件。
+///
+/// 与 PATCH 抢同一把会话锁：否则「对方正在写、这边删文件」在 POSIX 上
+/// 是写进已 unlink 的 inode（数据静默丢失），Windows 上直接删不动。
 pub async fn tus_delete(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    let lock = state.tus.op_lock(&id);
+    let _serial = lock.lock().await;
     state.tus.remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -398,6 +432,10 @@ fn finalize_upload(
             fs_ops::Placement::Use(name, overwrite) => (name, overwrite),
         };
     let target = session.target_dir.join(&final_name);
+
+    // 落位目标纳入 per-path 锁（v4.9.20）：「上传落位」与「删除/移动同名
+    // 文件」互斥；跨会话同名竞争在这里表现为 E_BUSY，而不是把整单上传丢掉。
+    let _path_guard = state.path_locks.acquire(std::slice::from_ref(&target))?;
 
     let attempt = if overwrite {
         path_guard::rename_replace(&session.temp_path, &target)

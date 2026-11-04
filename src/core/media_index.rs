@@ -460,13 +460,22 @@ fn under(root: &str, path: &str) -> bool {
     matches!(path.as_bytes().get(root.len()), None | Some(b'/'))
 }
 
+/// `retain_roots` 的结果（v4.9.20）：
+/// `dirs` 是清掉的目录数；`assets` 是旧根条目的**展示路径**——
+/// 调用方拿去按路径回收缩略图缓存单元与 ThumbHash 行。删行之前
+/// 必须先收集：`forget_dir` 之后路径信息就永久丢了。
+pub struct RetainOutcome {
+    pub dirs: usize,
+    pub assets: Vec<String>,
+}
+
 /// 丢掉不属于任何当前挂载点的索引行（v4.8.1）。
 ///
 /// 换挂载点之后旧根的 `media_assets` / `media_dirs` / `media_roots` 没人清：查询按
 /// root 前缀过滤，旧行不会串进新视图，但它们会永久占库；更糟的是配置回落到
 /// 「挂载点全部离线 → cwd 隐式根」时，上一次挂载留下的相册会原样冒出来
 /// （2026-11-03「换了挂载点图片库还显示旧目录」就是这个 + 前端快照）。
-pub fn retain_roots(conn: &Connection, keep: &[String]) -> rusqlite::Result<usize> {
+pub fn retain_roots(conn: &Connection, keep: &[String]) -> rusqlite::Result<RetainOutcome> {
     let keep: Vec<String> = keep
         .iter()
         .map(|root| root.trim_end_matches('/').to_string())
@@ -486,13 +495,17 @@ pub fn retain_roots(conn: &Connection, keep: &[String]) -> rusqlite::Result<usiz
     drop(stmt);
 
     let tx = conn.unchecked_transaction()?;
-    let mut removed = 0usize;
+    let mut outcome = RetainOutcome {
+        dirs: 0,
+        assets: Vec::new(),
+    };
     for dir in dirs {
         if keep.iter().any(|root| under(root, &dir)) {
             continue;
         }
+        outcome.assets.extend(dir_asset_paths(&tx, &dir)?);
         forget_dir(&tx, &dir)?;
-        removed += 1;
+        outcome.dirs += 1;
     }
     for root in roots {
         let stale = !keep
@@ -502,13 +515,21 @@ pub fn retain_roots(conn: &Connection, keep: &[String]) -> rusqlite::Result<usiz
             tx.execute("DELETE FROM media_roots WHERE root = ?1", params![root])?;
         }
     }
-    // 目录行没了、条目还在的孤儿（旧版本 forget_dir 只删一头的残留）
+    // 目录行没了、条目还在的孤儿（旧版本 forget_dir 只删一头的残留）：
+    // 路径一并交给调用方回收，否则垃圾只是从 media_assets 挪进了缩略图缓存
+    let mut stmt =
+        tx.prepare("SELECT path FROM media_assets WHERE dir NOT IN (SELECT dir FROM media_dirs)")?;
+    let orphans: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    outcome.assets.extend(orphans);
     tx.execute(
         "DELETE FROM media_assets WHERE dir NOT IN (SELECT dir FROM media_dirs)",
         [],
     )?;
     tx.commit()?;
-    Ok(removed)
+    Ok(outcome)
 }
 
 /// 作用域内各类型总数 `(image, video, audio)`：不受 `kind` 过滤影响
@@ -1607,10 +1628,12 @@ mod tests {
                 )?;
                 mark_synced(conn, "C:/old", 3)?;
 
-                assert_eq!(
-                    retain_roots(conn, &["//srv/share/".to_string()])?,
-                    1,
-                    "旧根整棵清掉，当前根一行不动"
+                let outcome = retain_roots(conn, &["//srv/share/".to_string()])?;
+                assert_eq!(outcome.dirs, 1, "旧根整棵清掉，当前根一行不动");
+                assert!(
+                    outcome.assets.iter().any(|p| p.ends_with("b.jpg")),
+                    "旧根的条目路径必须带出来给缓存回收用：{:?}",
+                    outcome.assets
                 );
                 let (image, _, _) = totals(conn, &Scope::new("//srv/share", 2))?;
                 assert_eq!(image, 1);

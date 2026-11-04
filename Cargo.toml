@@ -44,6 +44,7 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 # TOTP / Base32
 hmac = "0.12"
 sha1 = "0.10"
+sha2 = "0.10"
 data-encoding = "2"
 rand = "0.9"
 # otpauth:// 二维码：服务端直接出 SVG，前端 v-html 塞进页面即可。

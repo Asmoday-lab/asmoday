@@ -10,8 +10,12 @@
 //!   供 Video.js 与 ThumbHash 画布使用；`frame-ancestors 'self'` 防点击劫持，
 //!   但**必须**保留 iframe 能力（PDF 预览、Markdown 内嵌）。
 //!
-//! 例外：`/proxy/<id>/…` 是第三方应用的透传，响应头由代理层自行裁剪（设计文档 3.6），
-//! 在这里加本站 CSP 会把对方页面直接打死，所以整段跳过。
+//! 例外：`/proxy/<id>/…` 是第三方应用的透传，CSP 由代理层负责（上游自带的
+//! CSP 剥掉 `frame-ancestors` 后透传，见 proxy.rs；上游没有时补一条只含
+//! `frame-ancestors` 的兜底）。这里只对代理路径豁免 CSP——本站 CSP 的
+//! `connect-src 'self'` 等指令会把对方页面打死——但 `nosniff`、
+//! `Referrer-Policy`、`Permissions-Policy`、HSTS 照常下发，代理页面
+//! 不能因为这些头缺席而退化成二等公民（2026-11-04 审查）。
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, header};
@@ -71,10 +75,6 @@ pub async fn security_headers(
     } else {
         path
     };
-    if inner.starts_with("/proxy/") {
-        return next.run(request).await;
-    }
-
     // HTTPS 判定：自己终结 TLS，或来自可信反代的 X-Forwarded-Proto
     let via_trusted_proxy = peer
         .map(|addr| {
@@ -84,6 +84,32 @@ pub async fn security_headers(
         })
         .unwrap_or(false);
     let https = ssl_enabled || (via_trusted_proxy && forwarded_proto.as_deref() == Some("https"));
+
+    if inner.starts_with("/proxy/") {
+        let mut response = next.run(request).await;
+        // CSP 交给代理层（上游自带裁剪 / 兜底 frame-ancestors），其余头照常
+        let headers = response.headers_mut();
+        let mut put = |name: header::HeaderName, value: &str| {
+            if !headers.contains_key(&name)
+                && let Ok(value) = HeaderValue::from_str(value)
+            {
+                headers.insert(name, value);
+            }
+        };
+        put(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        put(header::REFERRER_POLICY, "no-referrer");
+        put(
+            header::HeaderName::from_static("permissions-policy"),
+            PERMISSIONS,
+        );
+        if https {
+            put(
+                header::STRICT_TRANSPORT_SECURITY,
+                "max-age=31536000; includeSubDomains",
+            );
+        }
+        return response;
+    }
 
     let mut response = next.run(request).await;
     let headers = response.headers_mut();

@@ -108,6 +108,22 @@ pub fn redact_query(raw: &str) -> String {
     cut
 }
 
+/// 路径脱敏：分享令牌在**路径段**里（`/api/public/share/{token}` 与
+/// `/api/shares/{token}`），查询串的 key 脱敏盖不住它——令牌本身就是
+/// 可用的凭据，原样进日志等于把分享链接的钥匙落盘（2026-11-04 审查）。
+pub fn redact_path(path: &str) -> String {
+    for prefix in ["/api/public/share/", "/api/shares/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            let token = rest.split('/').next().unwrap_or_default();
+            if !token.is_empty() {
+                let tail = rest.strip_prefix(token).unwrap_or_default();
+                return format!("{prefix}[REDACTED]{tail}");
+            }
+        }
+    }
+    path.to_string()
+}
+
 pub async fn track(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -115,7 +131,7 @@ pub async fn track(
     next: Next,
 ) -> Response {
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
+    let path = redact_path(req.uri().path());
     let interesting = trackable(&path);
     // 只在需要记日志时克隆请求头与查询串；请求体全程不读（设计文档 3.7）
     let (headers, query) = if interesting {
@@ -162,7 +178,19 @@ pub async fn track(
 
 #[cfg(test)]
 mod tests {
-    use super::redact_query;
+    use super::{redact_path, redact_query};
+
+    #[test]
+    fn share_tokens_never_reach_the_log() {
+        assert_eq!(
+            redact_path("/api/public/share/tok1234/download"),
+            "/api/public/share/[REDACTED]/download"
+        );
+        assert_eq!(redact_path("/api/shares/tok1234"), "/api/shares/[REDACTED]");
+        // 非分享路径原样保留
+        assert_eq!(redact_path("/api/files/list"), "/api/files/list");
+        assert_eq!(redact_path("/api/shares"), "/api/shares");
+    }
 
     #[test]
     fn keeps_diagnostic_params_and_masks_secrets() {

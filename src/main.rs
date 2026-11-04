@@ -94,6 +94,12 @@ pub struct AppState {
     pub mounts_revision: Arc<std::sync::atomic::AtomicU64>,
     /// 配置变更信号：后台索引器在 sleep 里 select 它，改完挂载点不必再等一整轮
     pub config_changed: Arc<tokio::sync::Notify>,
+    /// 一次性初始化令牌（设计文档 3.1.1）：进程内保存，setup 接口必须携带。
+    ///
+    /// 只在「还没有任何用户」时生成并打印到控制台；setup 成功后清空。
+    /// 走 `None`（无用户但没生成）以外的路径都视为不需要——已初始化的实例
+    /// setup 接口本来就返回 409。
+    pub setup_token: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -349,8 +355,21 @@ async fn run(cli: Cli) -> Result<(), String> {
         thumb_jobs: Arc::new(api::system::ThumbJobSlot::default()),
         mounts_revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_changed: Arc::new(tokio::sync::Notify::new()),
+        setup_token: Arc::new(std::sync::Mutex::new(None)),
         cwd,
     };
+
+    // 一次性初始化令牌（设计文档 3.1.1）：还没有管理员时生成并打印。
+    // 只走 println（不进 asmoday.log）——日志文件会被轮转/采集，明文凭据
+    // 不能落盘；这与 --reset-password 的口径一致（2026-11-04 审查）。
+    if auth.user_count().unwrap_or(1) == 0 {
+        let token = core::auth::random_token();
+        *state
+            .setup_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.clone());
+        println!("[asmoday] one-time setup token (required by the web setup page): {token}");
+    }
 
     state
         .thumbnails
@@ -452,7 +471,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
     if auth.user_count().unwrap_or(0) == 0 {
         crate::log_warn!(
-            "no administrator yet: open the web UI to finish setup, or run with --init"
+            "no administrator yet: open the web UI and enter the one-time setup token printed above, or run with --init"
         );
     }
     // 嵌套挂载点（父目录里又挂了子目录）是合法配置，但只读按「最深命中」判定：
@@ -623,6 +642,10 @@ fn protected_routes() -> Router<AppState> {
         .route(
             "/api/system/thumbnails/rebuild/status",
             get(api::system::rebuild_status),
+        )
+        .route(
+            "/api/system/thumbnails/rebuild/stop",
+            post(api::system::rebuild_stop),
         )
         // 预生成（v4.9.11）：把最近 N 天的图片提前渲好，浏览时直接命中缓存，
         // 不再每张都从网盘读原图。与「重建」分开：重建是全量重做，预生成是补齐。
@@ -855,18 +878,39 @@ fn spawn_media_indexer(state: AppState) {
             if mounts.iter().any(|path| path.is_dir()) {
                 let prune_index = Arc::clone(&index);
                 let prune_keep = keep.clone();
-                let removed = tokio::task::spawn_blocking(move || {
-                    prune_index
-                        .with_conn(|conn| core::media_index::retain_roots(conn, &prune_keep))
-                        .unwrap_or(0)
+                let outcome = tokio::task::spawn_blocking(move || {
+                    prune_index.with_conn(|conn| core::media_index::retain_roots(conn, &prune_keep))
                 })
                 .await
-                .unwrap_or(0);
-                if removed > 0 {
-                    crate::log_info!(
-                        "media index garbage-collected: {} stale dir(s) left over from old mounts",
-                        removed
-                    );
+                .ok()
+                .flatten();
+                if let Some(outcome) = outcome {
+                    if outcome.dirs > 0 {
+                        crate::log_info!(
+                            "media index garbage-collected: {} stale dir(s) left over from old mounts",
+                            outcome.dirs
+                        );
+                    }
+                    // 旧根的条目路径回收派生数据（v4.9.20）：缩略图缓存单元
+                    // 照旧占着 limit_bytes 会挤掉当前挂载点的活跃缓存；
+                    // ThumbHash 行（键 = 路径指纹）不清的话色值还会喂给前端。
+                    // 文件操作在 with_conn 之外，不占索引连接。
+                    if !outcome.assets.is_empty() {
+                        if let Some(cache_dir) = index.thumb_cache() {
+                            let units = core::thumbnail::purge_paths(cache_dir, &outcome.assets);
+                            if units > 0 {
+                                crate::log_info!(
+                                    "stale mount cache purged: {units} thumbnail unit(s)"
+                                );
+                            }
+                        }
+                        let keys: Vec<String> = outcome
+                            .assets
+                            .iter()
+                            .map(|p| core::thumbnail::Thumbnailer::hash_key(Path::new(p)))
+                            .collect();
+                        state.auth.thumb_hashes_forget(&keys);
+                    }
                 }
             }
 
@@ -960,6 +1004,12 @@ fn spawn_media_janitor(state: AppState) {
         ticker.tick().await;
         loop {
             ticker.tick().await;
+            // 与重建/预生成/手动清理互斥（v4.9.20）：清理删整单元目录，
+            // 撞上正在 rename 的生成任务会制造假失败 + 负缓存。抢不到就跳过本轮。
+            let Some(_job) = state.thumb_jobs.try_claim() else {
+                crate::log_debug!("thumbnail janitor skipped: another thumbnail job is running");
+                continue;
+            };
             let thumbnails = Arc::clone(&state.thumbnails);
             let config = state.config.read().await.media.clone();
             thumbnails.apply_limits(config.limit_bytes(), config.max_age_secs());
@@ -997,7 +1047,9 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path) -> Result<(), String
     let user = auth.create_user("admin", &password)?;
     auth.set_must_change_password(user.id, true)?;
     crate::log_info!("administrator created: {}", user.username);
-    crate::log_warn!("one-time password (must be changed after login): {password}");
+    // 一次性密码只打控制台（stdout），绝不走 log_*!——那会落进
+    // data/logs/asmoday.log 并随轮转留存（2026-11-04 审查）
+    println!("[asmoday] one-time password (must be changed after login): {password}");
     Ok(())
 }
 
@@ -1040,7 +1092,8 @@ async fn reset_admin_password(auth: &AuthStore) -> Result<(), String> {
             auth.update_password(user.id, &password)?;
             auth.set_must_change_password(user.id, true)?;
             crate::log_info!("password reset for {}", user.username);
-            crate::log_warn!("one-time password (must be changed after login): {password}");
+            // 同 bootstrap_admin：只打 stdout，不落日志文件
+            println!("[asmoday] one-time password (must be changed after login): {password}");
         }
     }
     Ok(())

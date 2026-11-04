@@ -45,12 +45,12 @@ export function ensureAuth(): Promise<void> {
   return inflight
 }
 
-async function post(url: string, body?: unknown): Promise<void> {
+async function post(url: string, body?: unknown, headers?: Record<string, string>): Promise<void> {
   busy.value = true
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...headers },
       body: body === undefined ? '{}' : JSON.stringify(body),
     })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
@@ -73,8 +73,8 @@ export const authApi = {
   async login(username: string, password: string, totp?: string) {
     await post('/api/auth/login', { username, password, totp: totp || undefined })
   },
-  async setup(username: string, password: string) {
-    await post('/api/auth/setup', { username, password })
+  async setup(username: string, password: string, setupToken: string) {
+    await post('/api/auth/setup', { username, password }, { 'X-Setup-Token': setupToken.trim() })
   },
   async logout() {
     await post('/api/auth/logout')
