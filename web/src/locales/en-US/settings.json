@@ -223,6 +223,23 @@
     "passwordReset": "Password reset; the user must change it at next login",
     "deleted": "User deleted",
     "loadFailed": "Failed to load users",
-    "failed": "Operation failed"
+    "failed": "Operation failed",
+    "perms": "Permissions",
+    "permAdminHint": "Admins have every permission; permission bits and mount scope do not apply",
+    "permBits": "Operations",
+    "permMounts": "Visible mounts",
+    "permAllMounts": "All mount points",
+    "permSave": "Save permissions",
+    "perm": {
+      "seeHidden": "See hidden files",
+      "write": "Create & upload",
+      "rename": "Rename",
+      "moveCopy": "Move & copy",
+      "delete": "Delete",
+      "share": "Create shares",
+      "webdavRead": "WebDAV read",
+      "webdavManage": "WebDAV manage",
+      "terminal": "Terminal"
+    }
   }
 }

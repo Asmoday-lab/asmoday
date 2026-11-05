@@ -223,6 +223,23 @@
     "passwordReset": "密码已重置，对方下次登录需改密",
     "deleted": "用户已删除",
     "loadFailed": "读取用户失败",
-    "failed": "操作失败"
+    "failed": "操作失败",
+    "perms": "权限",
+    "permAdminHint": "管理员拥有全部权限，不受权限位与挂载点范围限制",
+    "permBits": "操作权限",
+    "permMounts": "可见挂载点",
+    "permAllMounts": "全部挂载点",
+    "permSave": "保存权限",
+    "perm": {
+      "seeHidden": "查看隐藏文件",
+      "write": "新建与上传",
+      "rename": "重命名",
+      "moveCopy": "移动与复制",
+      "delete": "删除",
+      "share": "创建分享",
+      "webdavRead": "WebDAV 读取",
+      "webdavManage": "WebDAV 管理",
+      "terminal": "终端"
+    }
   }
 }

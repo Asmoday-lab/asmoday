@@ -9,6 +9,10 @@ export interface ManagedUser {
   is_active: boolean
   totp_enabled: boolean
   must_change_password: boolean
+  /** 权限位掩码（v4.9.25） */
+  permissions: number
+  /** 挂载点收权：'*' 或 JSON 字符串数组 */
+  mount_scope: string
 }
 
 async function request<T>(url: string, method: string, body?: unknown): Promise<T> {
@@ -36,7 +40,14 @@ export const usersApi = {
   },
   async update(
     id: number,
-    patch: { username?: string; password?: string; role?: 'admin' | 'user'; is_active?: boolean },
+    patch: {
+      username?: string
+      password?: string
+      role?: 'admin' | 'user'
+      is_active?: boolean
+      permissions?: number
+      mount_scope?: string
+    },
   ): Promise<ManagedUser> {
     const data = await request<{ user: ManagedUser }>(`/api/users/${id}`, 'PATCH', patch)
     return data.user

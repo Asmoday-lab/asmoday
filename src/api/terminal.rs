@@ -57,6 +57,15 @@ pub async fn ws_handler(
         );
     }
 
+    // 终端权限位（v4.9.25，对齐社区「普通用户不给 shell」的通行做法）
+    if !user.can(crate::core::auth::perms::TERMINAL) {
+        return crate::api::error::api_error(
+            axum::http::StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "No permission to use the terminal",
+        );
+    }
+
     let roots = {
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)

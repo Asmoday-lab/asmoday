@@ -378,6 +378,12 @@ GWT-AUTH-15 Given 用户 A 已登录  When A 用当前密码 POST /api/auth/user
 GWT-AUTH-16 Given 实例只有 admin 一个可用管理员  When admin 停用/降级/删除自己  Then 400 E_LAST_ADMIN 拒绝；不能删自己（v4.9.24）
 GWT-AUTH-17 Given admin 停用用户 B  When B 的现有 Cookie 访问 API  Then 401/403 被踢出；重新登录返回 403 E_ACCOUNT_DISABLED 且不泄露账号存在性（v4.9.24）
 GWT-AUTH-18 Given admin 删除用户 B  When 检查数据  Then B 的 sessions/favorites/history/tokens 级联删除，B 的 shares 置 tombstone，其他用户数据不受影响（v4.9.24）
+GWT-PERM-01 Given 普通用户被收走 delete/share/terminal 位  When DELETE /raw、POST /shares、WS 握手  Then 一律 403 E_FORBIDDEN；WRITE/RENAME 等保留位不受影响（v4.9.25）
+GWT-PERM-02 Given 用户 scope 只含挂载点 A  When 拉 /api/files/mounts、list scope 外路径  Then 清单只有 A；scope 外 404/400（视同不存在，不泄露存在性）（v4.9.25）
+GWT-PERM-03 Given 用户无 webdav_manage 但有 webdav_read  When 密码直连 PUT /dav/...  Then 403；PROPFIND 207 正常（读写位分离）（v4.9.25）
+GWT-PERM-04 Given 归属用户被停用/删除  When 其 asm_ 令牌或密码直连访问 WebDAV  Then 立即失效（每请求重查用户行）（v4.9.25）
+GWT-PERM-05 Given admin 在设置页收权  When 该用户下一个请求到达  Then 新权限即时生效，无需重新登录（AuthUser 每请求重读用户行）（v4.9.25）
+GWT-PERM-06 Given 存量库升级到 v4.9.25  When 迁移 v17 跑完  Then 所有存量用户 permissions=511、mount_scope='*'（升级不缩权）（v4.9.25）
 ```
 
 #### 依赖红线

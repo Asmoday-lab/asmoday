@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
+use crate::api::auth::AuthUser;
 use crate::core::ffmpeg;
 use crate::core::fs::{self, FsError};
 use crate::core::media_index::{self, MediaIndex, Scope};
@@ -324,8 +325,8 @@ fn fs_error(err: FsError) -> Response {
 /// 以前每请求 `fs::load_roots` 都会对每个挂载点做 `canonicalize` + `is_dir`；
 /// 缩略图一页 120 个请求、播放器一次播放几十个 Range 请求，全都在 async worker
 /// 上同步付这个代价 —— 一个离线 SMB 挂载点就能让整个站点打不开。
-async fn roots_for(state: &AppState) -> crate::core::fs::RootSet {
-    let set = crate::api::files::mounts_for(state).await;
+async fn roots_for(state: &AppState, user: &AuthUser) -> crate::core::fs::RootSet {
+    let set = crate::api::files::mounts_for_user(state, user).await;
     let follow_symlinks = state.config.read().await.system.follow_symlinks;
     fs::root_set_from_mounts(&set, follow_symlinks)
 }
@@ -334,16 +335,20 @@ async fn roots_for(state: &AppState) -> crate::core::fs::RootSet {
 ///
 /// 找不到归属时回空串 —— 那代表「进程 cwd 兜底」的隐式根，也是老库迁移过来的
 /// 记录的取值，两者必须一致，否则同一个路径会分裂成两条记录。
-async fn mount_of(state: &AppState, display: &str) -> String {
-    crate::api::files::mounts_for(state)
+async fn mount_of(state: &AppState, user: &AuthUser, display: &str) -> String {
+    crate::api::files::mounts_for_user(state, user)
         .await
         .find_by_path_text(display)
         .map(|mount| mount.info.id.clone())
         .unwrap_or_default()
 }
 
-async fn resolve_default(state: &AppState, requested: Option<&str>) -> Result<PathBuf, FsError> {
-    let roots = roots_for(state).await;
+async fn resolve_default(
+    state: &AppState,
+    user: &AuthUser,
+    requested: Option<&str>,
+) -> Result<PathBuf, FsError> {
+    let roots = roots_for(state, user).await;
     match requested.map(str::trim).filter(|p| !p.is_empty()) {
         Some(raw) => fs::resolve_existing(raw, &roots.allowed, roots.follow_symlinks),
         None => {
@@ -364,13 +369,14 @@ async fn resolve_default(state: &AppState, requested: Option<&str>) -> Result<Pa
 /// 光改服务端缓存键没用，URL 不变浏览器永远不会重新请求。
 pub async fn thumb(
     State(state): State<AppState>,
+    user: AuthUser,
     Query(query): Query<ThumbQuery>,
     headers: HeaderMap,
 ) -> Response {
     // 排障用（v4.9.7）：网盘上「卡」到底是路径解析、metadata 还是真生成，
     // 一条日志就能分开 —— 否则只能靠猜。
     let started = std::time::Instant::now();
-    let path = match resolve_default(&state, Some(&query.path)).await {
+    let path = match resolve_default(&state, &user, Some(&query.path)).await {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -585,8 +591,12 @@ pub struct CoverQuery {
 /// GET /api/media/cover?path=…：音频内嵌封面（设计文档 3.4 音乐库）。
 ///
 /// 直接吐原图字节，不做二次编码；没有封面回 404，前端按 `cover` 标记本来就不会请求。
-pub async fn cover(State(state): State<AppState>, Query(query): Query<CoverQuery>) -> Response {
-    let path = match resolve_default(&state, Some(&query.path)).await {
+pub async fn cover(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<CoverQuery>,
+) -> Response {
+    let path = match resolve_default(&state, &user, Some(&query.path)).await {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -684,8 +694,12 @@ fn cover_response(cover: Option<Arc<crate::core::audio_tags::Cover>>) -> Respons
 }
 
 /// GET /api/media/browse?path=…&kind=image&depth=2
-pub async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQuery>) -> Response {
-    let root = match resolve_default(&state, query.path.as_deref()).await {
+pub async fn browse(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<BrowseQuery>,
+) -> Response {
+    let root = match resolve_default(&state, &user, query.path.as_deref()).await {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -892,8 +906,12 @@ fn browse_indexed(
 /// 照片库「相册视图」：回「直接含有图片的目录」——**含挂载目录本身**（v2.8 口径），
 /// 剔除一张图片都没有的目录；每条记录的数量只数该目录第一层，与点进去看到的条数一致。
 /// 封面必须取相册里最新的一张图（设计文档 3.4.3），所以遍历时记下最大 mtime。
-pub async fn albums(State(state): State<AppState>, Query(query): Query<AlbumsQuery>) -> Response {
-    let root = match resolve_default(&state, query.path.as_deref()).await {
+pub async fn albums(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<AlbumsQuery>,
+) -> Response {
+    let root = match resolve_default(&state, &user, query.path.as_deref()).await {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
@@ -2478,13 +2496,13 @@ pub async fn progress(
     user: crate::api::auth::AuthUser,
     Json(body): Json<ProgressBody>,
 ) -> Response {
-    let roots = roots_for(&state).await;
+    let roots = roots_for(&state, &user).await;
     let target = match fs::resolve_existing(&body.path, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
     let display = fs::normalize_display(&target);
-    let mount_id = mount_of(&state, &display).await;
+    let mount_id = mount_of(&state, &user, &display).await;
 
     // 写库放阻塞池（v4.9.22）：播放中每几秒一次，而 `auth_connection` 要新开
     // 连接，busy 时最长等 5 秒（busy_timeout）—— 占着 runtime worker 不划算。
@@ -2550,13 +2568,13 @@ pub async fn favorite(
     user: crate::api::auth::AuthUser,
     Json(body): Json<FavoriteBody>,
 ) -> Response {
-    let roots = roots_for(&state).await;
+    let roots = roots_for(&state, &user).await;
     let target = match fs::resolve_existing(&body.path, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
     };
     let display = fs::normalize_display(&target);
-    let mount_id = mount_of(&state, &display).await;
+    let mount_id = mount_of(&state, &user, &display).await;
 
     // 与 progress 同理：写库新开连接，放阻塞池（v4.9.22）
     let favorite = body.favorite;

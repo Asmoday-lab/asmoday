@@ -30,7 +30,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::api::auth::AuthUser;
 use crate::core::auth::now_secs;
+use crate::core::auth::perms;
 use crate::core::fs::{self, FsError};
 use crate::core::fs_ops::{self, ItemResult, NameBook, OnConflict};
 use crate::core::path_guard::{self, MountEntry, MountSet};
@@ -60,8 +62,13 @@ pub type DeleteTickets = Mutex<HashMap<String, DeleteTicket>>;
 ///
 /// 以前每个删除/移动/复制请求都重扫一遍挂载点（每点一次 `canonicalize`），
 /// 挂载点离线时会把请求线程卡在 SMB 超时上。
-async fn mounts_of(state: &AppState) -> MountSet {
-    crate::api::files::mounts_for(state).await
+async fn mounts_of(state: &AppState, user: &AuthUser) -> MountSet {
+    crate::api::files::mounts_for_user(state, user).await
+}
+
+/// 权限位不足（v4.9.25）：403 E_FORBIDDEN，与只读挂载同一错误通道
+fn forbid() -> FsError {
+    FsError::Forbidden("没有执行该操作的权限".to_string())
 }
 
 /// `[server.limits]` → 运行期闸门（`0` 表示不限）。
@@ -159,23 +166,39 @@ pub struct CreateBody {
 }
 
 /// POST /api/files/mkdir
-pub async fn mkdir(State(state): State<AppState>, Json(body): Json<CreateBody>) -> Response {
-    match create_inner(&state, body, true).await {
+pub async fn mkdir(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CreateBody>,
+) -> Response {
+    match create_inner(&state, &user, body, true).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
 }
 
 /// POST /api/files/touch
-pub async fn touch(State(state): State<AppState>, Json(body): Json<CreateBody>) -> Response {
-    match create_inner(&state, body, false).await {
+pub async fn touch(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CreateBody>,
+) -> Response {
+    match create_inner(&state, &user, body, false).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
 }
 
-async fn create_inner(state: &AppState, body: CreateBody, is_dir: bool) -> Result<Value, FsError> {
-    let set = mounts_of(state).await;
+async fn create_inner(
+    state: &AppState,
+    user: &AuthUser,
+    body: CreateBody,
+    is_dir: bool,
+) -> Result<Value, FsError> {
+    if !user.can(perms::WRITE) {
+        return Err(forbid());
+    }
+    let set = mounts_of(state, user).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
@@ -212,15 +235,26 @@ pub struct RenameBody {
 }
 
 /// POST /api/files/rename
-pub async fn rename(State(state): State<AppState>, Json(body): Json<RenameBody>) -> Response {
-    match rename_inner(&state, body).await {
+pub async fn rename(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<RenameBody>,
+) -> Response {
+    match rename_inner(&state, &user, body).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
 }
 
-async fn rename_inner(state: &AppState, body: RenameBody) -> Result<Value, FsError> {
-    let set = mounts_of(state).await;
+async fn rename_inner(
+    state: &AppState,
+    user: &AuthUser,
+    body: RenameBody,
+) -> Result<Value, FsError> {
+    if !user.can(perms::RENAME) {
+        return Err(forbid());
+    }
+    let set = mounts_of(state, user).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
@@ -282,9 +316,10 @@ pub struct TransferBody {
 /// POST /api/files/move
 pub async fn move_entries(
     State(state): State<AppState>,
+    user: AuthUser,
     Json(body): Json<TransferBody>,
 ) -> Response {
-    match transfer_inner(&state, body, true).await {
+    match transfer_inner(&state, &user, body, true).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
@@ -293,9 +328,10 @@ pub async fn move_entries(
 /// POST /api/files/copy
 pub async fn copy_entries(
     State(state): State<AppState>,
+    user: AuthUser,
     Json(body): Json<TransferBody>,
 ) -> Response {
-    match transfer_inner(&state, body, false).await {
+    match transfer_inner(&state, &user, body, false).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
@@ -303,9 +339,13 @@ pub async fn copy_entries(
 
 async fn transfer_inner(
     state: &AppState,
+    user: &AuthUser,
     body: TransferBody,
     is_move: bool,
 ) -> Result<Value, FsError> {
+    if !user.can(perms::MOVE_COPY) {
+        return Err(forbid());
+    }
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
@@ -317,7 +357,7 @@ async fn transfer_inner(
         )));
     }
 
-    let set = mounts_of(state).await;
+    let set = mounts_of(state, user).await;
 
     // ---- 源 ----
     let mut sources = Vec::with_capacity(body.paths.len());
@@ -538,12 +578,16 @@ fn digest_paths(paths: &[String]) -> u64 {
 /// 脚本漏掉确认步骤时删不掉东西。
 pub async fn delete_token(
     State(state): State<AppState>,
+    user: AuthUser,
     Json(body): Json<DeleteTokenBody>,
 ) -> Response {
+    if !user.can(perms::DELETE) {
+        return fail(forbid());
+    }
     if body.paths.is_empty() {
         return fail(FsError::BadRequest("paths 不能为空".to_string()));
     }
-    let set = mounts_of(&state).await;
+    let set = mounts_of(&state, &user).await;
     let mut mount_id = body.mount_id.clone().unwrap_or_default();
     for raw in &body.paths {
         let Some(mount) = pick_mount(&set, body.mount_id.as_deref(), raw).ok() else {
@@ -593,19 +637,30 @@ pub struct DeleteBody {
 }
 
 /// POST /api/files/delete
-pub async fn delete(State(state): State<AppState>, Json(body): Json<DeleteBody>) -> Response {
-    match delete_inner(&state, body).await {
+pub async fn delete(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<DeleteBody>,
+) -> Response {
+    match delete_inner(&state, &user, body).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
 }
 
-async fn delete_inner(state: &AppState, body: DeleteBody) -> Result<Value, FsError> {
+async fn delete_inner(
+    state: &AppState,
+    user: &AuthUser,
+    body: DeleteBody,
+) -> Result<Value, FsError> {
+    if !user.can(perms::DELETE) {
+        return Err(forbid());
+    }
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
 
-    let set = mounts_of(state).await;
+    let set = mounts_of(state, user).await;
     let mut targets = Vec::with_capacity(body.paths.len());
     for raw in &body.paths {
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
@@ -738,14 +793,22 @@ pub struct MeasureBody {
 /// POST /api/files/measure：只读统计「将删除多少项、共多大」
 ///
 /// 统计本身不落任何改动，因此不加 per-path 锁；后端仍会做挂载点归属校验。
-pub async fn measure(State(state): State<AppState>, Json(body): Json<MeasureBody>) -> Response {
-    match measure_inner(&state, body).await {
+pub async fn measure(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<MeasureBody>,
+) -> Response {
+    match measure_inner(&state, &user, body).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
 }
 
-async fn measure_inner(state: &AppState, body: MeasureBody) -> Result<Value, FsError> {
+async fn measure_inner(
+    state: &AppState,
+    user: &AuthUser,
+    body: MeasureBody,
+) -> Result<Value, FsError> {
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
@@ -757,7 +820,7 @@ async fn measure_inner(state: &AppState, body: MeasureBody) -> Result<Value, FsE
         )));
     }
 
-    let set = mounts_of(state).await;
+    let set = mounts_of(state, user).await;
     let mut targets = Vec::with_capacity(body.paths.len());
     for raw in &body.paths {
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
@@ -786,8 +849,12 @@ pub struct StatQuery {
 }
 
 /// GET /api/files/stat：只读属性（不跟随软链接）
-pub async fn stat(State(state): State<AppState>, Query(query): Query<StatQuery>) -> Response {
-    let set = mounts_of(&state).await;
+pub async fn stat(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<StatQuery>,
+) -> Response {
+    let set = mounts_of(&state, &user).await;
     let mount = match pick_mount(&set, query.mount_id.as_deref(), &query.path) {
         Ok(mount) => mount,
         Err(err) => return fail(err),
@@ -923,15 +990,19 @@ pub struct HashBody {
 }
 
 /// POST /api/files/hash：仅对 < 64 MiB 文件按需计算，并发上限 2
-pub async fn hash(State(state): State<AppState>, Json(body): Json<HashBody>) -> Response {
-    match hash_inner(&state, body).await {
+pub async fn hash(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<HashBody>,
+) -> Response {
+    match hash_inner(&state, &user, body).await {
         Ok(value) => ok_json(value),
         Err(err) => fail(err),
     }
 }
 
-async fn hash_inner(state: &AppState, body: HashBody) -> Result<Value, FsError> {
-    let set = mounts_of(state).await;
+async fn hash_inner(state: &AppState, user: &AuthUser, body: HashBody) -> Result<Value, FsError> {
+    let set = mounts_of(state, user).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     let path = path_guard::resolve_existing(mount, &body.path)?;
 

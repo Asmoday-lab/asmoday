@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::AppState;
+use crate::api::auth::AuthUser;
 use crate::core::config::Config;
 use crate::core::fs::{self, FsError, RootSet};
 use crate::core::fs_ops;
@@ -82,8 +83,8 @@ pub struct SaveQuery {
 /// `path_guard::load` 对每个挂载点做 `canonicalize` + `is_dir`，离线 SMB 上单次
 /// 可达十几秒；而列表、raw、上传、缩略图**每个请求**都要这份根集合。
 /// 挂载点配置一改 `mounts_revision` 就 +1，缓存立即失效，不会读到旧视图。
-async fn roots_for(state: &AppState) -> RootSet {
-    let set = mounts_for(state).await;
+async fn roots_for(state: &AppState, user: &AuthUser) -> RootSet {
+    let set = mounts_for_user(state, user).await;
     let follow_symlinks = state.config.read().await.system.follow_symlinks;
     fs::root_set_from_mounts(&set, follow_symlinks)
 }
@@ -101,8 +102,8 @@ const MOUNTS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 挂载点集合（带 readonly / online），带 10 秒进程内缓存。
 ///
-/// `pub(crate)`：媒体库的路径解析（缩略图 / 封面 / 播放进度）也走这里 ——
-/// 它自己每请求重扫一遍挂载点，一个离线 SMB 就能把 worker 拖死（v4.9.22）。
+/// **不过滤用户 scope**：缓存里必须存全量集合（不同用户 scope 不同），
+/// 按用户收权一律走 `mounts_for_user`。media.rs 的路径解析也走这里。
 pub(crate) async fn mounts_for(state: &AppState) -> path_guard::MountSet {
     let revision = state
         .mounts_revision
@@ -128,6 +129,28 @@ pub(crate) async fn mounts_for(state: &AppState) -> path_guard::MountSet {
         at: std::time::Instant::now(),
         set: set.clone(),
     });
+    set
+}
+
+/// 按用户挂载点收权过滤后的集合（v4.9.25，对齐 FileBrowser scope / Alist base path）。
+///
+/// scope 存的是挂载点**展示路径**（或 canonical 路径），大小写不敏感；
+/// scope 外的挂载点视同不存在（列表不出现、`find_by_path_text` 落空 → 404，
+/// 不泄露存在性）。admin 或 `'*'` 原样返回全量。
+pub(crate) async fn mounts_for_user(state: &AppState, user: &AuthUser) -> path_guard::MountSet {
+    let mut set = mounts_for(state).await;
+    if user.allowed_mounts().is_some() {
+        set.mounts.retain(|m| {
+            user.mount_allowed(&m.info.path)
+                || m.root
+                    .as_ref()
+                    .is_some_and(|r| user.mount_allowed(&crate::core::fs::normalize_display(r)))
+        });
+        // scope 全空时不能退回 implicit 兜底根
+        if set.mounts.is_empty() {
+            set.implicit = false;
+        }
+    }
     set
 }
 
@@ -170,10 +193,11 @@ pub(crate) fn forget_parent_snapshot(state: &AppState, path: &std::path::Path) {
 /// 校验链：路径解析 → 是目录 → 只读 → 剩余空间 → 授权根包含性。
 pub(crate) async fn resolve_upload_dir(
     state: &AppState,
+    user: &AuthUser,
     dir: &str,
     needed_bytes: u64,
 ) -> Result<PathBuf, Response> {
-    let roots = roots_for(state).await;
+    let roots = roots_for(state, user).await;
     let resolved = match fs::resolve_existing(dir, &roots.allowed, roots.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return Err(fs_error(err)),
@@ -186,7 +210,7 @@ pub(crate) async fn resolve_upload_dir(
     }
 
     // 只读挂载点拒绝写入（与 files_mutate 的 mount.ensure_writable 同口径）
-    let mounts = mounts_for(state).await;
+    let mounts = mounts_for_user(state, user).await;
     if mounts.is_readonly(&resolved) {
         return Err(fs_error(FsError::Readonly(fs::normalize_display(
             &resolved,
@@ -217,8 +241,8 @@ pub(crate) async fn resolve_upload_dir(
     Ok(resolved)
 }
 
-pub async fn roots(State(state): State<AppState>) -> Response {
-    let set = roots_for(&state).await;
+pub async fn roots(State(state): State<AppState>, user: AuthUser) -> Response {
+    let set = roots_for(&state, &user).await;
     let default_root = set.default_root().map(|r| r.path.clone());
     Json(json!({
         "roots": set.roots,
@@ -232,8 +256,8 @@ pub async fn roots(State(state): State<AppState>) -> Response {
 ///
 /// 前端每次进入文件管理都必须重新拉取，禁止缓存 —— 单挂载点直接跳转的判定
 /// 依赖这份实时清单。
-pub async fn mounts(State(state): State<AppState>) -> Response {
-    let set = mounts_for(&state).await;
+pub async fn mounts(State(state): State<AppState>, user: AuthUser) -> Response {
+    let set = mounts_for_user(&state, &user).await;
     let items: Vec<_> = set.mounts.iter().map(|m| m.info.clone()).collect();
     // 分片大小随挂载点清单下发：文件页据此决定整包 PUT 还是 tus 分块（3.2.3.1）
     let chunk_size_mb = state.config.read().await.media.upload_chunk_size_mb;
@@ -252,8 +276,12 @@ pub async fn mounts(State(state): State<AppState>) -> Response {
 }
 
 /// GET /api/files/list
-pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    let set = mounts_for(&state).await;
+pub async fn list(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let set = mounts_for_user(&state, &user).await;
 
     let requested = query
         .path
@@ -284,10 +312,13 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
     }
 
     let readonly = mount.info.readonly;
+    // 看隐藏文件是权限位（v4.9.25）：无位用户传 show_hidden=1 也按 false 处理
+    let show_hidden =
+        query.show_hidden.unwrap_or(false) && user.can(crate::core::auth::perms::SEE_HIDDEN);
     match fs::list_dir(
         &target,
         query.page.unwrap_or(1),
-        query.show_hidden.unwrap_or(false),
+        show_hidden,
         readonly,
         fs::ListSort::parse(query.sort.as_deref()),
         fs::ListOrder::parse(query.order.as_deref()),
@@ -306,10 +337,11 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
 /// GET /api/files/raw
 pub async fn raw(
     State(state): State<AppState>,
+    user: AuthUser,
     Query(query): Query<PathQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let set = roots_for(&state).await;
+    let set = roots_for(&state, &user).await;
     let path = match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),
@@ -539,8 +571,12 @@ impl ArchiveQuery {
 ///
 /// 多选为什么合并成一个 zip：同一次用户手势里连开好几个下载，浏览器会当成
 /// 「多文件下载」拦掉（Chrome 只放行第一个），多选下载在手机上因此完全无效。
-pub async fn archive(State(state): State<AppState>, Query(query): Query<ArchiveQuery>) -> Response {
-    let set = roots_for(&state).await;
+pub async fn archive(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<ArchiveQuery>,
+) -> Response {
+    let set = roots_for(&state, &user).await;
     let requested = match query.targets() {
         Ok(list) if list.is_empty() => {
             return fs_error(FsError::BadRequest("没有指定要打包的路径".to_string()));
@@ -659,8 +695,12 @@ fn encode_rfc5987(name: &str) -> String {
 ///
 /// 与 `/api/files/raw` 的区别是**带元信息**：字符编码、换行符风格、是否有 BOM。
 /// 内容里的换行符统一成 `\n` 传输，保存时由服务端按 `eol_type` 还原。
-pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let set = mounts_for(&state).await;
+pub async fn read_text(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    let set = mounts_for_user(&state, &user).await;
     let Some(mount) = set.find_by_path_text(&query.path) else {
         return fs_error(FsError::NotFound(format!(
             "路径不在任何挂载点内：{}",
@@ -747,6 +787,7 @@ pub async fn read_text(State(state): State<AppState>, Query(query): Query<PathQu
 /// PUT /api/files/raw：文本文件写回。
 pub async fn write_text(
     State(state): State<AppState>,
+    user: AuthUser,
     Query(query): Query<SaveQuery>,
     body: Bytes,
 ) -> Response {
@@ -760,13 +801,20 @@ pub async fn write_text(
         );
     }
 
-    let set = mounts_for(&state).await;
+    let set = mounts_for_user(&state, &user).await;
     let Some(mount) = set.find_by_path_text(&query.path) else {
         return fs_error(FsError::NotFound(format!(
             "路径不在任何挂载点内：{}",
             query.path
         )));
     };
+    if !user.can(crate::core::auth::perms::WRITE) {
+        return fail_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "No permission to modify files",
+        );
+    }
     if let Err(err) = mount.ensure_writable() {
         return fs_error(err);
     }
@@ -964,12 +1012,22 @@ pub struct UploadQuery {
 /// 没带就边写边累计，超限即停（临时文件一并清掉）。
 pub async fn upload(
     State(state): State<AppState>,
+    user: AuthUser,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     use http_body_util::BodyExt;
     use tokio::io::AsyncWriteExt;
+
+    // 上传是写操作（v4.9.25 权限位）
+    if !user.can(crate::core::auth::perms::WRITE) {
+        return fail_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "No permission to upload files",
+        );
+    }
 
     // 单文件上限来自 `[media].upload_max_size_mb`，0 = 不限制（设计文档 3.2.3）
     let limit = {
@@ -997,7 +1055,7 @@ pub async fn upload(
     }
 
     // 路径 / 只读 / 剩余空间 / 授权根：与 tus 分块上传共用同一套校验
-    let dir = match resolve_upload_dir(&state, &query.dir, declared.unwrap_or(0)).await {
+    let dir = match resolve_upload_dir(&state, &user, &query.dir, declared.unwrap_or(0)).await {
         Ok(path) => path,
         Err(resp) => return resp,
     };
@@ -1125,7 +1183,11 @@ pub struct SearchQuery {
 ///
 /// 返回 `items` / `scanned` / `has_more` / `next_cursor`。没有「结果上限」：
 /// 只要 `has_more` 为真，把 `next_cursor` 原样带回来就能接着往下搜。
-pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> Response {
+pub async fn search(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<SearchQuery>,
+) -> Response {
     let keyword = query.q.trim().to_lowercase();
     if keyword.is_empty() {
         return Json(json!({
@@ -1138,7 +1200,7 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
         .into_response();
     }
 
-    let roots = roots_for(&state).await;
+    let roots = roots_for(&state, &user).await;
     let requested = query
         .path
         .as_deref()
@@ -1222,11 +1284,22 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
 // ---------------------------------------------------------------------------
 
 /// DELETE /api/files/raw?path=…：删除文件或目录（目录递归）
-pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let set = roots_for(&state).await;
+pub async fn delete(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    if !user.can(crate::core::auth::perms::DELETE) {
+        return fail_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "No permission to delete files",
+        );
+    }
+    let set = roots_for(&state, &user).await;
     // 只读拦截与 `POST /api/files/delete` 同口径（安全审查 2026-11-04）：
     // 这条老口子此前绕过了 readonly —— 只读挂载不能删，与不能写是同一个承诺。
-    let mounts = mounts_for(&state).await;
+    let mounts = mounts_for_user(&state, &user).await;
     if let Some(mount) = mounts.find_by_path_text(query.path.trim())
         && let Err(err) = mount.ensure_writable()
     {
@@ -1310,8 +1383,12 @@ pub async fn delete(State(state): State<AppState>, Query(query): Query<PathQuery
 // ---------------------------------------------------------------------------
 
 /// GET /api/files/subtitle?path=…：统一输出 WebVTT（浏览器只认 vtt，srt 现场转）
-pub async fn subtitle(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let set = roots_for(&state).await;
+pub async fn subtitle(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    let set = roots_for(&state, &user).await;
     let path = match fs::resolve_existing(&query.path, &set.allowed, set.follow_symlinks) {
         Ok(path) => path,
         Err(err) => return fs_error(err),

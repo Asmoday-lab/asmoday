@@ -10,11 +10,28 @@ export interface AuthStatus {
   user_id?: number | null
   /** 'admin' | 'user'（v4.9.24 多用户） */
   role?: string | null
+  /** 权限位掩码（v4.9.25）；admin 不看位 */
+  permissions?: number | null
+  /** 挂载点收权（v4.9.25）：'*' 或 JSON 数组 */
+  mount_scope?: string | null
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
   version?: string
 }
+
+/** 权限位（v4.9.25，与后端 core::auth::perms 对齐） */
+export const PERM = {
+  SEE_HIDDEN: 1 << 0,
+  WRITE: 1 << 1,
+  RENAME: 1 << 2,
+  MOVE_COPY: 1 << 3,
+  DELETE: 1 << 4,
+  SHARE: 1 << 5,
+  WEBDAV_READ: 1 << 6,
+  WEBDAV_MANAGE: 1 << 7,
+  TERMINAL: 1 << 8,
+} as const
 
 const status = ref<AuthStatus>({
   initialized: true,
@@ -73,6 +90,9 @@ export const authApi = {
   userId: computed(() => status.value.user_id ?? null),
   /** 当前用户是否管理员（多用户 v4.9.24） */
   isAdmin: computed(() => status.value.role === 'admin'),
+  /** 权限位判定（v4.9.25）：admin 恒真 */
+  can: (perm: number) =>
+    authApi.isAdmin.value || ((status.value.permissions ?? 0) & perm) !== 0,
   initialized: computed(() => status.value.initialized),
   ensureAuth,
   refresh,

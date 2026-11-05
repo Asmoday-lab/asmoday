@@ -31,11 +31,51 @@ pub struct AuthUser {
     pub must_change_password: bool,
     /// 'admin' | 'user'（v4.9.24 多用户）
     pub role: String,
+    /// 权限位掩码（v4.9.25）；admin 不看位
+    pub permissions: i64,
+    /// 挂载点收权：'*' = 全部；否则 JSON 数组（v4.9.25）
+    pub mount_scope: String,
 }
 
 impl AuthUser {
     pub fn is_admin(&self) -> bool {
         self.role == "admin"
+    }
+
+    /// 权限位判定（v4.9.25）：admin 恒真，普通用户按位。
+    pub fn can(&self, perm: i64) -> bool {
+        self.is_admin() || (self.permissions & perm) != 0
+    }
+
+    /// 挂载点是否对当前用户可见（大小写不敏感、前缀匹配；'*' / admin 全放行）。
+    pub fn mount_allowed(&self, display_path: &str) -> bool {
+        if self.is_admin() || self.mount_scope.trim() == "*" {
+            return true;
+        }
+        let needle = display_path
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        serde_json::from_str::<Vec<String>>(&self.mount_scope)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
+            .any(|p| !p.is_empty() && (needle == p || needle.starts_with(&format!("{p}/"))))
+    }
+
+    /// scope 内挂载点清单（全量时返回 None）。
+    pub fn allowed_mounts(&self) -> Option<Vec<String>> {
+        if self.is_admin() || self.mount_scope.trim() == "*" {
+            return None;
+        }
+        Some(
+            serde_json::from_str::<Vec<String>>(&self.mount_scope)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect(),
+        )
     }
 }
 
@@ -530,6 +570,8 @@ async fn sso_user(
         username: user.username,
         must_change_password: user.must_change_password,
         role: user.role,
+        permissions: user.permissions,
+        mount_scope: user.mount_scope,
     })
 }
 
@@ -577,6 +619,8 @@ pub async fn require_auth(
                         username: user.username,
                         must_change_password: user.must_change_password,
                         role: user.role,
+                        permissions: user.permissions,
+                        mount_scope: user.mount_scope,
                     });
                     via_cookie = true;
                 }
@@ -702,6 +746,8 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut must_change_password = false;
     let mut role: Option<String> = None;
     let mut uid: Option<i64> = None;
+    let mut permissions: Option<i64> = None;
+    let mut mount_scope: Option<String> = None;
 
     if let Some(token) = cookie_token(&headers)
         && let Ok(Some(session_user)) = state.auth.session_user(&token)
@@ -712,6 +758,8 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         username = Some(user.username);
         role = Some(user.role);
         uid = Some(user.id);
+        permissions = Some(user.permissions);
+        mount_scope = Some(user.mount_scope);
     }
 
     Json(json!({
@@ -720,6 +768,8 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "username": username,
         "user_id": uid,
         "role": role,
+        "permissions": permissions,
+        "mount_scope": mount_scope,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
         "version": env!("CARGO_PKG_VERSION"),
@@ -850,6 +900,8 @@ pub async fn login(
         "status": "ok",
         "username": user.username,
         "role": user.role,
+        "permissions": user.permissions,
+        "mount_scope": user.mount_scope,
         "must_change_password": user.must_change_password,
     }))
     .into_response();
@@ -899,6 +951,8 @@ pub async fn me(auth_user: AuthUser) -> Response {
         "id": auth_user.id,
         "username": auth_user.username,
         "role": auth_user.role,
+        "permissions": auth_user.permissions,
+        "mount_scope": auth_user.mount_scope,
         "must_change_password": auth_user.must_change_password,
     }))
     .into_response()

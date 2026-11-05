@@ -15,11 +15,30 @@ import { useI18n } from 'vue-i18n'
 import AppIcon from '../components/AppIcon.vue'
 import PasswordInput from '../components/PasswordInput.vue'
 import type { IconName } from '../components/icons'
-import { authApi } from '../api/auth'
+import { authApi, PERM } from '../api/auth'
 import { usersApi, type ManagedUser } from '../api/users'
 
-/** 行内编辑态：列表项 + 改名输入框的草稿 */
-type UserRow = ManagedUser & { _rename?: string }
+/** 行内编辑态：列表项 + 改名输入框的草稿 + 权限编辑草稿（v4.9.25） */
+type UserRow = ManagedUser & {
+  _rename?: string
+  _permOpen?: boolean
+  _permBits?: number
+  /** null = 全部挂载点（'*'） */
+  _permMounts?: string[] | null
+}
+
+/** 权限位清单（顺序即界面展示顺序，v4.9.25） */
+const PERM_DEFS: { bit: number; key: string }[] = [
+  { bit: PERM.SEE_HIDDEN, key: 'seeHidden' },
+  { bit: PERM.WRITE, key: 'write' },
+  { bit: PERM.RENAME, key: 'rename' },
+  { bit: PERM.MOVE_COPY, key: 'moveCopy' },
+  { bit: PERM.DELETE, key: 'delete' },
+  { bit: PERM.SHARE, key: 'share' },
+  { bit: PERM.WEBDAV_READ, key: 'webdavRead' },
+  { bit: PERM.WEBDAV_MANAGE, key: 'webdavManage' },
+  { bit: PERM.TERMINAL, key: 'terminal' },
+]
 import { cacheApi, type CacheStats } from '../api/media'
 import {
   systemApi,
@@ -777,10 +796,91 @@ async function removeUser(user: UserRow) {
   }
 }
 
+// ---- 权限编辑（v4.9.25，对齐 Alist 权限位 + FileBrowser scope）----
+const mountList = ref<MountPoint[]>([])
+
+async function loadMountList() {
+  if (!authApi.isAdmin.value) return
+  try {
+    const data = await filesApi.mounts()
+    mountList.value = data.mounts
+  } catch {
+    mountList.value = []
+  }
+}
+
+/** 打开某用户的权限面板：从当前值拷贝草稿 */
+function openPermEditor(user: UserRow) {
+  const opening = !user._permOpen
+  for (const row of users.value) row._permOpen = false
+  if (!opening) return
+  user._permBits = user.permissions
+  if (user.mount_scope.trim() === '*') {
+    user._permMounts = null
+  } else {
+    try {
+      user._permMounts = JSON.parse(user.mount_scope) as string[]
+    } catch {
+      user._permMounts = []
+    }
+  }
+  user._permOpen = true
+  if (!mountList.value.length) void loadMountList()
+}
+
+function togglePermBit(user: UserRow, bit: number) {
+  if (user._permBits === undefined) return
+  user._permBits ^= bit
+}
+
+function toggleScopeMount(user: UserRow, path: string) {
+  if (user._permMounts === null || user._permMounts === undefined) {
+    // 从「全部」切到自选：先全选再取消当前项
+    user._permMounts = mountList.value.map((m) => m.path).filter((p) => p !== path)
+    return
+  }
+  user._permMounts = user._permMounts.includes(path)
+    ? user._permMounts.filter((p) => p !== path)
+    : [...user._permMounts, path]
+}
+
+function scopeAllSelected(user: UserRow): boolean {
+  return user._permMounts === null
+}
+
+function toggleScopeAll(user: UserRow) {
+  user._permMounts = scopeAllSelected(user) ? [] : null
+}
+
+async function savePerms(user: UserRow) {
+  usersError.value = ''
+  const mounts =
+    user._permMounts === null || mountList.value.every((m) => (user._permMounts ?? []).includes(m.path))
+      ? '*'
+      : JSON.stringify(user._permMounts ?? [])
+  usersBusy.value = true
+  try {
+    await usersApi.update(user.id, {
+      permissions: user._permBits ?? user.permissions,
+      mount_scope: mounts,
+    })
+    showToast(t('settings.users.updated'))
+    user._permOpen = false
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
 watch(
   () => authApi.isAdmin.value,
   (admin) => {
-    if (admin) void loadUsers()
+    if (admin) {
+      void loadUsers()
+      void loadMountList()
+    }
   },
   { immediate: true },
 )
@@ -1718,6 +1818,14 @@ onBeforeUnmount(() => {
               {{ item.is_active ? t('settings.users.disable') : t('settings.users.enable') }}
             </button>
             <button
+              class="h-9 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:text-ink"
+              :disabled="usersBusy || item.role === 'admin'"
+              :title="item.role === 'admin' ? t('settings.users.permAdminHint') : ''"
+              @click="openPermEditor(item)"
+            >
+              {{ t('settings.users.perms') }}
+            </button>
+            <button
               class="h-9 rounded-lg border border-red-500/30 px-3 text-xs fg-danger transition-colors hover:bg-red-500/10"
               :disabled="usersBusy || item.id === authApi.userId.value"
               @click="removeUser(item)"
@@ -1725,10 +1833,74 @@ onBeforeUnmount(() => {
               {{ t('settings.users.delete') }}
             </button>
           </div>
+          <!-- 权限编辑面板（v4.9.25）：一次只展开一行 -->
+        <div v-if="item._permOpen" class="border-b border-line bg-elevated/40 px-5 py-4">
+          <div v-if="item.role === 'admin'" class="text-xs text-muted">
+            {{ t('settings.users.permAdminHint') }}
+          </div>
+          <template v-else>
+            <p class="text-xs font-semibold text-ink">{{ t('settings.users.permBits') }}</p>
+            <div class="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+              <label
+                v-for="def in PERM_DEFS"
+                :key="def.key"
+                class="flex cursor-pointer items-center gap-1.5 text-xs text-ink"
+              >
+                <input
+                  type="checkbox"
+                  class="accent-[var(--accent)]"
+                  :checked="((item._permBits ?? item.permissions) & def.bit) !== 0"
+                  @change="togglePermBit(item, def.bit)"
+                />
+                {{ t(`settings.users.perm.${def.key}`) }}
+              </label>
+            </div>
+            <p class="mt-4 text-xs font-semibold text-ink">{{ t('settings.users.permMounts') }}</p>
+            <div class="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+              <label class="flex cursor-pointer items-center gap-1.5 text-xs text-ink">
+                <input
+                  type="checkbox"
+                  class="accent-[var(--accent)]"
+                  :checked="scopeAllSelected(item)"
+                  @change="toggleScopeAll(item)"
+                />
+                {{ t('settings.users.permAllMounts') }}
+              </label>
+              <label
+                v-for="mount in mountList"
+                :key="mount.id"
+                class="flex cursor-pointer items-center gap-1.5 text-xs text-ink"
+              >
+                <input
+                  type="checkbox"
+                  class="accent-[var(--accent)]"
+                  :disabled="scopeAllSelected(item)"
+                  :checked="!scopeAllSelected(item) && (item._permMounts ?? []).includes(mount.path)"
+                  @change="toggleScopeMount(item, mount.path)"
+                />
+                <span class="max-w-56 truncate">{{ mount.name }}</span>
+              </label>
+            </div>
+            <div class="mt-4 flex items-center gap-2">
+              <button
+                class="h-8 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
+                :disabled="usersBusy"
+                @click="savePerms(item)"
+              >
+                {{ t('settings.users.permSave') }}
+              </button>
+              <button
+                class="h-8 rounded-lg border border-line px-4 text-xs text-muted transition-colors hover:text-ink"
+                @click="item._permOpen = false"
+              >
+                {{ t('common.cancel') }}
+              </button>
+            </div>
+          </template>
+        </div>
         </div>
       </div>
     </div>
-
     <div v-else-if="tab === 'advanced'" class="space-y-6">
       <div class="flex flex-wrap items-center gap-2">
         <div class="flex items-center rounded-lg border border-line p-0.5 text-xs">

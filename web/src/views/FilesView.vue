@@ -41,6 +41,7 @@ import {
 import { messageFromBody } from '../lib/errors'
 import { triggerDownload } from '../lib/download'
 import { sharesApi } from '../api/shares'
+import { authApi, PERM } from '../api/auth'
 import { THUMB_WIDTH, thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
 import { playerClearance } from '../lib/player-layout'
@@ -199,12 +200,18 @@ const fileMenuItems = computed<ContextMenuItem[]>(() => {
   ]
   // 极客联动（设计文档 3.2.5）：「在此终端中打开」紧跟「打开」——要路径时直接进终端，
   // 比复制一串文本有用（v4.4.9 起移除了「复制相对/绝对路径」，只留图床直链）。
-  items.push({ id: 'terminal', label: t('files.menu.terminal'), icon: 'terminal' })
+  // 终端是权限位（v4.9.25）：无位用户不出现这一项
+  if (canTerminal.value) {
+    items.push({ id: 'terminal', label: t('files.menu.terminal'), icon: 'terminal' })
+  }
   // 目录也能下载：后端打包成流式 zip（v4.4.9）
   items.push({ id: 'download', label: t('files.menu.download'), icon: 'archive' })
-  items.push({ id: 'share', label: t('files.menu.share'), icon: 'share' })
-  if (entry.kind === 'image' && !entry.is_dir) {
-    items.push({ id: 'directLink', label: t('files.menu.directLink'), icon: 'link' })
+  // 分享/图床直链都是创建分享（v4.9.25 权限位）
+  if (canShare.value) {
+    items.push({ id: 'share', label: t('files.menu.share'), icon: 'share' })
+    if (entry.kind === 'image' && !entry.is_dir) {
+      items.push({ id: 'directLink', label: t('files.menu.directLink'), icon: 'link' })
+    }
   }
   items.push(
     {
@@ -212,21 +219,21 @@ const fileMenuItems = computed<ContextMenuItem[]>(() => {
       label: t('files.menu.rename'),
       icon: 'edit',
       divider: true,
-      disabled: readonly.value,
+      disabled: !canRename.value,
       hint,
     },
     {
       id: 'move',
       label: t('files.menu.moveTo'),
       icon: 'arrowRight',
-      disabled: readonly.value,
+      disabled: !canMoveCopy.value,
       hint,
     },
     {
       id: 'copy',
       label: t('files.menu.copyTo'),
       icon: 'gallery',
-      disabled: readonly.value,
+      disabled: !canMoveCopy.value,
       hint,
     },
     { id: 'properties', label: t('files.menu.properties'), icon: 'chip', divider: true },
@@ -235,7 +242,7 @@ const fileMenuItems = computed<ContextMenuItem[]>(() => {
       label: t('files.menu.delete'),
       icon: 'trash',
       danger: true,
-      disabled: readonly.value,
+      disabled: !canDelete.value,
       hint,
     },
   )
@@ -294,21 +301,21 @@ const blankMenuItems = computed<ContextMenuItem[]>(() => {
       id: 'newDir',
       label: t('files.blankMenu.newDir'),
       icon: 'folder',
-      disabled: readonly.value,
+      disabled: !canWrite.value,
       hint,
     },
     {
       id: 'newFile',
       label: t('files.blankMenu.newFile'),
       icon: 'file',
-      disabled: readonly.value,
+      disabled: !canWrite.value,
       hint,
     },
     {
       id: 'upload',
       label: t('files.blankMenu.upload'),
       icon: 'upload',
-      disabled: readonly.value,
+      disabled: !canWrite.value,
       hint,
     },
   ]
@@ -318,24 +325,28 @@ const blankMenuItems = computed<ContextMenuItem[]>(() => {
       label: t('files.blankMenu.paste', { count: clip.entries.length }),
       icon: 'copy',
       divider: true,
-      disabled: readonly.value,
+      disabled: clip.mode === 'move' ? !canMoveCopy.value : !canWrite.value,
       hint,
     })
   }
-  // 终端永远可用：只读挂载点进去也只能看，但「看」本身就是需求
-  items.push({
-    id: 'terminal',
-    label: t('files.menu.terminal'),
-    icon: 'terminal',
-    divider: true,
-  })
+  // 终端（v4.9.25 权限位）：有位的用户只读挂载点也能进去看
+  if (canTerminal.value) {
+    items.push({
+      id: 'terminal',
+      label: t('files.menu.terminal'),
+      icon: 'terminal',
+      divider: true,
+    })
+  }
   items.push({ id: 'refresh', label: t('files.toolbar.refresh'), icon: 'refresh' })
-  items.push({
-    id: 'hidden',
-    label: showHidden.value ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden'),
-    icon: showHidden.value ? 'eyeOff' : 'eye',
-    divider: true,
-  })
+  if (canSeeHidden.value) {
+    items.push({
+      id: 'hidden',
+      label: showHidden.value ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden'),
+      icon: showHidden.value ? 'eyeOff' : 'eye',
+      divider: true,
+    })
+  }
   if (displayEntries.value.length) {
     items.push({ id: 'selectAll', label: t('files.select.all'), icon: 'check' })
   }
@@ -389,7 +400,7 @@ const createDialog = ref<{
 } | null>(null)
 
 function openCreateDialog(kind: 'dir' | 'file') {
-  if (readonly.value) {
+  if (!canWrite.value) {
     showToast(t('files.readonly.tooltip'))
     return
   }
@@ -594,6 +605,14 @@ const roots = ref<MountPoint[]>([])
 const rootsImplicit = ref(false)
 /** 当前目录所在挂载点是否只读：只读时全部变更入口置灰（设计文档 3.2.6） */
 const readonly = computed(() => listing.value?.readonly ?? false)
+// v4.9.25 权限位：无对应位的动作与只读同款置灰（后端仍会 403 兜底）
+const canWrite = computed(() => !readonly.value && authApi.can(PERM.WRITE))
+const canRename = computed(() => !readonly.value && authApi.can(PERM.RENAME))
+const canMoveCopy = computed(() => !readonly.value && authApi.can(PERM.MOVE_COPY))
+const canDelete = computed(() => !readonly.value && authApi.can(PERM.DELETE))
+const canShare = computed(() => authApi.can(PERM.SHARE))
+const canSeeHidden = computed(() => authApi.can(PERM.SEE_HIDDEN))
+const canTerminal = computed(() => authApi.can(PERM.TERMINAL))
 /** 在线挂载点数量：1 个时跳过卡片页直达根目录（设计文档 3.2.1） */
 const onlineMounts = computed(() => roots.value.filter((root) => root.online))
 const singleMount = computed(() => onlineMounts.value.length === 1)
@@ -965,8 +984,8 @@ const fileInput = ref<HTMLInputElement | null>(null)
 let uploadSeq = 0
 
 function pickFiles() {
-  // 只读挂载点直接拦在入口，不依赖后端 403（设计文档 8.4 第 7 条）
-  if (readonly.value) {
+  // 只读 / 无上传权限直接拦在入口，不依赖后端 403（设计文档 8.4 第 7 条）
+  if (!canWrite.value) {
     showToast(t('files.readonly.tooltip'))
     return
   }
@@ -2318,7 +2337,7 @@ async function onKeydown(event: KeyboardEvent) {
   }
 
   if (key === 'x' || key === 'X') {
-    if (!targets.length || readonly.value) return
+    if (!targets.length || !canMoveCopy.value) return
     clipboard.value = { mode: 'move', entries: targets }
     showToast(t('files.keys.cut', { count: targets.length }))
     return
@@ -2326,7 +2345,8 @@ async function onKeydown(event: KeyboardEvent) {
 
   if (key === 'v' || key === 'V') {
     const clip = clipboard.value
-    if (!clip || (clip.mode === 'move' && readonly.value)) return
+    if (!clip) return
+    if (clip.mode === 'move' ? !canMoveCopy.value : !canWrite.value) return
     event.preventDefault()
     await runTransfer(clip.mode, clip.entries, currentPath.value)
   }
@@ -2371,7 +2391,7 @@ function movableEntries(entry: EntryInfo): EntryInfo[] {
 }
 
 function onEntryDragStart(event: DragEvent, entry: EntryInfo) {
-  if (readonly.value) return
+  if (!canMoveCopy.value) return
   const items = movableEntries(entry)
   internalDrag.value = items
   dropTargetPath.value = null
@@ -2947,8 +2967,8 @@ onBeforeUnmount(() => {
                     <button
                       ref="newTriggerEl"
                       class="touch-chip flex items-center gap-1 rounded-md border border-line px-2 py-1.5 text-xs text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line"
-                      :disabled="readonly"
-                      :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.new')"
+                      :disabled="!canWrite"
+                      :title="canWrite ? t('files.toolbar.new') : t('files.readonly.tooltip')"
                       data-testid="new-entry"
                       :aria-expanded="newMenuOpen"
                       @click="toggleNewMenu"
@@ -2978,8 +2998,8 @@ onBeforeUnmount(() => {
 
                   <button
                     class="touch-chip flex shrink-0 items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-                    :disabled="readonly"
-                    :title="readonly ? t('files.readonly.tooltip') : t('files.toolbar.uploadHint')"
+                    :disabled="!canWrite"
+                    :title="canWrite ? t('files.toolbar.uploadHint') : t('files.readonly.tooltip')"
                     data-testid="toolbar-upload"
                     @click="pickFiles"
                   >
@@ -3113,6 +3133,7 @@ onBeforeUnmount(() => {
                   </div>
 
                   <button
+                    v-if="canSeeHidden"
                     class="touch-target grid size-7 shrink-0 place-items-center rounded-md transition-colors"
                     :class="showHidden ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-elevated hover:text-ink'"
                     :title="showHidden ? t('files.toolbar.hideHidden') : t('files.toolbar.showHidden')"
@@ -3276,7 +3297,7 @@ onBeforeUnmount(() => {
               :data-entry="entry.name"
               :data-kind="entry.kind"
               :data-selected="isSelected(entry.path) ? '1' : undefined"
-              :draggable="!readonly"
+              :draggable="canMoveCopy"
               @click="onEntryClick(entry, $event)"
               @dblclick="activate(entry)"
               @contextmenu.prevent="openMenu($event, entry)"
@@ -3392,7 +3413,7 @@ onBeforeUnmount(() => {
               :data-entry="entry.name"
               :data-kind="entry.kind"
               :data-selected="isSelected(entry.path) ? '1' : undefined"
-              :draggable="!readonly"
+              :draggable="canMoveCopy"
               @click="onEntryClick(entry, $event)"
               @dblclick="activate(entry)"
               @contextmenu.prevent="openMenu($event, entry)"
@@ -3533,8 +3554,8 @@ onBeforeUnmount(() => {
               </button>
               <button
                 class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none"
-                :disabled="readonly"
-                :title="readonly ? t('files.readonly.tooltip') : ''"
+                :disabled="!canMoveCopy"
+                :title="canMoveCopy ? '' : t('files.readonly.tooltip')"
                 @click="openTransferDialog('move', selectedEntries)"
               >
                 <AppIcon name="arrowRight" :size="12" />
@@ -3542,8 +3563,8 @@ onBeforeUnmount(() => {
               </button>
               <button
                 class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] text-ink transition-colors hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none"
-                :disabled="readonly"
-                :title="readonly ? t('files.readonly.tooltip') : ''"
+                :disabled="!canMoveCopy"
+                :title="canMoveCopy ? '' : t('files.readonly.tooltip')"
                 @click="openTransferDialog('copy', selectedEntries)"
               >
                 <AppIcon name="gallery" :size="12" />
@@ -3551,8 +3572,8 @@ onBeforeUnmount(() => {
               </button>
               <button
                 class="touch-chip flex flex-1 items-center justify-center gap-1 rounded-md border border-line px-2 py-1 text-[12px] fg-danger transition-colors hover:border-red-400/50 disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none"
-                :disabled="readonly"
-                :title="readonly ? t('files.readonly.tooltip') : ''"
+                :disabled="!canDelete"
+                :title="canDelete ? '' : t('files.readonly.tooltip')"
                 @click="openDeleteDialog(selectedEntries)"
               >
                 <AppIcon name="trash" :size="12" />

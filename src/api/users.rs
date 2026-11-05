@@ -27,6 +27,8 @@ fn user_json(u: &crate::core::auth::User) -> serde_json::Value {
         "is_active": u.is_active,
         "totp_enabled": u.totp_enabled,
         "must_change_password": u.must_change_password,
+        "permissions": u.permissions,
+        "mount_scope": u.mount_scope,
     })
 }
 
@@ -72,6 +74,12 @@ pub struct UpdateUserRequest {
     pub role: Option<String>,
     #[serde(default)]
     pub is_active: Option<bool>,
+    /// 权限位掩码（v4.9.25）：整数；admin 账号传了也只落库（判定时恒全放行）
+    #[serde(default)]
+    pub permissions: Option<i64>,
+    /// 挂载点收权（v4.9.25）：`"*"` 或挂载点展示路径的 JSON 数组
+    #[serde(default)]
+    pub mount_scope: Option<String>,
 }
 
 /// PATCH /api/users/{id}（管理员）：改名 / 代设密码 / 调角色 / 启停，可一次多项。
@@ -124,6 +132,24 @@ pub async fn update(
             );
         }
         if let Err(err) = state.auth.set_user_active(target.id, active) {
+            return json_error(StatusCode::BAD_REQUEST, err);
+        }
+    }
+    // 权限位 + 挂载点收权（v4.9.25）：两个一起传一次落库，避免中间态；
+    // 只传其一则另一个保持原值。权限收紧即时生效（AuthUser 每请求重读用户行）。
+    if body.permissions.is_some() || body.mount_scope.is_some() {
+        let Some(current) = state.auth.user_by_id(target.id).ok().flatten() else {
+            return json_error_code(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "User not found");
+        };
+        let permissions = body.permissions.unwrap_or(current.permissions);
+        let mount_scope = body
+            .mount_scope
+            .clone()
+            .unwrap_or_else(|| current.mount_scope.clone());
+        if let Err(err) = state
+            .auth
+            .set_user_perms(target.id, permissions, &mount_scope)
+        {
             return json_error(StatusCode::BAD_REQUEST, err);
         }
     }

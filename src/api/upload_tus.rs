@@ -33,6 +33,7 @@ use http_body_util::BodyExt;
 use serde::Deserialize;
 
 use crate::AppState;
+use crate::api::auth::AuthUser;
 use crate::core::fs::FsError;
 use crate::core::fs_ops::{self, NameBook, OnConflict, resolve_placement};
 use crate::core::path_guard;
@@ -189,9 +190,18 @@ fn parse_conflict(raw: Option<&str>) -> Result<OnConflict, Response> {
 /// 后续 PATCH 只对内存会话里的 `target_dir` 落位，不再重新解析路径。
 pub async fn tus_init(
     State(state): State<AppState>,
+    user: AuthUser,
     Query(query): Query<TusInitQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // 上传是写操作（v4.9.25 权限位）
+    if !user.can(crate::core::auth::perms::WRITE) {
+        return crate::api::error::api_error(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "No permission to upload files",
+        );
+    }
     let length: u64 = match headers
         .get("upload-length")
         .and_then(|v| v.to_str().ok())
@@ -227,7 +237,7 @@ pub async fn tus_init(
         Err(resp) => return resp,
     };
 
-    let dir = match crate::api::files::resolve_upload_dir(&state, &query.dir, length).await {
+    let dir = match crate::api::files::resolve_upload_dir(&state, &user, &query.dir, length).await {
         Ok(path) => path,
         Err(resp) => return resp,
     };

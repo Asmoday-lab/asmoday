@@ -445,6 +445,10 @@ async fn virtual_root(
                     {
                         continue;
                     }
+                    // 归属用户的挂载点收权（v4.9.25）：scope 外的不出现
+                    if !access.user_mount_allowed(&mount.info.path) {
+                        continue;
+                    }
                     let href = format!("{}{}/", base, percent_encode_segment(&mount.info.id));
                     let mtime = mount.root.as_deref().map(mtime_of).unwrap_or_else(now_secs);
                     xml.push_str(&collection_xml(&href, &mount.info.name, mtime));
@@ -473,6 +477,9 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}li{margin
                     .as_deref()
                     .is_some_and(|scope| scope != mount.info.id)
                 {
+                    continue;
+                }
+                if !access.user_mount_allowed(&mount.info.path) {
                     continue;
                 }
                 html.push_str(&format!(
@@ -599,6 +606,10 @@ pub async fn handle(
     let Some(mount) = set.find(&mount_id) else {
         return dav_error(StatusCode::NOT_FOUND, "挂载点不存在");
     };
+    // 归属用户的挂载点收权（v4.9.25）：scope 外的挂载点视同不存在
+    if !access.user_mount_allowed(&mount.info.path) {
+        return dav_error(StatusCode::NOT_FOUND, "挂载点不存在");
+    }
     let Ok(root) = mount.canon_root() else {
         return dav_error(StatusCode::NOT_FOUND, "挂载点当前不可用");
     };
@@ -606,7 +617,16 @@ pub async fn handle(
     let mount_owned = mount.clone();
     // 只读按「最深命中」判定：父挂载点里嵌了只读子挂载点时，经父路径写子目录
     // 必须被拦住（此前只看 URL 段的 mount，父可写就能写穿子只读）。
-    let readonly = access.readonly || effective_readonly(&set, mount, &root, &rest);
+    // v4.9.25：无 WebDAV 管理位的用户在 WebDAV 上等同只读。
+    let readonly = access.readonly
+        || effective_readonly(&set, mount, &root, &rest)
+        || !access.can(crate::core::auth::perms::WEBDAV_MANAGE);
+
+    // WebDAV 读取位（v4.9.25）：OPTIONS 永远放行，其余方法（含 PROPFIND/GET）
+    // 无读取位一律 403
+    if method.as_str() != "OPTIONS" && !access.can(crate::core::auth::perms::WEBDAV_READ) {
+        return dav_error(StatusCode::FORBIDDEN, "该账号无 WebDAV 读取权限");
+    }
 
     // 只读令牌：写方法直接 403，不让 dav-server 先落盘再报错
     if readonly && !matches!(method.as_str(), "OPTIONS" | "GET" | "HEAD" | "PROPFIND") {

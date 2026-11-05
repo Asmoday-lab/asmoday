@@ -52,16 +52,44 @@ pub struct CreateToken {
     pub mount_id: Option<String>,
 }
 
-/// 令牌校验结果：只读标记 + 挂载点范围 + 归属用户
+/// 令牌校验结果：只读标记 + 挂载点范围 + 归属用户及其权限（v4.9.25）
 #[derive(Debug, Clone)]
 pub struct TokenAccess {
     pub readonly: bool,
-    /// `None` = 全部挂载点
+    /// `None` = 全部挂载点（令牌自身范围，mount id）
     pub mount_scope: Option<String>,
-    /// 令牌归属的用户（v4.9.24 多用户）。挂载点当前是全局共享的，WebDAV 侧
-    /// 暂时只透传不消费；将来做按用户目录收权时这就是现成的身份入口。
-    #[allow(dead_code)]
+    /// 令牌归属的用户（v4.9.24 多用户）。
+    #[allow(dead_code)] // 暂透传：审计/按用户限流时消费
     pub user_id: i64,
+    /// 归属用户是否 admin（v4.9.25）：admin 不看位全放行
+    pub is_admin: bool,
+    /// 归属用户的权限位（v4.9.25）：WebDAV 读写位在此之上生效
+    pub permissions: i64,
+    /// 归属用户的挂载点收权（v4.9.25）：'*' 或 JSON 数组（展示路径）
+    pub user_mount_scope: String,
+}
+
+impl TokenAccess {
+    /// 权限位判定（admin 恒真）。
+    pub fn can(&self, perm: i64) -> bool {
+        self.is_admin || (self.permissions & perm) != 0
+    }
+
+    /// 挂载点展示路径是否在归属用户的 scope 内（'*' / admin 全放行）。
+    pub fn user_mount_allowed(&self, display_path: &str) -> bool {
+        if self.is_admin || self.user_mount_scope.trim() == "*" {
+            return true;
+        }
+        let needle = display_path
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        serde_json::from_str::<Vec<String>>(&self.user_mount_scope)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
+            .any(|p| !p.is_empty() && (needle == p || needle.starts_with(&format!("{p}/"))))
+    }
 }
 
 fn default_readonly() -> bool {
@@ -257,11 +285,27 @@ pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<Tok
     {
         return None;
     }
+    // 归属用户必须仍然存在且未停用（v4.9.25）：停用/删除用户的同时令牌随之失效；
+    // 用户的权限位与挂载点收权叠加在令牌自身范围之上
+    let user = store_user(state, owner_id)?;
     Some(TokenAccess {
         readonly: readonly != 0,
         mount_scope,
         user_id: owner_id,
+        is_admin: user.is_admin(),
+        permissions: user.permissions,
+        user_mount_scope: user.mount_scope,
     })
+}
+
+/// 按 id 取用户（WebDAV 每请求一次；SQLite 索引查询微秒级）。停用/不存在回 None。
+fn store_user(state: &AppState, user_id: i64) -> Option<crate::core::auth::User> {
+    state
+        .auth
+        .user_by_id(user_id)
+        .ok()
+        .flatten()
+        .filter(|user| user.is_active)
 }
 
 // ---------------------------------------------------------------------------
@@ -351,10 +395,11 @@ fn password_cache_key(username: &str, password: &str) -> String {
         .collect()
 }
 
-/// 校验 WebDAV Basic 凭证的管理员密码回退（用户名 + 登录密码）。
+/// 校验 WebDAV Basic 凭证的账号密码直连（用户名 + 登录密码；v4.9.25 起不限 admin）。
 ///
-/// 放行 = 全量管理员权限（读写、全部挂载点）；两条硬性拒绝见模块文档。
-/// 正确密码但被拒（2FA / 待改密）同样计一次防爆破失败：客户端反复重试
+/// 放行 = 该账号自身的权限（权限位 + 挂载点收权叠加生效，见 `TokenAccess`）；
+/// 两条硬性拒绝不变（待改密 / 2FA），停用账号同样拒绝。
+/// 正确密码但被拒同样计一次防爆破失败：客户端反复重试
 /// 说明凭证口径有问题，应该去换令牌而不是继续撞。
 pub fn verify_admin_password(
     state: &AppState,
@@ -385,6 +430,9 @@ pub(crate) fn verify_admin_with(
             readonly: false,
             mount_scope: None,
             user_id: user.id,
+            is_admin: user.is_admin(),
+            permissions: user.permissions,
+            user_mount_scope: user.mount_scope.clone(),
         });
     }
     if !crate::core::auth::verify_password(&hash, password) {
@@ -395,6 +443,9 @@ pub(crate) fn verify_admin_with(
         readonly: false,
         mount_scope: None,
         user_id: user.id,
+        is_admin: user.is_admin(),
+        permissions: user.permissions,
+        user_mount_scope: user.mount_scope,
     })
 }
 

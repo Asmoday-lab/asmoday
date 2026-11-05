@@ -52,7 +52,11 @@ CREATE TABLE IF NOT EXISTS users (
     -- 多用户（v4.9.24）：'admin' | 'user'。管理类端点（用户/系统配置/备份）只放行 admin
     role TEXT NOT NULL DEFAULT 'user',
     -- 停用的用户拒绝登录，已有会话一并失效；记录保留，启用即恢复
-    is_active BOOLEAN NOT NULL DEFAULT 1
+    is_active BOOLEAN NOT NULL DEFAULT 1,
+    -- 权限位（v4.9.25，对齐 Alist 位掩码）：admin 不看位全放行
+    permissions INTEGER NOT NULL DEFAULT 511,
+    -- 挂载点收权（v4.9.25，对齐 FileBrowser scope）：'*' = 全部；否则 JSON 数组
+    mount_scope TEXT NOT NULL DEFAULT '*'
 );
 
 CREATE TABLE IF NOT EXISTS access_tokens (
@@ -123,6 +127,33 @@ CREATE TABLE IF NOT EXISTS thumb_hashes (
 );
 "#;
 
+/// 权限位（v4.9.25，对齐 Alist 的 Permission 位掩码）。
+///
+/// 「读」不设位——挂载点在 scope 内即可读（社区同口径：FileBrowser/Alist 的
+/// 普通用户默认可见可下）；写类动作逐位收权。
+pub mod perms {
+    /// 看隐藏文件（list / search / WebDAV PROPFIND 的 show_hidden）
+    pub const SEE_HIDDEN: i64 = 1 << 0;
+    /// 新建：mkdir / 上传 / touch
+    pub const WRITE: i64 = 1 << 1;
+    /// 重命名
+    pub const RENAME: i64 = 1 << 2;
+    /// 移动 / 复制
+    pub const MOVE_COPY: i64 = 1 << 3;
+    /// 删除（含回收确认）
+    pub const DELETE: i64 = 1 << 4;
+    /// 创建分享
+    pub const SHARE: i64 = 1 << 5;
+    /// WebDAV 读取（PROPFIND / GET / HEAD）
+    pub const WEBDAV_READ: i64 = 1 << 6;
+    /// WebDAV 管理（PUT / DELETE / MKCOL / MOVE / COPY 等）
+    pub const WEBDAV_MANAGE: i64 = 1 << 7;
+    /// 终端（社区通行：普通用户不给 shell，这里保留开关能力）
+    pub const TERMINAL: i64 = 1 << 8;
+    /// 全量位掩码
+    pub const ALL: i64 = (1 << 9) - 1;
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
     pub id: i64,
@@ -134,11 +165,56 @@ pub struct User {
     pub role: String,
     /// 停用的账号拒绝登录（记录保留，启用即恢复）
     pub is_active: bool,
+    /// 权限位掩码（v4.9.25）；admin 不看位全放行
+    pub permissions: i64,
+    /// 挂载点收权：'*' = 全部；否则 JSON 数组（v4.9.25）
+    pub mount_scope: String,
 }
 
 impl User {
     pub fn is_admin(&self) -> bool {
         self.role == "admin"
+    }
+
+    /// 权限位判定。admin 恒真；普通用户按位。
+    pub fn can(&self, perm: i64) -> bool {
+        self.is_admin() || (self.permissions & perm) != 0
+    }
+
+    /// 挂载点是否全部可见（'*' 或 admin）。
+    pub fn mounts_all(&self) -> bool {
+        self.is_admin() || self.mount_scope.trim() == "*"
+    }
+
+    /// scope 内挂载点清单（`mounts_all` 为真时返回 None）。
+    pub fn allowed_mounts(&self) -> Option<Vec<String>> {
+        if self.mounts_all() {
+            return None;
+        }
+        Some(
+            serde_json::from_str::<Vec<String>>(&self.mount_scope)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect(),
+        )
+    }
+
+    /// 挂载点展示路径（或其下的子路径）是否在 scope 内。大小写不敏感、前缀匹配，
+    /// 与 `MountSet::find_by_path_text` 同口径。
+    pub fn mount_allowed(&self, display_path: &str) -> bool {
+        if self.mounts_all() {
+            return true;
+        }
+        let needle = display_path
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        self.allowed_mounts()
+            .unwrap_or_default()
+            .iter()
+            .any(|p| needle == *p || needle.starts_with(&format!("{p}/")))
     }
 }
 
@@ -433,7 +509,24 @@ fn migrations() -> Migrations<'static> {
             migrate_multi_user(tx)?;
             Ok(())
         }),
+        // v17：权限位 + 挂载点收权（v4.9.25）。存量用户回填全量位 + '*' scope——
+        // 升级即保持升级前「能看到全部挂载点、能做全部动作」的现状。
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            migrate_user_perms(tx)?;
+            Ok(())
+        }),
     ])
+}
+
+/// v17 钩子：users 补 permissions / mount_scope。**不要**写 BEGIN/COMMIT（已在事务里）。
+fn migrate_user_perms(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "users", "permissions") {
+        conn.execute_batch(
+            "ALTER TABLE users ADD COLUMN permissions INTEGER NOT NULL DEFAULT 511;
+             ALTER TABLE users ADD COLUMN mount_scope TEXT NOT NULL DEFAULT '*';",
+        )?;
+    }
+    Ok(())
 }
 
 /// v16 钩子：见上面迁移注释。**不要**在这里写 `BEGIN`/`COMMIT`——迁移本身跑在事务里。
@@ -856,9 +949,10 @@ impl AuthStore {
         let hash = hash_password(password)?;
         let conn = self.connect()?;
         conn.execute(
-            "INSERT INTO users (username, password_hash, created_at, role, must_change_password)
-             VALUES (?1, ?2, ?3, ?4, 1)",
-            params![username, hash, now_secs(), role],
+            "INSERT INTO users (username, password_hash, created_at, role, must_change_password,
+                                permissions, mount_scope)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, '*')",
+            params![username, hash, now_secs(), role, perms::ALL],
         )
         .map_err(|e| {
             if e.to_string().contains("UNIQUE") {
@@ -875,6 +969,8 @@ impl AuthStore {
             must_change_password: true,
             role: role.to_string(),
             is_active: true,
+            permissions: perms::ALL,
+            mount_scope: "*".to_string(),
         })
     }
 
@@ -885,7 +981,7 @@ impl AuthStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password,
-                    role, is_active
+                    role, is_active, permissions, mount_scope
              FROM users WHERE username = ?1",
             params![username],
             |row| {
@@ -897,6 +993,10 @@ impl AuthStore {
                         must_change_password: row.get::<_, i64>(5).unwrap_or(0) != 0,
                         role: row.get::<_, String>(6).unwrap_or_else(|_| "user".into()),
                         is_active: row.get::<_, i64>(7).unwrap_or(1) != 0,
+                        permissions: row.get::<_, i64>(8).unwrap_or(perms::ALL),
+                        mount_scope: row
+                            .get::<_, String>(9)
+                            .unwrap_or_else(|_| "*".into()),
                     },
                     row.get::<_, String>(2).unwrap_or_default(),
                     row.get::<_, Option<String>>(3).unwrap_or(None),
@@ -910,7 +1010,8 @@ impl AuthStore {
     pub fn first_user(&self) -> Result<Option<User>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active
+            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active,
+                    permissions, mount_scope
              FROM users ORDER BY id LIMIT 1",
             [],
             |row| {
@@ -921,6 +1022,8 @@ impl AuthStore {
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
                     role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
                     is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
+                    permissions: row.get::<_, i64>(6).unwrap_or(perms::ALL),
+                    mount_scope: row.get::<_, String>(7).unwrap_or_else(|_| "*".into()),
                 })
             },
         )
@@ -931,7 +1034,8 @@ impl AuthStore {
     pub fn user_by_id(&self, id: i64) -> Result<Option<User>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active
+            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active,
+                    permissions, mount_scope
              FROM users WHERE id = ?1",
             params![id],
             |row| {
@@ -942,6 +1046,8 @@ impl AuthStore {
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
                     role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
                     is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
+                    permissions: row.get::<_, i64>(6).unwrap_or(perms::ALL),
+                    mount_scope: row.get::<_, String>(7).unwrap_or_else(|_| "*".into()),
                 })
             },
         )
@@ -954,7 +1060,8 @@ impl AuthStore {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, username, is_totp_enabled, must_change_password, role, is_active
+                "SELECT id, username, is_totp_enabled, must_change_password, role, is_active,
+                        permissions, mount_scope
                  FROM users ORDER BY id",
             )
             .map_err(|e| format!("查询用户失败：{e}"))?;
@@ -967,6 +1074,8 @@ impl AuthStore {
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
                     role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
                     is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
+                    permissions: row.get::<_, i64>(6).unwrap_or(perms::ALL),
+                    mount_scope: row.get::<_, String>(7).unwrap_or_else(|_| "*".into()),
                 })
             })
             .map_err(|e| format!("查询用户失败：{e}"))?;
@@ -1029,6 +1138,41 @@ impl AuthStore {
             params![role, user_id],
         )
         .map_err(|e| format!("更新角色失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 更新权限位与挂载点收权（v4.9.25）。
+    ///
+    /// `mount_scope` 为 `"*"` 或挂载点展示路径的 JSON 数组（空数组 = 什么都看不到，
+    /// 允许——管理员可以先收光再慢慢放）。改完由调用方决定是否清会话：权限收紧
+    /// 立即生效（AuthUser 每请求重读用户行），无需踢登录。
+    pub fn set_user_perms(
+        &self,
+        user_id: i64,
+        permissions: i64,
+        mount_scope: &str,
+    ) -> Result<(), String> {
+        let permissions = if permissions < 0 {
+            0
+        } else {
+            permissions & perms::ALL
+        };
+        let scope = mount_scope.trim();
+        if scope != "*" {
+            let parsed: Vec<String> = serde_json::from_str(scope)
+                .map_err(|_| "mount_scope 需为 \"*\" 或路径字符串的 JSON 数组".to_string())?;
+            for p in &parsed {
+                if p.trim().is_empty() {
+                    return Err("mount_scope 数组里出现了空路径".to_string());
+                }
+            }
+        }
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE users SET permissions = ?1, mount_scope = ?2 WHERE id = ?3",
+            params![permissions, scope, user_id],
+        )
+        .map_err(|e| format!("更新权限失败：{e}"))?;
         Ok(())
     }
 
@@ -1906,5 +2050,46 @@ mod tests {
             expires <= created + SESSION_ABSOLUTE_TTL,
             "不得越过 30 天绝对上限"
         );
+    }
+
+    #[test]
+    fn user_perms_defaults_scope_and_update() {
+        let store = temp_store("user-perms");
+
+        // 新建用户：全量位 + '*' scope
+        let user = store.create_user("perm_u1", "Abcd1234", "user").unwrap();
+        assert_eq!(user.permissions, perms::ALL);
+        assert!(user.mounts_all());
+        assert!(user.can(perms::WRITE) && user.can(perms::TERMINAL));
+
+        // scope 解析：JSON 数组 → 归一化小写列表；'*' → None
+        store
+            .set_user_perms(
+                user.id,
+                perms::SEE_HIDDEN | perms::WRITE,
+                r#"["D:/Media","/docs"]"#,
+            )
+            .unwrap();
+        let user = store.user_by_id(user.id).unwrap().unwrap();
+        assert_eq!(user.allowed_mounts().unwrap(), vec!["d:/media", "/docs"]);
+        assert!(user.mount_allowed("d:/MEDIA"));
+        assert!(user.mount_allowed("D:/Media/sub/dir"));
+        assert!(!user.mount_allowed("E:/other"));
+        assert!(user.can(perms::WRITE) && !user.can(perms::DELETE));
+        assert!(!user.mounts_all());
+
+        // admin 不看位，恒全放行
+        let admin = store
+            .create_user("perm_admin", "Abcd1234", "admin")
+            .unwrap();
+        store.set_user_perms(admin.id, 0, "[]").unwrap();
+        let admin = store.user_by_id(admin.id).unwrap().unwrap();
+        assert!(admin.can(perms::DELETE) && admin.mount_allowed("anything"));
+
+        // 非法 scope 拒绝；负数位掩码钳到 0
+        assert!(store.set_user_perms(user.id, 1, "not-json").is_err());
+        assert!(store.set_user_perms(user.id, 1, r#"[""]"#).is_err());
+        store.set_user_perms(user.id, -1, "*").unwrap();
+        assert_eq!(store.user_by_id(user.id).unwrap().unwrap().permissions, 0);
     }
 }

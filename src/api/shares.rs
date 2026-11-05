@@ -67,6 +67,21 @@ pub async fn create(
     user: AuthUser,
     Json(body): Json<CreateShare>,
 ) -> Response {
+    // 分享权限位（v4.9.25）：管理员可以收走单个用户的对外分享能力
+    if !user.can(crate::core::auth::perms::SHARE) {
+        return error_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "No permission to create shares",
+        );
+    }
+
+    // 挂载点收权（v4.9.25）：scope 外的路径视同不存在
+    let mounts = crate::api::files::mounts_for_user(&state, &user).await;
+    if mounts.find_by_path_text(body.path.trim()).is_none() {
+        return error_code(StatusCode::NOT_FOUND, "E_NOT_FOUND", "路径不在任何挂载点内");
+    }
+
     let roots = {
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)
