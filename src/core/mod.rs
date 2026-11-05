@@ -6,6 +6,7 @@ pub mod auth;
 pub mod config;
 pub mod cover_cache;
 pub mod dir_cache;
+pub mod download;
 pub mod ffmpeg;
 pub mod fs;
 pub mod fs_ops;

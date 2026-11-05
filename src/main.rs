@@ -81,6 +81,8 @@ pub struct AppState {
     pub dav: Arc<api::webdav::DavCache>,
     /// 批量删除的一次性令牌
     pub delete_tickets: Arc<api::files_mutate::DeleteTickets>,
+    /// aria2 兼容下载引擎（设计文档 3.10，v4.9.26）
+    pub downloads: Arc<core::download::DownloadManager>,
     /// tus 分块上传会话表（设计文档 3.2.3.1）
     pub tus: Arc<api::upload_tus::TusStore>,
     /// 哈希并发槽位（上限 2，设计文档 6.2）
@@ -319,6 +321,52 @@ async fn run(cli: Cli) -> Result<(), String> {
     let media = config.media.clone();
     let terminal = config.terminal.clone();
     let listen = (config.server.host.clone(), config.server.ssl.enabled);
+
+    // aria2 兼容下载引擎（设计文档 3.10）：RPC 密钥 = 配置显式值，
+    // 否则用 data 目录下持久化的自动生成值（首轮生成并打印一次）。
+    let download_config = config.download.clone();
+    let download_secret = if download_config.rpc_secret.trim().is_empty() {
+        let path = core::download::DownloadManager::secret_path(&data_dir);
+        let existing = std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        match existing {
+            Some(secret) => secret,
+            None => {
+                let secret = core::auth::random_password();
+                std::fs::write(&path, &secret)
+                    .map_err(|e| format!("persist download rpc secret failed: {e}"))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+                println!(
+                    "[asmoday] download RPC enabled; generated secret (persisted to {}): {secret}",
+                    path.display()
+                );
+                secret
+            }
+        }
+    } else {
+        download_config.rpc_secret.trim().to_string()
+    };
+    let download_roots: Vec<PathBuf> = if download_config.roots.is_empty() {
+        vec![data_dir.join("downloads")]
+    } else {
+        download_config
+            .roots
+            .iter()
+            .map(|root| PathBuf::from(crate::core::fs::normalize_display(Path::new(root))))
+            .collect()
+    };
+    for root in &download_roots {
+        if !root.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(root);
+        }
+    }
+
     // 缩略图缓存根：缩略器与索引共用同一个串（索引靠它回收外部删除的缓存单元）
     let thumb_dir = data_dir.join("thumbnails");
     let state = AppState {
@@ -353,6 +401,17 @@ async fn run(cli: Cli) -> Result<(), String> {
         path_locks: Arc::new(core::locks::PathLocks::new()),
         dav: Arc::new(api::webdav::DavCache::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
+        downloads: Arc::new(core::download::DownloadManager::new(
+            reqwest::Client::builder()
+                .user_agent("aria2/1.37.0")
+                .build()
+                .map_err(|e| format!("failed to build download HTTP client: {e}"))?,
+            download_secret,
+            download_roots,
+            download_config.segments,
+            download_config.max_concurrent,
+            download_config.enable,
+        )),
         tus: Arc::new(api::upload_tus::TusStore::new(data_dir.join("uploads_tmp"))),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         started,
@@ -600,6 +659,9 @@ fn public_routes() -> Router<AppState> {
             "/api/public/share/{token}/download",
             get(api::shares::download),
         )
+        // aria2 兼容 RPC（v4.9.26）：自带 token:secret 鉴权，不经 Cookie 中间件；
+        // [download].enable=false 时不注册（客户端连接即 404，无引擎暴露面）
+        .route("/jsonrpc", any(api::aria2_rpc::handle))
         .route(
             "/api/public/share/{token}/list",
             get(api::shares::list_entries),

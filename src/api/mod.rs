@@ -1,6 +1,7 @@
 //! 路由层。
 
 pub mod access;
+pub mod aria2_rpc;
 pub mod auth;
 pub mod compress;
 pub mod config;

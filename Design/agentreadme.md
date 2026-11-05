@@ -384,6 +384,16 @@ GWT-PERM-03 Given 用户无 webdav_manage 但有 webdav_read  When 密码直连 
 GWT-PERM-04 Given 归属用户被停用/删除  When 其 asm_ 令牌或密码直连访问 WebDAV  Then 立即失效（每请求重查用户行）（v4.9.25）
 GWT-PERM-05 Given admin 在设置页收权  When 该用户下一个请求到达  Then 新权限即时生效，无需重新登录（AuthUser 每请求重读用户行）（v4.9.25）
 GWT-PERM-06 Given 存量库升级到 v4.9.25  When 迁移 v17 跑完  Then 所有存量用户 permissions=511、mount_scope='*'（升级不缩权）（v4.9.25）
+
+#### aria2 兼容下载引擎（GWT-DL，v4.9.26）
+
+GWT-DL-01 Given 任意 aria2 客户端  When `getVersion`  Then `enabledFeatures` 含 Asmoday / Multi-Connection / Resumable，**不含** BitTorrent（客户端据此隐藏 BT 入口）
+GWT-DL-02 Given 错误 RPC 密钥  When 调用任意方法  Then `{"code":1,"message":"Unauthorized"}`；正确密钥（token:<secret>，首项）正常返回
+GWT-DL-03 Given AriaNg 的批量轮询  When `system.multicall` 内层 params **不含** token  Then 两个子调用都成功（鉴权只在 multicall 层做一次），结果形如 `[[...],[...]]`
+GWT-DL-04 Given 支持 Range 的源站  When `addUri` 后 `tellStatus`  Then `connections > 1`（按 segments 均分并发），`tellStatus` 的 totalLength/completedLength/downloadSpeed/connections/dir/files/errorCode/errorMessage 全部存在
+GWT-DL-05 Given 下载中 `pause`  Then 状态 paused、已下载字节保留、`.aria2` 控制文件生成、任务出现在 `tellWaiting`（paused 属 waiting 族）；`unpause` 后从断点续传且最终字节与源 sha256 一致
+GWT-DL-06 Given `dir` 落在 `[download].roots` 之外  When `addUri`  Then JSON-RPC fault（拒绝，不夹到根里）；`out` 含路径分隔符或 `..` 同样拒绝
+GWT-DL-07 Given `[download].enable=false`  When 任意客户端访问 `/jsonrpc`  Then 404（协议面完全不存在）
 ```
 
 #### 依赖红线

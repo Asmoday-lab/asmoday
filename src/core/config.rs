@@ -109,6 +109,21 @@ index_scan_interval_secs = 300
 thumb_preheat_days = 365
 thumb_preheat_per_scan = 200
 
+# aria2-compatible download engine. Any aria2 client (AriaNg, Aria2 Explorer,
+# motrix ...) can connect to http://<host>:<port>/jsonrpc with the RPC secret.
+# The secret is generated on first start and written to <data>/download_rpc_secret;
+# set rpc_secret explicitly to override it.
+# [download]
+# enable = true
+# rpc_secret = ""
+# Parallel connections per download (1-32).
+# segments = 8
+# Max concurrent active downloads.
+# max_concurrent = 5
+# Allowed target directories for RPC dir/out. Empty = <data>/downloads.
+# Paths must exist (or be creatable) and stay inside this list.
+# roots = []
+
 [log]
 # debug | info | warn | error | off
 console_level = "info"
@@ -143,6 +158,8 @@ pub struct Config {
     pub shares: SharesConfig,
     /// 媒体缓存策略（设计文档 3.4 / 4.2）
     pub media: MediaConfig,
+    /// aria2 兼容下载引擎（设计文档 3.10，v4.9.26）
+    pub download: DownloadConfig,
     /// 日志分级与多输出（设计文档 3.7）
     pub log: LogConfig,
     /// 终端 PTY 拉起覆盖（设计文档 3.3.5）
@@ -250,6 +267,41 @@ impl MediaConfig {
     /// 换算成秒，供闲置过期逻辑使用
     pub fn max_age_secs(&self) -> u64 {
         self.thumb_cache_max_age_days.saturating_mul(24 * 60 * 60)
+    }
+}
+
+/// `[download]`：aria2 兼容下载引擎（设计文档 3.10，v4.9.26）。
+///
+/// 任何 aria2 客户端（AriaNg / Aria2 Explorer / motrix…）连
+/// `http://<host>:<port>/jsonrpc` + RPC 密钥即用。密钥缺省时首次启动
+/// 自动生成并持久化到 `<data>/download_rpc_secret`，启动日志会打印。
+///
+/// 落盘安全：RPC 的 `dir` / `out` 只允许落在 `roots` 白名单内（前缀校验，
+/// Windows 大小写不敏感），未配置时默认 `<data>/downloads`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DownloadConfig {
+    /// 关掉后 `/jsonrpc` 不注册，引擎不启动
+    pub enable: bool,
+    /// RPC 密钥（空 = 用 data 目录下持久化的自动生成密钥）
+    pub rpc_secret: String,
+    /// 每任务最大连接数（1-32，默认 8）
+    pub segments: usize,
+    /// 全局并发下载上限（默认 5，对齐 aria2 max-concurrent-downloads）
+    pub max_concurrent: usize,
+    /// 允许落盘的目录白名单（空 = `<data>/downloads`）
+    pub roots: Vec<String>,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            rpc_secret: String::new(),
+            segments: 8,
+            max_concurrent: 5,
+            roots: Vec::new(),
+        }
     }
 }
 
@@ -1667,7 +1719,8 @@ max_sessions = 10
 
         // 与 `pub struct Config` 的字段顺序逐一对应
         let expected = [
-            "server", "auth", "system", "services", "shares", "media", "log", "terminal",
+            "server", "auth", "system", "services", "shares", "media", "download", "log",
+            "terminal",
         ];
         let positions: Vec<usize> = expected.iter().map(|s| first(s)).collect();
         assert!(
