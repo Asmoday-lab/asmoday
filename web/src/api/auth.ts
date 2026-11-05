@@ -73,9 +73,6 @@ export const authApi = {
   async login(username: string, password: string, totp?: string) {
     await post('/api/auth/login', { username, password, totp: totp || undefined })
   },
-  async setup(username: string, password: string, setupToken: string) {
-    await post('/api/auth/setup', { username, password }, { 'X-Setup-Token': setupToken.trim() })
-  },
   async logout() {
     await post('/api/auth/logout')
   },

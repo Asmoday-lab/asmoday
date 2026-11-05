@@ -776,54 +776,6 @@ impl AuthStore {
         })
     }
 
-    /// 创建首个用户（setup 专用，设计文档 3.1.1）。
-    ///
-    /// 「是否已有用户」的检查与插入放在同一个 IMMEDIATE 事务里，
-    /// 消除 `setup` 处理器「两次独立数据库操作」的抢注竞态——
-    /// 两个并发 POST 否则都能读到 count=0 并各自 INSERT 成功。
-    /// 已有用户时返回 `Err("ALREADY_INITIALIZED")`（调用方映射为 409）。
-    pub fn create_first_user(&self, username: &str, password: &str) -> Result<User, String> {
-        use rusqlite::TransactionBehavior;
-
-        let username = username.trim();
-        if username.len() < 2 {
-            return Err("用户名至少 2 个字符".to_string());
-        }
-        check_password_strength(password)?;
-
-        let hash = hash_password(password)?;
-        let mut conn = self.connect()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("开启事务失败：{e}"))?;
-        let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
-            .map_err(|e| format!("查询用户失败：{e}"))?;
-        if count != 0 {
-            return Err("ALREADY_INITIALIZED".to_string());
-        }
-        tx.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-            params![username, hash, now_secs()],
-        )
-        .map_err(|e| {
-            if e.to_string().contains("UNIQUE") {
-                "用户名已存在".to_string()
-            } else {
-                format!("创建用户失败：{e}")
-            }
-        })?;
-        let id = tx.last_insert_rowid();
-        tx.commit().map_err(|e| format!("提交事务失败：{e}"))?;
-
-        Ok(User {
-            id,
-            username: username.to_string(),
-            totp_enabled: false,
-            must_change_password: false,
-        })
-    }
-
     pub fn find_user(
         &self,
         username: &str,

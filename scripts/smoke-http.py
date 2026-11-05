@@ -8,10 +8,11 @@
 用法：
     python scripts/smoke-http.py --base http://127.0.0.1:4971 \
         --user admin --password 'Smoke#2026test'
-    # 首次（还没有管理员）：加 --setup-token <启动时打印的令牌>
+    # 首次（还没有管理员）：先 `asmoday --init` 生成一次性密码（打印在控制台），
+    # 再把它作为 --password 传入；首登后服务端要求改密，冒烟流程不受影响。
 
 覆盖：
-    1. 登录 / 初始化
+    1. 登录
     2. 在第一个在线挂载点下建 __smoke__ 临时目录
     3. tus 5 字节（偏移必须推进并落位）
     4. tus 分块（2 片，字节一致）
@@ -132,23 +133,13 @@ def main() -> int:
     ap.add_argument("--base", default="http://127.0.0.1:4971")
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", default="Smoke#2026test")
-    ap.add_argument("--setup-token", default=None)
     args = ap.parse_args()
 
     c = Client(args.base)
 
     print("[1] 登录")
     status, payload = c.json("POST", "/api/auth/login", {"username": args.user, "password": args.password})
-    if status != 200 and args.setup_token:
-        # 首次启动：服务端把一次性令牌打印在控制台（不落日志），必须带在头里
-        status, payload, _ = c.request(
-            "POST",
-            "/api/auth/setup",
-            json.dumps({"username": args.user, "password": args.password}).encode(),
-            {"Content-Type": "application/json", "X-Setup-Token": args.setup_token},
-        )
-        payload = payload.decode(errors="replace")[:200]
-    check("登录 / 初始化", status == 200, f"{status} {payload}")
+    check("登录", status == 200, f"{status} {payload}")
 
     print("[2] 找挂载点")
     status, payload = c.json("GET", "/api/files/mounts")

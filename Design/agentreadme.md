@@ -368,9 +368,9 @@ POST /api/auth/password
 #### GWT 验收
 
 ```gwt
-GWT-AUTH-01 Given 应用首次启动  When 用户访问 /  Then 503 且重定向 /init
-GWT-AUTH-02 Given 初始化页面  When 提交错误 init_token  Then 行内错误"令牌无效"，不清空表单
-GWT-AUTH-03 Given 初始化页面  When 连续 6 次错误 init_token  Then 第 6 次返回 429 且底部倒计时 60s
+GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 控制台打印「created user 'admin' with a one-time password: …」（stdout，不进日志文件），数据库里 admin 的 must_change_password=1（v4.9.23）
+GWT-AUTH-02 Given 一次性密码登录成功  When 访问除改密/登出/me 以外的 API  Then 403 E_PASSWORD_CHANGE_REQUIRED；改密成功后全部放行，旧一次性密码 401（v4.9.23）
+GWT-AUTH-03 Given 已有管理员的实例重启  When 启动完成  Then 不再生成/打印新密码，登录页就是普通登录表单（无 setup 页、无 X-Setup-Token，v4.9.23）
 GWT-AUTH-04 Given 初始化成功且 must_change_password=1  When 用户登录  Then 强制跳转 /change-password，导航栏隐藏
 GWT-AUTH-05 Given 登录页  When 密码错误  Then 行内错误"用户名或密码错误"，不泄露用户是否存在
 GWT-AUTH-06 Given 登录页  When 密码正确但 TOTP 开启  Then 弹出 6 位 TOTP 输入，输入错误回登录页

@@ -100,12 +100,6 @@ pub struct AppState {
     pub mounts_revision: Arc<std::sync::atomic::AtomicU64>,
     /// 配置变更信号：后台索引器在 sleep 里 select 它，改完挂载点不必再等一整轮
     pub config_changed: Arc<tokio::sync::Notify>,
-    /// 一次性初始化令牌（设计文档 3.1.1）：进程内保存，setup 接口必须携带。
-    ///
-    /// 只在「还没有任何用户」时生成并打印到控制台；setup 成功后清空。
-    /// 走 `None`（无用户但没生成）以外的路径都视为不需要——已初始化的实例
-    /// setup 接口本来就返回 409。
-    pub setup_token: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -367,20 +361,25 @@ async fn run(cli: Cli) -> Result<(), String> {
         thumb_jobs: Arc::new(api::system::ThumbJobSlot::default()),
         mounts_revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_changed: Arc::new(tokio::sync::Notify::new()),
-        setup_token: Arc::new(std::sync::Mutex::new(None)),
         cwd,
     };
 
-    // 一次性初始化令牌（设计文档 3.1.1）：还没有管理员时生成并打印。
-    // 只走 println（不进 asmoday.log）——日志文件会被轮转/采集，明文凭据
+    // 首启自动引导（设计文档 3.1.1，对齐 FileBrowser）：还没有管理员时直接
+    // 生成 admin + 一次性随机密码，打印到控制台。网页端没有任何 setup 表单，
+    // 首次登录强制改密（must_change_password，中间件只放行改密接口）。
+    // 抢注问题天然消失：初始密码本身就是凭证，不存在「先到先得」的窗口。
+    // 密码只走 println（不进 asmoday.log）——日志文件会被轮转/采集，明文凭据
     // 不能落盘；这与 --reset-password 的口径一致（2026-11-04 审查）。
     if auth.user_count().unwrap_or(1) == 0 {
-        let token = core::auth::random_token();
-        *state
-            .setup_token
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.clone());
-        println!("[asmoday] one-time setup token (required by the web setup page): {token}");
+        let password = core::auth::random_password();
+        let user = auth
+            .create_user("admin", &password)
+            .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
+        auth.set_must_change_password(user.id, true)?;
+        println!(
+            "[asmoday] no administrator yet; created user 'admin' with a one-time password: {password}"
+        );
+        println!("[asmoday] sign in with 'admin' + this password, you will be asked to change it.");
     }
 
     state
@@ -480,11 +479,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     );
     if !base_url.is_empty() {
         crate::log_info!("base url prefix: {base_url}");
-    }
-    if auth.user_count().unwrap_or(0) == 0 {
-        crate::log_warn!(
-            "no administrator yet: open the web UI and enter the one-time setup token printed above, or run with --init"
-        );
     }
     // 嵌套挂载点（父目录里又挂了子目录）是合法配置，但只读按「最深命中」判定：
     // 通过父挂载点的路径访问子目录时用的是父的权限。明确告知，免得当成 bug 排查。
@@ -597,7 +591,6 @@ fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/api/health", get(status))
         .route("/api/auth/status", get(api::auth::status))
-        .route("/api/auth/setup", post(api::auth::setup))
         .route("/api/auth/login", post(api::auth::login))
         .route("/api/auth/logout", post(api::auth::logout))
         // 公开分享（令牌/口令/有效期/防盗链由处理器自行校验）

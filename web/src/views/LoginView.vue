@@ -1,8 +1,12 @@
 <script setup lang="ts">
 /**
- * 登录 / 首次初始化。整页独立布局，不套侧边栏。
+ * 登录页。整页独立布局，不套侧边栏。
+ *
+ * 初始化不再走网页表单（v4.9.23，对齐 FileBrowser）：首启时服务端自动创建
+ * admin + 一次性随机密码并打印在控制台，这里就是普通登录页；一次性密码
+ * 会话登录后由 App.vue 的强制改密对话框接管。
  */
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -19,62 +23,21 @@ const route = useRoute()
 
 const username = ref('')
 const password = ref('')
-const confirm = ref('')
-const setupToken = ref('')
 const totp = ref('')
 const showTotp = ref(false)
 const error = ref('')
 const submitting = ref(false)
-// 用户点过一次提交后，校验提示对「空值」也生效（否则空表单提交毫无反馈）
-const submitAttempted = ref(false)
-
-const isSetup = computed(() => !authApi.initialized.value)
-
-// 内联校验提示：已输入但不满足规则时即时出现；空值提示只在尝试提交后出现，避免一进页面就满屏红字
-const usernameShort = computed(() => {
-  const u = username.value.trim()
-  return u.length < 2 && (u.length > 0 || submitAttempted.value)
-})
-const passwordShort = computed(
-  () => password.value.length < 8 && (password.value.length > 0 || submitAttempted.value),
-)
-const passwordDigits = computed(
-  () => password.value.length >= 8 && /^\d+$/.test(password.value),
-)
-const confirmMismatch = computed(
-  () => confirm.value !== password.value && (confirm.value.length > 0 || submitAttempted.value),
-)
-
-const canSubmit = computed(() => {
-  if (isSetup.value) {
-    return (
-      username.value.trim().length >= 2 &&
-      password.value.length >= 8 &&
-      !/^\d+$/.test(password.value) &&
-      password.value === confirm.value &&
-      setupToken.value.trim().length > 0 &&
-      !submitting.value
-    )
-  }
-  return username.value.trim().length > 0 && password.value.length > 0 && !submitting.value
-})
 
 async function submit() {
   if (submitting.value) return
-  submitAttempted.value = true
   error.value = ''
-  if (!canSubmit.value) {
-    // 登录模式没有内联规则可提示，空表单给一句明确反馈
-    if (!isSetup.value) error.value = t('auth.login.required')
+  if (!username.value.trim() || !password.value) {
+    error.value = t('auth.login.required')
     return
   }
   submitting.value = true
   try {
-    if (isSetup.value) {
-      await authApi.setup(username.value.trim(), password.value, setupToken.value)
-    } else {
-      await authApi.login(username.value.trim(), password.value, totp.value.trim())
-    }
+    await authApi.login(username.value.trim(), password.value, totp.value.trim())
     const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(target)
   } catch (err) {
@@ -86,7 +49,7 @@ async function submit() {
 
 onMounted(async () => {
   await authApi.ensureAuth()
-  if (!isSetup.value) username.value = 'admin'
+  username.value = 'admin'
 })
 
 /** 语言切换：登录前也能改（首次运行可能整站是英文环境） */
@@ -130,9 +93,7 @@ function changeLocale(event: Event) {
           <AppIcon name="sparkle" :size="48" :stroke-width="1.75" />
         </span>
         <h1 class="text-xl font-semibold text-ink">Asmoday</h1>
-        <p class="mt-1 text-xs text-muted">
-          {{ isSetup ? t('auth.login.setupTagline') : t('auth.login.tagline') }}
-        </p>
+        <p class="mt-1 text-xs text-muted">{{ t('auth.login.tagline') }}</p>
       </div>
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
@@ -145,74 +106,35 @@ function changeLocale(event: Event) {
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             placeholder="admin"
           />
-          <span v-if="isSetup && usernameShort" class="mt-1 block text-[11px] fg-danger">
-            {{ t('auth.login.usernameShort') }}
-          </span>
         </label>
 
         <label class="block">
           <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
           <PasswordInput
             v-model="password"
-            :autocomplete="isSetup ? 'new-password' : 'current-password'"
+            autocomplete="current-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-            :placeholder="isSetup ? t('auth.login.passwordPlaceholder') : '••••••••'"
+            placeholder="••••••••"
           />
-          <span
-            v-if="isSetup && (passwordShort || passwordDigits)"
-            class="mt-1 block text-[11px] fg-danger"
-          >
-            {{ passwordShort ? t('auth.login.passwordShort') : t('auth.login.passwordDigits') }}
-          </span>
         </label>
 
-        <label v-if="isSetup" class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.confirmPassword') }}</span>
-          <PasswordInput
-            v-model="confirm"
-            autocomplete="new-password"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-            :placeholder="t('auth.login.confirmPlaceholder')"
-          />
-          <span v-if="confirmMismatch" class="mt-1 block text-[11px] fg-danger">
-            {{ t('auth.login.confirmMismatch') }}
-          </span>
-        </label>
-
-        <label v-if="isSetup" class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.setupToken') }}</span>
+        <button
+          type="button"
+          class="text-[12px] text-muted transition-colors hover:text-ink"
+          @click="showTotp = !showTotp"
+        >
+          {{ showTotp ? t('auth.login.totpHide') : t('auth.login.totpToggle') }}
+        </button>
+        <label v-if="showTotp" class="block">
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
           <input
-            v-model="setupToken"
+            v-model="totp"
             type="text"
-            autocomplete="off"
-            spellcheck="false"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 font-mono text-sm text-ink outline-none focus:border-accent"
-            :placeholder="t('auth.login.setupTokenPlaceholder')"
+            autocomplete="one-time-code"
+            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm tracking-[0.2em] text-ink outline-none focus:border-accent"
+            placeholder="000000 / XXXXX-XXXXX"
           />
-          <span class="mt-1 block text-[11px] text-muted">
-            {{ t('auth.login.setupTokenHint') }}
-          </span>
         </label>
-
-        <template v-if="!isSetup">
-          <button
-            type="button"
-            class="text-[12px] text-muted transition-colors hover:text-ink"
-            @click="showTotp = !showTotp"
-          >
-            {{ showTotp ? t('auth.login.totpHide') : t('auth.login.totpToggle') }}
-          </button>
-          <label v-if="showTotp" class="block">
-            <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
-            <input
-              v-model="totp"
-              type="text"
-              autocomplete="one-time-code"
-              class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm tracking-[0.2em] text-ink outline-none focus:border-accent"
-              placeholder="000000 / XXXXX-XXXXX"
-            />
-          </label>
-        </template>
 
         <p
           v-if="error"
@@ -226,11 +148,11 @@ function changeLocale(event: Event) {
           :disabled="submitting"
           class="w-full rounded-lg bg-accent py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
         >
-          {{ submitting ? t('auth.login.submitting') : isSetup ? t('auth.login.submitSetup') : t('auth.login.submit') }}
+          {{ submitting ? t('auth.login.submitting') : t('auth.login.submit') }}
         </button>
 
         <p class="pt-1 text-center text-[12px] leading-relaxed text-muted">
-          {{ isSetup ? t('auth.login.footerSetup') : t('auth.login.footerLogin') }}
+          {{ t('auth.login.footerLogin') }}
         </p>
       </form>
     </div>
