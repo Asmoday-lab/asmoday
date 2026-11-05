@@ -790,6 +790,16 @@ impl AuthStore {
             .map_err(|e| format!("查询用户数失败：{e}"))
     }
 
+    /// 是否已进入多用户模式（v4.9.27）。
+    ///
+    /// 产品语义：默认安装就是**单用户**——只有一个管理员，所有能力全开，
+    /// 界面上不出现权限位与挂载点收权；管理员第一次新建账号后才启用多用户。
+    /// 判据是「账号总数 > 1」而不是「存在非 admin 账号」：把最后一个普通
+    /// 用户停用或降级时，他名下的权限配置还在，不该让管理界面在那一刻消失。
+    pub fn multi_user(&self) -> Result<bool, String> {
+        Ok(self.user_count()? > 1)
+    }
+
     // -----------------------------------------------------------------------
     // 元数据联动（设计文档 3.2.6.7）
     //
@@ -2091,5 +2101,26 @@ mod tests {
         assert!(store.set_user_perms(user.id, 1, r#"[""]"#).is_err());
         store.set_user_perms(user.id, -1, "*").unwrap();
         assert_eq!(store.user_by_id(user.id).unwrap().unwrap().permissions, 0);
+    }
+
+    #[test]
+    fn multi_user_turns_on_with_second_account() {
+        let store = temp_store("multi-user-mode");
+        // 空库不算多用户；只有一个管理员也不算
+        assert!(!store.multi_user().unwrap());
+        let admin = store.create_user("solo", "Abcd1234", "admin").unwrap();
+        assert!(!store.multi_user().unwrap());
+
+        // 建第二个账号才进多用户（哪怕它只是个普通用户）
+        let second = store.create_user("second", "Abcd1234", "user").unwrap();
+        assert!(store.multi_user().unwrap());
+
+        // 停用不等于删除：权限配置还在，界面不该退回单用户
+        store.set_user_active(second.id, false).unwrap();
+        assert!(store.multi_user().unwrap());
+
+        // 删掉后回到单用户
+        store.delete_user(second.id, admin.id).unwrap();
+        assert!(!store.multi_user().unwrap());
     }
 }

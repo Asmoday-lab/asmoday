@@ -1,0 +1,22 @@
+[package]
+name = "librqbit-sha1-wrapper"
+version = "4.1.0"
+edition = "2018"
+license = "Apache-2.0"
+description = "Local drop-in replacement for librqbit-sha1-wrapper using RustCrypto sha1 (no C toolchain)."
+
+[lib]
+name = "librqbit_sha1_wrapper"
+path = "src/lib.rs"
+
+# 与上游 4.1.0 保持同名 feature，否则 librqbit 的 `sha1w/sha1-ring` 引用会解析失败。
+# 两个 feature 的实现完全相同：上游把它们分成 crypto-hash（Linux 落 openssl）与
+# aws-lc-rs（C 构建），两者在 musl 交叉编译下都要外部工具链。这里统一成纯 Rust。
+[features]
+default = ["sha1-crypto-hash"]
+sha1-crypto-hash = ["dep:sha1"]
+sha1-ring = ["dep:sha1"]
+
+[dependencies]
+# 与项目已有依赖同版本，不新增第二条 SHA-1 实现
+sha1 = { version = "0.10", optional = true }

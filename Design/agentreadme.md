@@ -378,6 +378,7 @@ GWT-AUTH-15 Given 用户 A 已登录  When A 用当前密码 POST /api/auth/user
 GWT-AUTH-16 Given 实例只有 admin 一个可用管理员  When admin 停用/降级/删除自己  Then 400 E_LAST_ADMIN 拒绝；不能删自己（v4.9.24）
 GWT-AUTH-17 Given admin 停用用户 B  When B 的现有 Cookie 访问 API  Then 401/403 被踢出；重新登录返回 403 E_ACCOUNT_DISABLED 且不泄露账号存在性（v4.9.24）
 GWT-AUTH-18 Given admin 删除用户 B  When 检查数据  Then B 的 sessions/favorites/history/tokens 级联删除，B 的 shares 置 tombstone，其他用户数据不受影响（v4.9.24）
+GWT-AUTH-19 Given 全新安装只有一个 admin  When 打开设置页  Then 用户页显示「单用户模式」说明，不展示权限位/挂载点收权；创建第二个账号后 `/api/auth/status.multi_user=true`，权限 UI 立即出现（停用不算退回，删除后回到单用户）（v4.9.27）
 GWT-PERM-01 Given 普通用户被收走 delete/share/terminal 位  When DELETE /raw、POST /shares、WS 握手  Then 一律 403 E_FORBIDDEN；WRITE/RENAME 等保留位不受影响（v4.9.25）
 GWT-PERM-02 Given 用户 scope 只含挂载点 A  When 拉 /api/files/mounts、list scope 外路径  Then 清单只有 A；scope 外 404/400（视同不存在，不泄露存在性）（v4.9.25）
 GWT-PERM-03 Given 用户无 webdav_manage 但有 webdav_read  When 密码直连 PUT /dav/...  Then 403；PROPFIND 207 正常（读写位分离）（v4.9.25）
@@ -387,13 +388,23 @@ GWT-PERM-06 Given 存量库升级到 v4.9.25  When 迁移 v17 跑完  Then 所�
 
 #### aria2 兼容下载引擎（GWT-DL，v4.9.26）
 
-GWT-DL-01 Given 任意 aria2 客户端  When `getVersion`  Then `enabledFeatures` 含 Asmoday / Multi-Connection / Resumable，**不含** BitTorrent（客户端据此隐藏 BT 入口）
+GWT-DL-01 Given 任意 aria2 客户端  When `getVersion`  Then `enabledFeatures` 含 Asmoday / Multi-Connection / Resumable；BT 会话就绪时追加 BitTorrent（否则客户端自动隐藏磁力/种子入口）（v4.9.27 更新）
 GWT-DL-02 Given 错误 RPC 密钥  When 调用任意方法  Then `{"code":1,"message":"Unauthorized"}`；正确密钥（token:<secret>，首项）正常返回
 GWT-DL-03 Given AriaNg 的批量轮询  When `system.multicall` 内层 params **不含** token  Then 两个子调用都成功（鉴权只在 multicall 层做一次），结果形如 `[[...],[...]]`
 GWT-DL-04 Given 支持 Range 的源站  When `addUri` 后 `tellStatus`  Then `connections > 1`（按 segments 均分并发），`tellStatus` 的 totalLength/completedLength/downloadSpeed/connections/dir/files/errorCode/errorMessage 全部存在
 GWT-DL-05 Given 下载中 `pause`  Then 状态 paused、已下载字节保留、`.aria2` 控制文件生成、任务出现在 `tellWaiting`（paused 属 waiting 族）；`unpause` 后从断点续传且最终字节与源 sha256 一致
 GWT-DL-06 Given `dir` 落在 `[download].roots` 之外  When `addUri`  Then JSON-RPC fault（拒绝，不夹到根里）；`out` 含路径分隔符或 `..` 同样拒绝
 GWT-DL-07 Given `[download].enable=false`  When 任意客户端访问 `/jsonrpc`  Then 404（协议面完全不存在）
+
+#### BitTorrent（GWT-BT，v4.9.27）
+
+GWT-BT-01 Given `[download].enable_bt=true`  When `addUri(["magnet:?xt=urn:btih:…"])`  Then 返回 16 位 GID，任务进 active；`tellStatus` 的 infoHash 为 40 位 hex，元信息解析后 files 逐条列出（index/path/length/completedLength/selected）
+GWT-BT-02 Given base64 编码的 .torrent  When `addTorrent`  Then 与 addUri 同一条引擎路径；`select-file="1,3-5"` 只下载选中文件，未选中的文件 completedLength 恒 0
+GWT-BT-03 Given 本地做种端 + 直连 peer  When 完整下载  Then 落盘字节与种子逐字节一致，任务转 complete，`onBtDownloadComplete` 与 `onDownloadComplete` 两条通知都发出（`cargo test bt::tests::local_seeder` 覆盖）
+GWT-BT-04 Given BT 任务下载中  When `pause` / `unpause`  Then 状态在 paused / active 间切换且已完成字节不回退；`remove` 后任务转 removed 但**已下载文件保留**（delete_files=false）
+GWT-BT-05 Given `[download].enable_bt=false`  When `addUri` 磁力链或 `addTorrent`  Then JSON-RPC fault 明确拒绝（不创建永远 waiting 的假任务），`enabledFeatures` 不含 BitTorrent
+GWT-BT-06 Given BT 会话启动失败（端口被占等）  When 进程启动  Then 只降级为 HTTP-only 并记 WARN，整个服务与 `/jsonrpc` 照常可用
+GWT-BT-07 Given 多文件种子  When 落盘  Then 文件在 `dir/<种子名>/…` 下（与 aria2 同构），且路径仍在 `[download].roots` 白名单内
 ```
 
 #### 依赖红线

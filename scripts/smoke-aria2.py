@@ -72,8 +72,9 @@ def main():
     version, status, _ = rpc.result("aria2.getVersion")
     check("getVersion 200", status == 200 and version, str(status))
     features = (version or {}).get("enabledFeatures", [])
-    check("enabledFeatures 不声明 BT（AriaNg 据此隐藏 BT 入口）",
-          "BitTorrent" not in features and "Asmoday" in features, str(features))
+    check("enabledFeatures 含 Asmoday", "Asmoday" in features, str(features))
+    # BT 是可选能力：会话就绪才声明。这里只报告，不作为失败条件
+    print(f"      (BitTorrent {'已声明' if 'BitTorrent' in features else '未声明'})")
 
     print("[2] system.multicall + listMethods（AriaNg 批量轮询依赖）")
     status, payload = rpc.call("system.multicall", [[

@@ -198,6 +198,8 @@
     "RESET_PASSWORD_ENV_PRESENT": "ASMODAY_RESET_PASSWORD is set: it takes effect on every start. Remove it after resetting."
   },
   "users": {
+    "singleTitle": "Single-user mode",
+    "singleHint": "A default install only needs one administrator: every capability is enabled and there are no permission bits or mount scopes to manage. Creating the first account switches to multi-user, where each account gets its own permission bits and visible mounts.",
     "create": "Create user",
     "createHint": "The initial password is shown once; the user must change it at first login",
     "username": "Username",

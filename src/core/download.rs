@@ -1,15 +1,17 @@
-//! aria2 兼容下载引擎（v4.9.26，设计文档 3.10）。
+//! aria2 兼容下载引擎（v4.9.26，设计文档 3.10；BT v4.9.27，设计文档 3.11）。
 //!
 //! 目标：asmoday 自身成为下载服务端，`/jsonrpc` 暴露 aria2 兼容协议，
 //! AriaNg / Aria2 Explorer / 任意 aria2 客户端填地址 + 密钥即用。
 //!
-//! 本模块只管**引擎**（任务队列 + 分段下载 + 断点续传），协议层在
-//! `api::aria2_rpc`。第一版能力边界：
+//! 本模块管**引擎**（任务队列 + 调度 + 状态机），协议层在 `api::aria2_rpc`，
+//! 两种传输后端：
 //!
-//! - HTTP(S) 多连接分段下载（`Range` 并发 + 控制文件续传）
-//! - 队列语义对齐 aria2：active / waiting(含 paused) / stopped 族
-//! - 不做：BT / Metalink / FTP —— `getVersion.enabledFeatures` 里**不声明**，
-//!   客户端（AriaNg 等）会自动隐藏对应入口，不会出现「假支持」
+//! - HTTP(S) 多连接分段下载（`Range` 并发 + `.aria2` 控制文件续传）
+//! - BitTorrent（magnet / .torrent / DHT / PEX，走 `core::bt` 的 librqbit 会话）
+//!
+//! 队列语义对齐 aria2：active / waiting(含 paused) / stopped 族。
+//! 仍然不做 Metalink / FTP / SFTP —— `getVersion.enabledFeatures` 里不声明，
+//! 客户端会自动隐藏对应入口，不会出现「假支持」。
 //!
 //! 落盘安全：所有任务目录必须落在 `download.roots` 白名单内（前缀校验，
 //! Windows 大小写不敏感），RPC 传进来的 `dir` 不合法直接拒绝。
@@ -26,11 +28,22 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
+use super::bt::{BtEngine, TorrentHandle, TorrentSource};
+
 // ---------------------------------------------------------------------------
 // 状态与数据结构
 // ---------------------------------------------------------------------------
 
+/// 传输类型。BT 的进度语义与 HTTP 完全不同（校验字节 vs 写入字节），
+/// 所有进度/速度/文件清单的分支都看这个字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Http,
+    Torrent,
+}
+
 /// 任务状态（aria2 语义：waiting 含排队；paused 是显式暂停，出现在 waiting 清单里）
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -79,12 +92,13 @@ pub struct SegmentState {
 /// 单个任务的可变状态。协议层 `tellStatus` 的字段来源。
 pub struct TaskState {
     pub gid: String,
+    pub kind: TaskKind,
     pub uris: Vec<String>,
     pub status: Status,
     pub dir: PathBuf,
     pub out_name: String,
     pub total: u64,
-    /// 各段进度；completed = sum(done)
+    /// 各段进度；completed = sum(done)。BT 任务恒为空。
     pub segments: Vec<SegmentState>,
     pub connections: usize,
     pub error_code: u32,
@@ -94,11 +108,38 @@ pub struct TaskState {
     speed_sample: (Instant, u64),
     pub speed: u64,
     pub etag: Option<String>,
+    /// BT：种子句柄（换任务/暂停/删除都要用）。`None` = HTTP 任务。
+    pub bt: Option<TorrentHandle>,
+    /// BT：已校验的字节数（与 segments 互斥，只能从 stats 读）
+    pub bt_completed: u64,
+    pub upload_length: u64,
+    pub upload_speed: u64,
+    pub info_hash: String,
+    pub piece_length: u64,
+    pub num_pieces: u64,
+    pub seeder: bool,
+    /// BT 文件清单（相对路径 + 长度 + 已完成），`tellStatus.files` 的来源
+    pub bt_files: Vec<BtFileEntry>,
+    /// `tellStatus.bittorrent` 子对象（info.name / announceList / comment）
+    pub bittorrent: Option<Value>,
+}
+
+/// BT 种子里单个文件的进度
+#[derive(Debug, Clone)]
+pub struct BtFileEntry {
+    /// 相对种子根的文件路径
+    pub relative: PathBuf,
+    pub length: u64,
+    pub completed: u64,
+    pub selected: bool,
 }
 
 impl TaskState {
     pub fn completed(&self) -> u64 {
-        self.segments.iter().map(|s| s.done).sum()
+        match self.kind {
+            TaskKind::Torrent => self.bt_completed,
+            TaskKind::Http => self.segments.iter().map(|s| s.done).sum(),
+        }
     }
 
     pub fn target_path(&self) -> PathBuf {
@@ -112,8 +153,13 @@ impl TaskState {
         self.dir.join(name)
     }
 
-    /// 速度刷新：距上次采样 ≥ 500ms 才重算，避免客户端高频轮询时数字抖成锯齿
+    /// 速度刷新：距上次采样 ≥ 500ms 才重算，避免客户端高频轮询时数字抖成锯齿。
+    /// BT 任务的数字全部来自 librqbit（它自己维护滑动窗口），这里只做搬运。
     fn refresh_speed(&mut self) {
+        if let Some(handle) = self.bt.clone() {
+            self.apply_bt_stats(&handle);
+            return;
+        }
         let now = Instant::now();
         let dt = now.duration_since(self.speed_sample.0);
         if dt < Duration::from_millis(500) {
@@ -126,6 +172,83 @@ impl TaskState {
             0
         };
         self.speed_sample = (now, completed);
+    }
+
+    /// 把 librqbit 的统计搬进任务状态。
+    ///
+    /// 注意 `stats().state` 不等于我们的任务状态：用户刚点暂停时 stats 可能还是
+    /// `Live`，所以 `Paused` / `Removed` 由上层控制，这里只在 live/error/完成之间推断。
+    fn apply_bt_stats(&mut self, handle: &TorrentHandle) {
+        use librqbit::TorrentStatsState;
+
+        let stats = handle.stats();
+        self.total = stats.total_bytes.max(self.total);
+        self.bt_completed = stats.progress_bytes;
+        self.upload_length = stats.uploaded_bytes;
+        self.seeder = stats.finished;
+        if let Some(live) = &stats.live {
+            self.speed = (live.download_speed.mbps * 1024.0 * 1024.0) as u64;
+            self.upload_speed = (live.upload_speed.mbps * 1024.0 * 1024.0) as u64;
+            self.connections = live.snapshot.peer_stats.live;
+        }
+        // 文件清单（metadata 解析完成前是空的，客户端会先显示 0/0）
+        if let Some(metadata) = handle.metadata.load_full() {
+            let selected = handle.only_files();
+            if self.bt_files.len() != metadata.file_infos.len() {
+                self.num_pieces = metadata.info.pieces.as_ref().len() as u64 / 20;
+                self.piece_length = metadata.info.piece_length as u64;
+                self.bt_files = metadata
+                    .file_infos
+                    .iter()
+                    .enumerate()
+                    .map(|(index, info)| BtFileEntry {
+                        relative: info.relative_filename.clone(),
+                        length: info.len,
+                        completed: stats.file_progress.get(index).copied().unwrap_or(0),
+                        selected: selected
+                            .as_ref()
+                            .map(|list| list.contains(&index))
+                            .unwrap_or(true),
+                    })
+                    .collect();
+                if let Some(name) = &metadata.name {
+                    self.out_name = name.clone();
+                }
+            } else {
+                for (entry, done) in self.bt_files.iter_mut().zip(&stats.file_progress) {
+                    entry.completed = *done;
+                }
+            }
+            let trackers: Vec<Value> = handle
+                .shared()
+                .trackers
+                .iter()
+                .map(|url| json!([url.as_str()]))
+                .collect();
+            self.bittorrent = Some(json!({
+                "announceList": trackers,
+                "comment": "",
+                "creationDate": 0,
+                "mode": if metadata.file_infos.len() > 1 { "multi" } else { "single" },
+                "info": {"name": metadata.name.clone().unwrap_or_else(|| self.out_name.clone())},
+            }));
+        }
+        match stats.state {
+            TorrentStatsState::Error => {
+                if self.status == Status::Active {
+                    self.status = Status::Error;
+                    self.error_code = 1;
+                    self.error_message = stats
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "bittorrent engine error".to_string());
+                }
+            }
+            _ if stats.finished && self.status == Status::Active => {
+                self.status = Status::Complete;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -155,6 +278,8 @@ pub enum Event {
     Stop,
     Complete,
     Error,
+    /// BT 种子完成（aria2.onBtDownloadComplete）：与 Complete 一起发
+    BtComplete,
 }
 
 impl Event {
@@ -165,6 +290,7 @@ impl Event {
             Event::Stop => "aria2.onDownloadStop",
             Event::Complete => "aria2.onDownloadComplete",
             Event::Error => "aria2.onDownloadError",
+            Event::BtComplete => "aria2.onBtDownloadComplete",
         }
     }
 }
@@ -196,6 +322,8 @@ pub struct DownloadManager {
     max_concurrent_count: usize,
     tasks: Mutex<TaskMap>,
     events: broadcast::Sender<(String, Event)>,
+    /// BitTorrent 后端（`[download].enable_bt=false` 时为 None）
+    bt: Option<Arc<BtEngine>>,
 }
 
 /// 协议层错误（JSON-RPC fault）
@@ -227,6 +355,7 @@ impl DownloadManager {
         segments: usize,
         max_concurrent: usize,
         enabled: bool,
+        bt: Option<Arc<BtEngine>>,
     ) -> Self {
         let default_root = roots.first().cloned().unwrap_or_default();
         let (events, _) = broadcast::channel(256);
@@ -242,7 +371,18 @@ impl DownloadManager {
             max_concurrent_count,
             tasks: Mutex::new(TaskMap::default()),
             events,
+            bt,
         }
+    }
+
+    /// BT 后端是否可用（配置开关 + 会话是否起来）
+    pub fn bt_enabled(&self) -> bool {
+        self.enabled && self.bt.is_some()
+    }
+
+    /// 入站 peer 监听端口（未监听时为 None），启动日志用
+    pub fn bt_listen_port(&self) -> Option<u16> {
+        self.bt.as_ref().and_then(|bt| bt.listen_port())
     }
 
     /// 订阅任务事件（WS 通知通道）
@@ -303,6 +443,9 @@ impl DownloadManager {
     // -- 任务生命周期 -------------------------------------------------------
 
     /// addUri：创建任务并排队。返回 GID。
+    ///
+    /// `magnet:` 开头（或 40 位 info hash 裸串）走 BitTorrent 分支，
+    /// 与 aria2 的 addUri 行为一致 —— 客户端不需要区分调用哪个方法。
     pub async fn add_uri(
         self: &Arc<Self>,
         uris: Vec<String>,
@@ -315,8 +458,15 @@ impl DownloadManager {
         let uri = uris
             .first()
             .cloned()
-            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-            .ok_or_else(|| RpcError::new(2, "uris must contain an http(s) URL"))?;
+            .ok_or_else(|| RpcError::new(2, "uris is required"))?;
+        if is_torrent_uri(&uri) {
+            return self
+                .add_torrent(TorrentSource::Magnet(uri), dir, out, None, false)
+                .await;
+        }
+        if !(uri.starts_with("http://") || uri.starts_with("https://")) {
+            return Err(RpcError::new(2, "uris must contain an http(s) URL"));
+        }
         let dir = self.resolve_dir(dir.as_deref())?;
 
         let filename = match out {
@@ -342,6 +492,7 @@ impl DownloadManager {
         let handle = Arc::new(TaskHandle {
             state: Mutex::new(TaskState {
                 gid: gid.clone(),
+                kind: TaskKind::Http,
                 uris: uris.clone(),
                 status: Status::Waiting,
                 dir: options.dir.clone(),
@@ -355,6 +506,16 @@ impl DownloadManager {
                 speed_sample: (Instant::now(), 0),
                 speed: 0,
                 etag: None,
+                bt: None,
+                bt_completed: 0,
+                upload_length: 0,
+                upload_speed: 0,
+                info_hash: String::new(),
+                piece_length: 0,
+                num_pieces: 0,
+                seeder: false,
+                bt_files: Vec::new(),
+                bittorrent: None,
             }),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
         });
@@ -376,6 +537,106 @@ impl DownloadManager {
         Ok(gid)
     }
 
+    /// addTorrent / addUri(magnet)：创建 BT 任务并排队。返回 GID。
+    ///
+    /// `only_files` 是 aria2 的 `select-file` 语义（1 基索引），这里已经换成 0 基。
+    pub async fn add_torrent(
+        self: &Arc<Self>,
+        source: TorrentSource,
+        dir: Option<String>,
+        out: Option<String>,
+        only_files: Option<Vec<usize>>,
+        paused: bool,
+    ) -> Result<String, RpcError> {
+        let bt = self
+            .bt
+            .clone()
+            .ok_or_else(|| RpcError::new(2, "bittorrent is disabled on this server"))?;
+        let dir = self.resolve_dir(dir.as_deref())?;
+        // aria2 会替用户建目录；librqbit 的 output_folder 要求已存在
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            RpcError::new(2, format!("cannot create dir {}: {err}", dir.display()))
+        })?;
+        if let Some(name) = &out
+            && !is_safe_filename(name)
+        {
+            return Err(RpcError::new(2, format!("invalid out filename: {name}")));
+        }
+        // 加会话前先拿到 info hash / 种子名：非法字节在这里就拒绝，
+        // magnet 也能立刻有 infoHash（不必等元信息解析）
+        let preview = source.preview().map_err(|err| RpcError::new(2, err))?;
+
+        let uris = match &source {
+            TorrentSource::Magnet(uri) => vec![uri.clone()],
+            TorrentSource::Bytes(_) => Vec::new(),
+        };
+        let out_name = out
+            .clone()
+            .or(preview.name)
+            .unwrap_or_else(|| format!("torrent-{}", new_gid()));
+        let options = TaskOptions {
+            dir: dir.clone(),
+            out: out.clone(),
+            user_agent: None,
+            headers: Vec::new(),
+            extra: Vec::new(),
+        };
+
+        let gid = new_gid();
+        let handle = Arc::new(TaskHandle {
+            state: Mutex::new(TaskState {
+                gid: gid.clone(),
+                kind: TaskKind::Torrent,
+                uris,
+                // 元信息还没到也算 active：aria2 对 magnet 同样立刻进 active
+                status: if paused {
+                    Status::Paused
+                } else {
+                    Status::Active
+                },
+                dir,
+                out_name,
+                total: 0,
+                segments: Vec::new(),
+                connections: 0,
+                error_code: 0,
+                error_message: String::new(),
+                options,
+                speed_sample: (Instant::now(), 0),
+                speed: 0,
+                etag: None,
+                bt: None,
+                bt_completed: 0,
+                upload_length: 0,
+                upload_speed: 0,
+                info_hash: preview.info_hash,
+                piece_length: 0,
+                num_pieces: 0,
+                seeder: false,
+                bt_files: Vec::new(),
+                bittorrent: None,
+            }),
+            cancel: std::sync::Mutex::new(CancellationToken::new()),
+        });
+
+        {
+            let mut map = self.tasks.lock().await;
+            map.order.push(gid.clone());
+            map.tasks.insert(gid.clone(), handle.clone());
+        }
+        if paused {
+            self.mark_stopped(&gid).await;
+        }
+
+        let manager = self.clone();
+        let events = self.events.clone();
+        let permit = self.max_concurrent.clone();
+        tokio::spawn(run_bt_task(
+            manager, bt, events, permit, handle, source, only_files, paused,
+        ));
+        Ok(gid)
+    }
+
     async fn get(&self, gid: &str) -> Option<Arc<TaskHandle>> {
         self.tasks.lock().await.tasks.get(gid).cloned()
     }
@@ -383,7 +644,7 @@ impl DownloadManager {
     /// 暂停：active → 落控制文件；waiting → 直接翻状态
     pub async fn pause(&self, gid: &str) -> Result<String, RpcError> {
         let handle = self.get(gid).await.ok_or_else(|| unknown_gid(gid))?;
-        {
+        let (is_bt, bt_torrent) = {
             let mut state = handle.state.lock().await;
             if !matches!(state.status, Status::Active | Status::Waiting) {
                 return Err(RpcError::new(
@@ -397,8 +658,22 @@ impl DownloadManager {
             state.status = Status::Paused;
             state.connections = 0;
             state.refresh_speed();
+            state.speed = 0;
+            state.upload_speed = 0;
+            (state.kind == TaskKind::Torrent, state.bt.clone())
+        };
+        match (is_bt, bt_torrent) {
+            // BT：交给 librqbit 暂停（它会停掉 peer 连接但保留校验状态），
+            // 监控协程不退出 —— 用户随时可能 unpause。
+            (true, Some(torrent)) => {
+                if let Some(bt) = &self.bt {
+                    let _ = bt.pause(&torrent).await;
+                }
+            }
+            // 还在解析元信息：状态已落成 paused，协程拿到句柄后会补一刀
+            (true, None) => {}
+            (false, _) => handle.cancel_current(),
         }
-        handle.cancel_current();
         self.events.send((gid.to_string(), Event::Pause)).ok();
         self.mark_stopped(gid).await;
         Ok(gid.to_string())
@@ -407,7 +682,7 @@ impl DownloadManager {
     /// 恢复：paused → 重新排队执行（换新取消令牌）
     pub async fn unpause(self: &Arc<Self>, gid: &str) -> Result<String, RpcError> {
         let handle = self.get(gid).await.ok_or_else(|| unknown_gid(gid))?;
-        let segments = {
+        let (segments, is_bt, bt_torrent) = {
             let mut state = handle.state.lock().await;
             if state.status != Status::Paused {
                 return Err(RpcError::new(
@@ -421,13 +696,30 @@ impl DownloadManager {
             state.status = Status::Waiting;
             state.error_code = 0;
             state.error_message.clear();
-            self.segments
+            (
+                self.segments,
+                state.kind == TaskKind::Torrent,
+                state.bt.clone(),
+            )
         };
-        handle.reset_token();
         {
             let mut map = self.tasks.lock().await;
             map.stopped.retain(|g| g != gid);
         }
+        if is_bt {
+            if let Some(torrent) = bt_torrent
+                && let Some(bt) = &self.bt
+            {
+                bt.unpause(&torrent)
+                    .await
+                    .map_err(|err| RpcError::new(2, format!("cannot resume torrent: {err}")))?;
+            }
+            // 句柄还没就绪（元信息解析中）也直接回 active：协程看到非 paused
+            // 就不会补暂停，元信息到了自然开跑。
+            handle.state.lock().await.status = Status::Active;
+            return Ok(gid.to_string());
+        }
+        handle.reset_token();
         let engine = EngineHandle {
             http: self.http.clone(),
             max_concurrent: self.max_concurrent.clone(),
@@ -439,18 +731,26 @@ impl DownloadManager {
         Ok(gid.to_string())
     }
 
-    /// forceRemove：取消执行并移除
+    /// forceRemove：取消执行并移除（不删已下载文件，对齐 aria2）
     pub async fn remove(&self, gid: &str) -> Result<String, RpcError> {
         let handle = self.get(gid).await.ok_or_else(|| unknown_gid(gid))?;
-        let was_running = {
+        let (is_bt, was_running, bt_torrent) = {
             let mut state = handle.state.lock().await;
             let running = matches!(state.status, Status::Active | Status::Waiting);
             state.status = Status::Removed;
             state.speed = 0;
+            state.upload_speed = 0;
             state.connections = 0;
-            running
+            (state.kind == TaskKind::Torrent, running, state.bt.clone())
         };
-        if was_running {
+        if is_bt {
+            // 句柄可能还没就绪（元信息解析中）：协程返回时会看到 Removed 自行清理
+            if let Some(torrent) = bt_torrent
+                && let Some(bt) = &self.bt
+            {
+                bt.remove(&torrent).await;
+            }
+        } else if was_running {
             handle.cancel_current();
         }
         self.events.send((gid.to_string(), Event::Stop)).ok();
@@ -460,37 +760,55 @@ impl DownloadManager {
 
     /// 清空全部已停止任务。返回删除的 GID 列表。
     pub async fn purge(&self) -> Vec<String> {
-        let mut map = self.tasks.lock().await;
-        let purged = map.stopped.clone();
-        for gid in &purged {
-            map.tasks.remove(gid);
+        let (purged, handles) = {
+            let mut map = self.tasks.lock().await;
+            let purged = map.stopped.clone();
+            let mut handles = Vec::new();
+            for gid in &purged {
+                if let Some(handle) = map.tasks.remove(gid) {
+                    handles.push(handle);
+                }
+            }
+            let live: Vec<String> = map.tasks.keys().cloned().collect();
+            map.order.retain(|g| live.contains(g));
+            map.stopped.clear();
+            (purged, handles)
+        };
+        // 锁外释放 BT 会话：已完成的任务仍在做种，不清掉会一直传数据
+        for handle in handles {
+            let bt_handle = handle.state.lock().await.bt.clone();
+            if let (Some(torrent), Some(engine)) = (bt_handle, &self.bt) {
+                engine.remove(&torrent).await;
+            }
         }
-        let live: Vec<String> = map.tasks.keys().cloned().collect();
-        map.order.retain(|g| live.contains(g));
-        map.stopped.clear();
         purged
     }
 
     /// removeDownloadResult：只许删已停止的任务
     pub async fn remove_result(&self, gid: &str) -> Result<String, RpcError> {
-        let mut map = self.tasks.lock().await;
-        if let Some(handle) = map.tasks.get(gid) {
-            let status = handle.state.lock().await.status;
-            if matches!(status, Status::Active | Status::Waiting | Status::Paused) {
-                return Err(RpcError::new(
-                    2,
-                    format!(
-                        "GID {gid} cannot be removed now (status {})",
-                        status.as_str()
-                    ),
-                ));
+        let handle = {
+            let mut map = self.tasks.lock().await;
+            if let Some(handle) = map.tasks.get(gid) {
+                let status = handle.state.lock().await.status;
+                if matches!(status, Status::Active | Status::Waiting | Status::Paused) {
+                    return Err(RpcError::new(
+                        2,
+                        format!(
+                            "GID {gid} cannot be removed now (status {})",
+                            status.as_str()
+                        ),
+                    ));
+                }
             }
+            let handle = map.tasks.remove(gid).ok_or_else(|| unknown_gid(gid))?;
+            map.order.retain(|g| g != gid);
+            map.stopped.retain(|g| g != gid);
+            handle
+        };
+        let bt_handle = handle.state.lock().await.bt.clone();
+        if let (Some(torrent), Some(engine)) = (bt_handle, &self.bt) {
+            engine.remove(&torrent).await;
         }
-        if map.tasks.remove(gid).is_none() {
-            return Err(unknown_gid(gid));
-        }
-        map.order.retain(|g| g != gid);
-        map.stopped.retain(|g| g != gid);
         Ok(gid.to_string())
     }
 
@@ -651,12 +969,19 @@ impl DownloadManager {
 
     /// 全局选项回显（aria2.getGlobalOption）：只声明真实生效的键
     pub fn global_options(&self) -> serde_json::Value {
-        json!({
+        let mut options = json!({
             "dir": self.default_root.to_string_lossy(),
             "max-concurrent-downloads": format!("{}", self.max_concurrent_count),
             "split": format!("{}", self.segments),
             "user-agent": "aria2/1.37.0",
-        })
+        });
+        if self.bt.is_some()
+            && let Some(map) = options.as_object_mut()
+        {
+            map.insert("enable-dht".into(), json!("true"));
+            map.insert("bt-max-peers".into(), json!("55"));
+        }
+        options
     }
 }
 
@@ -740,6 +1065,101 @@ async fn run_task(engine: EngineHandle, manager: Arc<DownloadManager>, handle: A
                 manager.mark_stopped(&gid).await;
                 engine.events.send((gid, Event::Error)).ok();
             }
+        }
+    }
+}
+
+/// BT 任务协程：加入会话 → 周期性同步 → 落定完成/失败。
+///
+/// 与 HTTP 任务的区别：没有「分段 worker 全部返回」这种天然终点，完成与否
+/// 只有 librqbit 知道。所以这里是一个轻量监控循环（800ms），把最终状态
+/// 写回任务表并发通知；暂停不退出（用户随时可能恢复）。
+#[allow(clippy::too_many_arguments)]
+async fn run_bt_task(
+    manager: Arc<DownloadManager>,
+    bt: Arc<BtEngine>,
+    events: broadcast::Sender<(String, Event)>,
+    permit: Arc<Semaphore>,
+    handle: Arc<TaskHandle>,
+    source: TorrentSource,
+    only_files: Option<Vec<usize>>,
+    paused: bool,
+) {
+    // 与 HTTP 任务共用 max-concurrent-downloads 配额
+    let _permit = match permit.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return,
+    };
+
+    let gid = handle.state.lock().await.gid.clone();
+    let dir = handle.state.lock().await.dir.clone();
+
+    let torrent = match bt.add(source, &dir, only_files, paused).await {
+        Ok(torrent) => torrent,
+        Err(err) => {
+            let mut state = handle.state.lock().await;
+            // 用户可能在 add 期间就删了任务，别把 Removed 覆盖成 Error
+            if matches!(
+                state.status,
+                Status::Waiting | Status::Active | Status::Paused
+            ) {
+                state.status = Status::Error;
+                state.error_code = 1;
+                state.error_message = err;
+                state.speed = 0;
+                state.connections = 0;
+                drop(state);
+                manager.mark_stopped(&gid).await;
+                events.send((gid, Event::Error)).ok();
+            }
+            return;
+        }
+    };
+
+    let info_hash = torrent.info_hash().as_string();
+    {
+        let mut state = handle.state.lock().await;
+        if state.status == Status::Removed {
+            drop(state);
+            bt.remove(&torrent).await;
+            return;
+        }
+        // 加会话期间用户可能已点暂停：先挂上句柄，再按当前状态补一刀
+        let should_pause = state.status == Status::Paused;
+        state.bt = Some(torrent.clone());
+        state.info_hash = info_hash;
+        // 第一次同步：把种子名/文件清单/总长填上，客户端立刻能看到结构
+        state.refresh_speed();
+        drop(state);
+        if should_pause {
+            let _ = bt.pause(&torrent).await;
+        }
+    }
+    events.send((gid.clone(), Event::Start)).ok();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let (status, _) = {
+            let mut state = handle.state.lock().await;
+            state.refresh_speed();
+            (state.status, state.error_code)
+        };
+        match status {
+            Status::Removed => return,
+            Status::Complete => {
+                manager.mark_stopped(&gid).await;
+                // aria2 在 BT 完成时两条通知都发：onBtDownloadComplete 给种子，
+                // onDownloadComplete 给通用列表（AriaNg 靠后者刷新行状态）。
+                events.send((gid.clone(), Event::BtComplete)).ok();
+                events.send((gid, Event::Complete)).ok();
+                return;
+            }
+            Status::Error => {
+                manager.mark_stopped(&gid).await;
+                events.send((gid, Event::Error)).ok();
+                return;
+            }
+            _ => {}
         }
     }
 }
@@ -1103,6 +1523,12 @@ fn is_safe_filename(name: &str) -> bool {
         && name.len() < 255
 }
 
+/// magnet: 链接，或 40 位十六进制 info hash（aria2 也接受裸 hash）
+fn is_torrent_uri(uri: &str) -> bool {
+    uri.starts_with("magnet:")
+        || (uri.len() == 40 && uri.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 /// URL → 文件名（去 query/fragment，简单 percent-decode）
 fn filename_from_url(uri: &str) -> String {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
@@ -1187,43 +1613,74 @@ fn split_segments(total: u64, n: usize) -> Vec<SegmentState> {
 /// tellStatus 的 JSON 快照。`keys` 提供时只保留声明的字段（gid 恒在）。
 fn task_json(state: &TaskState, keys: Option<&[String]>) -> serde_json::Value {
     let completed = state.completed();
-    let files = serde_json::json!([{
-        "path": display_path(&state.target_path()),
-        "length": state.total,
-        "completedLength": completed,
-        "selected": true,
-        "indexed": true,
-        "uris": state
-            .uris
-            .iter()
-            .map(|u| serde_json::json!({"uri": u, "status": "used"}))
-            .collect::<Vec<_>>(),
-    }]);
+    let is_bt = state.kind == TaskKind::Torrent;
+    // BT 是多文件结构：files 必须逐条列出（AriaNg 的「文件选择」直接绑这个数组）；
+    // 元信息还没解析出来时退回单文件占位，别让客户端拿到空数组去画空气。
+    let files = if is_bt && !state.bt_files.is_empty() {
+        Value::Array(
+            state
+                .bt_files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    json!({
+                        "index": index + 1,
+                        "path": display_path(&state.dir.join(&file.relative)),
+                        "length": file.length,
+                        "completedLength": file.completed,
+                        "selected": file.selected,
+                        "indexed": true,
+                        "uris": [],
+                    })
+                })
+                .collect(),
+        )
+    } else {
+        json!([{
+            "index": 1,
+            "path": display_path(&state.target_path()),
+            "length": state.total,
+            "completedLength": completed,
+            "selected": true,
+            "indexed": true,
+            "uris": state
+                .uris
+                .iter()
+                .map(|u| json!({"uri": u, "status": "used"}))
+                .collect::<Vec<_>>(),
+        }])
+    };
 
-    let value = serde_json::json!({
+    let mut value = json!({
         "gid": state.gid,
         "status": state.status.as_str(),
         "totalLength": state.total.max(completed),
         "completedLength": completed,
-        "uploadLength": 0,
+        "uploadLength": state.upload_length,
         "bitfield": "",
         "downloadSpeed": state.speed,
-        "uploadSpeed": 0,
-        "infoHash": "",
+        "uploadSpeed": state.upload_speed,
+        "infoHash": state.info_hash,
         "numSeeders": 0,
-        "seeder": false,
-        "pieceLength": 0,
-        "numPieces": 0,
+        "seeder": state.seeder,
+        "pieceLength": state.piece_length,
+        "numPieces": state.num_pieces,
         "connections": state.connections,
         "errorCode": state.error_code,
         "errorMessage": state.error_message,
         "followedBy": [],
         "following": [],
         "belongsTo": "",
-        "verifiedLength": 0,
+        "verifiedLength": if is_bt { state.bt_completed } else { 0 },
         "dir": display_path(&state.dir),
         "files": files,
     });
+    // aria2 只给 BT 任务带 bittorrent 键；凭空给 HTTP 任务加会让部分客户端误判类型
+    if let Some(bt) = &state.bittorrent
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert("bittorrent".into(), bt.clone());
+    }
     match keys {
         Some(keys) if !keys.is_empty() => {
             let mut filtered = serde_json::Map::new();
@@ -1332,6 +1789,7 @@ mod tests {
             4,
             2,
             true,
+            None,
         ));
         // 不可达端口：任务创建成功，随后自己走向 error
         let gid = manager
@@ -1387,6 +1845,7 @@ mod tests {
             4,
             2,
             true,
+            None,
         );
         assert!(manager.resolve_dir(Some(base.to_str().unwrap())).is_ok());
         let outside = std::env::temp_dir().join("asmoday-dl-roots-outside");
@@ -1398,6 +1857,44 @@ mod tests {
         // 未指定 → 默认根
         let resolved = manager.resolve_dir(None).unwrap();
         assert!(path_contains(&base, &resolved));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn torrent_uri_detection() {
+        assert!(is_torrent_uri("magnet:?xt=urn:btih:abc"));
+        assert!(is_torrent_uri("cab507494d02ebb1178b38f2e9d7be299c86b862"));
+        assert!(!is_torrent_uri("http://example.com/a.torrent"));
+        assert!(!is_torrent_uri("cab507494d02ebb1178b38f2e9d7be299c86b86")); // 39 位
+        assert!(!is_torrent_uri("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+    }
+
+    #[tokio::test]
+    async fn magnet_rejected_when_bt_disabled() {
+        let base = std::env::temp_dir().join("asmoday-dl-bt-off");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::new(),
+            "secret1".into(),
+            vec![base.clone()],
+            4,
+            2,
+            true,
+            None,
+        ));
+        let err = manager
+            .add_uri(
+                vec!["magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862".into()],
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        // 能力关闭时是「明确的拒绝」，而不是默默创建一个永远 waiting 的任务
+        assert!(err.message.contains("bittorrent"));
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

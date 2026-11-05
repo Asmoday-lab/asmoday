@@ -367,6 +367,40 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
     }
 
+    // BitTorrent 会话（v4.9.27）：DHT / 入站监听都在这里起。
+    // 起不来只降级成 HTTP-only，不让整个服务跟着挂 —— BT 是附加能力。
+    let bt_engine = if download_config.enable && download_config.enable_bt {
+        let default_root = download_roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| data_dir.join("downloads"));
+        match core::bt::BtEngine::start(
+            default_root,
+            &data_dir,
+            download_config.bt_port_range(),
+            download_config.bt_disable_dht,
+        )
+        .await
+        {
+            Ok(engine) => {
+                match engine.listen_port() {
+                    Some(port) => crate::log_info!("bittorrent enabled; listening on tcp/{port}"),
+                    None => crate::log_info!("bittorrent enabled; outbound peers only"),
+                }
+                if download_config.bt_disable_dht {
+                    crate::log_info!("bittorrent DHT disabled (tracker-only mode)");
+                }
+                Some(engine)
+            }
+            Err(err) => {
+                crate::log_warn!("bittorrent disabled: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 缩略图缓存根：缩略器与索引共用同一个串（索引靠它回收外部删除的缓存单元）
     let thumb_dir = data_dir.join("thumbnails");
     let state = AppState {
@@ -411,6 +445,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             download_config.segments,
             download_config.max_concurrent,
             download_config.enable,
+            bt_engine,
         )),
         tus: Arc::new(api::upload_tus::TusStore::new(data_dir.join("uploads_tmp"))),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),

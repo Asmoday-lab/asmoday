@@ -123,6 +123,14 @@ thumb_preheat_per_scan = 200
 # Allowed target directories for RPC dir/out. Empty = <data>/downloads.
 # Paths must exist (or be creatable) and stay inside this list.
 # roots = []
+# BitTorrent: magnet links, .torrent uploads, DHT + PEX + LSD. Set false to
+# advertise HTTP-only (addTorrent / magnet are rejected, clients hide BT UI).
+# enable_bt = true
+# Incoming peer port range. Both 0 = no inbound listener (outbound only).
+# bt_listen_port_min = 6881
+# bt_listen_port_max = 6999
+# Tracker-only mode without DHT.
+# bt_disable_dht = false
 
 [log]
 # debug | info | warn | error | off
@@ -291,6 +299,27 @@ pub struct DownloadConfig {
     pub max_concurrent: usize,
     /// 允许落盘的目录白名单（空 = `<data>/downloads`）
     pub roots: Vec<String>,
+    /// 启用 BitTorrent（magnet / .torrent / DHT / PEX）。关掉后 RPC 不声明
+    /// `BitTorrent` 能力，`addUri` 的 magnet 与 `addTorrent` 直接报错。
+    pub enable_bt: bool,
+    /// 入站 peer 监听端口下界（0 = 让系统随机分配）
+    pub bt_listen_port_min: u16,
+    /// 入站 peer 监听端口上界（与下界相同 = 只试这一个端口）
+    pub bt_listen_port_max: u16,
+    /// 只走 tracker、不跑 DHT（隐私 / 内网环境）
+    pub bt_disable_dht: bool,
+}
+
+impl DownloadConfig {
+    /// 监听端口区间；上下界都是 0 时返回 None（不监听入站，仅出站连接）。
+    pub fn bt_port_range(&self) -> Option<std::ops::Range<u16>> {
+        let min = self.bt_listen_port_min;
+        let max = self.bt_listen_port_max.max(min);
+        if min == 0 && max == 0 {
+            return None;
+        }
+        Some(min..max.saturating_add(1))
+    }
 }
 
 impl Default for DownloadConfig {
@@ -301,6 +330,10 @@ impl Default for DownloadConfig {
             segments: 8,
             max_concurrent: 5,
             roots: Vec::new(),
+            enable_bt: true,
+            bt_listen_port_min: 6881,
+            bt_listen_port_max: 6999,
+            bt_disable_dht: false,
         }
     }
 }

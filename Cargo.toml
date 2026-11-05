@@ -98,6 +98,19 @@ bytes = "1"
 crc32fast = "1"
 heifer = { version = "0.3.26", features = ["image"] }
 fast_image_resize = "6.1.0"
+# BitTorrent 引擎（BEP 3 / 9 / 10 / 11 / 19 / 52，DHT + PEX + LSD + uTP）。
+#
+# 为什么是 librqbit 而不是自研：BT 不是「HTTP + Range」那种线性协议，要 bencode、
+# metainfo 校验、tracker（HTTP/UDP）、DHT、peer wire、分块调度、SHA-1 校验、
+# 做种与上传。自研能跑通演示，但互操作性（私有 tracker、magnet、IPv6、uTP）
+# 会长期补不完 —— 这正是 aria2 的护城河。
+#
+# **刻意钉 8.1.1**：9.x 改用 reqwest 0.13，其 `rustls` 特性强制 aws-lc-rs，
+# 会给二进制再拉一份 TLS 栈和一个必须 cmake/perl 的 C 构建（musl 交叉编译直接废）。
+# 8.1.1 仍是 reqwest 0.12，与项目共用同一份 TLS 与连接池。
+# `rust-tls`：Linux 侧不能落 OpenSSL（musl 无 openssl），统一 rustls + ring。
+# 纯 Rust 库、编进同一个可执行文件，不启动任何外部进程 —— 保持单文件分发。
+librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls"] }
 
 # 测试专用：把生成的二维码矩阵再解回来，证明「扫出来的就是那条 otpauth 链接」。
 # 只解码不编码（编码仍用上面的 qrcode），且仅在测试构建里链接，不进发布产物。
@@ -143,6 +156,12 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 # 静态链接的场景本来就少一次堆竞争，用系统分配器没有明显损失。
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
+
+# SHA-1 实现替换（见 vendor/librqbit-sha1-wrapper）。
+# 上游把 SHA-1 绑在 openssl / aws-lc-rs 上，两者都要 C 工具链；这里换成
+# 纯 Rust 实现，API 与 feature 名保持不变，只影响 librqbit 内部的校验路径。
+[patch.crates-io]
+librqbit-sha1-wrapper = { path = "vendor/librqbit-sha1-wrapper" }
 
 # panic = "unwind"（2026-11-04 审查）：abort 会让任意一个 handler 的 panic
 # 变成整进程 SIGABRT——所有连接断开、不优雅关闭、日志不 flush。

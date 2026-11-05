@@ -23,6 +23,7 @@ use crate::core::download::{RpcError, WindowList};
 /// 方法清单（system.listMethods；通知另列）
 const METHODS: &[&str] = &[
     "aria2.addUri",
+    "aria2.addTorrent",
     "aria2.remove",
     "aria2.forceRemove",
     "aria2.pause",
@@ -39,6 +40,12 @@ const METHODS: &[&str] = &[
     "aria2.getGlobalStat",
     "aria2.purgeDownloadResult",
     "aria2.removeDownloadResult",
+    "aria2.getFiles",
+    "aria2.getPeers",
+    "aria2.getServers",
+    "aria2.getUris",
+    "aria2.changeUri",
+    "aria2.saveSession",
     "aria2.getVersion",
     "aria2.getSessionInfo",
     "aria2.shutdown",
@@ -292,8 +299,48 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
             let segments = option_str(&options, "max-connection-per-server")
                 .and_then(|v| v.parse::<usize>().ok());
             let headers = option_header_list(&options);
+            // magnet 走 BT 分支时把 select-file 一起带过去（0 基）
+            let only_files = option_select_files(&options);
+            if let Some(first) = uris.first()
+                && (first.starts_with("magnet:") || is_bare_info_hash(first))
+            {
+                let gid = manager
+                    .add_torrent(
+                        crate::core::bt::TorrentSource::Magnet(first.clone()),
+                        dir,
+                        out,
+                        only_files,
+                        false,
+                    )
+                    .await?;
+                return Ok(Value::String(gid));
+            }
             let gid = manager
                 .add_uri(uris, dir, out, user_agent, headers, segments)
+                .await?;
+            Ok(Value::String(gid))
+        }
+        "aria2.addTorrent" => {
+            // aria2: addTorrent(token, base64(.torrent), uris?, options?)
+            let encoded = args
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(2, "torrent (base64) is required"))?;
+            let bytes = data_encoding::BASE64
+                .decode(encoded.trim().as_bytes())
+                .map_err(|err| RpcError::new(2, format!("invalid base64 torrent: {err}")))?;
+            let options = args.get(2).cloned().unwrap_or(Value::Null);
+            let dir = option_str(&options, "dir");
+            let out = option_str(&options, "out");
+            let only_files = option_select_files(&options);
+            let gid = manager
+                .add_torrent(
+                    crate::core::bt::TorrentSource::Bytes(bytes),
+                    dir,
+                    out,
+                    only_files,
+                    false,
+                )
                 .await?;
             Ok(Value::String(gid))
         }
@@ -355,6 +402,82 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
         }
         "aria2.getGlobalStat" => Ok(manager.global_stat().await),
 
+        // -- 文件 / 连接信息（AriaNg 的文件页与连接页） ---------------------
+        "aria2.getFiles" => {
+            let gid = arg_str(args, 0, "gid")?;
+            let status = manager
+                .status_with_keys(&gid, Some(&["files".to_string()]))
+                .await
+                .ok_or_else(|| unknown_gid(&gid))?;
+            Ok(status.get("files").cloned().unwrap_or_else(|| json!([])))
+        }
+        "aria2.getUris" => {
+            let gid = arg_str(args, 0, "gid")?;
+            let status = manager
+                .status_with_keys(&gid, Some(&["files".to_string()]))
+                .await
+                .ok_or_else(|| unknown_gid(&gid))?;
+            let uris = status
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(|file| file.get("uris"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            Ok(uris)
+        }
+        "aria2.getPeers" => {
+            // librqbit 不暴露 peer 明细列表；返回空数组比伪造地址诚实，
+            // 客户端（AriaNg 的连接页）显示「无连接」而不是报错。
+            let gid = arg_str(args, 0, "gid")?;
+            manager
+                .status_with_keys(&gid, Some(&["gid".to_string()]))
+                .await
+                .ok_or_else(|| unknown_gid(&gid))?;
+            Ok(json!([]))
+        }
+        "aria2.getServers" => {
+            let gid = arg_str(args, 0, "gid")?;
+            let status = manager
+                .status_with_keys(&gid, Some(&["files".to_string()]))
+                .await
+                .ok_or_else(|| unknown_gid(&gid))?;
+            let uris = status
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(|file| file.get("uris"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let servers: Vec<Value> = uris
+                .iter()
+                .filter_map(|entry| entry.get("uri").and_then(Value::as_str))
+                .map(|uri| {
+                    json!({
+                        "uri": uri,
+                        "currentUri": uri,
+                        "downloadSpeed": "0",
+                    })
+                })
+                .collect();
+            if servers.is_empty() {
+                Ok(json!([]))
+            } else {
+                Ok(json!([{"index": "1", "servers": servers}]))
+            }
+        }
+        "aria2.changeUri" => {
+            // 不改地址：返回 OK，避免客户端把「不支持」当成失败反复重试
+            let gid = arg_str(args, 0, "gid")?;
+            manager
+                .status_with_keys(&gid, Some(&["gid".to_string()]))
+                .await
+                .ok_or_else(|| unknown_gid(&gid))?;
+            Ok(Value::Array(vec![]))
+        }
+        "aria2.saveSession" => Ok(Value::String("OK".into())),
+
         // -- 选项 -----------------------------------------------------------
         "aria2.getOption" => {
             let gid = arg_str(args, 0, "gid")?;
@@ -387,11 +510,8 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
         }
 
         // -- 元信息 ---------------------------------------------------------
-        "aria2.getVersion" => Ok(json!({
-            // 对外报告 aria2 稳定版语义版本；能力差异由 enabledFeatures 声明
-            "version": "1.37.0",
-            // 不含 BitTorrent / Metalink / FTP / SFTP：客户端据此隐藏对应入口
-            "enabledFeatures": [
+        "aria2.getVersion" => {
+            let mut features = vec![
                 "Asmoday",
                 "Async DNS",
                 "GZip",
@@ -399,8 +519,17 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
                 "Message Digest",
                 "Multi-Connection",
                 "Resumable",
-            ],
-        })),
+            ];
+            // 只有真起来了 BT 会话才声明：客户端据此显示/隐藏 magnet 与种子入口
+            if manager.bt_enabled() {
+                features.push("BitTorrent");
+            }
+            Ok(json!({
+                // 对外报告 aria2 稳定版语义版本；能力差异由 enabledFeatures 声明
+                "version": "1.37.0",
+                "enabledFeatures": features,
+            }))
+        }
         "aria2.getSessionInfo" => Ok(json!({"sessionId": session_id()})),
         "aria2.shutdown" | "aria2.forceShutdown" => {
             // 引擎不随 RPC 关停进程——下载任务无损，进程管理走系统服务
@@ -511,6 +640,50 @@ fn option_str(options: &Value, key: &str) -> Option<String> {
     options.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// 裸 info hash（40 位十六进制）：aria2 的 addUri 也接受这种写法
+fn is_bare_info_hash(uri: &str) -> bool {
+    uri.len() == 40 && uri.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// `select-file` 选项："1,3-5" → `[0, 2, 3, 4]`
+///
+/// aria2 用 1 基下标，librqbit 的 `only_files` 用 0 基。非法片段直接跳过
+/// （aria2 自身对这个选项也是宽松解析），整串解析不出东西时返回 None
+/// 表示「全选」，而不是空集 —— 空集会一个文件都不下。
+fn option_select_files(options: &Value) -> Option<Vec<usize>> {
+    let raw = options.get("select-file").and_then(Value::as_str)?;
+    let mut files = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let (Ok(start), Ok(end)) =
+                    (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+                else {
+                    continue;
+                };
+                if start == 0 || end < start {
+                    continue;
+                }
+                for index in start..=end {
+                    files.push(index - 1);
+                }
+            }
+            None => {
+                if let Ok(index) = part.parse::<usize>()
+                    && index > 0
+                {
+                    files.push(index - 1);
+                }
+            }
+        }
+    }
+    if files.is_empty() { None } else { Some(files) }
+}
+
 /// `header` 选项：["Name: value", ...] → (name, value) 列表
 fn option_header_list(options: &Value) -> Vec<(String, String)> {
     options
@@ -560,4 +733,37 @@ fn session_id() -> String {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| format!("{:016x}", rand::random::<u64>()))
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_file_parses_ranges() {
+        // 1 基输入 → 0 基输出；区间闭合
+        assert_eq!(
+            option_select_files(&json!({"select-file": "1,3-5"})),
+            Some(vec![0, 2, 3, 4])
+        );
+        assert_eq!(
+            option_select_files(&json!({"select-file": "2"})),
+            Some(vec![1])
+        );
+        // 非法片段跳过；整串无效 = None（全选，不是空集）
+        assert_eq!(option_select_files(&json!({"select-file": "0,x,3-"})), None);
+        assert_eq!(option_select_files(&json!({"select-file": ""})), None);
+        assert_eq!(option_select_files(&json!({})), None);
+    }
+
+    #[test]
+    fn bare_info_hash_detection() {
+        assert!(is_bare_info_hash(
+            "cab507494d02ebb1178b38f2e9d7be299c86b862"
+        ));
+        assert!(!is_bare_info_hash("magnet:?xt=urn:btih:abc"));
+        assert!(!is_bare_info_hash(
+            "cab507494d02ebb1178b38f2e9d7be299c86b86"
+        ));
+    }
 }

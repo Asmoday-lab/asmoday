@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod audio_tags;
 pub mod auth;
+pub mod bt;
 pub mod config;
 pub mod cover_cache;
 pub mod dir_cache;

@@ -17,6 +17,12 @@ export interface AuthStatus {
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
+  /**
+   * 是否已进入多用户模式（v4.9.27）。
+   * 默认安装只有一个管理员 → false：不显示权限位/挂载点收权，
+   * 管理员新建第一个账号后自动变 true。
+   */
+  multi_user?: boolean
   version?: string
 }
 
@@ -90,6 +96,8 @@ export const authApi = {
   userId: computed(() => status.value.user_id ?? null),
   /** 当前用户是否管理员（多用户 v4.9.24） */
   isAdmin: computed(() => status.value.role === 'admin'),
+  /** 是否已启用多用户（v4.9.27）：单用户模式下不展示权限位与挂载点收权 */
+  multiUser: computed(() => status.value.multi_user === true),
   /** 权限位判定（v4.9.25）：admin 恒真 */
   can: (perm: number) =>
     authApi.isAdmin.value || ((status.value.permissions ?? 0) & perm) !== 0,

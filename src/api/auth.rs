@@ -772,6 +772,9 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "mount_scope": mount_scope,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
+        // 单用户模式（v4.9.27）：只有内置管理员时不展示权限位/挂载点收权，
+        // 管理员新建第一个账号后自动切换为多用户视图。
+        "multi_user": state.auth.multi_user().unwrap_or(false),
         "version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()

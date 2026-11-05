@@ -709,6 +709,8 @@ async function createUser() {
     newUserRole.value = 'user'
     showToast(t('settings.users.created'))
     await loadUsers()
+    // 创建第一个账号后服务端进入多用户模式，刷新登录态让权限 UI 立刻出现
+    await authApi.refresh()
   } catch (err) {
     usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
   } finally {
@@ -1704,6 +1706,18 @@ onBeforeUnmount(() => {
       >
         {{ usersError }}
       </p>
+
+      <!-- 单用户模式（v4.9.27）：默认只有一个管理员，不展示权限位与挂载点收权；
+           新建第一个账号后自动切换为多用户视图。 -->
+      <div
+        v-if="!authApi.multiUser.value"
+        class="rounded-xl border border-line bg-elevated/40 px-5 py-4"
+      >
+        <p class="text-sm font-medium text-ink">{{ t('settings.users.singleTitle') }}</p>
+        <p class="mt-1 text-[12px] leading-relaxed text-muted">
+          {{ t('settings.users.singleHint') }}
+        </p>
+      </div>
 
       <!-- 新建用户：初始密码只此一份，首登强制改密（对齐 FileBrowser Quantum） -->
       <div class="rounded-xl border border-line p-6">
