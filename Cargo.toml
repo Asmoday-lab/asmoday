@@ -115,7 +115,17 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 # Windows 下某些 MSVC 环境会在 C 依赖（SQLite / ring 等）上触发
 # cl.exe D8050「无法把命令行放入调试记录」，关闭 dev 调试信息即可绕开。
 [profile.dev]
+# 默认 opt-level = 0 让**依赖**也全在未优化状态下跑：image 的 PNG/JPEG 解码循环、
+# bundled SQLite（cc 按同一 opt-level 编译）、sha2 —— 缩略图链路实测比 release 慢 12 倍
+# （2026-11-05 基准：20 张缓存缩略图 250ms vs 20ms）。前端图片瀑布因此像卡住。
+#
+# 提一档：自己的代码 1（编译速度基本不变、断点与变量仍可看），依赖 3（热点全在依赖里）。
+# debug-assertions / overflow-checks 保持默认开 —— 调试构建的价值就在这，别关。
+opt-level = 1
 debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3
 
 # 控制台日志着色（设计文档 3.7）：经典 conhost 需要显式打开 ANSI VT 处理。
 # 仅 Windows 平台、仅 Console 两个 feature，不引入其他 Win32 面。
