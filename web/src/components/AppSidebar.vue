@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * 全局侧边栏：PC 端固定 240px，可折叠为图标栏（w-60 ↔ w-16），移动端为抽屉。
- * 分组对齐原型：工作区 / 媒体库（照片·影视·音乐）/ 系统（分享与图床·设置）。
+ * 分组对齐原型：工作区（主页·文件·下载·终端）/ 媒体库（照片·影视·音乐）/ 系统（分享与图床·设置）。
  * 主题切换入口**不在**这里（设计文档 8.2：禁止侧边栏底部孤立图标），统一收在顶栏账号菜单。
  */
 import { computed, ref, watch } from 'vue'
@@ -38,6 +38,7 @@ const groups = computed<NavGroup[]>(() => [
     items: [
       { to: '/', label: 'common.nav.portal', icon: 'home' },
       { to: '/files', label: 'common.nav.files', icon: 'folder' },
+      { to: '/downloads', label: 'common.nav.downloads', icon: 'download' },
       { to: '/terminal', label: 'common.nav.terminal', icon: 'terminal' },
     ],
   },

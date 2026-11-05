@@ -390,6 +390,12 @@ GWT-DL-04 Given 支持 Range 的源站  When `addUri` 后 `tellStatus`  Then `co
 GWT-DL-05 Given 下载中 `pause`  Then 状态 paused、已下载字节保留、`.aria2` 控制文件生成、任务出现在 `tellWaiting`（paused 属 waiting 族）；`unpause` 后从断点续传且最终字节与源 sha256 一致
 GWT-DL-06 Given `dir` 落在 `[download].roots` 之外  When `addUri`  Then JSON-RPC fault（拒绝，不夹到根里）；`out` 含路径分隔符或 `..` 同样拒绝
 GWT-DL-07 Given `[download].enable=false`  When 任意客户端访问 `/jsonrpc`  Then 404（协议面完全不存在）
+GWT-DL-08 Given 已登录  When 打开侧边栏「下载」  Then URL 为 `/downloads`，页头显示下载/上传速度、进行中与队列计数、BT 监听端口；分栏为进行中 / 等待中 / 已完成（v4.9.31）
+GWT-DL-09 Given `/downloads`  When 新建下载填一行或多行链接  Then 每行各建一个任务并切到「进行中」；`GET /api/downloads` 的 `tasks.active[].name` 为落盘文件名、`kind=http`，进度字段随轮询增长（v4.9.31）
+GWT-DL-10 Given 下载中点暂停  Then 该任务只出现在 `waiting`（`status=paused`），**不再同时出现在 `stopped`**；点继续回到 active（v4.9.31 修正）
+GWT-DL-11 Given 已完成/已失败的任务  When 点移除  Then 任务从 `stopped` 列表彻底消失（走 removeDownloadResult，不留 `removed` 行）；`DELETE /api/downloads/stopped` 一次清空（v4.9.31）
+GWT-DL-12 Given 「引擎设置」  Then 回显 segments / max_concurrent / roots / BT 端口并标注「重启生效」；RPC 地址与密钥可复制（密钥默认掩码），保存后 `POST /api/config` 的 `[download]` 生效但引擎仍是旧快照，重启后 `GET /api/downloads/engine` 才反映新值（v4.9.31）
+GWT-DL-13 Given `[download].enable=false`  When 打开 `/downloads`  Then 显示「下载引擎未启用」提示且新建按钮禁用，`GET /api/downloads` 返回 `{enabled:false}`（v4.9.31）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

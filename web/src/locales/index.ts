@@ -12,6 +12,7 @@ import galleryZh from './zh-CN/gallery.json'
 import terminalZh from './zh-CN/terminal.json'
 import sharesZh from './zh-CN/shares.json'
 import settingsZh from './zh-CN/settings.json'
+import downloadsZh from './zh-CN/downloads.json'
 import ecosystemZh from './zh-CN/ecosystem.json'
 import errorsZh from './zh-CN/errors.json'
 
@@ -23,6 +24,7 @@ import galleryEn from './en-US/gallery.json'
 import terminalEn from './en-US/terminal.json'
 import sharesEn from './en-US/shares.json'
 import settingsEn from './en-US/settings.json'
+import downloadsEn from './en-US/downloads.json'
 import ecosystemEn from './en-US/ecosystem.json'
 import errorsEn from './en-US/errors.json'
 
@@ -43,6 +45,7 @@ export const messages = {
     shares: sharesZh,
     settings: settingsZh,
     ecosystem: ecosystemZh,
+    downloads: downloadsZh,
     errors: errorsZh,
   },
   'en-US': {
@@ -55,6 +58,7 @@ export const messages = {
     shares: sharesEn,
     settings: settingsEn,
     ecosystem: ecosystemEn,
+    downloads: downloadsEn,
     errors: errorsEn,
   },
 } as const

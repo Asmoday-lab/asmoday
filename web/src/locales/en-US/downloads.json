@@ -1,0 +1,89 @@
+{
+  "heading": "Downloads",
+  "loadFailed": "Failed to load the download queue",
+  "actionFailed": "Action failed",
+  "connections": "{count} connections",
+  "seeding": "Seeding",
+  "add": "New download",
+  "adding": "Adding…",
+  "settingsButton": "Engine settings",
+  "clearDone": "Clear records",
+  "summary": {
+    "counts": "Active {active} · Queued {queue}"
+  },
+  "tabs": {
+    "active": "Active",
+    "queue": "Queued",
+    "done": "Completed"
+  },
+  "empty": {
+    "active": "No active downloads",
+    "queue": "The queue is empty",
+    "done": "No completed records yet"
+  },
+  "status": {
+    "active": "Downloading",
+    "waiting": "Queued",
+    "paused": "Paused",
+    "error": "Failed",
+    "complete": "Completed",
+    "removed": "Removed"
+  },
+  "actions": {
+    "pause": "Pause",
+    "resume": "Resume",
+    "remove": "Remove task",
+    "copyPath": "Copy save path"
+  },
+  "toast": {
+    "added": "Added to the queue",
+    "paused": "Paused",
+    "resumed": "Resumed",
+    "removed": "Task removed",
+    "purged": "Cleared {count} records",
+    "pathCopied": "Save path copied"
+  },
+  "disabled": {
+    "title": "Download engine is disabled",
+    "hint": "Set [download].enable to true in config.toml and restart, or turn it on below in Engine settings and restart."
+  },
+  "dialog": {
+    "title": "New download",
+    "modeUri": "Link / magnet",
+    "modeTorrent": "Torrent file",
+    "btDisabled": "BitTorrent is not enabled",
+    "uriPlaceholder": "https://… or magnet:?xt=…",
+    "uriHint": "One per line. HTTP/HTTPS, magnet links and bare 40-character info hashes are supported.",
+    "pickFile": "Choose a .torrent file",
+    "dir": "Save to",
+    "defaultDir": "Default directory (<data>/downloads; extend it via [download].roots in config.toml)",
+    "uriRequired": "Enter at least one link",
+    "submit": "Start download"
+  },
+  "settings": {
+    "title": "Engine settings",
+    "enable": "Enable download engine",
+    "enableBt": "Enable BitTorrent",
+    "disableDht": "Trackers only (disable DHT)",
+    "segments": "Connections per task",
+    "maxConcurrent": "Concurrent downloads",
+    "portMin": "BT port (min)",
+    "portMax": "BT port (max)",
+    "roots": "Allowed save directories",
+    "rootsHint": "Edit [download].roots in config.toml. A `dir` passed over RPC must live inside these; when empty only <data>/downloads is allowed.",
+    "restartHint": "These values are read at startup — restart asmoday for changes to take effect.",
+    "restartPending": "Saved. Takes effect after a restart.",
+    "saving": "Saving…",
+    "saved": "Configuration saved"
+  },
+  "rpc": {
+    "title": "RPC access",
+    "hint": "Point AriaNg / Aria2 Explorer at this address and secret to drive the same queue — changes show up here immediately.",
+    "address": "Address",
+    "secret": "Secret",
+    "show": "Show",
+    "hide": "Hide",
+    "copy": "Copy",
+    "copied": "Copied"
+  }
+}

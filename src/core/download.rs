@@ -400,6 +400,21 @@ impl DownloadManager {
         self.enabled
     }
 
+    /// RPC 密钥（仅 `/api/downloads/engine` 用：管理页要把它显示给用户去接客户端）
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    /// 允许落盘的根白名单（`dir` 只能落在这些目录内）
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// 全局并发上限（创建时快照，改配置需重启）
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent_count
+    }
+
     /// RPC 密钥持久化路径
     pub fn secret_path(data_dir: &Path) -> PathBuf {
         data_dir.join("download_rpc_secret")
@@ -675,7 +690,10 @@ impl DownloadManager {
             (false, _) => handle.cancel_current(),
         }
         self.events.send((gid.to_string(), Event::Pause)).ok();
-        self.mark_stopped(gid).await;
+        // 不进 stopped 清单（v4.9.31）：aria2 里 paused 属于 waiting 族，
+        // `tellStopped` 只收 complete / error / removed。旧实现顺手 mark_stopped，
+        // 结果同一个任务既在 tellWaiting 又在 tellStopped —— AriaNg 的
+        // 「已停止」页会冒出一条还在队列里的任务。
         Ok(gid.to_string())
     }
 
@@ -702,10 +720,6 @@ impl DownloadManager {
                 state.bt.clone(),
             )
         };
-        {
-            let mut map = self.tasks.lock().await;
-            map.stopped.retain(|g| g != gid);
-        }
         if is_bt {
             if let Some(torrent) = bt_torrent
                 && let Some(bt) = &self.bt
@@ -894,22 +908,44 @@ impl DownloadManager {
         out
     }
 
-    /// 全局统计（getGlobalStat）
+    /// 全局统计（getGlobalStat）。
+    ///
+    /// 单次遍历：旧实现为了拿三个计数，把 active / waiting / stopped 三份清单
+    /// 各序列化一遍，而 AriaNg 这类客户端每秒轮询一次。上传速度按**所有**任务
+    /// 求和——BT 下载完成后仍在做种，那时状态是 stopped，只统计 active 会让
+    /// 「做种上传」永远显示 0（v4.9.31）。
     pub async fn global_stat(&self) -> serde_json::Value {
-        let active = self.tell_active().await;
-        let waiting = self.tell_waiting().await;
-        let stopped = self.tell_stopped().await;
-        let speed: u64 = active
-            .iter()
-            .filter_map(|t| t["downloadSpeed"].as_u64())
-            .sum();
+        let map = self.tasks.lock().await;
+        let (mut active, mut waiting, mut stopped) = (0usize, 0usize, 0usize);
+        let (mut down, mut up) = (0u64, 0u64);
+        for gid in &map.order {
+            let Some(handle) = map.tasks.get(gid) else {
+                continue;
+            };
+            let mut state = handle.state.lock().await;
+            match state.status {
+                Status::Active => {
+                    state.refresh_speed();
+                    active += 1;
+                    down += state.speed;
+                    up += state.upload_speed;
+                }
+                Status::Waiting | Status::Paused => waiting += 1,
+                Status::Complete | Status::Error | Status::Removed => {
+                    // 做种的 BT 任务在这里：速度只有 stats 会给
+                    state.refresh_speed();
+                    stopped += 1;
+                    up += state.upload_speed;
+                }
+            }
+        }
         serde_json::json!({
-            "downloadSpeed": speed,
-            "uploadSpeed": 0,
-            "numActive": active.len(),
-            "numWaiting": waiting.len(),
-            "numStopped": stopped.len(),
-            "numStoppedTotal": stopped.len(),
+            "downloadSpeed": down,
+            "uploadSpeed": up,
+            "numActive": active,
+            "numWaiting": waiting,
+            "numStopped": stopped,
+            "numStoppedTotal": stopped,
         })
     }
 
@@ -1831,6 +1867,67 @@ mod tests {
         // removeDownloadResult 删得掉已停止任务；purge 清空
         assert!(manager.remove_result(&gid).await.is_ok());
         assert!(manager.remove_result(&gid).await.is_err());
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 暂停的任务只属于 waiting 族（aria2 语义），不能同时出现在 tellStopped
+    /// —— 否则客户端的「已停止」页会多出一条还能继续的条目（v4.9.31）。
+    #[tokio::test]
+    async fn paused_task_stays_out_of_stopped_list() {
+        let base = std::env::temp_dir().join("asmoday-dl-paused");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::new(),
+            "secret1".into(),
+            vec![base.clone()],
+            2,
+            1,
+            true,
+            None,
+        ));
+        // 只接受连接、不回响应：任务停在「等响应头」，暂停一定来得及
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let gid = manager
+            .add_uri(
+                vec![format!("http://{addr}/slow.bin")],
+                Some(base.to_str().unwrap().into()),
+                Some("slow.bin".into()),
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        manager.pause(&gid).await.unwrap();
+
+        let waiting = manager.tell_waiting().await;
+        let entry = waiting.iter().find(|t| t["gid"] == gid.as_str()).unwrap();
+        assert_eq!(entry["status"], "paused");
+        assert!(
+            !manager
+                .tell_stopped()
+                .await
+                .iter()
+                .any(|t| t["gid"] == gid.as_str()),
+            "paused 不该出现在 tellStopped"
+        );
+
+        // 继续后回到 active/waiting，再移除收尾
+        manager.unpause(&gid).await.unwrap();
+        let status = manager.status_with_keys(&gid, None).await.unwrap()["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(matches!(status.as_str(), "active" | "waiting"), "{status}");
+        manager.remove(&gid).await.unwrap();
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 

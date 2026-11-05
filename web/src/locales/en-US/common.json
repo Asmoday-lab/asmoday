@@ -2,6 +2,7 @@
   "nav": {
     "portal": "Dashboard",
     "files": "Files",
+    "downloads": "Downloads",
     "terminal": "Terminal",
     "photos": "Photos",
     "cinema": "Cinema",
@@ -15,6 +16,7 @@
   "subtitle": {
     "portal": "Services and runtime overview",
     "files": "Browse · Upload · Edit",
+    "downloads": "Queue · direct links and torrents",
     "photos": "Albums and timeline",
     "cinema": "Local films and resume",
     "music": "Local audio and lyrics",

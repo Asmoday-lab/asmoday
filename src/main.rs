@@ -27,7 +27,7 @@ use std::time::Instant;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::response::IntoResponse;
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use serde_json::{Value, json};
@@ -729,6 +729,21 @@ fn protected_routes() -> Router<AppState> {
             "/api/config/raw",
             get(api::config::get_config_raw).post(api::config::update_config_raw),
         )
+        // 下载页（v4.9.31，设计文档 3.10）：登录态直接读写任务。
+        // 外部客户端仍走 /jsonrpc（token 鉴权、不经 Cookie），两条通道共用同一个管理器。
+        .route(
+            "/api/downloads",
+            get(api::downloads::snapshot).post(api::downloads::add),
+        )
+        .route("/api/downloads/engine", get(api::downloads::engine))
+        .route("/api/downloads/torrents", post(api::downloads::add_torrent))
+        .route("/api/downloads/stopped", delete(api::downloads::purge))
+        .route("/api/downloads/{gid}/pause", post(api::downloads::pause))
+        .route(
+            "/api/downloads/{gid}/unpause",
+            post(api::downloads::unpause),
+        )
+        .route("/api/downloads/{gid}", delete(api::downloads::remove))
         .route("/api/auth/me", get(api::auth::me))
         .route("/api/system/health", get(api::system::health))
         // 数据库热备下载（设计文档 4.1）：高敏，需近期验证过密码

@@ -76,6 +76,18 @@ const routes: RouteRecordRaw[] = [
     },
   },
   {
+    // 下载（v4.9.31）：内置引擎的一级入口，与文件管理 / 媒体库同级。
+    // 任务读写走 /api/downloads（登录态），外部客户端仍连 /jsonrpc。
+    path: '/downloads',
+    name: 'downloads',
+    component: () => import('../views/DownloadsView.vue'),
+    meta: {
+      title: 'common.nav.downloads',
+      icon: 'download',
+      subtitle: 'common.subtitle.downloads',
+    },
+  },
+  {
     path: '/photos',
     name: 'photos',
     component: () => import('../views/GalleryView.vue'),

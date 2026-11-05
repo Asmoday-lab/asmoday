@@ -1,0 +1,89 @@
+{
+  "heading": "下载任务",
+  "loadFailed": "读取下载队列失败",
+  "actionFailed": "操作失败",
+  "connections": "{count} 个连接",
+  "seeding": "做种中",
+  "add": "新建下载",
+  "adding": "添加中…",
+  "settingsButton": "引擎设置",
+  "clearDone": "清空记录",
+  "summary": {
+    "counts": "进行中 {active} · 队列 {queue}"
+  },
+  "tabs": {
+    "active": "进行中",
+    "queue": "等待中",
+    "done": "已完成"
+  },
+  "empty": {
+    "active": "暂无进行中的下载",
+    "queue": "队列是空的",
+    "done": "还没有已完成的记录"
+  },
+  "status": {
+    "active": "下载中",
+    "waiting": "排队中",
+    "paused": "已暂停",
+    "error": "失败",
+    "complete": "已完成",
+    "removed": "已移除"
+  },
+  "actions": {
+    "pause": "暂停",
+    "resume": "继续",
+    "remove": "移除任务",
+    "copyPath": "复制保存路径"
+  },
+  "toast": {
+    "added": "已加入下载队列",
+    "paused": "已暂停",
+    "resumed": "已继续",
+    "removed": "任务已移除",
+    "purged": "已清空 {count} 条记录",
+    "pathCopied": "保存路径已复制"
+  },
+  "disabled": {
+    "title": "下载引擎未启用",
+    "hint": "在 config.toml 里把 [download].enable 设为 true 并重启服务，或在下方引擎设置中打开后重启。"
+  },
+  "dialog": {
+    "title": "新建下载",
+    "modeUri": "链接 / 磁力链",
+    "modeTorrent": "种子文件",
+    "btDisabled": "BitTorrent 未启用",
+    "uriPlaceholder": "https://… 或 magnet:?xt=…",
+    "uriHint": "每行一个，支持 HTTP/HTTPS、磁力链与 40 位 info hash。",
+    "pickFile": "选择 .torrent 文件",
+    "dir": "保存到",
+    "defaultDir": "默认目录（<data>/downloads，可在 config.toml 的 [download].roots 中扩展）",
+    "uriRequired": "请先填写下载链接",
+    "submit": "开始下载"
+  },
+  "settings": {
+    "title": "引擎设置",
+    "enable": "启用下载引擎",
+    "enableBt": "启用 BitTorrent",
+    "disableDht": "仅用 Tracker（关闭 DHT）",
+    "segments": "每任务连接数",
+    "maxConcurrent": "同时下载上限",
+    "portMin": "BT 端口下界",
+    "portMax": "BT 端口上界",
+    "roots": "允许的保存目录",
+    "rootsHint": "在 config.toml 的 [download].roots 中增删；RPC 传入的 dir 必须落在这里面，空则只有 <data>/downloads。",
+    "restartHint": "以上参数在进程启动时读取，保存后需要重启 asmoday 才会生效。",
+    "restartPending": "已保存，重启后生效。",
+    "saving": "保存中…",
+    "saved": "配置已保存"
+  },
+  "rpc": {
+    "title": "RPC 接入",
+    "hint": "AriaNg / Aria2 Explorer 填这个地址与密钥即可接管同一份任务队列，改动会立刻反映在本页。",
+    "address": "地址",
+    "secret": "密钥",
+    "show": "显示",
+    "hide": "隐藏",
+    "copy": "复制",
+    "copied": "已复制"
+  }
+}

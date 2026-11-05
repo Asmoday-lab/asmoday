@@ -6,6 +6,7 @@ pub mod auth;
 pub mod compress;
 pub mod config;
 pub mod dav_fs;
+pub mod downloads;
 pub mod error;
 pub mod files;
 pub mod files_mutate;
