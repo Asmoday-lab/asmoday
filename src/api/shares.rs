@@ -67,17 +67,8 @@ pub async fn create(
     user: AuthUser,
     Json(body): Json<CreateShare>,
 ) -> Response {
-    // 分享权限位（v4.9.25）：管理员可以收走单个用户的对外分享能力
-    if !user.can(crate::core::auth::perms::SHARE) {
-        return error_code(
-            StatusCode::FORBIDDEN,
-            "E_FORBIDDEN",
-            "No permission to create shares",
-        );
-    }
-
-    // 挂载点收权（v4.9.25）：scope 外的路径视同不存在
-    let mounts = crate::api::files::mounts_for_user(&state, &user).await;
+    // 路径必须落在某个挂载点内（挂载点外的路径不提供分享）
+    let mounts = crate::api::files::mounts_for(&state).await;
     if mounts.find_by_path_text(body.path.trim()).is_none() {
         return error_code(StatusCode::NOT_FOUND, "E_NOT_FOUND", "路径不在任何挂载点内");
     }
@@ -161,20 +152,15 @@ pub async fn create(
     }
 }
 
-/// GET /api/shares：admin 看全量，普通用户只看自己的
-pub async fn list(State(state): State<AppState>, user: AuthUser) -> Response {
+/// GET /api/shares：单用户模型下就是这台设备的全部分享
+pub async fn list(State(state): State<AppState>, _user: AuthUser) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
-    let sql = if user.is_admin() {
-        "SELECT token, file_path, is_folder, password_hash IS NOT NULL, allow_download, expires_at, created_at
-         FROM shares ORDER BY created_at DESC"
-    } else {
-        "SELECT token, file_path, is_folder, password_hash IS NOT NULL, allow_download, expires_at, created_at
-         FROM shares WHERE user_id = ?1 ORDER BY created_at DESC"
-    };
+    let sql = "SELECT token, file_path, is_folder, password_hash IS NOT NULL, allow_download, expires_at, created_at
+         FROM shares ORDER BY created_at DESC";
     let mut statement = match conn.prepare(sql) {
         Ok(statement) => statement,
         Err(err) => {
@@ -196,13 +182,8 @@ pub async fn list(State(state): State<AppState>, user: AuthUser) -> Response {
             "created_at": row.get::<_, Option<i64>>(6)?,
         }))
     }
-    // 两个分支的闭包是不同类型，无法 if/else 统一 —— 用同一个 fn 指针
     let row_fn: fn(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> = |row| row_json(row);
-    let mapped = if user.is_admin() {
-        statement.query_map([], row_fn)
-    } else {
-        statement.query_map([user.id], row_fn)
-    };
+    let mapped = statement.query_map([], row_fn);
 
     match mapped {
         Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() }))
@@ -214,25 +195,17 @@ pub async fn list(State(state): State<AppState>, user: AuthUser) -> Response {
     }
 }
 
-/// DELETE /api/shares/{token}：owner 或 admin 可删
+/// DELETE /api/shares/{token}
 pub async fn delete(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(token): Path<String>,
 ) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
-    let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = if user.is_admin() {
-        ("DELETE FROM shares WHERE token = ?1", vec![&token])
-    } else {
-        (
-            "DELETE FROM shares WHERE token = ?1 AND user_id = ?2",
-            vec![&token, &user.id],
-        )
-    };
-    match conn.execute(sql, params.as_slice()) {
+    match conn.execute("DELETE FROM shares WHERE token = ?1", [&token]) {
         Ok(0) => error_code(StatusCode::NOT_FOUND, "SHARE_NOT_FOUND", "Share not found"),
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
         Err(err) => error(

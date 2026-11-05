@@ -57,15 +57,6 @@ pub async fn ws_handler(
         );
     }
 
-    // 终端权限位（v4.9.25，对齐社区「普通用户不给 shell」的通行做法）
-    if !user.can(crate::core::auth::perms::TERMINAL) {
-        return crate::api::error::api_error(
-            axum::http::StatusCode::FORBIDDEN,
-            "E_FORBIDDEN",
-            "No permission to use the terminal",
-        );
-    }
-
     let roots = {
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)
@@ -429,15 +420,11 @@ async fn handle_socket(
 /// 否则用户只会看到「已达上限」却无从下手。
 pub async fn list_sessions(
     State(state): State<AppState>,
-    user: crate::api::auth::AuthUser,
+    _user: crate::api::auth::AuthUser,
 ) -> Response {
     let manager = state.terminals.clone();
-    // 普通用户只看到自己的会话；admin 看全量（并发打满时要有全局视野）
-    let mut sessions: Vec<_> = manager
-        .snapshot()
-        .into_iter()
-        .filter(|info| user.is_admin() || info.owner == user.id)
-        .collect();
+    // 单用户模型（v4.9.28）下所有 PTY 都归这台设备的账号，直接给全量
+    let mut sessions = manager.snapshot();
     sessions.sort_by_key(|info| info.age_secs);
     axum::Json(json!({
         "count": sessions.len(),
@@ -450,14 +437,10 @@ pub async fn list_sessions(
 /// DELETE /api/terminal/sessions/{id}：强制关闭一条遗留 PTY（设计文档 3.3.6）
 pub async fn kill_session(
     State(state): State<AppState>,
-    user: crate::api::auth::AuthUser,
+    _user: crate::api::auth::AuthUser,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let owned = state
-        .terminals
-        .get(&id)
-        .is_some_and(|session| user.is_admin() || session.owner == user.id);
-    if !owned {
+    if state.terminals.get(&id).is_none() {
         return crate::api::error::api_error(
             axum::http::StatusCode::NOT_FOUND,
             "E_NOT_FOUND",

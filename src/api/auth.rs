@@ -22,61 +22,16 @@ use crate::core::totp;
 /// 会话 Cookie 名
 pub const SESSION_COOKIE: &str = "asmoday_session";
 
-/// 注入到请求扩展里的当前用户
+/// 注入到请求扩展里的当前账号。
+///
+/// 单用户模型（v4.9.28）下不再有角色与权限位：能登录的就是这台设备的主人，
+/// 能看到全部挂载点、能做全部动作。所以这里只剩身份与「待改密」标记。
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: i64,
     pub username: String,
     /// 是否还是一次性密码（`--init` / `--reset-password` / 管理员代设）会话：改密前只放行改密自身
     pub must_change_password: bool,
-    /// 'admin' | 'user'（v4.9.24 多用户）
-    pub role: String,
-    /// 权限位掩码（v4.9.25）；admin 不看位
-    pub permissions: i64,
-    /// 挂载点收权：'*' = 全部；否则 JSON 数组（v4.9.25）
-    pub mount_scope: String,
-}
-
-impl AuthUser {
-    pub fn is_admin(&self) -> bool {
-        self.role == "admin"
-    }
-
-    /// 权限位判定（v4.9.25）：admin 恒真，普通用户按位。
-    pub fn can(&self, perm: i64) -> bool {
-        self.is_admin() || (self.permissions & perm) != 0
-    }
-
-    /// 挂载点是否对当前用户可见（大小写不敏感、前缀匹配；'*' / admin 全放行）。
-    pub fn mount_allowed(&self, display_path: &str) -> bool {
-        if self.is_admin() || self.mount_scope.trim() == "*" {
-            return true;
-        }
-        let needle = display_path
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_lowercase();
-        serde_json::from_str::<Vec<String>>(&self.mount_scope)
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
-            .any(|p| !p.is_empty() && (needle == p || needle.starts_with(&format!("{p}/"))))
-    }
-
-    /// scope 内挂载点清单（全量时返回 None）。
-    pub fn allowed_mounts(&self) -> Option<Vec<String>> {
-        if self.is_admin() || self.mount_scope.trim() == "*" {
-            return None;
-        }
-        Some(
-            serde_json::from_str::<Vec<String>>(&self.mount_scope)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
-                .filter(|p| !p.is_empty())
-                .collect(),
-        )
-    }
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -92,12 +47,13 @@ where
     }
 }
 
-/// 管理员专用提取器（v4.9.24 多用户）：挂它的 handler 只放行 `role = admin`。
+/// 管理端点提取器（配置 / 系统维护 / 备份）。
 ///
-/// 非管理员得到 403 `E_ADMIN_REQUIRED`——前端按这个码提示「需要管理员账号」，
-/// 路由守卫用同一个码隐藏管理入口。
+/// v4.9.24 时它按 `role = admin` 放行；v4.9.28 回归单用户后，唯一能登录的账号
+/// 就是管理员，因此它等价于「已登录」。保留这个名字是因为二十多个 handler 的
+/// 签名都在用它，而它们的语义本来也是「只归这台设备的账号」。
 #[derive(Debug, Clone)]
-pub struct AdminUser(pub AuthUser);
+pub struct AdminUser(#[allow(dead_code)] pub AuthUser);
 
 impl<S> FromRequestParts<S> for AdminUser
 where
@@ -109,15 +65,7 @@ where
         let user = parts.extensions.get::<AuthUser>().cloned().ok_or_else(|| {
             json_error_code(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", "Unauthorized")
         })?;
-        if user.is_admin() {
-            Ok(AdminUser(user))
-        } else {
-            Err(json_error_code(
-                StatusCode::FORBIDDEN,
-                "E_ADMIN_REQUIRED",
-                "Administrator account required",
-            ))
-        }
+        Ok(AdminUser(user))
     }
 }
 
@@ -560,18 +508,10 @@ async fn sso_user(
     if user.totp_enabled && !skip_2fa {
         return None;
     }
-    // 停用账号同样拒绝（与登录口径一致）
-    if !user.is_active {
-        return None;
-    }
-
     Some(AuthUser {
         id: user.id,
         username: user.username,
         must_change_password: user.must_change_password,
-        role: user.role,
-        permissions: user.permissions,
-        mount_scope: user.mount_scope,
     })
 }
 
@@ -605,22 +545,10 @@ pub async fn require_auth(
         match state.auth.session_state(&token) {
             Ok(Some(session)) => match state.auth.user_by_id(session.user_id) {
                 Ok(Some(user)) => {
-                    // 账号被停用：会话立即不可用（停用操作本身已删会话，这里是兜底，
-                    // 比如管理员停用后数据库被外部回滚之类的边角）
-                    if !user.is_active {
-                        return json_error_code(
-                            StatusCode::FORBIDDEN,
-                            "E_ACCOUNT_DISABLED",
-                            "Account is disabled",
-                        );
-                    }
                     auth_user = Some(AuthUser {
                         id: user.id,
                         username: user.username,
                         must_change_password: user.must_change_password,
-                        role: user.role,
-                        permissions: user.permissions,
-                        mount_scope: user.mount_scope,
                     });
                     via_cookie = true;
                 }
@@ -744,10 +672,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut username: Option<String> = None;
     let mut totp_enabled = false;
     let mut must_change_password = false;
-    let mut role: Option<String> = None;
     let mut uid: Option<i64> = None;
-    let mut permissions: Option<i64> = None;
-    let mut mount_scope: Option<String> = None;
 
     if let Some(token) = cookie_token(&headers)
         && let Ok(Some(session_user)) = state.auth.session_user(&token)
@@ -756,10 +681,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         totp_enabled = user.totp_enabled;
         must_change_password = user.must_change_password;
         username = Some(user.username);
-        role = Some(user.role);
         uid = Some(user.id);
-        permissions = Some(user.permissions);
-        mount_scope = Some(user.mount_scope);
     }
 
     Json(json!({
@@ -767,14 +689,8 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "authenticated": username.is_some(),
         "username": username,
         "user_id": uid,
-        "role": role,
-        "permissions": permissions,
-        "mount_scope": mount_scope,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
-        // 单用户模式（v4.9.27）：只有内置管理员时不展示权限位/挂载点收权，
-        // 管理员新建第一个账号后自动切换为多用户视图。
-        "multi_user": state.auth.multi_user().unwrap_or(false),
         "version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()
@@ -840,17 +756,6 @@ pub async fn login(
         );
     }
 
-    // 停用账号拒绝登录（对齐 Navidrome 的 disabled user 语义）。
-    // 放在密码校验之后：不泄露「账号存在但被停用」给密码错误的人。
-    if !user.is_active {
-        record_login_failure(&state.login_guard, &keys);
-        return json_error_code(
-            StatusCode::FORBIDDEN,
-            "E_ACCOUNT_DISABLED",
-            "Account is disabled",
-        );
-    }
-
     // 可选双因素（设计文档 3.1.4）：6 位数字走 TOTP，其余当一次性恢复码
     if user.totp_enabled {
         let Some(secret) = secret else {
@@ -902,9 +807,6 @@ pub async fn login(
     let mut response = Json(json!({
         "status": "ok",
         "username": user.username,
-        "role": user.role,
-        "permissions": user.permissions,
-        "mount_scope": user.mount_scope,
         "must_change_password": user.must_change_password,
     }))
     .into_response();
@@ -953,9 +855,6 @@ pub async fn me(auth_user: AuthUser) -> Response {
     Json(json!({
         "id": auth_user.id,
         "username": auth_user.username,
-        "role": auth_user.role,
-        "permissions": auth_user.permissions,
-        "mount_scope": auth_user.mount_scope,
         "must_change_password": auth_user.must_change_password,
     }))
     .into_response()

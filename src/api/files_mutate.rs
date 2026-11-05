@@ -32,7 +32,6 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::api::auth::AuthUser;
 use crate::core::auth::now_secs;
-use crate::core::auth::perms;
 use crate::core::fs::{self, FsError};
 use crate::core::fs_ops::{self, ItemResult, NameBook, OnConflict};
 use crate::core::path_guard::{self, MountEntry, MountSet};
@@ -62,13 +61,8 @@ pub type DeleteTickets = Mutex<HashMap<String, DeleteTicket>>;
 ///
 /// 以前每个删除/移动/复制请求都重扫一遍挂载点（每点一次 `canonicalize`），
 /// 挂载点离线时会把请求线程卡在 SMB 超时上。
-async fn mounts_of(state: &AppState, user: &AuthUser) -> MountSet {
-    crate::api::files::mounts_for_user(state, user).await
-}
-
-/// 权限位不足（v4.9.25）：403 E_FORBIDDEN，与只读挂载同一错误通道
-fn forbid() -> FsError {
-    FsError::Forbidden("没有执行该操作的权限".to_string())
+async fn mounts_of(state: &AppState) -> MountSet {
+    crate::api::files::mounts_for(state).await
 }
 
 /// `[server.limits]` → 运行期闸门（`0` 表示不限）。
@@ -191,14 +185,11 @@ pub async fn touch(
 
 async fn create_inner(
     state: &AppState,
-    user: &AuthUser,
+    _user: &AuthUser,
     body: CreateBody,
     is_dir: bool,
 ) -> Result<Value, FsError> {
-    if !user.can(perms::WRITE) {
-        return Err(forbid());
-    }
-    let set = mounts_of(state, user).await;
+    let set = mounts_of(state).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
@@ -248,13 +239,10 @@ pub async fn rename(
 
 async fn rename_inner(
     state: &AppState,
-    user: &AuthUser,
+    _user: &AuthUser,
     body: RenameBody,
 ) -> Result<Value, FsError> {
-    if !user.can(perms::RENAME) {
-        return Err(forbid());
-    }
-    let set = mounts_of(state, user).await;
+    let set = mounts_of(state).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     mount.ensure_writable()?;
 
@@ -339,13 +327,10 @@ pub async fn copy_entries(
 
 async fn transfer_inner(
     state: &AppState,
-    user: &AuthUser,
+    _user: &AuthUser,
     body: TransferBody,
     is_move: bool,
 ) -> Result<Value, FsError> {
-    if !user.can(perms::MOVE_COPY) {
-        return Err(forbid());
-    }
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
@@ -357,7 +342,7 @@ async fn transfer_inner(
         )));
     }
 
-    let set = mounts_of(state, user).await;
+    let set = mounts_of(state).await;
 
     // ---- 源 ----
     let mut sources = Vec::with_capacity(body.paths.len());
@@ -578,16 +563,13 @@ fn digest_paths(paths: &[String]) -> u64 {
 /// 脚本漏掉确认步骤时删不掉东西。
 pub async fn delete_token(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Json(body): Json<DeleteTokenBody>,
 ) -> Response {
-    if !user.can(perms::DELETE) {
-        return fail(forbid());
-    }
     if body.paths.is_empty() {
         return fail(FsError::BadRequest("paths 不能为空".to_string()));
     }
-    let set = mounts_of(&state, &user).await;
+    let set = mounts_of(&state).await;
     let mut mount_id = body.mount_id.clone().unwrap_or_default();
     for raw in &body.paths {
         let Some(mount) = pick_mount(&set, body.mount_id.as_deref(), raw).ok() else {
@@ -650,17 +632,14 @@ pub async fn delete(
 
 async fn delete_inner(
     state: &AppState,
-    user: &AuthUser,
+    _user: &AuthUser,
     body: DeleteBody,
 ) -> Result<Value, FsError> {
-    if !user.can(perms::DELETE) {
-        return Err(forbid());
-    }
     if body.paths.is_empty() {
         return Err(FsError::BadRequest("paths 不能为空".to_string()));
     }
 
-    let set = mounts_of(state, user).await;
+    let set = mounts_of(state).await;
     let mut targets = Vec::with_capacity(body.paths.len());
     for raw in &body.paths {
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
@@ -806,7 +785,7 @@ pub async fn measure(
 
 async fn measure_inner(
     state: &AppState,
-    user: &AuthUser,
+    _user: &AuthUser,
     body: MeasureBody,
 ) -> Result<Value, FsError> {
     if body.paths.is_empty() {
@@ -820,7 +799,7 @@ async fn measure_inner(
         )));
     }
 
-    let set = mounts_of(state, user).await;
+    let set = mounts_of(state).await;
     let mut targets = Vec::with_capacity(body.paths.len());
     for raw in &body.paths {
         let mount = pick_mount(&set, body.mount_id.as_deref(), raw)?;
@@ -851,10 +830,10 @@ pub struct StatQuery {
 /// GET /api/files/stat：只读属性（不跟随软链接）
 pub async fn stat(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Query(query): Query<StatQuery>,
 ) -> Response {
-    let set = mounts_of(&state, &user).await;
+    let set = mounts_of(&state).await;
     let mount = match pick_mount(&set, query.mount_id.as_deref(), &query.path) {
         Ok(mount) => mount,
         Err(err) => return fail(err),
@@ -1001,8 +980,8 @@ pub async fn hash(
     }
 }
 
-async fn hash_inner(state: &AppState, user: &AuthUser, body: HashBody) -> Result<Value, FsError> {
-    let set = mounts_of(state, user).await;
+async fn hash_inner(state: &AppState, _user: &AuthUser, body: HashBody) -> Result<Value, FsError> {
+    let set = mounts_of(state).await;
     let mount = pick_mount(&set, body.mount_id.as_deref(), &body.path)?;
     let path = path_guard::resolve_existing(mount, &body.path)?;
 

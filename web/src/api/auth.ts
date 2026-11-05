@@ -8,36 +8,11 @@ export interface AuthStatus {
   authenticated: boolean
   username: string | null
   user_id?: number | null
-  /** 'admin' | 'user'（v4.9.24 多用户） */
-  role?: string | null
-  /** 权限位掩码（v4.9.25）；admin 不看位 */
-  permissions?: number | null
-  /** 挂载点收权（v4.9.25）：'*' 或 JSON 数组 */
-  mount_scope?: string | null
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
-  /**
-   * 是否已进入多用户模式（v4.9.27）。
-   * 默认安装只有一个管理员 → false：不显示权限位/挂载点收权，
-   * 管理员新建第一个账号后自动变 true。
-   */
-  multi_user?: boolean
   version?: string
 }
-
-/** 权限位（v4.9.25，与后端 core::auth::perms 对齐） */
-export const PERM = {
-  SEE_HIDDEN: 1 << 0,
-  WRITE: 1 << 1,
-  RENAME: 1 << 2,
-  MOVE_COPY: 1 << 3,
-  DELETE: 1 << 4,
-  SHARE: 1 << 5,
-  WEBDAV_READ: 1 << 6,
-  WEBDAV_MANAGE: 1 << 7,
-  TERMINAL: 1 << 8,
-} as const
 
 const status = ref<AuthStatus>({
   initialized: true,
@@ -94,13 +69,13 @@ export const authApi = {
   isAuthenticated: computed(() => status.value.authenticated),
   username: computed(() => status.value.username),
   userId: computed(() => status.value.user_id ?? null),
-  /** 当前用户是否管理员（多用户 v4.9.24） */
-  isAdmin: computed(() => status.value.role === 'admin'),
-  /** 是否已启用多用户（v4.9.27）：单用户模式下不展示权限位与挂载点收权 */
-  multiUser: computed(() => status.value.multi_user === true),
-  /** 权限位判定（v4.9.25）：admin 恒真 */
-  can: (perm: number) =>
-    authApi.isAdmin.value || ((status.value.permissions ?? 0) & perm) !== 0,
+  /**
+   * 是否「设备主人」。
+   *
+   * v4.9.28 回归单用户后这件事等价于「已登录」——唯一账号就是管理员，
+   * 没有角色与权限位可判。保留这个名字是因为设置页的 tab 过滤还在用它。
+   */
+  isAdmin: computed(() => status.value.authenticated),
   initialized: computed(() => status.value.initialized),
   ensureAuth,
   refresh,

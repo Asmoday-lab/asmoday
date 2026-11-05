@@ -127,95 +127,19 @@ CREATE TABLE IF NOT EXISTS thumb_hashes (
 );
 "#;
 
-/// 权限位（v4.9.25，对齐 Alist 的 Permission 位掩码）。
+/// 唯一账号（单用户模型）。
 ///
-/// 「读」不设位——挂载点在 scope 内即可读（社区同口径：FileBrowser/Alist 的
-/// 普通用户默认可见可下）；写类动作逐位收权。
-pub mod perms {
-    /// 看隐藏文件（list / search / WebDAV PROPFIND 的 show_hidden）
-    pub const SEE_HIDDEN: i64 = 1 << 0;
-    /// 新建：mkdir / 上传 / touch
-    pub const WRITE: i64 = 1 << 1;
-    /// 重命名
-    pub const RENAME: i64 = 1 << 2;
-    /// 移动 / 复制
-    pub const MOVE_COPY: i64 = 1 << 3;
-    /// 删除（含回收确认）
-    pub const DELETE: i64 = 1 << 4;
-    /// 创建分享
-    pub const SHARE: i64 = 1 << 5;
-    /// WebDAV 读取（PROPFIND / GET / HEAD）
-    pub const WEBDAV_READ: i64 = 1 << 6;
-    /// WebDAV 管理（PUT / DELETE / MKCOL / MOVE / COPY 等）
-    pub const WEBDAV_MANAGE: i64 = 1 << 7;
-    /// 终端（社区通行：普通用户不给 shell，这里保留开关能力）
-    pub const TERMINAL: i64 = 1 << 8;
-    /// 全量位掩码
-    pub const ALL: i64 = (1 << 9) - 1;
-}
-
+/// v4.9.28 起 asmoday 回归单用户语义：`users` 表里只有一个账号，首启创建的管理员。
+/// 表结构中的 `role` / `is_active` / `permissions` / `mount_scope` 列**保留但不读**——
+/// 它们是多用户时代（v4.9.24 / v4.9.25）的遗留，删列会让存量库无法回滚，而单用户
+/// 模型的权限答案恒为「全部」。
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
     pub id: i64,
     pub username: String,
     pub totp_enabled: bool,
-    /// 一次性密码（--init / --reset-password / 管理员代设）登录后必须改密
+    /// 一次性密码（--init / --reset-password）登录后必须改密
     pub must_change_password: bool,
-    /// 'admin' | 'user'（v4.9.24 多用户）
-    pub role: String,
-    /// 停用的账号拒绝登录（记录保留，启用即恢复）
-    pub is_active: bool,
-    /// 权限位掩码（v4.9.25）；admin 不看位全放行
-    pub permissions: i64,
-    /// 挂载点收权：'*' = 全部；否则 JSON 数组（v4.9.25）
-    pub mount_scope: String,
-}
-
-impl User {
-    pub fn is_admin(&self) -> bool {
-        self.role == "admin"
-    }
-
-    /// 权限位判定。admin 恒真；普通用户按位。
-    pub fn can(&self, perm: i64) -> bool {
-        self.is_admin() || (self.permissions & perm) != 0
-    }
-
-    /// 挂载点是否全部可见（'*' 或 admin）。
-    pub fn mounts_all(&self) -> bool {
-        self.is_admin() || self.mount_scope.trim() == "*"
-    }
-
-    /// scope 内挂载点清单（`mounts_all` 为真时返回 None）。
-    pub fn allowed_mounts(&self) -> Option<Vec<String>> {
-        if self.mounts_all() {
-            return None;
-        }
-        Some(
-            serde_json::from_str::<Vec<String>>(&self.mount_scope)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
-                .filter(|p| !p.is_empty())
-                .collect(),
-        )
-    }
-
-    /// 挂载点展示路径（或其下的子路径）是否在 scope 内。大小写不敏感、前缀匹配，
-    /// 与 `MountSet::find_by_path_text` 同口径。
-    pub fn mount_allowed(&self, display_path: &str) -> bool {
-        if self.mounts_all() {
-            return true;
-        }
-        let needle = display_path
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_lowercase();
-        self.allowed_mounts()
-            .unwrap_or_default()
-            .iter()
-            .any(|p| needle == *p || needle.starts_with(&format!("{p}/")))
-    }
 }
 
 pub struct AuthStore {
@@ -515,7 +439,50 @@ fn migrations() -> Migrations<'static> {
             migrate_user_perms(tx)?;
             Ok(())
         }),
+        // v18：回归单用户（v4.9.28）。只保留一个账号（最早的 admin），其余置
+        // `is_active = 0` 并清会话——**数据不删**，回滚到多用户版本即可恢复。
+        // 权限位与挂载点收权随之退役：单用户模型下答案恒为「全部」。
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            migrate_single_user(tx)?;
+            Ok(())
+        }),
     ])
+}
+
+/// v18 钩子：把历史多账号收敛成单账号。**不要**写 BEGIN/COMMIT（已在事务里）。
+///
+/// 保留顺序：`is_active = 1` 的 admin 里 id 最小的 → 任一启用账号里 id 最小的 →
+/// 任意一行（全部被禁用过的极端情况）。`role` 顺手改成 `admin`，让回滚到
+/// v4.9.27 时这个人仍是管理员。
+fn migrate_single_user(conn: &Connection) -> rusqlite::Result<()> {
+    let keep: Option<i64> = conn.query_row(
+        "SELECT COALESCE(
+             (SELECT MIN(id) FROM users WHERE role = 'admin' AND is_active = 1),
+             (SELECT MIN(id) FROM users WHERE is_active = 1),
+             (SELECT MIN(id) FROM users)
+         )",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let Some(keep) = keep else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE users SET role = 'admin' WHERE id = ?1",
+        params![keep],
+    )?;
+    let deactivated = conn.execute(
+        "UPDATE users SET is_active = 0 WHERE id <> ?1 AND is_active <> 0",
+        params![keep],
+    )?;
+    if deactivated > 0 {
+        conn.execute("DELETE FROM sessions WHERE user_id <> ?1", params![keep])?;
+        eprintln!(
+            "[asmoday] 已切换为单用户模式：保留账号 #{keep}，停用其余 {deactivated} 个账号\
+             （收藏/分享/令牌等数据保留，不做物理删除）"
+        );
+    }
+    Ok(())
 }
 
 /// v17 钩子：users 补 permissions / mount_scope。**不要**写 BEGIN/COMMIT（已在事务里）。
@@ -790,16 +757,6 @@ impl AuthStore {
             .map_err(|e| format!("查询用户数失败：{e}"))
     }
 
-    /// 是否已进入多用户模式（v4.9.27）。
-    ///
-    /// 产品语义：默认安装就是**单用户**——只有一个管理员，所有能力全开，
-    /// 界面上不出现权限位与挂载点收权；管理员第一次新建账号后才启用多用户。
-    /// 判据是「账号总数 > 1」而不是「存在非 admin 账号」：把最后一个普通
-    /// 用户停用或降级时，他名下的权限配置还在，不该让管理界面在那一刻消失。
-    pub fn multi_user(&self) -> Result<bool, String> {
-        Ok(self.user_count()? > 1)
-    }
-
     // -----------------------------------------------------------------------
     // 元数据联动（设计文档 3.2.6.7）
     //
@@ -941,28 +898,25 @@ impl AuthStore {
         }
     }
 
-    /// 创建用户（管理员建号 / 首启自动引导共用）。
+    /// 创建唯一账号（首启自动引导 / `--init` / `--reset-password` 共用）。
     ///
-    /// `role` 为 `"admin"` 或 `"user"`。管理员代建与一次性引导都置
-    /// `must_change_password = 1`——初始密码经由控制台/管理员传递，
-    /// 登录后强制换掉（对齐 FileBrowser Quantum 的 requirePasswordChange）。
-    pub fn create_user(&self, username: &str, password: &str, role: &str) -> Result<User, String> {
+    /// 单用户模型下没有角色可挑：建出来的就是管理员。`role` 列仍写 `'admin'`，
+    /// 只为「回滚到多用户版本」时身份不丢。初始密码经由控制台传递，
+    /// 登录后强制换掉（`must_change_password = 1`）。
+    pub fn create_user(&self, username: &str, password: &str) -> Result<User, String> {
         let username = username.trim();
         if !valid_username(username) {
             return Err("用户名需 2~32 个字符，可含中文、字母、数字与 _ - . @".to_string());
-        }
-        if role != "admin" && role != "user" {
-            return Err(format!("未知角色：{role}"));
         }
         check_password_strength(password)?;
 
         let hash = hash_password(password)?;
         let conn = self.connect()?;
         conn.execute(
-            "INSERT INTO users (username, password_hash, created_at, role, must_change_password,
-                                permissions, mount_scope)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, '*')",
-            params![username, hash, now_secs(), role, perms::ALL],
+            "INSERT INTO users (username, password_hash, created_at, role, is_active,
+                                must_change_password)
+             VALUES (?1, ?2, ?3, 'admin', 1, 1)",
+            params![username, hash, now_secs()],
         )
         .map_err(|e| {
             if e.to_string().contains("UNIQUE") {
@@ -977,22 +931,19 @@ impl AuthStore {
             username: username.to_string(),
             totp_enabled: false,
             must_change_password: true,
-            role: role.to_string(),
-            is_active: true,
-            permissions: perms::ALL,
-            mount_scope: "*".to_string(),
         })
     }
 
+    /// 按用户名查账号（登录用）。`is_active = 1` 是单用户模型的收敛条件：
+    /// v4.9.28 迁移把历史多账号的其余人置 0，他们从此查不到、登不进。
     pub fn find_user(
         &self,
         username: &str,
     ) -> Result<Option<(User, String, Option<String>)>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password,
-                    role, is_active, permissions, mount_scope
-             FROM users WHERE username = ?1",
+            "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password
+             FROM users WHERE username = ?1 AND is_active = 1",
             params![username],
             |row| {
                 Ok((
@@ -1001,12 +952,6 @@ impl AuthStore {
                         username: row.get(1)?,
                         totp_enabled: row.get::<_, i64>(4).unwrap_or(0) != 0,
                         must_change_password: row.get::<_, i64>(5).unwrap_or(0) != 0,
-                        role: row.get::<_, String>(6).unwrap_or_else(|_| "user".into()),
-                        is_active: row.get::<_, i64>(7).unwrap_or(1) != 0,
-                        permissions: row.get::<_, i64>(8).unwrap_or(perms::ALL),
-                        mount_scope: row
-                            .get::<_, String>(9)
-                            .unwrap_or_else(|_| "*".into()),
                     },
                     row.get::<_, String>(2).unwrap_or_default(),
                     row.get::<_, Option<String>>(3).unwrap_or(None),
@@ -1020,9 +965,8 @@ impl AuthStore {
     pub fn first_user(&self) -> Result<Option<User>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active,
-                    permissions, mount_scope
-             FROM users ORDER BY id LIMIT 1",
+            "SELECT id, username, is_totp_enabled, must_change_password
+             FROM users WHERE is_active = 1 ORDER BY id LIMIT 1",
             [],
             |row| {
                 Ok(User {
@@ -1030,10 +974,6 @@ impl AuthStore {
                     username: row.get(1)?,
                     totp_enabled: row.get::<_, i64>(2).unwrap_or(0) != 0,
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
-                    role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
-                    is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
-                    permissions: row.get::<_, i64>(6).unwrap_or(perms::ALL),
-                    mount_scope: row.get::<_, String>(7).unwrap_or_else(|_| "*".into()),
                 })
             },
         )
@@ -1044,9 +984,8 @@ impl AuthStore {
     pub fn user_by_id(&self, id: i64) -> Result<Option<User>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active,
-                    permissions, mount_scope
-             FROM users WHERE id = ?1",
+            "SELECT id, username, is_totp_enabled, must_change_password
+             FROM users WHERE id = ?1 AND is_active = 1",
             params![id],
             |row| {
                 Ok(User {
@@ -1054,10 +993,6 @@ impl AuthStore {
                     username: row.get(1)?,
                     totp_enabled: row.get::<_, i64>(2).unwrap_or(0) != 0,
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
-                    role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
-                    is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
-                    permissions: row.get::<_, i64>(6).unwrap_or(perms::ALL),
-                    mount_scope: row.get::<_, String>(7).unwrap_or_else(|_| "*".into()),
                 })
             },
         )
@@ -1065,35 +1000,7 @@ impl AuthStore {
         .map_err(|e| format!("查询用户失败：{e}"))
     }
 
-    /// 用户清单（管理页）：按 id 排序，附账号状态。不含密码哈希等敏感列。
-    pub fn list_users(&self) -> Result<Vec<User>, String> {
-        let conn = self.connect()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, username, is_totp_enabled, must_change_password, role, is_active,
-                        permissions, mount_scope
-                 FROM users ORDER BY id",
-            )
-            .map_err(|e| format!("查询用户失败：{e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(User {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    totp_enabled: row.get::<_, i64>(2).unwrap_or(0) != 0,
-                    must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
-                    role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
-                    is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
-                    permissions: row.get::<_, i64>(6).unwrap_or(perms::ALL),
-                    mount_scope: row.get::<_, String>(7).unwrap_or_else(|_| "*".into()),
-                })
-            })
-            .map_err(|e| format!("查询用户失败：{e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("读取用户失败：{e}"))
-    }
-
-    /// 改名。UNIQUE 冲突返回「用户名已存在」；改名后由调用方负责让该用户全部会话失效
+    /// 改名。UNIQUE 冲突返回「用户名已存在」；改名后由调用方负责让会话失效
     /// （旧会话里缓存的用户名/身份要重新登录确认）。
     pub fn rename_user(&self, user_id: i64, new_username: &str) -> Result<(), String> {
         let username = new_username.trim();
@@ -1112,121 +1019,6 @@ impl AuthStore {
                 format!("改名失败：{e}")
             }
         })?;
-        Ok(())
-    }
-
-    /// 启用 / 停用账号。停用即踢掉该用户全部会话。
-    /// **最后一个 admin 不能停用**（否则没有人能再进管理页）。
-    pub fn set_user_active(&self, user_id: i64, active: bool) -> Result<(), String> {
-        let conn = self.connect()?;
-        if !active {
-            ensure_not_last_admin(&conn, user_id, "不能停用最后一个管理员")?;
-        }
-        conn.execute(
-            "UPDATE users SET is_active = ?1 WHERE id = ?2",
-            params![if active { 1 } else { 0 }, user_id],
-        )
-        .map_err(|e| format!("更新账号状态失败：{e}"))?;
-        if !active {
-            conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
-                .map_err(|e| format!("清理会话失败：{e}"))?;
-        }
-        Ok(())
-    }
-
-    /// 调整角色。**最后一个 admin 不能降级**。
-    pub fn set_user_role(&self, user_id: i64, role: &str) -> Result<(), String> {
-        if role != "admin" && role != "user" {
-            return Err(format!("未知角色：{role}"));
-        }
-        let conn = self.connect()?;
-        if role != "admin" {
-            ensure_not_last_admin(&conn, user_id, "不能降级最后一个管理员")?;
-        }
-        conn.execute(
-            "UPDATE users SET role = ?1 WHERE id = ?2",
-            params![role, user_id],
-        )
-        .map_err(|e| format!("更新角色失败：{e}"))?;
-        Ok(())
-    }
-
-    /// 更新权限位与挂载点收权（v4.9.25）。
-    ///
-    /// `mount_scope` 为 `"*"` 或挂载点展示路径的 JSON 数组（空数组 = 什么都看不到，
-    /// 允许——管理员可以先收光再慢慢放）。改完由调用方决定是否清会话：权限收紧
-    /// 立即生效（AuthUser 每请求重读用户行），无需踢登录。
-    pub fn set_user_perms(
-        &self,
-        user_id: i64,
-        permissions: i64,
-        mount_scope: &str,
-    ) -> Result<(), String> {
-        let permissions = if permissions < 0 {
-            0
-        } else {
-            permissions & perms::ALL
-        };
-        let scope = mount_scope.trim();
-        if scope != "*" {
-            let parsed: Vec<String> = serde_json::from_str(scope)
-                .map_err(|_| "mount_scope 需为 \"*\" 或路径字符串的 JSON 数组".to_string())?;
-            for p in &parsed {
-                if p.trim().is_empty() {
-                    return Err("mount_scope 数组里出现了空路径".to_string());
-                }
-            }
-        }
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE users SET permissions = ?1, mount_scope = ?2 WHERE id = ?3",
-            params![permissions, scope, user_id],
-        )
-        .map_err(|e| format!("更新权限失败：{e}"))?;
-        Ok(())
-    }
-
-    /// 管理员代设密码：与自助改密不同，这里保留 must_change_password=1，
-    /// 让用户下次登录自己换掉（管理员不该知道用户的长期密码）。
-    pub fn admin_set_password(&self, user_id: i64, password: &str) -> Result<(), String> {
-        check_password_strength(password)?;
-        let hash = hash_password(password)?;
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE users SET password_hash = ?1, must_change_password = 1 WHERE id = ?2",
-            params![hash, user_id],
-        )
-        .map_err(|e| format!("设置密码失败：{e}"))?;
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
-            .map_err(|e| format!("清理会话失败：{e}"))?;
-        Ok(())
-    }
-
-    /// 删除用户及其全部归属数据（会话/收藏/播放历史/分享/令牌）。
-    /// 不能删自己；**不能删最后一个 admin**。
-    pub fn delete_user(&self, user_id: i64, caller_id: i64) -> Result<(), String> {
-        if user_id == caller_id {
-            return Err("不能删除当前登录的账号".to_string());
-        }
-        let conn = self.connect()?;
-        ensure_not_last_admin(&conn, user_id, "不能删除最后一个管理员")?;
-        for sql in [
-            "DELETE FROM sessions WHERE user_id = ?1",
-            "DELETE FROM favorites WHERE user_id = ?1",
-            "DELETE FROM play_history WHERE user_id = ?1",
-            "DELETE FROM access_tokens WHERE user_id = ?1",
-        ] {
-            conn.execute(sql, params![user_id])
-                .map_err(|e| format!("清理用户数据失败：{e}"))?;
-        }
-        // 分享不物理删：转 tombstone（30 天后 janitor 回收），公开链接立即 410
-        conn.execute(
-            "UPDATE shares SET deleted_at = ?2 WHERE user_id = ?1 AND deleted_at IS NULL",
-            params![user_id, now_secs()],
-        )
-        .map_err(|e| format!("清理用户分享失败：{e}"))?;
-        conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])
-            .map_err(|e| format!("删除用户失败：{e}"))?;
         Ok(())
     }
 
@@ -1503,33 +1295,6 @@ pub fn valid_username(username: &str) -> bool {
     })
 }
 
-/// 守护「系统里至少留一个可登录的 admin」：停用/降级/删除目标前调用。
-/// 单行检查与写操作之间没有事务包裹——管理操作是人工低频动作，
-/// 且最坏结果（两个 admin 同时被降）需要两个管理员并发操作自己，可接受。
-fn ensure_not_last_admin(conn: &Connection, user_id: i64, message: &str) -> Result<(), String> {
-    let is_admin: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM users WHERE id = ?1 AND role = 'admin'",
-            params![user_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("查询角色失败：{e}"))?;
-    if is_admin == 0 {
-        return Ok(());
-    }
-    let other_admins: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND id != ?1 AND is_active != 0",
-            params![user_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("查询管理员数失败：{e}"))?;
-    if other_admins == 0 {
-        return Err(message.to_string());
-    }
-    Ok(())
-}
-
 /// 32 字节随机 token（16 进制）
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
@@ -1686,60 +1451,33 @@ mod tests {
     }
 
     #[test]
-    fn user_crud_roles_and_last_admin_guard() {
-        let store = temp_store("multi-user");
-        let admin = store.create_user("boss", "Asmoday#2026", "admin").unwrap();
-        assert!(admin.is_admin());
+    fn single_primary_account_is_created_and_looked_up() {
+        let store = temp_store("single-user");
+        let admin = store.create_user("boss", "Asmoday#2026").unwrap();
         assert!(admin.must_change_password, "建号即待改密");
+        assert_eq!(store.first_user().unwrap().unwrap().id, admin.id);
+        assert_eq!(store.find_user("boss").unwrap().unwrap().0.id, admin.id);
+        assert_eq!(
+            store.user_by_id(admin.id).unwrap().unwrap().username,
+            "boss"
+        );
 
-        let member = store.create_user("member", "Asmoday#2026", "user").unwrap();
-        assert!(!member.is_admin());
-
-        // 清掉待改密标志（模拟用户已完成首登改密）
+        // 首登改密后待改密标志落下
         store.update_password(admin.id, "Asmoday#2026").unwrap();
-
-        // 最后一个 admin 不能被降级 / 停用 / 删除
-        assert!(store.set_user_role(admin.id, "user").is_err());
-        assert!(store.set_user_active(admin.id, false).is_err());
-        assert!(store.delete_user(admin.id, admin.id).is_err());
-
-        // 普通 admin 存在时，另一名 admin 可以被降级
-        let second = store.create_user("boss2", "Asmoday#2026", "admin").unwrap();
-        store.update_password(second.id, "Asmoday#2026").unwrap();
-        store.set_user_role(second.id, "user").unwrap();
-        assert!(!store.user_by_id(second.id).unwrap().unwrap().is_admin());
-
-        // 删除用户级联清理归属数据
-        let conn = store.connect().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO favorites (user_id, mount_id, file_path, created_at)
-             VALUES (?1, 'm', '/m/x.mp4', 1)",
-            params![member.id],
-        )
-        .unwrap();
-        drop(conn);
-        store.delete_user(member.id, admin.id).unwrap();
-        assert!(store.user_by_id(member.id).unwrap().is_none());
-        let conn = store.connect().unwrap();
-        let left: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM favorites WHERE user_id = ?1",
-                params![member.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(left, 0, "删除用户应级联清掉收藏");
+        assert!(
+            !store
+                .user_by_id(admin.id)
+                .unwrap()
+                .unwrap()
+                .must_change_password
+        );
     }
 
     #[test]
-    fn rename_rejects_duplicates_and_bad_names() {
+    fn rename_rejects_bad_names() {
         let store = temp_store("rename");
-        let admin = store.create_user("boss", "Asmoday#2026", "admin").unwrap();
-        store.create_user("member", "Asmoday#2026", "user").unwrap();
-
-        // 重名拒绝
-        assert!(store.rename_user(admin.id, "member").is_err());
-        // 非法字符（路径分隔符）拒绝
+        let admin = store.create_user("boss", "Asmoday#2026").unwrap();
+        // 非法字符（路径分隔符）与过短的名字拒绝
         assert!(store.rename_user(admin.id, "a/b").is_err());
         assert!(store.rename_user(admin.id, "x").is_err());
         // 正常改名生效
@@ -1751,30 +1489,60 @@ mod tests {
     }
 
     #[test]
-    fn disabled_users_are_excluded_from_login_lookup_guards() {
+    fn deactivated_accounts_are_invisible_to_login_and_session_lookup() {
         let store = temp_store("disabled");
-        let admin = store.create_user("boss", "Asmoday#2026", "admin").unwrap();
-        let member = store.create_user("member", "Asmoday#2026", "user").unwrap();
-        store.set_user_active(member.id, false).unwrap();
+        let keeper = store.create_user("boss", "Asmoday#2026").unwrap();
+        // 模拟「升级前就存在第二个账号」：v18 把它置 is_active=0 之后，
+        // find_user / user_by_id 都查不到，等于不存在
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at, role, is_active)
+             VALUES ('ghost', 'x', 0, 'user', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(store.find_user("ghost").unwrap().is_none());
+        assert!(store.user_by_id(2).unwrap().is_none());
+        assert_eq!(store.first_user().unwrap().unwrap().id, keeper.id);
+    }
 
-        let found = store.find_user("member").unwrap().unwrap();
-        assert!(
-            !found.0.is_active,
-            "find_user 仍能找到行（审计需要），但 is_active=false"
-        );
-        assert!(
-            store
-                .user_by_id(member.id)
-                .unwrap()
-                .unwrap()
-                .must_change_password
-        );
+    #[test]
+    fn migration_folds_extra_accounts_into_the_oldest_admin() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA}
+             INSERT INTO users (username, password_hash, created_at, role, is_active)
+                 VALUES ('boss', 'x', 0, 'admin', 1),
+                        ('member', 'x', 0, 'user', 1),
+                        ('boss2', 'x', 0, 'admin', 1);
+             INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('t1', 1, 0, 9999999999), ('t2', 2, 0, 9999999999);"
+        ))
+        .unwrap();
 
-        // 重新启用后恢复
-        store.set_user_active(member.id, true).unwrap();
-        assert!(store.user_by_id(member.id).unwrap().unwrap().is_active);
-        // admin 未被误伤
-        assert!(store.user_by_id(admin.id).unwrap().unwrap().is_active);
+        migrate_single_user(&conn).unwrap();
+        let keep: i64 = conn
+            .query_row("SELECT id FROM users WHERE is_active = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keep, 1, "最早的 admin 胜出");
+        let active: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users WHERE is_active = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(active, 1);
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1, "被停用账号的会话要清掉");
+
+        // 幂等：再跑一次不动
+        migrate_single_user(&conn).unwrap();
+        let same: i64 = conn
+            .query_row("SELECT id FROM users WHERE is_active = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(same, 1);
     }
 
     #[test]
@@ -1876,7 +1644,7 @@ mod tests {
     #[test]
     fn backup_writes_a_usable_copy_and_never_overwrites() {
         let store = temp_store("backup");
-        store.create_user("admin", "Asmoday#2026", "admin").unwrap();
+        store.create_user("admin", "Asmoday#2026").unwrap();
 
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -1911,7 +1679,7 @@ mod tests {
         let store = temp_store("session");
         assert_eq!(store.user_count().unwrap(), 0);
 
-        let user = store.create_user("admin", "Asmoday#2026", "admin").unwrap();
+        let user = store.create_user("admin", "Asmoday#2026").unwrap();
         assert_eq!(store.user_count().unwrap(), 1);
 
         let (found, hash, _) = store.find_user("admin").unwrap().unwrap();
@@ -1928,9 +1696,9 @@ mod tests {
     #[test]
     fn weak_passwords_are_rejected() {
         let store = temp_store("weak");
-        assert!(store.create_user("a", "Asmoday#2026", "user").is_err()); // 用户名太短
-        assert!(store.create_user("admin", "short", "user").is_err());
-        assert!(store.create_user("admin", "12345678", "user").is_err());
+        assert!(store.create_user("a", "Asmoday#2026").is_err()); // 用户名太短
+        assert!(store.create_user("admin", "short").is_err());
+        assert!(store.create_user("admin", "12345678").is_err());
     }
 
     #[test]
@@ -1993,9 +1761,7 @@ mod tests {
     #[test]
     fn recovery_codes_are_hashed_and_single_use() {
         let store = temp_store("recovery");
-        let user = store
-            .create_user("vfy_recovery", "Abcd1234", "user")
-            .unwrap();
+        let user = store.create_user("vfy_recovery", "Abcd1234").unwrap();
         let codes = generate_recovery_codes(10);
         assert_eq!(codes.len(), 10);
         for code in &codes {
@@ -2032,7 +1798,7 @@ mod tests {
     #[test]
     fn session_slides_but_never_past_absolute_cap() {
         let store = temp_store("session-slide");
-        let user = store.create_user("vfy_slide", "Abcd1234", "user").unwrap();
+        let user = store.create_user("vfy_slide", "Abcd1234").unwrap();
         let token = store.create_session(user.id).unwrap();
         let now = now_secs();
 
@@ -2060,67 +1826,5 @@ mod tests {
             expires <= created + SESSION_ABSOLUTE_TTL,
             "不得越过 30 天绝对上限"
         );
-    }
-
-    #[test]
-    fn user_perms_defaults_scope_and_update() {
-        let store = temp_store("user-perms");
-
-        // 新建用户：全量位 + '*' scope
-        let user = store.create_user("perm_u1", "Abcd1234", "user").unwrap();
-        assert_eq!(user.permissions, perms::ALL);
-        assert!(user.mounts_all());
-        assert!(user.can(perms::WRITE) && user.can(perms::TERMINAL));
-
-        // scope 解析：JSON 数组 → 归一化小写列表；'*' → None
-        store
-            .set_user_perms(
-                user.id,
-                perms::SEE_HIDDEN | perms::WRITE,
-                r#"["D:/Media","/docs"]"#,
-            )
-            .unwrap();
-        let user = store.user_by_id(user.id).unwrap().unwrap();
-        assert_eq!(user.allowed_mounts().unwrap(), vec!["d:/media", "/docs"]);
-        assert!(user.mount_allowed("d:/MEDIA"));
-        assert!(user.mount_allowed("D:/Media/sub/dir"));
-        assert!(!user.mount_allowed("E:/other"));
-        assert!(user.can(perms::WRITE) && !user.can(perms::DELETE));
-        assert!(!user.mounts_all());
-
-        // admin 不看位，恒全放行
-        let admin = store
-            .create_user("perm_admin", "Abcd1234", "admin")
-            .unwrap();
-        store.set_user_perms(admin.id, 0, "[]").unwrap();
-        let admin = store.user_by_id(admin.id).unwrap().unwrap();
-        assert!(admin.can(perms::DELETE) && admin.mount_allowed("anything"));
-
-        // 非法 scope 拒绝；负数位掩码钳到 0
-        assert!(store.set_user_perms(user.id, 1, "not-json").is_err());
-        assert!(store.set_user_perms(user.id, 1, r#"[""]"#).is_err());
-        store.set_user_perms(user.id, -1, "*").unwrap();
-        assert_eq!(store.user_by_id(user.id).unwrap().unwrap().permissions, 0);
-    }
-
-    #[test]
-    fn multi_user_turns_on_with_second_account() {
-        let store = temp_store("multi-user-mode");
-        // 空库不算多用户；只有一个管理员也不算
-        assert!(!store.multi_user().unwrap());
-        let admin = store.create_user("solo", "Abcd1234", "admin").unwrap();
-        assert!(!store.multi_user().unwrap());
-
-        // 建第二个账号才进多用户（哪怕它只是个普通用户）
-        let second = store.create_user("second", "Abcd1234", "user").unwrap();
-        assert!(store.multi_user().unwrap());
-
-        // 停用不等于删除：权限配置还在，界面不该退回单用户
-        store.set_user_active(second.id, false).unwrap();
-        assert!(store.multi_user().unwrap());
-
-        // 删掉后回到单用户
-        store.delete_user(second.id, admin.id).unwrap();
-        assert!(!store.multi_user().unwrap());
     }
 }

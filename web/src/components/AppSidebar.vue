@@ -9,7 +9,7 @@ import { useI18n } from 'vue-i18n'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
-import { authApi, PERM } from '../api/auth'
+import { authApi } from '../api/auth'
 
 const props = defineProps<{
   open: boolean
@@ -38,10 +38,7 @@ const groups = computed<NavGroup[]>(() => [
     items: [
       { to: '/', label: 'common.nav.portal', icon: 'home' },
       { to: '/files', label: 'common.nav.files', icon: 'folder' },
-      // 终端是权限位（v4.9.25）：无位用户不显示入口（社区通行：普通用户不给 shell）
-      ...(authApi.can(PERM.TERMINAL)
-        ? [{ to: '/terminal', label: 'common.nav.terminal', icon: 'terminal' } as NavItem]
-        : []),
+      { to: '/terminal', label: 'common.nav.terminal', icon: 'terminal' },
     ],
   },
   {

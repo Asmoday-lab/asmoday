@@ -319,7 +319,7 @@ stateDiagram-v2
 
 错误展示：**行内**（输入框下方红色小字），不用 toast。限流 429 → 底部提示条 `"请求过于频繁，请在 {seconds}s 后重试"` 倒计时。
 
-登录页同构，只有用户名 + 密码 + TOTP 输入。多用户已落地（v4.9.24）：首启只建 admin，其余账号走设置页「用户管理」。
+登录页同构，只有用户名 + 密码 + TOTP 输入。单用户模型（v4.9.28）：首启建唯一账号 admin，没有用户管理入口。
 
 #### API 契约
 
@@ -371,20 +371,14 @@ GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任�
 GWT-AUTH-09 Given 初始化完成  When 用同一令牌再 POST /api/auth/setup  Then 403（令牌一次性，成功即作废；重启后重新生成）
 GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问日志  Then 无初始化令牌、无一次性密码明文（两者只打 stdout）
 GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When 客户端连发登录失败  Then 防爆破池按「最右不可信地址」计数，伪造值换不动桶
-GWT-AUTH-12 Given admin  When POST /api/users 建 user 账号  Then 新号 must_change_password=1，首次登录被强制改密；改密后管理员无法再知道其密码（v4.9.24）
-GWT-AUTH-13 Given 普通用户 Cookie  When 访问 /api/config、/api/system/cleanup/*、/api/users  Then 一律 403 E_ADMIN_REQUIRED（AdminUser 门，v4.9.24）
-GWT-AUTH-14 Given 用户 A 与 B 各自收藏  When A 拉取 /api/media/favorites  Then 只见 A 自己的；B 的进度/收藏/令牌/分享互不可见（v4.9.24）
-GWT-AUTH-15 Given 用户 A 已登录  When A 用当前密码 POST /api/auth/username 改名  Then 改名成功、A 全部会话失效、当前浏览器补发新 Cookie 保持登录（v4.9.24）
-GWT-AUTH-16 Given 实例只有 admin 一个可用管理员  When admin 停用/降级/删除自己  Then 400 E_LAST_ADMIN 拒绝；不能删自己（v4.9.24）
-GWT-AUTH-17 Given admin 停用用户 B  When B 的现有 Cookie 访问 API  Then 401/403 被踢出；重新登录返回 403 E_ACCOUNT_DISABLED 且不泄露账号存在性（v4.9.24）
-GWT-AUTH-18 Given admin 删除用户 B  When 检查数据  Then B 的 sessions/favorites/history/tokens 级联删除，B 的 shares 置 tombstone，其他用户数据不受影响（v4.9.24）
-GWT-AUTH-19 Given 全新安装只有一个 admin  When 打开设置页  Then 用户页显示「单用户模式」说明，不展示权限位/挂载点收权；创建第二个账号后 `/api/auth/status.multi_user=true`，权限 UI 立即出现（停用不算退回，删除后回到单用户）（v4.9.27）
-GWT-PERM-01 Given 普通用户被收走 delete/share/terminal 位  When DELETE /raw、POST /shares、WS 握手  Then 一律 403 E_FORBIDDEN；WRITE/RENAME 等保留位不受影响（v4.9.25）
-GWT-PERM-02 Given 用户 scope 只含挂载点 A  When 拉 /api/files/mounts、list scope 外路径  Then 清单只有 A；scope 外 404/400（视同不存在，不泄露存在性）（v4.9.25）
-GWT-PERM-03 Given 用户无 webdav_manage 但有 webdav_read  When 密码直连 PUT /dav/...  Then 403；PROPFIND 207 正常（读写位分离）（v4.9.25）
-GWT-PERM-04 Given 归属用户被停用/删除  When 其 asm_ 令牌或密码直连访问 WebDAV  Then 立即失效（每请求重查用户行）（v4.9.25）
-GWT-PERM-05 Given admin 在设置页收权  When 该用户下一个请求到达  Then 新权限即时生效，无需重新登录（AuthUser 每请求重读用户行）（v4.9.25）
-GWT-PERM-06 Given 存量库升级到 v4.9.25  When 迁移 v17 跑完  Then 所有存量用户 permissions=511、mount_scope='*'（升级不缩权）（v4.9.25）
+GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码，must_change_password=1；登录后强制改密（v4.9.28）
+GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
+GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v18 跑完  Then 只留「启用中 id 最小的 admin」为 is_active=1，其余置 0 并清其会话；收藏/播放历史/分享/令牌数据仍在（不物理删），再次启动幂等（v4.9.28）
+GWT-USER-04 Given 历史账号已被 v18 停用  When 用它登录或用其 asm_ 令牌访问 WebDAV  Then 一律失败（find_user / user_by_id 只看 is_active=1，查不到行），不泄露「账号存在」（v4.9.28）
+GWT-USER-05 Given 唯一账号已登录  When 调用任意写接口（mkdir/上传/改名/移动/删除/分享/终端）  Then 全部放行；唯一的限制来自挂载点自身的 readonly（v4.9.28）
+GWT-USER-06 Given 唯一账号已登录  When GET /api/files/mounts  Then 返回配置里的全部挂载点（不再有 scope 过滤），文件/媒体/缩略图/搜索路径解析同口径（v4.9.28）
+GWT-USER-07 Given 配置、系统维护、备份等管理端点  When 未登录  Then 401 AUTH_REQUIRED；登录后放行（AdminUser 提取器保留名字，语义已等价于「已登录」）（v4.9.28）
+GWT-DL-08 Given 单用户模型  When 任意 aria2 客户端用 `token:<secret>` 调 addUri/addTorrent  Then 任务进入唯一队列，所有任务都归设备主人；不存在 per-user 参数或隔离（v4.9.28）
 
 #### aria2 兼容下载引擎（GWT-DL，v4.9.26）
 

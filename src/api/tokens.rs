@@ -52,44 +52,18 @@ pub struct CreateToken {
     pub mount_id: Option<String>,
 }
 
-/// 令牌校验结果：只读标记 + 挂载点范围 + 归属用户及其权限（v4.9.25）
+/// 令牌校验结果：只读标记 + 令牌自身的挂载点范围。
+///
+/// 单用户模型（v4.9.28）下不再有「归属用户的权限位 / 挂载点收权」这一层：
+/// 令牌的边界只有它自己的 `readonly` 与 `mount_scope`。
 #[derive(Debug, Clone)]
 pub struct TokenAccess {
     pub readonly: bool,
     /// `None` = 全部挂载点（令牌自身范围，mount id）
     pub mount_scope: Option<String>,
-    /// 令牌归属的用户（v4.9.24 多用户）。
-    #[allow(dead_code)] // 暂透传：审计/按用户限流时消费
+    /// 归属账号（单用户模型下恒为主账号），审计用
+    #[allow(dead_code)]
     pub user_id: i64,
-    /// 归属用户是否 admin（v4.9.25）：admin 不看位全放行
-    pub is_admin: bool,
-    /// 归属用户的权限位（v4.9.25）：WebDAV 读写位在此之上生效
-    pub permissions: i64,
-    /// 归属用户的挂载点收权（v4.9.25）：'*' 或 JSON 数组（展示路径）
-    pub user_mount_scope: String,
-}
-
-impl TokenAccess {
-    /// 权限位判定（admin 恒真）。
-    pub fn can(&self, perm: i64) -> bool {
-        self.is_admin || (self.permissions & perm) != 0
-    }
-
-    /// 挂载点展示路径是否在归属用户的 scope 内（'*' / admin 全放行）。
-    pub fn user_mount_allowed(&self, display_path: &str) -> bool {
-        if self.is_admin || self.user_mount_scope.trim() == "*" {
-            return true;
-        }
-        let needle = display_path
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_lowercase();
-        serde_json::from_str::<Vec<String>>(&self.user_mount_scope)
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.replace('\\', "/").trim_end_matches('/').to_lowercase())
-            .any(|p| !p.is_empty() && (needle == p || needle.starts_with(&format!("{p}/"))))
-    }
 }
 
 fn default_readonly() -> bool {
@@ -285,27 +259,18 @@ pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<Tok
     {
         return None;
     }
-    // 归属用户必须仍然存在且未停用（v4.9.25）：停用/删除用户的同时令牌随之失效；
-    // 用户的权限位与挂载点收权叠加在令牌自身范围之上
-    let user = store_user(state, owner_id)?;
+    // 归属账号必须仍然存在（删除/停用后令牌随之失效）
+    store_user(state, owner_id)?;
     Some(TokenAccess {
         readonly: readonly != 0,
         mount_scope,
         user_id: owner_id,
-        is_admin: user.is_admin(),
-        permissions: user.permissions,
-        user_mount_scope: user.mount_scope,
     })
 }
 
-/// 按 id 取用户（WebDAV 每请求一次；SQLite 索引查询微秒级）。停用/不存在回 None。
+/// 按 id 取账号（WebDAV 每请求一次；SQLite 索引查询微秒级）。不存在/已停用回 None。
 fn store_user(state: &AppState, user_id: i64) -> Option<crate::core::auth::User> {
-    state
-        .auth
-        .user_by_id(user_id)
-        .ok()
-        .flatten()
-        .filter(|user| user.is_active)
+    state.auth.user_by_id(user_id).ok().flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +385,7 @@ pub(crate) fn verify_admin_with(
         return None;
     }
     let (user, hash, _secret) = store.find_user(username).ok().flatten()?;
-    if user.must_change_password || user.totp_enabled || !user.is_active {
+    if user.must_change_password || user.totp_enabled {
         return None;
     }
     let key = password_cache_key(username, password);
@@ -430,9 +395,6 @@ pub(crate) fn verify_admin_with(
             readonly: false,
             mount_scope: None,
             user_id: user.id,
-            is_admin: user.is_admin(),
-            permissions: user.permissions,
-            user_mount_scope: user.mount_scope.clone(),
         });
     }
     if !crate::core::auth::verify_password(&hash, password) {
@@ -443,9 +405,6 @@ pub(crate) fn verify_admin_with(
         readonly: false,
         mount_scope: None,
         user_id: user.id,
-        is_admin: user.is_admin(),
-        permissions: user.permissions,
-        user_mount_scope: user.mount_scope,
     })
 }
 
@@ -470,7 +429,7 @@ mod tests {
     #[test]
     fn admin_password_grants_full_access_and_caches() {
         let store = temp_store("full");
-        let user = store.create_user("vfy_admin", PASS, "admin").unwrap();
+        let user = store.create_user("vfy_admin", PASS).unwrap();
         store.set_must_change_password(user.id, false).unwrap();
         let cache = PasswordCache::default();
 
@@ -489,7 +448,7 @@ mod tests {
     #[test]
     fn password_change_invalidates_cached_credentials() {
         let store = temp_store("rotate");
-        let user = store.create_user("vfy_rotate", PASS, "user").unwrap();
+        let user = store.create_user("vfy_rotate", PASS).unwrap();
         store.set_must_change_password(user.id, false).unwrap();
         let cache = PasswordCache::default();
 
@@ -503,7 +462,7 @@ mod tests {
     #[test]
     fn onetime_password_accounts_are_rejected() {
         let store = temp_store("onetime");
-        let user = store.create_user("vfy_onetime", PASS, "user").unwrap();
+        let user = store.create_user("vfy_onetime", PASS).unwrap();
         let cache = PasswordCache::default();
 
         // 创建即 must_change_password=1（v4.9.24），一次性密码改密前不许直连
@@ -518,7 +477,7 @@ mod tests {
     #[test]
     fn totp_enabled_accounts_are_rejected() {
         let store = temp_store("totp");
-        let user = store.create_user("vfy_totp", PASS, "user").unwrap();
+        let user = store.create_user("vfy_totp", PASS).unwrap();
         store.set_must_change_password(user.id, false).unwrap();
         let cache = PasswordCache::default();
 
@@ -533,7 +492,7 @@ mod tests {
     #[test]
     fn unknown_users_and_empty_passwords_fail_fast() {
         let store = temp_store("unknown");
-        store.create_user("vfy_unknown", PASS, "user").unwrap();
+        store.create_user("vfy_unknown", PASS).unwrap();
         let cache = PasswordCache::default();
 
         assert!(verify_admin_with(&store, &cache, "nobody", PASS).is_none());

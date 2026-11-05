@@ -194,14 +194,6 @@ pub async fn tus_init(
     Query(query): Query<TusInitQuery>,
     headers: HeaderMap,
 ) -> Response {
-    // 上传是写操作（v4.9.25 权限位）
-    if !user.can(crate::core::auth::perms::WRITE) {
-        return crate::api::error::api_error(
-            StatusCode::FORBIDDEN,
-            "E_FORBIDDEN",
-            "No permission to upload files",
-        );
-    }
     let length: u64 = match headers
         .get("upload-length")
         .and_then(|v| v.to_str().ok())

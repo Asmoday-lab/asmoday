@@ -3,8 +3,7 @@
     "general": "通用",
     "media": "媒体",
     "security": "安全",
-    "advanced": "高级",
-    "users": "用户管理"
+    "advanced": "高级"
   },
   "general": {
     "appearance": "外观",
@@ -196,52 +195,5 @@
     "PROXY_TRUST_SKIP_2FA": "auth.proxy_trust.skip_2fa 已开启：SSO 登录将跳过两步验证。",
     "SSL_DISABLED_WITH_HTTPS_BASE": "server.ssl.enabled=false 但 base_url 是 https 地址：请确认部署方式。",
     "RESET_PASSWORD_ENV_PRESENT": "检测到 ASMODAY_RESET_PASSWORD 环境变量：每次启动都会生效，重置完成后请移除。"
-  },
-  "users": {
-    "singleTitle": "当前为单用户模式",
-    "singleHint": "默认安装只需要一个管理员，所有能力全开，不涉及权限位与挂载点收权。创建第一个账号后自动启用多用户：可为每个账号单独分配权限位、限定可见挂载点。",
-    "create": "新建用户",
-    "createHint": "初始密码只在创建时可见；对方首次登录会被要求改密",
-    "username": "用户名",
-    "initialPassword": "初始密码",
-    "roleUser": "普通用户",
-    "roleAdmin": "管理员",
-    "createSubmit": "创建",
-    "list": "账号清单",
-    "refresh": "刷新",
-    "rename": "改名",
-    "newPassword": "新密码（代设）",
-    "resetPassword": "设为一次性密码",
-    "promote": "升为管理员",
-    "demote": "降为普通用户",
-    "disable": "停用",
-    "enable": "启用",
-    "delete": "删除",
-    "disabled": "已停用",
-    "pendingPassword": "待改密",
-    "deleteConfirm": "确定删除账号「{name}」？其收藏、播放历史、令牌将一并删除，分享转为失效。",
-    "created": "用户已创建",
-    "updated": "已更新",
-    "passwordReset": "密码已重置，对方下次登录需改密",
-    "deleted": "用户已删除",
-    "loadFailed": "读取用户失败",
-    "failed": "操作失败",
-    "perms": "权限",
-    "permAdminHint": "管理员拥有全部权限，不受权限位与挂载点范围限制",
-    "permBits": "操作权限",
-    "permMounts": "可见挂载点",
-    "permAllMounts": "全部挂载点",
-    "permSave": "保存权限",
-    "perm": {
-      "seeHidden": "查看隐藏文件",
-      "write": "新建与上传",
-      "rename": "重命名",
-      "moveCopy": "移动与复制",
-      "delete": "删除",
-      "share": "创建分享",
-      "webdavRead": "WebDAV 读取",
-      "webdavManage": "WebDAV 管理",
-      "terminal": "终端"
-    }
   }
 }

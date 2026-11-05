@@ -41,7 +41,7 @@ import {
 import { messageFromBody } from '../lib/errors'
 import { triggerDownload } from '../lib/download'
 import { sharesApi } from '../api/shares'
-import { authApi, PERM } from '../api/auth'
+
 import { THUMB_WIDTH, thumbUrl } from '../api/media'
 import { formatSize, formatTime } from '../lib/format'
 import { playerClearance } from '../lib/player-layout'
@@ -606,13 +606,15 @@ const rootsImplicit = ref(false)
 /** 当前目录所在挂载点是否只读：只读时全部变更入口置灰（设计文档 3.2.6） */
 const readonly = computed(() => listing.value?.readonly ?? false)
 // v4.9.25 权限位：无对应位的动作与只读同款置灰（后端仍会 403 兜底）
-const canWrite = computed(() => !readonly.value && authApi.can(PERM.WRITE))
-const canRename = computed(() => !readonly.value && authApi.can(PERM.RENAME))
-const canMoveCopy = computed(() => !readonly.value && authApi.can(PERM.MOVE_COPY))
-const canDelete = computed(() => !readonly.value && authApi.can(PERM.DELETE))
-const canShare = computed(() => authApi.can(PERM.SHARE))
-const canSeeHidden = computed(() => authApi.can(PERM.SEE_HIDDEN))
-const canTerminal = computed(() => authApi.can(PERM.TERMINAL))
+// 单用户模型（v4.9.28）：登录即可写，唯一的限制来自挂载点自身的 readonly。
+const canWrite = computed(() => !readonly.value)
+const canRename = computed(() => !readonly.value)
+const canMoveCopy = computed(() => !readonly.value)
+const canDelete = computed(() => !readonly.value)
+// 分享 / 隐藏文件 / 终端不再有独立权限位
+const canShare = computed(() => true)
+const canSeeHidden = computed(() => true)
+const canTerminal = computed(() => true)
 /** 在线挂载点数量：1 个时跳过卡片页直达根目录（设计文档 3.2.1） */
 const onlineMounts = computed(() => roots.value.filter((root) => root.online))
 const singleMount = computed(() => onlineMounts.value.length === 1)
