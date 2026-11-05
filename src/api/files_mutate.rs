@@ -44,7 +44,6 @@ pub const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 /// 一次性删除令牌（存内存，用后即删，重启丢失可接受）
 #[derive(Debug, Clone)]
 pub struct DeleteTicket {
-    pub user_id: i64,
     pub mount_id: String,
     pub digest: u64,
     pub expires: Instant,
@@ -586,9 +585,7 @@ pub async fn delete_token(
     }
 
     let token = crate::core::auth::random_token()[..24].to_string();
-    let user_id = 0;
     let ticket = DeleteTicket {
-        user_id,
         mount_id,
         digest: digest_paths(&body.paths),
         expires: Instant::now() + DELETE_TOKEN_TTL,
@@ -751,7 +748,6 @@ fn consume_delete_token(state: &AppState, token: &str, paths: &[String]) -> Resu
             "删除令牌与本次 paths 不匹配".to_string(),
         ));
     }
-    let _ = ticket.user_id;
     Ok(true)
 }
 

@@ -1176,7 +1176,7 @@ async fn reset_admin_password(auth: &AuthStore) -> Result<(), String> {
     let Some(user) = auth.first_user()? else {
         return Err("no user yet; run with --init first".to_string());
     };
-    auth.invalidate_sessions(user.id)?;
+    auth.invalidate_sessions()?;
 
     let env_password = std::env::var("ASMODAY_RESET_PASSWORD")
         .ok()
@@ -1226,7 +1226,7 @@ async fn reset_two_factor(auth: &AuthStore) -> Result<(), String> {
         return Err("wrong password, 2FA not reset".to_string());
     }
     auth.clear_totp(user.id)?;
-    auth.invalidate_sessions(user.id)?;
+    auth.invalidate_sessions()?;
     crate::log_info!("2FA disabled for {}", user.username);
     println!("[asmoday] 2FA disabled");
     Ok(())

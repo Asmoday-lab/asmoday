@@ -7,7 +7,6 @@ export interface AuthStatus {
   initialized: boolean
   authenticated: boolean
   username: string | null
-  user_id?: number | null
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
@@ -68,7 +67,6 @@ export const authApi = {
   busy,
   isAuthenticated: computed(() => status.value.authenticated),
   username: computed(() => status.value.username),
-  userId: computed(() => status.value.user_id ?? null),
   /**
    * 是否「设备主人」。
    *

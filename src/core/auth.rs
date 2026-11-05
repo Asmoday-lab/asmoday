@@ -24,11 +24,6 @@ pub const SESSION_TTL: i64 = 7 * 24 * 3600;
 /// 会话绝对上限：30 天（无论怎么续期都不能超过，设计文档 3.1.3）
 pub const SESSION_ABSOLUTE_TTL: i64 = 30 * 86_400;
 
-/// 会话的服务端状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionState {
-    pub user_id: i64,
-}
 /// 连续失败次数上限
 pub const MAX_ATTEMPTS: u32 = 5;
 /// 封禁时长
@@ -36,9 +31,11 @@ pub const BAN_DURATION: Duration = Duration::from_secs(15 * 60);
 
 /// 建表语句，字段与设计文档 4.1 对齐（sessions 为会话所必需，文档未列，此处补上）
 ///
-/// v4.9.24 起为**最终结构**：多用户角色（role/is_active）与按用户隔离
-/// （favorites/play_history/shares 的 user_id）一步到位。存量库由 v16 迁移补齐
-/// （按缺列判断幂等），新库在 v1 就拿到最终结构、v16 钩子空跑。
+/// v4.9.30 起为**最终结构**：单用户模型下没有任何「归属列」——`users` 只有账号本身，
+/// `favorites` / `play_history` 主键回到 `(mount_id, file_path)`，`shares` /
+/// `access_tokens` / `sessions` 不再记 owner。多用户时代（v4.9.24~v4.9.29）的
+/// `role` / `is_active` / `permissions` / `mount_scope` 与各表 `user_id` 全部移除，
+/// 存量库由迁移 v20 一次性清理（见 `collapse_multi_user_columns`）。
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -48,20 +45,11 @@ CREATE TABLE IF NOT EXISTS users (
     is_totp_enabled BOOLEAN DEFAULT 0,
     totp_recovery_codes TEXT,
     must_change_password BOOLEAN NOT NULL DEFAULT 0,
-    created_at DATETIME,
-    -- 多用户（v4.9.24）：'admin' | 'user'。管理类端点（用户/系统配置/备份）只放行 admin
-    role TEXT NOT NULL DEFAULT 'user',
-    -- 停用的用户拒绝登录，已有会话一并失效；记录保留，启用即恢复
-    is_active BOOLEAN NOT NULL DEFAULT 1,
-    -- 权限位（v4.9.25，对齐 Alist 位掩码）：admin 不看位全放行
-    permissions INTEGER NOT NULL DEFAULT 511,
-    -- 挂载点收权（v4.9.25，对齐 FileBrowser scope）：'*' = 全部；否则 JSON 数组
-    mount_scope TEXT NOT NULL DEFAULT '*'
+    created_at DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS access_tokens (
     id INTEGER PRIMARY KEY,
-    user_id INTEGER,
     token_name TEXT,
     token_hash TEXT UNIQUE,
     is_readonly BOOLEAN DEFAULT 1,
@@ -80,29 +68,24 @@ CREATE TABLE IF NOT EXISTS shares (
     allow_download BOOLEAN DEFAULT 1,
     expires_at INTEGER,
     created_at INTEGER,
-    deleted_at INTEGER,
-    -- 归属（v4.9.24）：创建者；列表/删除按归属过滤，公开访问仍按 token 匿名
-    user_id INTEGER NOT NULL DEFAULT 1
+    deleted_at INTEGER
 );
 
--- 收藏与播放历史（设计文档 4.1）：主键是 (user_id, mount_id, file_path)。
--- file_path 一直是绝对路径；mount_id 用于「按挂载点批量清理 / 分组展示」；
--- user_id 让同一份共享文件库里每个人有独立的收藏与播放进度（v4.9.24）。
+-- 收藏与播放历史（设计文档 4.1）：主键是 (mount_id, file_path)。
+-- file_path 一直是绝对路径；mount_id 用于「按挂载点批量清理 / 分组展示」。
 CREATE TABLE IF NOT EXISTS favorites (
-    user_id INTEGER NOT NULL DEFAULT 1,
     mount_id TEXT NOT NULL DEFAULT '',
     file_path TEXT NOT NULL,
     created_at INTEGER,
-    PRIMARY KEY (user_id, mount_id, file_path)
+    PRIMARY KEY (mount_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS play_history (
-    user_id INTEGER NOT NULL DEFAULT 1,
     mount_id TEXT NOT NULL DEFAULT '',
     file_path TEXT NOT NULL,
     last_played_at INTEGER,
     progress INTEGER,
-    PRIMARY KEY (user_id, mount_id, file_path)
+    PRIMARY KEY (mount_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -112,7 +95,6 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     -- v4.4.1 前的「5 分钟二次验证闸门」依据，闸门已移除；
@@ -129,10 +111,8 @@ CREATE TABLE IF NOT EXISTS thumb_hashes (
 
 /// 唯一账号（单用户模型）。
 ///
-/// v4.9.28 起 asmoday 回归单用户语义：`users` 表里只有一个账号，首启创建的管理员。
-/// 表结构中的 `role` / `is_active` / `permissions` / `mount_scope` 列**保留但不读**——
-/// 它们是多用户时代（v4.9.24 / v4.9.25）的遗留，删列会让存量库无法回滚，而单用户
-/// 模型的权限答案恒为「全部」。
+/// v4.9.28 起 asmoday 回归单用户语义，v4.9.30 把多用户遗留列一并删掉：
+/// `users` 表里只有这一行，没有角色、没有启停位、没有权限位与挂载点收权。
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
     pub id: i64,
@@ -424,175 +404,109 @@ fn migrations() -> Migrations<'static> {
         // v15：同理清掉标签缓存里的 verbatim 键。v11 是整表清空，但已经跑过 v11 的库
         // 不会重跑，只有这一条能保证「开发机中途升级」也不会留双份。
         M::up("DELETE FROM media_tags WHERE instr(path, '\\') > 0;"),
-        // v16：多用户（v4.9.24）。三件事，全部按缺列判断幂等（新库在 v1 已是最终结构）：
-        // ① users 补 role / is_active，id 最小的存量用户升为 admin；
-        // ② favorites / play_history 重建主键为 (user_id, mount_id, file_path)，
-        //    存量行归属到第一个用户（单用户时代本来也只有他一个人在用）；
-        // ③ shares 补 user_id（owner），access_tokens 的 NULL user_id 回填。
+        // v16~v19：多用户时期（v4.9.24~v4.9.29）的迁移，alpha 阶段整体作废。
+        // 留四条空占位只为对齐存量库的 user_version —— 直接删掉条目会让已经停在
+        // v19 的库被判定成「版本高于代码」而拒绝启动。真正的清理在 v20 一次做完。
+        M::up(""),
+        M::up(""),
+        M::up(""),
+        M::up(""),
+        // v20：单用户 schema 收口（v4.9.30）。alpha 阶段不再保留多用户遗留：
+        // ① 多余账号（含其会话 / 令牌 / 分享 / 收藏 / 播放历史）物理删除；
+        // ② favorites / play_history 主键去掉 user_id（主键列不能 DROP COLUMN，只能重建）；
+        // ③ users 的 role / is_active / permissions / mount_scope 与其余表的 user_id
+        //    直接 DROP COLUMN。幂等：每一步都按「列是否存在」判断。
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            migrate_multi_user(tx)?;
-            Ok(())
-        }),
-        // v17：权限位 + 挂载点收权（v4.9.25）。存量用户回填全量位 + '*' scope——
-        // 升级即保持升级前「能看到全部挂载点、能做全部动作」的现状。
-        M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            migrate_user_perms(tx)?;
-            Ok(())
-        }),
-        // v18：回归单用户（v4.9.28）。只保留一个账号（最早的 admin），其余置
-        // `is_active = 0` 并清会话——**数据不删**，回滚到多用户版本即可恢复。
-        // 权限位与挂载点收权随之退役：单用户模型下答案恒为「全部」。
-        M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            migrate_single_user(tx)?;
-            Ok(())
-        }),
-        // v19：物理删除多余账号（v4.9.29）。v18 只是「停用」——库文件里仍留着别人的
-        // 密码哈希、TOTP 密钥、收藏与分享，等于没清干净。这里把非保留账号连同其
-        // 会话 / 令牌 / 分享 / 收藏 / 播放历史一并删行（单用户模型下这些数据没有
-        // 任何归属可归，留着只是死重量）。保留账号由 v18 的同一口径选出。
-        M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            purge_extra_users(tx)?;
+            collapse_multi_user_columns(tx)?;
             Ok(())
         }),
     ])
 }
 
-/// 「唯一账号」的选取口径（v18 / v19 共用）：启用中 id 最小的 admin →
-/// 任一启用账号里 id 最小的 → 任意一行（全部被禁用过的极端情况）。
-fn single_user_keeper(conn: &Connection) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        "SELECT COALESCE(
-             (SELECT MIN(id) FROM users WHERE role = 'admin' AND is_active = 1),
-             (SELECT MIN(id) FROM users WHERE is_active = 1),
-             (SELECT MIN(id) FROM users)
-         )",
-        [],
-        |row| row.get::<_, Option<i64>>(0),
-    )
-}
-
-/// v18 钩子：把历史多账号收敛成单账号。**不要**写 BEGIN/COMMIT（已在事务里）。
+/// v20 钩子：把多用户遗留列清干净。**不要**写 BEGIN/COMMIT（已在事务里）。
 ///
-/// 保留顺序：`is_active = 1` 的 admin 里 id 最小的 → 任一启用账号里 id 最小的 →
-/// 任意一行（全部被禁用过的极端情况）。`role` 顺手改成 `admin`，让回滚到
-/// v4.9.27 时这个人仍是管理员。
-fn migrate_single_user(conn: &Connection) -> rusqlite::Result<()> {
-    let Some(keep) = single_user_keeper(conn)? else {
-        return Ok(());
+/// 这是 alpha 阶段的一次性收口，不追求回滚兼容：删列之后回到 v4.9.29 会因为
+/// schema 对不上而失败，需要删库重建——本地开发库如此，发布版不做承诺。
+fn collapse_multi_user_columns(conn: &Connection) -> rusqlite::Result<()> {
+    // ① 多余账号。老库有 is_active 时按「启用的那一行」优先，否则取 id 最小的。
+    let keep_sql = if table_has_column(conn, "users", "is_active") {
+        "SELECT COALESCE((SELECT MIN(id) FROM users WHERE is_active = 1), (SELECT MIN(id) FROM users))"
+    } else {
+        "SELECT MIN(id) FROM users"
     };
-    conn.execute(
-        "UPDATE users SET role = 'admin' WHERE id = ?1",
-        params![keep],
-    )?;
-    let deactivated = conn.execute(
-        "UPDATE users SET is_active = 0 WHERE id <> ?1 AND is_active <> 0",
-        params![keep],
-    )?;
-    if deactivated > 0 {
-        conn.execute("DELETE FROM sessions WHERE user_id <> ?1", params![keep])?;
-        eprintln!("[asmoday] 已切换为单用户模式：保留账号 #{keep}，停用其余 {deactivated} 个账号");
+    let keep: Option<i64> = conn.query_row(keep_sql, [], |row| row.get::<_, Option<i64>>(0))?;
+    if let Some(keep) = keep {
+        let mut child_rows = 0usize;
+        for table in [
+            "sessions",
+            "favorites",
+            "play_history",
+            "shares",
+            "access_tokens",
+        ] {
+            if table_has_column(conn, table, "user_id") {
+                child_rows += conn.execute(
+                    &format!("DELETE FROM {table} WHERE user_id IS NULL OR user_id <> ?1"),
+                    params![keep],
+                )?;
+            }
+        }
+        let accounts = conn.execute("DELETE FROM users WHERE id <> ?1", params![keep])?;
+        if accounts > 0 {
+            crate::log_info!(
+                "已删除 {} 个多余账号（保留 #{keep}）及其 {child_rows} 条会话/令牌/分享/收藏/播放历史",
+                accounts
+            );
+        }
     }
-    Ok(())
-}
 
-/// v19 钩子：物理删除非保留账号及其从属数据。**不要**写 BEGIN/COMMIT（已在事务里）。
-///
-/// 从属表先删、主表后删：`favorites` / `play_history` / `shares` / `access_tokens`
-/// 的 `user_id` 目前没有真正的外键约束（`foreign_keys = ON` 形同虚设），漏删就会
-/// 留下永远查不到的孤儿行。`access_tokens` 的 NULL 归属行（多用户之前的遗留）在
-/// `verify_token` 里走 `store_user(0)` 恒失效，也一并清掉。
-fn purge_extra_users(conn: &Connection) -> rusqlite::Result<()> {
-    let Some(keep) = single_user_keeper(conn)? else {
-        return Ok(());
-    };
-    let mut child_rows = 0usize;
-    for table in ["sessions", "favorites", "play_history", "shares"] {
-        child_rows += conn.execute(
-            &format!("DELETE FROM {table} WHERE user_id <> ?1"),
-            params![keep],
-        )?;
-    }
-    child_rows += conn.execute(
-        "DELETE FROM access_tokens WHERE user_id IS NULL OR user_id <> ?1",
-        params![keep],
-    )?;
-    let accounts = conn.execute("DELETE FROM users WHERE id <> ?1", params![keep])?;
-    if accounts > 0 {
-        crate::log_info!(
-            "已物理删除 {} 个多余账号（保留 #{keep}）及其 {child_rows} 条会话/令牌/分享/收藏/播放历史",
-            accounts
-        );
-    }
-    Ok(())
-}
-
-/// v17 钩子：users 补 permissions / mount_scope。**不要**写 BEGIN/COMMIT（已在事务里）。
-fn migrate_user_perms(conn: &Connection) -> rusqlite::Result<()> {
-    if !table_has_column(conn, "users", "permissions") {
+    // ② 收藏 / 播放历史：主键里的 user_id 只能靠重建表去掉。同一路径若有多行
+    //    （不同账号各存一份），按时间取最新那条——单用户下本来就是同一个人的进度。
+    if table_has_column(conn, "favorites", "user_id") {
         conn.execute_batch(
-            "ALTER TABLE users ADD COLUMN permissions INTEGER NOT NULL DEFAULT 511;
-             ALTER TABLE users ADD COLUMN mount_scope TEXT NOT NULL DEFAULT '*';",
-        )?;
-    }
-    Ok(())
-}
-
-/// v16 钩子：见上面迁移注释。**不要**在这里写 `BEGIN`/`COMMIT`——迁移本身跑在事务里。
-fn migrate_multi_user(conn: &Connection) -> rusqlite::Result<()> {
-    // ① users 角色 + 启停
-    if !table_has_column(conn, "users", "role") {
-        conn.execute_batch(
-            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
-             ALTER TABLE users ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1;
-             UPDATE users SET role = 'admin' WHERE id = (SELECT MIN(id) FROM users);",
-        )?;
-    }
-    // ② 收藏 / 播放历史：主键加 user_id，需重建表
-    let owner = "(SELECT COALESCE(MIN(id), 1) FROM users)";
-    if !table_has_column(conn, "favorites", "user_id") {
-        conn.execute_batch(&format!(
-            "CREATE TABLE favorites_v17 (
-                 user_id INTEGER NOT NULL DEFAULT 1,
+            "CREATE TABLE favorites_v20 (
                  mount_id TEXT NOT NULL DEFAULT '',
                  file_path TEXT NOT NULL,
                  created_at INTEGER,
-                 PRIMARY KEY (user_id, mount_id, file_path)
+                 PRIMARY KEY (mount_id, file_path)
              );
-             INSERT OR IGNORE INTO favorites_v17 (user_id, mount_id, file_path, created_at)
-                 SELECT {owner}, mount_id, file_path, created_at FROM favorites;
+             INSERT OR REPLACE INTO favorites_v20 (mount_id, file_path, created_at)
+                 SELECT mount_id, file_path, created_at FROM favorites ORDER BY created_at;
              DROP TABLE favorites;
-             ALTER TABLE favorites_v17 RENAME TO favorites;"
-        ))?;
+             ALTER TABLE favorites_v20 RENAME TO favorites;",
+        )?;
     }
-    if !table_has_column(conn, "play_history", "user_id") {
-        conn.execute_batch(&format!(
-            "CREATE TABLE play_history_v17 (
-                 user_id INTEGER NOT NULL DEFAULT 1,
+    if table_has_column(conn, "play_history", "user_id") {
+        conn.execute_batch(
+            "CREATE TABLE play_history_v20 (
                  mount_id TEXT NOT NULL DEFAULT '',
                  file_path TEXT NOT NULL,
                  last_played_at INTEGER,
                  progress INTEGER,
-                 PRIMARY KEY (user_id, mount_id, file_path)
+                 PRIMARY KEY (mount_id, file_path)
              );
-             INSERT OR IGNORE INTO play_history_v17 (user_id, mount_id, file_path, last_played_at, progress)
-                 SELECT {owner}, mount_id, file_path, last_played_at, progress FROM play_history;
+             INSERT OR REPLACE INTO play_history_v20
+                 (mount_id, file_path, last_played_at, progress)
+                 SELECT mount_id, file_path, last_played_at, progress
+                 FROM play_history ORDER BY last_played_at;
              DROP TABLE play_history;
-             ALTER TABLE play_history_v17 RENAME TO play_history;"
-        ))?;
-    }
-    // ③ 分享归属 + 令牌归属
-    if !table_has_column(conn, "shares", "user_id") {
-        conn.execute_batch(&format!(
-            "ALTER TABLE shares ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1;
-             UPDATE shares SET user_id = {owner} WHERE user_id IS NULL OR user_id = 0;"
-        ))?;
-    }
-    if table_has_column(conn, "access_tokens", "user_id") {
-        conn.execute(
-            "UPDATE access_tokens SET user_id = (SELECT COALESCE(MIN(id), 1) FROM users)
-             WHERE user_id IS NULL",
-            [],
+             ALTER TABLE play_history_v20 RENAME TO play_history;",
         )?;
+    }
+
+    // ③ 其余遗留列
+    for (table, column) in [
+        ("sessions", "user_id"),
+        ("shares", "user_id"),
+        ("access_tokens", "user_id"),
+        ("users", "role"),
+        ("users", "is_active"),
+        ("users", "permissions"),
+        ("users", "mount_scope"),
+    ] {
+        if table_has_column(conn, table, column) {
+            conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
+        }
     }
     Ok(())
 }
@@ -773,10 +687,13 @@ impl AuthStore {
         Ok(())
     }
 
-    /// 作废该用户的全部会话（改密 / 重置 / 关闭 2FA 后必须调用）
-    pub fn invalidate_sessions(&self, user_id: i64) -> Result<(), String> {
+    /// 作废全部会话（改密 / 重置 / 关闭 2FA 后必须调用）。
+    ///
+    /// 单用户模型下没有「只作废某一个账号的会话」这回事：库里只有一个账号，
+    /// 会话表也不记 owner。
+    pub fn invalidate_sessions(&self) -> Result<(), String> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])
+        conn.execute("DELETE FROM sessions", [])
             .map_err(|e| format!("作废会话失败：{e}"))?;
         Ok(())
     }
@@ -941,8 +858,7 @@ impl AuthStore {
 
     /// 创建唯一账号（首启自动引导 / `--init` / `--reset-password` 共用）。
     ///
-    /// 单用户模型下没有角色可挑：建出来的就是管理员。`role` 列仍写 `'admin'`，
-    /// 只为「回滚到多用户版本」时身份不丢。初始密码经由控制台传递，
+    /// 单用户模型下没有角色可挑：建出来的就是设备主人。初始密码经由控制台传递，
     /// 登录后强制换掉（`must_change_password = 1`）。
     pub fn create_user(&self, username: &str, password: &str) -> Result<User, String> {
         let username = username.trim();
@@ -954,9 +870,8 @@ impl AuthStore {
         let hash = hash_password(password)?;
         let conn = self.connect()?;
         conn.execute(
-            "INSERT INTO users (username, password_hash, created_at, role, is_active,
-                                must_change_password)
-             VALUES (?1, ?2, ?3, 'admin', 1, 1)",
+            "INSERT INTO users (username, password_hash, created_at, must_change_password)
+             VALUES (?1, ?2, ?3, 1)",
             params![username, hash, now_secs()],
         )
         .map_err(|e| {
@@ -975,8 +890,7 @@ impl AuthStore {
         })
     }
 
-    /// 按用户名查账号（登录用）。`is_active = 1` 是单用户模型的收敛条件：
-    /// v18 迁移把历史多账号的其余人置 0（v19 起直接删行），他们查不到、登不进。
+    /// 按用户名查账号（登录用）。库里只有一行（3.9），命中即登录者。
     pub fn find_user(
         &self,
         username: &str,
@@ -984,7 +898,7 @@ impl AuthStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password
-             FROM users WHERE username = ?1 AND is_active = 1",
+             FROM users WHERE username = ?1",
             params![username],
             |row| {
                 Ok((
@@ -1007,7 +921,7 @@ impl AuthStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, username, is_totp_enabled, must_change_password
-             FROM users WHERE is_active = 1 ORDER BY id LIMIT 1",
+             FROM users ORDER BY id LIMIT 1",
             [],
             |row| {
                 Ok(User {
@@ -1026,7 +940,7 @@ impl AuthStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, username, is_totp_enabled, must_change_password
-             FROM users WHERE id = ?1 AND is_active = 1",
+             FROM users WHERE id = ?1",
             params![id],
             |row| {
                 Ok(User {
@@ -1073,7 +987,7 @@ impl AuthStore {
         )
         .map_err(|e| format!("更新密码失败：{e}"))?;
         // 改密后强制所有会话失效
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
+        conn.execute("DELETE FROM sessions", [])
             .map_err(|e| format!("清理会话失败：{e}"))?;
         Ok(())
     }
@@ -1178,20 +1092,20 @@ impl AuthStore {
         .map_err(|e| format!("查询 TOTP 失败：{e}"))
     }
 
-    pub fn create_session(&self, user_id: i64) -> Result<String, String> {
+    /// 创建会话（单用户：会话表不记 owner）。
+    pub fn create_session(&self) -> Result<String, String> {
         let token = crate::core::auth::random_token();
         let conn = self.connect()?;
         let now = now_secs();
         conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_digest(&token), user_id, now, now + SESSION_TTL],
+            "INSERT INTO sessions (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            params![session_digest(&token), now, now + SESSION_TTL],
         )
         .map_err(|e| format!("创建会话失败：{e}"))?;
         Ok(token)
     }
 
-    /// 会话状态（user_id）。
+    /// 会话是否仍然有效。
     ///
     /// 滑动续期（设计文档 3.1.3）：剩余不足半个 TTL 时把过期时间往后推，
     /// 但**不超过** `created_at + SESSION_ABSOLUTE_TTL`（绝对上限 30 天）。
@@ -1199,21 +1113,21 @@ impl AuthStore {
     ///
     /// 入库的 token 是 SHA-256 摘要（见 `session_digest`）：查库 / 删库 /
     /// 续期全部按摘要走，明文只存在于浏览器 Cookie 里。
-    pub fn session_state(&self, token: &str) -> Result<Option<SessionState>, String> {
+    pub fn session_active(&self, token: &str) -> Result<bool, String> {
         let conn = self.connect()?;
         let digest = session_digest(token);
-        let row: Option<(i64, i64, i64)> = conn
+        let row: Option<(i64, i64)> = conn
             .query_row(
-                "SELECT user_id, expires_at, created_at FROM sessions WHERE token = ?1",
+                "SELECT expires_at, created_at FROM sessions WHERE token = ?1",
                 params![digest],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| format!("查询会话失败：{e}"))?;
 
         let now = now_secs();
         match row {
-            Some((user_id, expires_at, created_at)) if expires_at > now => {
+            Some((expires_at, created_at)) if expires_at > now => {
                 if expires_at - now <= SESSION_TTL / 2 {
                     let ceiling = created_at.saturating_add(SESSION_ABSOLUTE_TTL);
                     let renewed = (now + SESSION_TTL).min(ceiling);
@@ -1224,19 +1138,14 @@ impl AuthStore {
                         );
                     }
                 }
-                Ok(Some(SessionState { user_id }))
+                Ok(true)
             }
             Some(_) => {
                 let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![digest]);
-                Ok(None)
+                Ok(false)
             }
-            None => Ok(None),
+            None => Ok(false),
         }
-    }
-
-    /// 返回 user_id —— 过期会话视为无效并顺手清理（`session_state` 的薄包装）
-    pub fn session_user(&self, token: &str) -> Result<Option<i64>, String> {
-        Ok(self.session_state(token)?.map(|state| state.user_id))
     }
 
     pub fn delete_session(&self, token: &str) -> Result<(), String> {
@@ -1530,120 +1439,119 @@ mod tests {
     }
 
     #[test]
-    fn deactivated_accounts_are_invisible_to_login_and_session_lookup() {
-        let store = temp_store("disabled");
-        let keeper = store.create_user("boss", "Asmoday#2026").unwrap();
-        // 模拟「升级前就存在第二个账号」：v18 把它置 is_active=0 之后，
-        // find_user / user_by_id 都查不到，等于不存在
-        let conn = store.connect().unwrap();
-        conn.execute(
-            "INSERT INTO users (username, password_hash, created_at, role, is_active)
-             VALUES ('ghost', 'x', 0, 'user', 0)",
-            [],
+    fn migration_collapses_legacy_multi_user_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        // v4.9.29 的库形态：users 带 4 个遗留列，各业务表带 user_id
+        conn.execute_batch(
+            "CREATE TABLE users (
+                 id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT,
+                 must_change_password BOOLEAN NOT NULL DEFAULT 0,
+                 role TEXT NOT NULL DEFAULT 'user',
+                 is_active BOOLEAN NOT NULL DEFAULT 1,
+                 permissions INTEGER NOT NULL DEFAULT 511,
+                 mount_scope TEXT NOT NULL DEFAULT '*'
+             );
+             CREATE TABLE sessions (
+                 token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                 verified_at INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE favorites (
+                 user_id INTEGER NOT NULL DEFAULT 1, mount_id TEXT NOT NULL DEFAULT '',
+                 file_path TEXT NOT NULL, created_at INTEGER,
+                 PRIMARY KEY (user_id, mount_id, file_path)
+             );
+             CREATE TABLE play_history (
+                 user_id INTEGER NOT NULL DEFAULT 1, mount_id TEXT NOT NULL DEFAULT '',
+                 file_path TEXT NOT NULL, last_played_at INTEGER, progress INTEGER,
+                 PRIMARY KEY (user_id, mount_id, file_path)
+             );
+             CREATE TABLE shares (
+                 token TEXT PRIMARY KEY, file_path TEXT NOT NULL, is_folder BOOLEAN NOT NULL,
+                 password_hash TEXT, allow_download BOOLEAN DEFAULT 1,
+                 expires_at INTEGER, created_at INTEGER, deleted_at INTEGER,
+                 user_id INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE access_tokens (
+                 id INTEGER PRIMARY KEY, user_id INTEGER, token_name TEXT,
+                 token_hash TEXT UNIQUE, is_readonly BOOLEAN DEFAULT 1,
+                 expires_at DATETIME, created_at DATETIME, mount_scope TEXT
+             );
+             INSERT INTO users (username, password_hash, role, is_active)
+                 VALUES ('old', 'x', 'user', 0), ('boss', 'x', 'admin', 1),
+                        ('boss2', 'x', 'admin', 1);
+             INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('s-old', 1, 0, 9999999999), ('s-boss', 2, 0, 9999999999);
+             INSERT INTO favorites (user_id, mount_id, file_path, created_at)
+                 VALUES (1, 'nas', '/m/a.mp4', 1), (2, 'nas', '/m/a.mp4', 9),
+                        (2, 'nas', '/m/b.mp4', 5);
+             INSERT INTO play_history (user_id, mount_id, file_path, last_played_at, progress)
+                 VALUES (2, 'nas', '/m/a.mp4', 7, 70), (3, 'nas', '/m/c.mp4', 2, 20);
+             INSERT INTO shares (token, file_path, is_folder, user_id)
+                 VALUES ('s1', '/m/a.mp4', 0, 1), ('s2', '/m/c.mp4', 0, 2);
+             INSERT INTO access_tokens (user_id, token_name, token_hash, is_readonly)
+                 VALUES (2, 'dav', 'h1', 0), (3, 'other', 'h2', 0);",
         )
         .unwrap();
-        drop(conn);
-        assert!(store.find_user("ghost").unwrap().is_none());
-        assert!(store.user_by_id(2).unwrap().is_none());
-        assert_eq!(store.first_user().unwrap().unwrap().id, keeper.id);
-    }
 
-    #[test]
-    fn migration_folds_extra_accounts_into_the_oldest_admin() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!(
-            "{SCHEMA}
-             INSERT INTO users (username, password_hash, created_at, role, is_active)
-                 VALUES ('boss', 'x', 0, 'admin', 1),
-                        ('member', 'x', 0, 'user', 1),
-                        ('boss2', 'x', 0, 'admin', 1);
-             INSERT INTO sessions (token, user_id, created_at, expires_at)
-                 VALUES ('t1', 1, 0, 9999999999), ('t2', 2, 0, 9999999999);"
-        ))
-        .unwrap();
+        collapse_multi_user_columns(&conn).unwrap();
 
-        migrate_single_user(&conn).unwrap();
-        let keep: i64 = conn
-            .query_row("SELECT id FROM users WHERE is_active = 1", [], |r| r.get(0))
+        // ① 账号只剩「启用中 id 最小的那个」（id 2）
+        let users: Vec<i64> = conn
+            .prepare("SELECT id FROM users ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(keep, 1, "最早的 admin 胜出");
-        let active: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users WHERE is_active = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(active, 1);
-        let sessions: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(sessions, 1, "被停用账号的会话要清掉");
+        assert_eq!(users, vec![2]);
 
-        // 幂等：再跑一次不动
-        migrate_single_user(&conn).unwrap();
-        let same: i64 = conn
-            .query_row("SELECT id FROM users WHERE is_active = 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(same, 1);
-    }
+        // ② 从属数据只留保留账号的
+        for table in ["sessions", "shares", "access_tokens"] {
+            assert!(
+                !table_has_column(&conn, table, "user_id"),
+                "{table}.user_id 必须被删掉"
+            );
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1, "{table} 只剩保留账号的行");
+        }
+        for (table, column) in [
+            ("users", "role"),
+            ("users", "is_active"),
+            ("users", "permissions"),
+            ("users", "mount_scope"),
+        ] {
+            assert!(
+                !table_has_column(&conn, table, column),
+                "{table}.{column} 必须被删掉"
+            );
+        }
 
-    #[test]
-    fn migration_purges_extra_accounts_and_their_rows() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!(
-            "{SCHEMA}
-             INSERT INTO users (username, password_hash, created_at, role, is_active)
-                 VALUES ('boss', 'x', 0, 'admin', 1),
-                        ('member', 'x', 0, 'user', 1),
-                        ('boss2', 'x', 0, 'admin', 1);
-             INSERT INTO sessions (token, user_id, created_at, expires_at)
-                 VALUES ('t1', 1, 0, 9999999999), ('t2', 2, 0, 9999999999);
-             INSERT INTO favorites (user_id, mount_id, file_path, created_at)
-                 VALUES (1, 'nas', '/m/a.mp4', 1), (2, 'nas', '/m/b.mp4', 2);
-             INSERT INTO play_history (user_id, mount_id, file_path, last_played_at, progress)
-                 VALUES (1, 'nas', '/m/a.mp4', 1, 10), (3, 'nas', '/m/c.mp4', 2, 20);
-             INSERT INTO shares (token, file_path, is_folder, user_id)
-                 VALUES ('s1', '/m/a.mp4', 0, 1), ('s2', '/m/c.mp4', 0, 3);
-             INSERT INTO access_tokens (user_id, token_name, token_hash, is_readonly)
-                 VALUES (1, 'dav', 'h1', 1), (2, 'old', 'h2', 1), (NULL, 'legacy', 'h3', 1);"
-        ))
-        .unwrap();
-
-        // v18 先收敛（停用 + 清会话），v19 再物理删除——与真实升级顺序一致
-        migrate_single_user(&conn).unwrap();
-        purge_extra_users(&conn).unwrap();
-
-        let users: Vec<(i64, String)> = conn
-            .prepare("SELECT id, username FROM users ORDER BY id")
+        // ③ 收藏 / 播放历史主键回到 (mount_id, file_path)，重复路径取最新一条
+        assert!(!table_has_column(&conn, "favorites", "user_id"));
+        assert!(!table_has_column(&conn, "play_history", "user_id"));
+        let favorites: Vec<(String, i64)> = conn
+            .prepare("SELECT file_path, created_at FROM favorites ORDER BY file_path")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(users, vec![(1, "boss".to_string())], "只留最早的 admin");
+        assert_eq!(
+            favorites,
+            vec![("/m/a.mp4".to_string(), 9), ("/m/b.mp4".to_string(), 5)]
+        );
+        let (path, progress): (String, i64) = conn
+            .query_row("SELECT file_path, progress FROM play_history", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((path.as_str(), progress), ("/m/a.mp4", 70));
 
-        for table in [
-            "sessions",
-            "favorites",
-            "play_history",
-            "shares",
-            "access_tokens",
-        ] {
-            let total: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(total, 1, "{table} 里只剩保留账号的行");
-            let foreign: i64 = conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE user_id IS NULL OR user_id <> 1"),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(foreign, 0, "{table} 不应留下孤儿行");
-        }
-
-        // 幂等：再跑一次什么都不变
-        purge_extra_users(&conn).unwrap();
+        // ④ 幂等：再跑一次什么都不变
+        collapse_multi_user_columns(&conn).unwrap();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .unwrap();
@@ -1791,11 +1699,11 @@ mod tests {
         assert_eq!(found.id, user.id);
         assert!(verify_password(&hash, "Asmoday#2026"));
 
-        let token = store.create_session(user.id).unwrap();
-        assert_eq!(store.session_user(&token).unwrap(), Some(user.id));
+        let token = store.create_session().unwrap();
+        assert!(store.session_active(&token).unwrap());
 
         store.delete_session(&token).unwrap();
-        assert_eq!(store.session_user(&token).unwrap(), None);
+        assert!(!store.session_active(&token).unwrap());
     }
 
     #[test]
@@ -1903,8 +1811,8 @@ mod tests {
     #[test]
     fn session_slides_but_never_past_absolute_cap() {
         let store = temp_store("session-slide");
-        let user = store.create_user("vfy_slide", "Abcd1234").unwrap();
-        let token = store.create_session(user.id).unwrap();
+        store.create_user("vfy_slide", "Abcd1234").unwrap();
+        let token = store.create_session().unwrap();
         let now = now_secs();
 
         // 29 天前创建、60 秒后过期：应被续期，但顶上绝对上限（created_at + 30 天）
@@ -1916,7 +1824,7 @@ mod tests {
                 params![now - 29 * 86_400, now + 60, session_digest(&token)],
             )
             .unwrap();
-        assert!(store.session_user(&token).unwrap().is_some());
+        assert!(store.session_active(&token).unwrap());
         let (created, expires): (i64, i64) = store
             .connect()
             .unwrap()

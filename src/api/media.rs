@@ -2486,10 +2486,10 @@ pub struct FavoriteBody {
     pub favorite: bool,
 }
 
-/// POST /api/media/progress：记录/刷新播放进度（按当前用户隔离）
+/// POST /api/media/progress：记录/刷新播放进度
 pub async fn progress(
     State(state): State<AppState>,
-    user: crate::api::auth::AuthUser,
+    _user: crate::api::auth::AuthUser,
     Json(body): Json<ProgressBody>,
 ) -> Response {
     let roots = roots_for(&state).await;
@@ -2507,17 +2507,11 @@ pub async fn progress(
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
         let conn = state_for_write.auth_connection()?;
         conn.execute(
-            "INSERT INTO play_history (user_id, mount_id, file_path, last_played_at, progress)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(user_id, mount_id, file_path)
-             DO UPDATE SET last_played_at = ?4, progress = ?5",
-            rusqlite::params![
-                user.id,
-                mount_id,
-                display,
-                crate::core::auth::now_secs(),
-                progress
-            ],
+            "INSERT INTO play_history (mount_id, file_path, last_played_at, progress)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mount_id, file_path)
+             DO UPDATE SET last_played_at = ?3, progress = ?4",
+            rusqlite::params![mount_id, display, crate::core::auth::now_secs(), progress],
         )
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -2530,20 +2524,20 @@ pub async fn progress(
     }
 }
 
-/// GET /api/media/history：播放历史（最近 200 条，按当前用户隔离）
-pub async fn history(State(state): State<AppState>, user: crate::api::auth::AuthUser) -> Response {
+/// GET /api/media/history：播放历史（最近 200 条）
+pub async fn history(State(state): State<AppState>, _user: crate::api::auth::AuthUser) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return fs_error(FsError::Io(err)),
     };
     let mut statement = match conn.prepare(
         "SELECT mount_id, file_path, last_played_at, progress FROM play_history
-         WHERE user_id = ?1 ORDER BY last_played_at DESC LIMIT 200",
+         ORDER BY last_played_at DESC LIMIT 200",
     ) {
         Ok(statement) => statement,
         Err(err) => return fs_error(FsError::Io(format!("查询播放历史失败：{err}"))),
     };
-    let rows = statement.query_map([user.id], |row| {
+    let rows = statement.query_map([], |row| {
         Ok(json!({
             "mount_id": row.get::<_, String>(0)?,
             "path": row.get::<_, String>(1)?,
@@ -2558,10 +2552,10 @@ pub async fn history(State(state): State<AppState>, user: crate::api::auth::Auth
     }
 }
 
-/// POST /api/media/favorite：收藏 / 取消收藏（按当前用户隔离）
+/// POST /api/media/favorite：收藏 / 取消收藏
 pub async fn favorite(
     State(state): State<AppState>,
-    user: crate::api::auth::AuthUser,
+    _user: crate::api::auth::AuthUser,
     Json(body): Json<FavoriteBody>,
 ) -> Response {
     let roots = roots_for(&state).await;
@@ -2579,16 +2573,16 @@ pub async fn favorite(
         let conn = state_for_write.auth_connection()?;
         if favorite {
             conn.execute(
-                "INSERT OR IGNORE INTO favorites (user_id, mount_id, file_path, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![user.id, mount_id, display, crate::core::auth::now_secs()],
+                "INSERT OR IGNORE INTO favorites (mount_id, file_path, created_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![mount_id, display, crate::core::auth::now_secs()],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
         } else {
             conn.execute(
-                "DELETE FROM favorites WHERE user_id = ?1 AND mount_id = ?2 AND file_path = ?3",
-                rusqlite::params![user.id, mount_id, display],
+                "DELETE FROM favorites WHERE mount_id = ?1 AND file_path = ?2",
+                rusqlite::params![mount_id, display],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -2602,23 +2596,22 @@ pub async fn favorite(
     }
 }
 
-/// GET /api/media/favorites：收藏清单（按当前用户隔离）
+/// GET /api/media/favorites：收藏清单
 pub async fn favorites(
     State(state): State<AppState>,
-    user: crate::api::auth::AuthUser,
+    _user: crate::api::auth::AuthUser,
 ) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return fs_error(FsError::Io(err)),
     };
-    let mut statement = match conn.prepare(
-        "SELECT mount_id, file_path, created_at FROM favorites
-             WHERE user_id = ?1 ORDER BY created_at DESC",
-    ) {
+    let mut statement = match conn
+        .prepare("SELECT mount_id, file_path, created_at FROM favorites ORDER BY created_at DESC")
+    {
         Ok(statement) => statement,
         Err(err) => return fs_error(FsError::Io(format!("查询收藏失败：{err}"))),
     };
-    let rows = statement.query_map([user.id], |row| {
+    let rows = statement.query_map([], |row| {
         Ok(json!({
             "mount_id": row.get::<_, String>(0)?,
             "path": row.get::<_, String>(1)?,

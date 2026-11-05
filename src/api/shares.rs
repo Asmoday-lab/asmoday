@@ -61,10 +61,10 @@ pub struct ShareAuth {
     pub download: Option<u8>,
 }
 
-/// POST /api/shares（归属当前用户）
+/// POST /api/shares
 pub async fn create(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Json(body): Json<CreateShare>,
 ) -> Response {
     // 路径必须落在某个挂载点内（挂载点外的路径不提供分享）
@@ -121,10 +121,9 @@ pub async fn create(
     };
 
     let result = conn.execute(
-        "INSERT INTO shares (token, file_path, is_folder, password_hash, allow_download, expires_at, created_at, user_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO shares (token, file_path, is_folder, password_hash, allow_download, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
-            user.id,
             token,
             fs::normalize_display(&target),
             if is_folder { 1 } else { 0 },

@@ -542,8 +542,8 @@ pub async fn require_auth(
     let mut via_cookie = false;
 
     if let Some(token) = cookie_token(request.headers()) {
-        match state.auth.session_state(&token) {
-            Ok(Some(session)) => match state.auth.user_by_id(session.user_id) {
+        match state.auth.session_active(&token) {
+            Ok(true) => match state.auth.first_user() {
                 Ok(Some(user)) => {
                     auth_user = Some(AuthUser {
                         id: user.id,
@@ -560,7 +560,7 @@ pub async fn require_auth(
                     );
                 }
             },
-            Ok(None) => {
+            Ok(false) => {
                 // 会话过期：继续尝试代理信任，失败再报错
             }
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -585,7 +585,7 @@ pub async fn require_auth(
     }
 
     // 滑动续期（设计文档 3.1.3）：Cookie 的 Max-Age 跟着每次请求往后刷，
-    // 服务端 expires_at 由 `session_user` 在临近过期时才写库。
+    // 服务端 expires_at 由 `session_active` 在临近过期时才写库。
     let refreshed_cookie = if via_cookie {
         match cookie_token(request.headers()) {
             Some(token) => {
@@ -672,23 +672,20 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut username: Option<String> = None;
     let mut totp_enabled = false;
     let mut must_change_password = false;
-    let mut uid: Option<i64> = None;
 
     if let Some(token) = cookie_token(&headers)
-        && let Ok(Some(session_user)) = state.auth.session_user(&token)
-        && let Ok(Some(user)) = state.auth.user_by_id(session_user)
+        && let Ok(true) = state.auth.session_active(&token)
+        && let Ok(Some(user)) = state.auth.first_user()
     {
         totp_enabled = user.totp_enabled;
         must_change_password = user.must_change_password;
         username = Some(user.username);
-        uid = Some(user.id);
     }
 
     Json(json!({
         "initialized": initialized,
         "authenticated": username.is_some(),
         "username": username,
-        "user_id": uid,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
         "version": env!("CARGO_PKG_VERSION"),
@@ -799,7 +796,7 @@ pub async fn login(
     clear_login_failures(&state.login_guard, &keys);
     let _ = state.auth.purge_expired();
 
-    let token = match state.auth.create_session(user.id) {
+    let token = match state.auth.create_session() {
         Ok(token) => token,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -894,7 +891,7 @@ pub async fn change_password(
     }
 
     // 改密会清空所有会话，这里给当前浏览器补一个新的
-    let token = match state.auth.create_session(user.id) {
+    let token = match state.auth.create_session() {
         Ok(token) => token,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -956,7 +953,7 @@ pub async fn change_username(
     }
 
     // 改名让旧身份 everywhere 失效，当前浏览器补一个新的（含新用户名的会话）
-    let token = match state.auth.create_session(user.id) {
+    let token = match state.auth.create_session() {
         Ok(token) => token,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
