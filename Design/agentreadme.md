@@ -373,8 +373,9 @@ GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问�
 GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When 客户端连发登录失败  Then 防爆破池按「最右不可信地址」计数，伪造值换不动桶
 GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码，must_change_password=1；登录后强制改密（v4.9.28）
 GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
-GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v18 跑完  Then 只留「启用中 id 最小的 admin」为 is_active=1，其余置 0 并清其会话；收藏/播放历史/分享/令牌数据仍在（不物理删），再次启动幂等（v4.9.28）
-GWT-USER-04 Given 历史账号已被 v18 停用  When 用它登录或用其 asm_ 令牌访问 WebDAV  Then 一律失败（find_user / user_by_id 只看 is_active=1，查不到行），不泄露「账号存在」（v4.9.28）
+GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v18 + v19 跑完  Then 只留「启用中 id 最小的 admin」，其余账号从 users 表物理删除，其 sessions / favorites / play_history / shares / access_tokens 一并删掉（含 user_id 为 NULL 的遗留令牌）；再次启动幂等（v4.9.29）
+GWT-USER-04 Given 库中仍有被停用的历史账号（v18 之后、v19 之前的状态或手工插入）  When 用它登录或用其 asm_ 令牌访问 WebDAV  Then 一律失败（find_user / user_by_id 只看 is_active=1，查不到行），不泄露「账号存在」（v4.9.28）
+GWT-USER-08 Given 升级删除了多余账号  When 检查数据目录  Then `<data>/terminal_history/u<id>`（id ≠ 保留账号）目录被移除，其余非 `u<数字>` 目录不受影响；日志同时打印删除的账号数与行数（v4.9.29）
 GWT-USER-05 Given 唯一账号已登录  When 调用任意写接口（mkdir/上传/改名/移动/删除/分享/终端）  Then 全部放行；唯一的限制来自挂载点自身的 readonly（v4.9.28）
 GWT-USER-06 Given 唯一账号已登录  When GET /api/files/mounts  Then 返回配置里的全部挂载点（不再有 scope 过滤），文件/媒体/缩略图/搜索路径解析同口径（v4.9.28）
 GWT-USER-07 Given 配置、系统维护、备份等管理端点  When 未登录  Then 401 AUTH_REQUIRED；登录后放行（AdminUser 提取器保留名字，语义已等价于「已登录」）（v4.9.28）

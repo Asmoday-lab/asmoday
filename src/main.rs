@@ -300,6 +300,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         auth.describe()
     );
 
+    // 物理删除多余账号（迁移 v19）之后，终端历史目录 `terminal_history/u<id>` 也要
+    // 跟着清掉，否则被删账号的 shell 历史会一直躺在 data 目录里（v4.9.29）
+    if let Ok(Some(owner)) = auth.first_user() {
+        let removed = core::terminal::purge_orphan_history(&data_dir, owner.id);
+        if removed > 0 {
+            crate::log_info!("purged {removed} terminal history dirs of removed accounts");
+        }
+    }
+
     // 启动时清理 30 天前的分享 tombstone（设计文档 4.1：不引入常驻定时任务）
     match auth.purge_share_tombstones(core::auth::now_secs()) {
         Ok(0) => {}

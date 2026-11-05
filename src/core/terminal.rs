@@ -102,6 +102,36 @@ pub fn prepare_env(data_dir: &Path, user_id: i64) -> TerminalEnv {
     }
 }
 
+/// 删掉不再对应任何账号的终端历史目录（v4.9.29）。
+///
+/// 目录名固定是 `u<id>`（见 `prepare_env`）。只处理 `terminal_history` **下一层**
+/// 的 `u<数字>`，其余名字一律不碰——这个目录里也可能有用户自己放的东西。
+/// 只用于「账号已被物理删除」的场景，返回删掉的目录数。
+pub fn purge_orphan_history(data_dir: &Path, keep: i64) -> usize {
+    let root = absolutize(data_dir).join("terminal_history");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name
+            .strip_prefix('u')
+            .and_then(|rest| rest.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if id == keep || !entry.path().is_dir() {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// 目标平台标识（前端据此决定是否显示「修复乱码」按钮）
 pub const fn platform() -> &'static str {
     if cfg!(windows) { "windows" } else { "unix" }
@@ -912,6 +942,32 @@ mod tests {
         );
         // 绝不指向系统 PSReadLine 历史目录（受限令牌下必失败）
         assert!(!normalized.to_lowercase().contains("powershell/psreadline"));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn orphan_history_dirs_of_removed_accounts_are_purged() {
+        let temp = std::env::temp_dir().join("asmoday-term-purge-test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("terminal_history/u1")).unwrap();
+        std::fs::create_dir_all(temp.join("terminal_history/u7")).unwrap();
+        std::fs::create_dir_all(temp.join("terminal_history/notes")).unwrap();
+
+        assert_eq!(purge_orphan_history(&temp, 1), 1);
+        assert!(
+            temp.join("terminal_history/u1").is_dir(),
+            "保留账号的目录不动"
+        );
+        assert!(
+            !temp.join("terminal_history/u7").is_dir(),
+            "被删账号的目录要清掉"
+        );
+        assert!(
+            temp.join("terminal_history/notes").is_dir(),
+            "不是 u<数字> 的目录一律不碰"
+        );
+        // 重复调用无副作用
+        assert_eq!(purge_orphan_history(&temp, 1), 0);
         let _ = std::fs::remove_dir_all(&temp);
     }
 

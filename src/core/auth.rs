@@ -446,7 +446,29 @@ fn migrations() -> Migrations<'static> {
             migrate_single_user(tx)?;
             Ok(())
         }),
+        // v19：物理删除多余账号（v4.9.29）。v18 只是「停用」——库文件里仍留着别人的
+        // 密码哈希、TOTP 密钥、收藏与分享，等于没清干净。这里把非保留账号连同其
+        // 会话 / 令牌 / 分享 / 收藏 / 播放历史一并删行（单用户模型下这些数据没有
+        // 任何归属可归，留着只是死重量）。保留账号由 v18 的同一口径选出。
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            purge_extra_users(tx)?;
+            Ok(())
+        }),
     ])
+}
+
+/// 「唯一账号」的选取口径（v18 / v19 共用）：启用中 id 最小的 admin →
+/// 任一启用账号里 id 最小的 → 任意一行（全部被禁用过的极端情况）。
+fn single_user_keeper(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT COALESCE(
+             (SELECT MIN(id) FROM users WHERE role = 'admin' AND is_active = 1),
+             (SELECT MIN(id) FROM users WHERE is_active = 1),
+             (SELECT MIN(id) FROM users)
+         )",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )
 }
 
 /// v18 钩子：把历史多账号收敛成单账号。**不要**写 BEGIN/COMMIT（已在事务里）。
@@ -455,16 +477,7 @@ fn migrations() -> Migrations<'static> {
 /// 任意一行（全部被禁用过的极端情况）。`role` 顺手改成 `admin`，让回滚到
 /// v4.9.27 时这个人仍是管理员。
 fn migrate_single_user(conn: &Connection) -> rusqlite::Result<()> {
-    let keep: Option<i64> = conn.query_row(
-        "SELECT COALESCE(
-             (SELECT MIN(id) FROM users WHERE role = 'admin' AND is_active = 1),
-             (SELECT MIN(id) FROM users WHERE is_active = 1),
-             (SELECT MIN(id) FROM users)
-         )",
-        [],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    let Some(keep) = keep else {
+    let Some(keep) = single_user_keeper(conn)? else {
         return Ok(());
     };
     conn.execute(
@@ -477,9 +490,37 @@ fn migrate_single_user(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     if deactivated > 0 {
         conn.execute("DELETE FROM sessions WHERE user_id <> ?1", params![keep])?;
-        eprintln!(
-            "[asmoday] 已切换为单用户模式：保留账号 #{keep}，停用其余 {deactivated} 个账号\
-             （收藏/分享/令牌等数据保留，不做物理删除）"
+        eprintln!("[asmoday] 已切换为单用户模式：保留账号 #{keep}，停用其余 {deactivated} 个账号");
+    }
+    Ok(())
+}
+
+/// v19 钩子：物理删除非保留账号及其从属数据。**不要**写 BEGIN/COMMIT（已在事务里）。
+///
+/// 从属表先删、主表后删：`favorites` / `play_history` / `shares` / `access_tokens`
+/// 的 `user_id` 目前没有真正的外键约束（`foreign_keys = ON` 形同虚设），漏删就会
+/// 留下永远查不到的孤儿行。`access_tokens` 的 NULL 归属行（多用户之前的遗留）在
+/// `verify_token` 里走 `store_user(0)` 恒失效，也一并清掉。
+fn purge_extra_users(conn: &Connection) -> rusqlite::Result<()> {
+    let Some(keep) = single_user_keeper(conn)? else {
+        return Ok(());
+    };
+    let mut child_rows = 0usize;
+    for table in ["sessions", "favorites", "play_history", "shares"] {
+        child_rows += conn.execute(
+            &format!("DELETE FROM {table} WHERE user_id <> ?1"),
+            params![keep],
+        )?;
+    }
+    child_rows += conn.execute(
+        "DELETE FROM access_tokens WHERE user_id IS NULL OR user_id <> ?1",
+        params![keep],
+    )?;
+    let accounts = conn.execute("DELETE FROM users WHERE id <> ?1", params![keep])?;
+    if accounts > 0 {
+        crate::log_info!(
+            "已物理删除 {} 个多余账号（保留 #{keep}）及其 {child_rows} 条会话/令牌/分享/收藏/播放历史",
+            accounts
         );
     }
     Ok(())
@@ -935,7 +976,7 @@ impl AuthStore {
     }
 
     /// 按用户名查账号（登录用）。`is_active = 1` 是单用户模型的收敛条件：
-    /// v4.9.28 迁移把历史多账号的其余人置 0，他们从此查不到、登不进。
+    /// v18 迁移把历史多账号的其余人置 0（v19 起直接删行），他们查不到、登不进。
     pub fn find_user(
         &self,
         username: &str,
@@ -1543,6 +1584,70 @@ mod tests {
             .query_row("SELECT id FROM users WHERE is_active = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(same, 1);
+    }
+
+    #[test]
+    fn migration_purges_extra_accounts_and_their_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA}
+             INSERT INTO users (username, password_hash, created_at, role, is_active)
+                 VALUES ('boss', 'x', 0, 'admin', 1),
+                        ('member', 'x', 0, 'user', 1),
+                        ('boss2', 'x', 0, 'admin', 1);
+             INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('t1', 1, 0, 9999999999), ('t2', 2, 0, 9999999999);
+             INSERT INTO favorites (user_id, mount_id, file_path, created_at)
+                 VALUES (1, 'nas', '/m/a.mp4', 1), (2, 'nas', '/m/b.mp4', 2);
+             INSERT INTO play_history (user_id, mount_id, file_path, last_played_at, progress)
+                 VALUES (1, 'nas', '/m/a.mp4', 1, 10), (3, 'nas', '/m/c.mp4', 2, 20);
+             INSERT INTO shares (token, file_path, is_folder, user_id)
+                 VALUES ('s1', '/m/a.mp4', 0, 1), ('s2', '/m/c.mp4', 0, 3);
+             INSERT INTO access_tokens (user_id, token_name, token_hash, is_readonly)
+                 VALUES (1, 'dav', 'h1', 1), (2, 'old', 'h2', 1), (NULL, 'legacy', 'h3', 1);"
+        ))
+        .unwrap();
+
+        // v18 先收敛（停用 + 清会话），v19 再物理删除——与真实升级顺序一致
+        migrate_single_user(&conn).unwrap();
+        purge_extra_users(&conn).unwrap();
+
+        let users: Vec<(i64, String)> = conn
+            .prepare("SELECT id, username FROM users ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(users, vec![(1, "boss".to_string())], "只留最早的 admin");
+
+        for table in [
+            "sessions",
+            "favorites",
+            "play_history",
+            "shares",
+            "access_tokens",
+        ] {
+            let total: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(total, 1, "{table} 里只剩保留账号的行");
+            let foreign: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE user_id IS NULL OR user_id <> 1"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(foreign, 0, "{table} 不应留下孤儿行");
+        }
+
+        // 幂等：再跑一次什么都不变
+        purge_extra_users(&conn).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1);
     }
 
     #[test]
