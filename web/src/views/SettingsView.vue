@@ -16,6 +16,10 @@ import AppIcon from '../components/AppIcon.vue'
 import PasswordInput from '../components/PasswordInput.vue'
 import type { IconName } from '../components/icons'
 import { authApi } from '../api/auth'
+import { usersApi, type ManagedUser } from '../api/users'
+
+/** 行内编辑态：列表项 + 改名输入框的草稿 */
+type UserRow = ManagedUser & { _rename?: string }
 import { cacheApi, type CacheStats } from '../api/media'
 import {
   systemApi,
@@ -83,14 +87,28 @@ const MEDIA_DEFAULTS: MediaSettings = {
   ffmpeg_path: '',
 }
 
-type Tab = 'general' | 'media' | 'security' | 'advanced'
-const tabs: { key: Tab; label: string; icon: IconName }[] = [
-  { key: 'general', label: 'settings.tabs.general', icon: 'chip' },
-  { key: 'media', label: 'settings.tabs.media', icon: 'image' },
+type Tab = 'general' | 'media' | 'security' | 'users' | 'advanced'
+// 用户管理只有管理员可见（v4.9.24 多用户）；普通用户只剩安全自助页
+const allTabs: { key: Tab; label: string; icon: IconName; adminOnly?: boolean }[] = [
+  { key: 'general', label: 'settings.tabs.general', icon: 'chip', adminOnly: true },
+  { key: 'media', label: 'settings.tabs.media', icon: 'image', adminOnly: true },
   { key: 'security', label: 'settings.tabs.security', icon: 'lock' },
-  { key: 'advanced', label: 'settings.tabs.advanced', icon: 'terminal' },
+  { key: 'users', label: 'settings.tabs.users', icon: 'users', adminOnly: true },
+  { key: 'advanced', label: 'settings.tabs.advanced', icon: 'terminal', adminOnly: true },
 ]
+const tabs = computed(() =>
+  allTabs.filter((item) => !item.adminOnly || authApi.isAdmin.value),
+)
 const tab = ref<Tab>('general')
+// 登录身份变化时（登出换号），普通用户不能停在管理 Tab 上
+watch(
+  () => authApi.isAdmin.value,
+  (admin) => {
+    if (!admin && (tab.value === 'users' || tab.value === 'general' || tab.value === 'media' || tab.value === 'advanced')) {
+      tab.value = 'security'
+    }
+  },
+)
 
 // ---------------- 通用：主题 / 语言 ----------------
 const themes: { key: ThemeMode; label: string }[] = [
@@ -619,6 +637,154 @@ async function changePassword() {
   }
 }
 
+// ---------------- 安全：改用户名（v4.9.24 多用户，对齐 Navidrome/Immich） ----------------
+const newUsername = ref('')
+const usernameBusy = ref(false)
+
+async function changeUsername() {
+  securityError.value = ''
+  const next = newUsername.value.trim()
+  if (!next || next === authApi.username.value) return
+  usernameBusy.value = true
+  try {
+    await authApi.changeUsername(currentPassword.value, next)
+    newUsername.value = ''
+    currentPassword.value = ''
+    showToast(t('settings.security.usernameChanged'))
+  } catch (err) {
+    securityError.value = err instanceof Error ? err.message : t('settings.security.failed')
+  } finally {
+    usernameBusy.value = false
+  }
+}
+
+// ---------------- 用户管理（仅管理员可见，v4.9.24 多用户） ----------------
+const users = ref<UserRow[]>([])
+const usersBusy = ref(false)
+const newUserName = ref('')
+const newUserPassword = ref('')
+const newUserRole = ref<'admin' | 'user'>('user')
+const userEditPassword = ref('')
+const usersError = ref('')
+
+async function loadUsers() {
+  if (!authApi.isAdmin.value) return
+  usersBusy.value = true
+  try {
+    users.value = await usersApi.list()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.loadFailed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+async function createUser() {
+  usersError.value = ''
+  if (!newUserName.value.trim() || !newUserPassword.value) return
+  usersBusy.value = true
+  try {
+    await usersApi.create(newUserName.value.trim(), newUserPassword.value, newUserRole.value)
+    newUserName.value = ''
+    newUserPassword.value = ''
+    newUserRole.value = 'user'
+    showToast(t('settings.users.created'))
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+async function toggleUser(user: UserRow) {
+  usersError.value = ''
+  usersBusy.value = true
+  try {
+    await usersApi.update(user.id, { is_active: !user.is_active })
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+async function renameUser(user: UserRow, username: string) {
+  const next = username.trim()
+  if (!next || next === user.username) return
+  usersError.value = ''
+  usersBusy.value = true
+  try {
+    await usersApi.update(user.id, { username: next })
+    showToast(t('settings.users.updated'))
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+    await loadUsers()
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+async function resetUserPassword(user: UserRow) {
+  usersError.value = ''
+  if (!userEditPassword.value) return
+  usersBusy.value = true
+  try {
+    await usersApi.update(user.id, { password: userEditPassword.value })
+    userEditPassword.value = ''
+    showToast(t('settings.users.passwordReset'))
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+async function toggleRole(user: UserRow) {
+  usersError.value = ''
+  usersBusy.value = true
+  try {
+    await usersApi.update(user.id, { role: user.role === 'admin' ? 'user' : 'admin' })
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+async function removeUser(user: UserRow) {
+  usersError.value = ''
+  if (
+    !window.confirm(
+      t('settings.users.deleteConfirm', { name: user.username }),
+    )
+  ) {
+    return
+  }
+  usersBusy.value = true
+  try {
+    await usersApi.remove(user.id)
+    showToast(t('settings.users.deleted'))
+    await loadUsers()
+  } catch (err) {
+    usersError.value = err instanceof Error ? err.message : t('settings.users.failed')
+  } finally {
+    usersBusy.value = false
+  }
+}
+
+watch(
+  () => authApi.isAdmin.value,
+  (admin) => {
+    if (admin) void loadUsers()
+  },
+  { immediate: true },
+)
+
 async function startTotp() {
   securityError.value = ''
   try {
@@ -1071,6 +1237,36 @@ onBeforeUnmount(() => {
            xl 以下回落单列——密码三连框在 2×400px 里会被挤扁。 -->
       <div class="grid gap-6 xl:grid-cols-2 xl:items-start">
       <div class="space-y-6">
+      <!-- 改用户名（v4.9.24）：验证当前密码；改名后其他设备全部重新登录 -->
+      <div class="rounded-xl border border-line p-6">
+        <div class="mb-4">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.security.username') }}</p>
+          <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.security.usernameHint') }}</p>
+        </div>
+        <div class="grid gap-3">
+          <input
+            v-model="newUsername"
+            type="text"
+            autocomplete="username"
+            :placeholder="authApi.username.value ?? ''"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+          />
+          <PasswordInput
+            v-model="currentPassword"
+            :placeholder="t('settings.security.current')"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+          />
+        </div>
+        <div class="mt-3 flex justify-end">
+          <button
+            class="h-9 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
+            :disabled="usernameBusy || !newUsername.trim()"
+            @click="changeUsername"
+          >
+            {{ t('settings.security.usernameSubmit') }}
+          </button>
+        </div>
+      </div>
       <div class="rounded-xl border border-line p-6">
         <div class="mb-4">
           <p class="text-sm font-semibold text-ink">{{ t('settings.security.password') }}</p>
@@ -1400,6 +1596,139 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- ================= 高级 ================= -->
+    <!-- ================= 用户管理（仅管理员，v4.9.24） ================= -->
+    <div v-else-if="tab === 'users'" class="space-y-6">
+      <p
+        v-if="usersError"
+        class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
+      >
+        {{ usersError }}
+      </p>
+
+      <!-- 新建用户：初始密码只此一份，首登强制改密（对齐 FileBrowser Quantum） -->
+      <div class="rounded-xl border border-line p-6">
+        <div class="mb-4">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.users.create') }}</p>
+          <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.users.createHint') }}</p>
+        </div>
+        <div class="grid gap-3 md:grid-cols-[1fr_1fr_auto_auto] md:items-center">
+          <input
+            v-model="newUserName"
+            type="text"
+            :placeholder="t('settings.users.username')"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+          />
+          <PasswordInput
+            v-model="newUserPassword"
+            :placeholder="t('settings.users.initialPassword')"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+          />
+          <select
+            v-model="newUserRole"
+            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
+          >
+            <option value="user">{{ t('settings.users.roleUser') }}</option>
+            <option value="admin">{{ t('settings.users.roleAdmin') }}</option>
+          </select>
+          <button
+            class="h-10 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
+            :disabled="usersBusy || !newUserName.trim() || !newUserPassword"
+            @click="createUser"
+          >
+            {{ t('settings.users.createSubmit') }}
+          </button>
+        </div>
+      </div>
+
+      <!-- 用户清单 -->
+      <div class="rounded-xl border border-line">
+        <div class="flex items-center justify-between border-b border-line px-5 py-3">
+          <p class="text-sm font-semibold text-ink">{{ t('settings.users.list') }}</p>
+          <button
+            class="text-[12px] text-muted transition-colors hover:text-ink"
+            :disabled="usersBusy"
+            @click="loadUsers"
+          >
+            {{ t('settings.users.refresh') }}
+          </button>
+        </div>
+        <div
+          v-for="item in users"
+          :key="item.id"
+          class="flex flex-col gap-3 border-b border-line px-5 py-4 last:border-b-0 md:flex-row md:items-center"
+          :class="{ 'opacity-60': !item.is_active }"
+        >
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-sm font-medium text-ink">
+              {{ item.username }}
+              <span
+                v-if="item.role === 'admin'"
+                class="ml-1 rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent"
+              >{{ t('settings.users.roleAdmin') }}</span>
+              <span
+                v-if="!item.is_active"
+                class="ml-1 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted"
+              >{{ t('settings.users.disabled') }}</span>
+              <span
+                v-if="item.must_change_password"
+                class="ml-1 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted"
+              >{{ t('settings.users.pendingPassword') }}</span>
+            </p>
+            <p class="mt-0.5 text-[11px] text-muted">id {{ item.id }}<template v-if="item.totp_enabled"> · 2FA</template></p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <input
+              v-model="item._rename"
+              type="text"
+              :placeholder="item.username"
+              class="h-9 w-40 rounded-lg border border-line bg-elevated px-3 text-xs text-ink outline-none focus:border-accent"
+              @keydown.enter="renameUser(item, item._rename ?? '')"
+            />
+            <button
+              class="h-9 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:text-ink"
+              :disabled="usersBusy"
+              @click="renameUser(item, item._rename ?? '')"
+            >
+              {{ t('settings.users.rename') }}
+            </button>
+            <PasswordInput
+              v-model="userEditPassword"
+              :placeholder="t('settings.users.newPassword')"
+              class="h-9 w-44 rounded-lg border border-line bg-elevated px-3 text-xs text-ink outline-none focus:border-accent"
+            />
+            <button
+              class="h-9 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:text-ink"
+              :disabled="usersBusy || !userEditPassword"
+              @click="resetUserPassword(item)"
+            >
+              {{ t('settings.users.resetPassword') }}
+            </button>
+            <button
+              class="h-9 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:text-ink"
+              :disabled="usersBusy || item.id === authApi.userId.value"
+              @click="toggleRole(item)"
+            >
+              {{ item.role === 'admin' ? t('settings.users.demote') : t('settings.users.promote') }}
+            </button>
+            <button
+              class="h-9 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:text-ink"
+              :disabled="usersBusy || item.id === authApi.userId.value"
+              @click="toggleUser(item)"
+            >
+              {{ item.is_active ? t('settings.users.disable') : t('settings.users.enable') }}
+            </button>
+            <button
+              class="h-9 rounded-lg border border-red-500/30 px-3 text-xs fg-danger transition-colors hover:bg-red-500/10"
+              :disabled="usersBusy || item.id === authApi.userId.value"
+              @click="removeUser(item)"
+            >
+              {{ t('settings.users.delete') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div v-else-if="tab === 'advanced'" class="space-y-6">
       <div class="flex flex-wrap items-center gap-2">
         <div class="flex items-center rounded-lg border border-line p-0.5 text-xs">

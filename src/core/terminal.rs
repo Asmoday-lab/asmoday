@@ -85,9 +85,12 @@ pub struct TerminalEnv {
 ///
 /// 目录建不出来（磁盘满 / 权限全坏）时仍然注入路径——让 shell 自己报错并
 /// 原样透传，绝不回退到系统目录。
-pub fn prepare_env(data_dir: &Path) -> TerminalEnv {
+pub fn prepare_env(data_dir: &Path, user_id: i64) -> TerminalEnv {
     let data_dir = absolutize(data_dir);
-    let dir = data_dir.join("terminal_history");
+    // 历史按用户分目录（v4.9.24 多用户）：同一个共享盘上每个人有自己的 shell 历史
+    let dir = data_dir
+        .join("terminal_history")
+        .join(format!("u{user_id}"));
     let _ = std::fs::create_dir_all(&dir);
     let file = if cfg!(windows) {
         dir.join("ConsoleHost_history.txt")
@@ -111,6 +114,8 @@ pub struct Session {
     pub shell: String,
     /// 是否以纯净模式拉起（重连时展示用；模式不同不能复用同一会话）
     pub no_profile: bool,
+    /// 归属用户（v4.9.24 多用户）：attach / 列表 / 强制关闭都按它判归属
+    pub owner: i64,
     pub created: Instant,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -283,6 +288,8 @@ pub struct SessionInfo {
     pub cwd: String,
     pub shell: String,
     pub no_profile: bool,
+    /// 归属用户 id（v4.9.24 多用户）
+    pub owner: i64,
     pub cols: u16,
     pub rows: u16,
     /// 当前挂着的 WebSocket 数：0 表示已断线正在保活，是最该被清理的
@@ -310,6 +317,7 @@ impl TerminalManager {
                     cwd: session.cwd.clone(),
                     shell: session.shell.clone(),
                     no_profile: session.no_profile,
+                    owner: session.owner,
                     cols,
                     rows,
                     clients: session.clients.load(Ordering::SeqCst),
@@ -627,6 +635,7 @@ impl TerminalManager {
         rows: u16,
         options: ShellOptions,
         env: &TerminalEnv,
+        owner: i64,
     ) -> Result<Arc<Session>, String> {
         if self.len() >= self.max_sessions {
             let idle: Vec<String> = self
@@ -718,6 +727,7 @@ impl TerminalManager {
             cwd: session_display(&native),
             shell: shell.clone(),
             no_profile: options.no_profile,
+            owner,
             created: Instant::now(),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
@@ -784,10 +794,14 @@ impl TerminalManager {
     /// 就把会话收了 —— 用户重连上来立刻黑屏。
     ///
     /// `no_profile` 不匹配时返回 `None` 且不加计数（纯净模式是进程启动期决定的）。
-    pub fn attach(&self, id: &str, no_profile: bool) -> Option<Arc<Session>> {
+    pub fn attach(&self, id: &str, no_profile: bool, owner: i64) -> Option<Arc<Session>> {
         let map = self.inner.lock().ok()?;
         let session = map.get(id)?.clone();
         if session.no_profile != no_profile {
+            return None;
+        }
+        // 只能重连自己的会话（v4.9.24 多用户）：拿到别人的 session_id 一律视为新会话
+        if session.owner != owner {
             return None;
         }
         session.client_join();
@@ -889,7 +903,7 @@ mod tests {
     fn history_is_always_isolated_under_data_dir() {
         let temp = std::env::temp_dir().join("asmoday-term-env-test");
         let _ = std::fs::create_dir_all(&temp);
-        let env = prepare_env(&temp);
+        let env = prepare_env(&temp, 1);
         let path = env.history_path.expect("历史路径必须总是给出（强制隔离）");
         let normalized = path.replace('\\', "/");
         assert!(
@@ -932,7 +946,7 @@ mod tests {
     fn unix_history_file_lands_in_data_dir() {
         let temp = std::env::temp_dir().join("asmoday-term-unix-test");
         let _ = std::fs::create_dir_all(&temp);
-        let env = prepare_env(&temp);
+        let env = prepare_env(&temp, 1);
         let path = env.history_path.unwrap();
         assert!(
             path.replace('\\', "/")

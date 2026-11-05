@@ -18,6 +18,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+use super::auth::AuthUser;
 use crate::AppState;
 use crate::core::auth::{hash_password, now_secs, random_token, verify_password};
 use crate::core::fs;
@@ -60,8 +61,12 @@ pub struct ShareAuth {
     pub download: Option<u8>,
 }
 
-/// POST /api/shares
-pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>) -> Response {
+/// POST /api/shares（归属当前用户）
+pub async fn create(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CreateShare>,
+) -> Response {
     let roots = {
         let config = state.config.read().await;
         fs::load_roots(&config, &state.cwd)
@@ -110,9 +115,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>
     };
 
     let result = conn.execute(
-        "INSERT INTO shares (token, file_path, is_folder, password_hash, allow_download, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO shares (token, file_path, is_folder, password_hash, allow_download, expires_at, created_at, user_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
+            user.id,
             token,
             fs::normalize_display(&target),
             if is_folder { 1 } else { 0 },
@@ -140,22 +146,31 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateShare>
     }
 }
 
-/// GET /api/shares
-pub async fn list(State(state): State<AppState>) -> Response {
+/// GET /api/shares：admin 看全量，普通用户只看自己的
+pub async fn list(State(state): State<AppState>, user: AuthUser) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
-    let mut statement = match conn.prepare(
+    let sql = if user.is_admin() {
         "SELECT token, file_path, is_folder, password_hash IS NOT NULL, allow_download, expires_at, created_at
-         FROM shares ORDER BY created_at DESC",
-    ) {
+         FROM shares ORDER BY created_at DESC"
+    } else {
+        "SELECT token, file_path, is_folder, password_hash IS NOT NULL, allow_download, expires_at, created_at
+         FROM shares WHERE user_id = ?1 ORDER BY created_at DESC"
+    };
+    let mut statement = match conn.prepare(sql) {
         Ok(statement) => statement,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败：{err}")),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询失败：{err}"),
+            );
+        }
     };
 
-    let rows = statement.query_map([], |row| {
+    fn row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
         Ok(json!({
             "token": row.get::<_, String>(0)?,
             "path": row.get::<_, String>(1)?,
@@ -165,9 +180,16 @@ pub async fn list(State(state): State<AppState>) -> Response {
             "expires_at": row.get::<_, Option<i64>>(5)?,
             "created_at": row.get::<_, Option<i64>>(6)?,
         }))
-    });
+    }
+    // 两个分支的闭包是不同类型，无法 if/else 统一 —— 用同一个 fn 指针
+    let row_fn: fn(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> = |row| row_json(row);
+    let mapped = if user.is_admin() {
+        statement.query_map([], row_fn)
+    } else {
+        statement.query_map([user.id], row_fn)
+    };
 
-    match rows {
+    match mapped {
         Ok(iter) => Json(json!({ "items": iter.filter_map(Result::ok).collect::<Vec<_>>() }))
             .into_response(),
         Err(err) => error(
@@ -177,13 +199,25 @@ pub async fn list(State(state): State<AppState>) -> Response {
     }
 }
 
-/// DELETE /api/shares/{token}
-pub async fn delete(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+/// DELETE /api/shares/{token}：owner 或 admin 可删
+pub async fn delete(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(token): Path<String>,
+) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
-    match conn.execute("DELETE FROM shares WHERE token = ?1", [&token]) {
+    let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = if user.is_admin() {
+        ("DELETE FROM shares WHERE token = ?1", vec![&token])
+    } else {
+        (
+            "DELETE FROM shares WHERE token = ?1 AND user_id = ?2",
+            vec![&token, &user.id],
+        )
+    };
+    match conn.execute(sql, params.as_slice()) {
         Ok(0) => error_code(StatusCode::NOT_FOUND, "SHARE_NOT_FOUND", "Share not found"),
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
         Err(err) => error(

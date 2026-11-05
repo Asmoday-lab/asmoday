@@ -42,6 +42,7 @@ pub struct TerminalQuery {
 /// Linux `/home/<name>`），不要传 `~` / `%USERPROFILE%` / `$HOME`。
 pub async fn ws_handler(
     State(state): State<AppState>,
+    user: crate::api::auth::AuthUser,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     Query(query): Query<TerminalQuery>,
@@ -198,13 +199,14 @@ pub async fn ws_handler(
     };
 
     // 历史记录强制隔离（设计文档 3.3.5）：不做探测、不做条件分支，
-    // 一律把 shell 历史钉在 <data>/terminal_history/，绝不碰 %APPDATA% / ~。
+    // 一律把 shell 历史钉在 <data>/terminal_history/u<user_id>/，绝不碰 %APPDATA% / ~。
+    // 多用户后（v4.9.24）再按用户分一层，同一台机器上各人的历史互不可见。
     // 权限受限与重定向本身不提示（前端必须静默），warning 只保留目录落点变化。
-    let env = crate::core::terminal::prepare_env(&state.data_dir);
+    let env = crate::core::terminal::prepare_env(&state.data_dir, user.id);
 
     ws.on_upgrade(move |socket| {
         handle_socket(
-            socket, state, cwd, cols, rows, session_id, options, env, warning,
+            socket, state, user.id, cwd, cols, rows, session_id, options, env, warning,
         )
     })
 }
@@ -262,6 +264,7 @@ fn reject(err: FsError) -> Response {
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
+    owner: i64,
     cwd: PathBuf,
     cols: u16,
     rows: u16,
@@ -277,11 +280,11 @@ async fn handle_socket(
     // `attach` 在 map 锁内完成「查会话 + 计数 +1」，与回收器的 `take_if_idle` 互斥。
     let existing = session_id
         .as_deref()
-        .and_then(|id| manager.attach(id, options.no_profile));
+        .and_then(|id| manager.attach(id, options.no_profile, owner));
     let reconnected = existing.is_some();
     let session = match existing {
         Some(session) => session,
-        None => match manager.create(&cwd, cols, rows, options, &env) {
+        None => match manager.create(&cwd, cols, rows, options, &env, owner) {
             Ok(session) => {
                 // 新建会话的计数从 0 起，首个连接自己登记
                 session.client_join();
@@ -415,9 +418,18 @@ async fn handle_socket(
 ///
 /// 返回明细而不只是数量：并发打满时前端要能列出「谁在占着」并让用户踢掉，
 /// 否则用户只会看到「已达上限」却无从下手。
-pub async fn list_sessions(State(state): State<AppState>) -> Response {
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    user: crate::api::auth::AuthUser,
+) -> Response {
     let manager = state.terminals.clone();
-    let sessions = manager.snapshot();
+    // 普通用户只看到自己的会话；admin 看全量（并发打满时要有全局视野）
+    let mut sessions: Vec<_> = manager
+        .snapshot()
+        .into_iter()
+        .filter(|info| user.is_admin() || info.owner == user.id)
+        .collect();
+    sessions.sort_by_key(|info| info.age_secs);
     axum::Json(json!({
         "count": sessions.len(),
         "limit": manager.max_sessions(),
@@ -429,8 +441,20 @@ pub async fn list_sessions(State(state): State<AppState>) -> Response {
 /// DELETE /api/terminal/sessions/{id}：强制关闭一条遗留 PTY（设计文档 3.3.6）
 pub async fn kill_session(
     State(state): State<AppState>,
+    user: crate::api::auth::AuthUser,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let owned = state
+        .terminals
+        .get(&id)
+        .is_some_and(|session| user.is_admin() || session.owner == user.id);
+    if !owned {
+        return crate::api::error::api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "E_NOT_FOUND",
+            "会话不存在或已结束",
+        );
+    }
     if state.terminals.force_close(&id) {
         axum::Json(json!({ "status": "ok" })).into_response()
     } else {

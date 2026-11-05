@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 
+use super::auth::AuthUser;
 use crate::AppState;
 use crate::core::auth::now_secs;
 
@@ -51,12 +52,16 @@ pub struct CreateToken {
     pub mount_id: Option<String>,
 }
 
-/// 令牌校验结果：只读标记 + 挂载点范围
+/// 令牌校验结果：只读标记 + 挂载点范围 + 归属用户
 #[derive(Debug, Clone)]
 pub struct TokenAccess {
     pub readonly: bool,
     /// `None` = 全部挂载点
     pub mount_scope: Option<String>,
+    /// 令牌归属的用户（v4.9.24 多用户）。挂载点当前是全局共享的，WebDAV 侧
+    /// 暂时只透传不消费；将来做按用户目录收权时这就是现成的身份入口。
+    #[allow(dead_code)]
+    pub user_id: i64,
 }
 
 fn default_readonly() -> bool {
@@ -73,21 +78,27 @@ fn error_code(status: StatusCode, code: &str, message: impl Into<String>) -> Res
     crate::api::error::api_error(status, code, message)
 }
 
-/// GET /api/tokens
-pub async fn list(State(state): State<AppState>) -> Response {
+/// GET /api/tokens（只列自己的令牌）
+pub async fn list(State(state): State<AppState>, user: AuthUser) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
     let mut statement = match conn.prepare(
-        "SELECT id, token_name, is_readonly, expires_at, created_at, mount_scope FROM access_tokens ORDER BY id DESC",
+        "SELECT id, token_name, is_readonly, expires_at, created_at, mount_scope
+         FROM access_tokens WHERE user_id = ?1 ORDER BY id DESC",
     ) {
         Ok(statement) => statement,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败：{err}")),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询失败：{err}"),
+            );
+        }
     };
 
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([user.id], |row| {
         Ok(json!({
             "id": row.get::<_, i64>(0)?,
             "name": row.get::<_, String>(1)?,
@@ -108,8 +119,12 @@ pub async fn list(State(state): State<AppState>) -> Response {
     }
 }
 
-/// POST /api/tokens
-pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>) -> Response {
+/// POST /api/tokens（归属当前用户）
+pub async fn create(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CreateToken>,
+) -> Response {
     let name = body.name.trim();
     if name.is_empty() {
         return error_code(
@@ -157,7 +172,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>
         "INSERT INTO access_tokens (user_id, token_name, token_hash, is_readonly, expires_at, created_at, mount_scope)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
-            1,
+            user.id,
             name,
             hashed,
             if body.readonly { 1 } else { 0 },
@@ -185,14 +200,21 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateToken>
     }
 }
 
-/// DELETE /api/tokens/{id}
-pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+/// DELETE /api/tokens/{id}（只能删自己的）
+pub async fn delete(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> Response {
     let conn = match state.auth_connection() {
         Ok(conn) => conn,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
-    match conn.execute("DELETE FROM access_tokens WHERE id = ?1", [id]) {
+    match conn.execute(
+        "DELETE FROM access_tokens WHERE id = ?1 AND user_id = ?2",
+        rusqlite::params![id, user.id],
+    ) {
         Ok(0) => error(StatusCode::NOT_FOUND, "令牌不存在"),
         Ok(_) => Json(json!({ "status": "ok" })).into_response(),
         Err(err) => error(
@@ -208,15 +230,25 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
 pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<TokenAccess> {
     let conn = state.auth_connection().ok()?;
     let hashed = hash_token(token);
-    let row: Option<(String, i64, Option<i64>, Option<String>)> = conn
+    type TokenRow = (String, i64, Option<i64>, Option<String>, i64);
+    let row: Option<TokenRow> = conn
         .query_row(
-            "SELECT token_name, is_readonly, expires_at, mount_scope FROM access_tokens WHERE token_hash = ?1",
+            "SELECT token_name, is_readonly, expires_at, mount_scope, COALESCE(user_id, 0)
+             FROM access_tokens WHERE token_hash = ?1",
             [hashed],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .ok();
 
-    let (token_name, readonly, expires_at, mount_scope) = row?;
+    let (token_name, readonly, expires_at, mount_scope, owner_id) = row?;
     if token_name != username {
         return None;
     }
@@ -228,6 +260,7 @@ pub fn verify_token(state: &AppState, username: &str, token: &str) -> Option<Tok
     Some(TokenAccess {
         readonly: readonly != 0,
         mount_scope,
+        user_id: owner_id,
     })
 }
 
@@ -342,7 +375,7 @@ pub(crate) fn verify_admin_with(
         return None;
     }
     let (user, hash, _secret) = store.find_user(username).ok().flatten()?;
-    if user.must_change_password || user.totp_enabled {
+    if user.must_change_password || user.totp_enabled || !user.is_active {
         return None;
     }
     let key = password_cache_key(username, password);
@@ -351,6 +384,7 @@ pub(crate) fn verify_admin_with(
         return Some(TokenAccess {
             readonly: false,
             mount_scope: None,
+            user_id: user.id,
         });
     }
     if !crate::core::auth::verify_password(&hash, password) {
@@ -360,6 +394,7 @@ pub(crate) fn verify_admin_with(
     Some(TokenAccess {
         readonly: false,
         mount_scope: None,
+        user_id: user.id,
     })
 }
 
@@ -384,7 +419,8 @@ mod tests {
     #[test]
     fn admin_password_grants_full_access_and_caches() {
         let store = temp_store("full");
-        store.create_user("vfy_admin", PASS).unwrap();
+        let user = store.create_user("vfy_admin", PASS, "admin").unwrap();
+        store.set_must_change_password(user.id, false).unwrap();
         let cache = PasswordCache::default();
 
         let access = verify_admin_with(&store, &cache, "vfy_admin", PASS).unwrap();
@@ -402,7 +438,8 @@ mod tests {
     #[test]
     fn password_change_invalidates_cached_credentials() {
         let store = temp_store("rotate");
-        let user = store.create_user("vfy_rotate", PASS).unwrap();
+        let user = store.create_user("vfy_rotate", PASS, "user").unwrap();
+        store.set_must_change_password(user.id, false).unwrap();
         let cache = PasswordCache::default();
 
         assert!(verify_admin_with(&store, &cache, "vfy_rotate", PASS).is_some());
@@ -415,10 +452,11 @@ mod tests {
     #[test]
     fn onetime_password_accounts_are_rejected() {
         let store = temp_store("onetime");
-        let user = store.create_user("vfy_onetime", PASS).unwrap();
+        let user = store.create_user("vfy_onetime", PASS, "user").unwrap();
         let cache = PasswordCache::default();
 
-        // --init / --reset-password 发的是一次性密码，改密前不许直连
+        // 创建即 must_change_password=1（v4.9.24），一次性密码改密前不许直连
+        assert!(verify_admin_with(&store, &cache, "vfy_onetime", PASS).is_none());
         store.set_must_change_password(user.id, true).unwrap();
         assert!(verify_admin_with(&store, &cache, "vfy_onetime", PASS).is_none());
 
@@ -429,7 +467,8 @@ mod tests {
     #[test]
     fn totp_enabled_accounts_are_rejected() {
         let store = temp_store("totp");
-        let user = store.create_user("vfy_totp", PASS).unwrap();
+        let user = store.create_user("vfy_totp", PASS, "user").unwrap();
+        store.set_must_change_password(user.id, false).unwrap();
         let cache = PasswordCache::default();
 
         store.set_totp(user.id, "JBSWY3DPEHPK3PXP", true).unwrap();
@@ -443,7 +482,7 @@ mod tests {
     #[test]
     fn unknown_users_and_empty_passwords_fail_fast() {
         let store = temp_store("unknown");
-        store.create_user("vfy_unknown", PASS).unwrap();
+        store.create_user("vfy_unknown", PASS, "user").unwrap();
         let cache = PasswordCache::default();
 
         assert!(verify_admin_with(&store, &cache, "nobody", PASS).is_none());

@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::auth::AdminUser;
 use crate::AppState;
 use crate::core::{ffmpeg, fs, fs_ops, media_index, path_guard, thumbnail};
 
@@ -101,6 +102,7 @@ pub struct TestPayload {
 /// 只测用户填的那一条（不回落），这样「该路径不可用」才是准确结论。
 pub async fn test_ffmpeg(
     State(_state): State<AppState>,
+    _admin: AdminUser,
     body: Option<Json<TestPayload>>,
 ) -> Response {
     let path = body.map(|Json(payload)| payload.path).unwrap_or_default();
@@ -180,7 +182,7 @@ pub async fn health(State(state): State<AppState>) -> Response {
 }
 
 /// POST /api/system/cleanup/thumbnails
-pub async fn cleanup_thumbnails(State(state): State<AppState>) -> Response {
+pub async fn cleanup_thumbnails(State(state): State<AppState>, _admin: AdminUser) -> Response {
     // 清理与重建/预生成互斥（v4.9.20）：清理会 remove_dir_all 整个缩略图
     // 单元目录，撞上正在 write_atomic/rename 的生成任务会把「解码成功」
     // 变成「落盘失败 + 负缓存 30 分钟」。
@@ -221,7 +223,7 @@ pub async fn cleanup_thumbnails(State(state): State<AppState>) -> Response {
 }
 
 /// POST /api/system/cleanup/parts：只清 24 小时前的 `.part`
-pub async fn cleanup_parts(State(state): State<AppState>) -> Response {
+pub async fn cleanup_parts(State(state): State<AppState>, _admin: AdminUser) -> Response {
     let roots = mount_roots(&state).await;
     let summary = tokio::task::spawn_blocking(move || {
         let mut removed = 0usize;
@@ -259,7 +261,11 @@ pub async fn cleanup_parts(State(state): State<AppState>) -> Response {
 ///   没验证过回 403 `REVERIFY_REQUIRED`，前端弹密码框。这是单次操作的
 ///   确认，不是全局闸门——终端与日常操作不受影响；
 /// - 响应 `no-store` + `attachment`，绝不能被缓存或内联渲染。
-pub async fn backup(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+pub async fn backup(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let verified = crate::api::auth::cookie_token(&headers)
         .map(|token| state.auth.session_verified_recently(&token))
         .unwrap_or(false);
@@ -352,7 +358,7 @@ fn utc_stamp(secs: i64) -> String {
 }
 
 /// POST /api/system/cleanup/shares：清理 30 天前的分享 tombstone
-pub async fn cleanup_shares(State(state): State<AppState>) -> Response {
+pub async fn cleanup_shares(State(state): State<AppState>, _admin: AdminUser) -> Response {
     let auth = state.auth.clone();
     let now = crate::core::auth::now_secs();
     match tokio::task::spawn_blocking(move || auth.purge_share_tombstones(now)).await {
@@ -382,7 +388,7 @@ async fn mount_roots(state: &AppState) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// POST /api/system/thumbnails/rebuild：立即返回，进度靠轮询
-pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
+pub async fn rebuild_thumbnails(State(state): State<AppState>, _admin: AdminUser) -> Response {
     // 先抢进程级互斥位：预生成正在跑时也让这次请求直接退回去，不再并行抢 CPU
     let Some(job) = state.thumb_jobs.try_claim() else {
         return Json(json!({ "status": "already_running" })).into_response();
@@ -422,7 +428,7 @@ pub async fn rebuild_thumbnails(State(state): State<AppState>) -> Response {
 /// 之后的候选自动排除它们（文件一改 mtime/size 失配就重新入列；台账还有
 /// 7 天保鲜期，janitor 淘汰掉的缩略图最迟一周补回）。所以重复调用是安全的：
 /// 库没变时候选为空，直接秒退（v4.9.16）。
-pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
+pub async fn preheat_thumbnails(State(state): State<AppState>, _admin: AdminUser) -> Response {
     // 与「全量重建」共用一条互斥位：两边都想跑时，谁先谁跑，另一个直接返回
     let Some(job) = state.thumb_jobs.try_claim() else {
         return Json(json!({ "status": "already_running" })).into_response();
@@ -453,7 +459,7 @@ pub async fn preheat_thumbnails(State(state): State<AppState>) -> Response {
 }
 
 /// GET /api/system/preheat-thumbnails/status
-pub async fn preheat_status(State(state): State<AppState>) -> Response {
+pub async fn preheat_status(State(state): State<AppState>, _admin: AdminUser) -> Response {
     let status = state
         .preheat
         .lock()
@@ -465,7 +471,7 @@ pub async fn preheat_status(State(state): State<AppState>) -> Response {
 /// POST /api/system/preheat-thumbnails/stop
 ///
 /// 只置一个标志，worker 每张之间检查一次 —— 正在生成的那张会跑完。
-pub async fn preheat_stop(State(state): State<AppState>) -> Response {
+pub async fn preheat_stop(State(state): State<AppState>, _admin: AdminUser) -> Response {
     if let Ok(mut status) = state.preheat.lock() {
         status.is_running = false;
     }
@@ -663,7 +669,7 @@ async fn run_preheat_inner(state: &AppState, limit: Option<usize>) {
 }
 
 /// GET /api/system/thumbnails/rebuild/status
-pub async fn rebuild_status(State(state): State<AppState>) -> Response {
+pub async fn rebuild_status(State(state): State<AppState>, _admin: AdminUser) -> Response {
     let status = state
         .rebuild
         .lock()
@@ -676,7 +682,7 @@ pub async fn rebuild_status(State(state): State<AppState>) -> Response {
 ///
 /// 只置取消标志：正在生成的那张会跑完，扫描阶段每 64 个条目检查一次。
 /// 没在跑时调用是无害的 no-op（标志随后由下一次启动重置）。
-pub async fn rebuild_stop(State(state): State<AppState>) -> Response {
+pub async fn rebuild_stop(State(state): State<AppState>, _admin: AdminUser) -> Response {
     if let Ok(mut status) = state.rebuild.lock()
         && status.is_running
     {

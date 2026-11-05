@@ -7,6 +7,9 @@ export interface AuthStatus {
   initialized: boolean
   authenticated: boolean
   username: string | null
+  user_id?: number | null
+  /** 'admin' | 'user'（v4.9.24 多用户） */
+  role?: string | null
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
@@ -67,6 +70,9 @@ export const authApi = {
   busy,
   isAuthenticated: computed(() => status.value.authenticated),
   username: computed(() => status.value.username),
+  userId: computed(() => status.value.user_id ?? null),
+  /** 当前用户是否管理员（多用户 v4.9.24） */
+  isAdmin: computed(() => status.value.role === 'admin'),
   initialized: computed(() => status.value.initialized),
   ensureAuth,
   refresh,
@@ -78,6 +84,10 @@ export const authApi = {
   },
   async changePassword(current: string, next: string) {
     await post('/api/auth/password', { current, next })
+  },
+  /** 改自己的用户名（改名后其他设备全部登出，当前浏览器自动续期） */
+  async changeUsername(current: string, username: string) {
+    await post('/api/auth/username', { current, username })
   },
   /**
    * 生成 TOTP 密钥。

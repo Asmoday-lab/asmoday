@@ -27,8 +27,16 @@ pub const SESSION_COOKIE: &str = "asmoday_session";
 pub struct AuthUser {
     pub id: i64,
     pub username: String,
-    /// 是否还是一次性密码（`--init` / `--reset-password`）会话：改密前只放行改密自身
+    /// 是否还是一次性密码（`--init` / `--reset-password` / 管理员代设）会话：改密前只放行改密自身
     pub must_change_password: bool,
+    /// 'admin' | 'user'（v4.9.24 多用户）
+    pub role: String,
+}
+
+impl AuthUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -41,6 +49,35 @@ where
         parts.extensions.get::<AuthUser>().cloned().ok_or_else(|| {
             json_error_code(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", "Unauthorized")
         })
+    }
+}
+
+/// 管理员专用提取器（v4.9.24 多用户）：挂它的 handler 只放行 `role = admin`。
+///
+/// 非管理员得到 403 `E_ADMIN_REQUIRED`——前端按这个码提示「需要管理员账号」，
+/// 路由守卫用同一个码隐藏管理入口。
+#[derive(Debug, Clone)]
+pub struct AdminUser(pub AuthUser);
+
+impl<S> FromRequestParts<S> for AdminUser
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let user = parts.extensions.get::<AuthUser>().cloned().ok_or_else(|| {
+            json_error_code(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", "Unauthorized")
+        })?;
+        if user.is_admin() {
+            Ok(AdminUser(user))
+        } else {
+            Err(json_error_code(
+                StatusCode::FORBIDDEN,
+                "E_ADMIN_REQUIRED",
+                "Administrator account required",
+            ))
+        }
     }
 }
 
@@ -165,7 +202,7 @@ fn authority_of(candidate: &str) -> &str {
 fn is_password_change_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/auth/password" | "/api/auth/me" | "/api/auth/logout"
+        "/api/auth/password" | "/api/auth/username" | "/api/auth/me" | "/api/auth/logout"
     )
 }
 
@@ -286,12 +323,16 @@ fn cleared_cookie(path: &str, secure: bool) -> String {
 }
 
 /// 细节型错误（4xx 参数类，消息本身带具体说明）
-fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     crate::api::error::detail(status, message)
 }
 
 /// 带错误码的错误（设计文档 3.8.2：前端按 code 查 i18n）
-fn json_error_code(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn json_error_code(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> Response {
     crate::api::error::api_error(status, code, message)
 }
 
@@ -479,11 +520,16 @@ async fn sso_user(
     if user.totp_enabled && !skip_2fa {
         return None;
     }
+    // 停用账号同样拒绝（与登录口径一致）
+    if !user.is_active {
+        return None;
+    }
 
     Some(AuthUser {
         id: user.id,
         username: user.username,
         must_change_password: user.must_change_password,
+        role: user.role,
     })
 }
 
@@ -517,10 +563,20 @@ pub async fn require_auth(
         match state.auth.session_state(&token) {
             Ok(Some(session)) => match state.auth.user_by_id(session.user_id) {
                 Ok(Some(user)) => {
+                    // 账号被停用：会话立即不可用（停用操作本身已删会话，这里是兜底，
+                    // 比如管理员停用后数据库被外部回滚之类的边角）
+                    if !user.is_active {
+                        return json_error_code(
+                            StatusCode::FORBIDDEN,
+                            "E_ACCOUNT_DISABLED",
+                            "Account is disabled",
+                        );
+                    }
                     auth_user = Some(AuthUser {
                         id: user.id,
                         username: user.username,
                         must_change_password: user.must_change_password,
+                        role: user.role,
                     });
                     via_cookie = true;
                 }
@@ -575,9 +631,9 @@ pub async fn require_auth(
         None
     };
 
-    // 一次性密码（`--init` / `--reset-password`）会话必须先改密。
+    // 一次性密码（`--init` / `--reset-password` / 管理员代设）会话必须先改密。
     // 前端有遮罩，但遮罩只是 UI——直接 curl 带着 Cookie 照样能开终端、
-    // 能读全盘。这里只放行改密自身与状态查询，其余一律 403。
+    // 能读全盘。这里只放行改密/改名自身与状态查询，其余一律 403。
     if user.must_change_password && !is_password_change_path(request.uri().path()) {
         return json_error_code(
             StatusCode::FORBIDDEN,
@@ -644,20 +700,26 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut username: Option<String> = None;
     let mut totp_enabled = false;
     let mut must_change_password = false;
+    let mut role: Option<String> = None;
+    let mut uid: Option<i64> = None;
 
     if let Some(token) = cookie_token(&headers)
-        && let Ok(Some(user_id)) = state.auth.session_user(&token)
-        && let Ok(Some(user)) = state.auth.user_by_id(user_id)
+        && let Ok(Some(session_user)) = state.auth.session_user(&token)
+        && let Ok(Some(user)) = state.auth.user_by_id(session_user)
     {
         totp_enabled = user.totp_enabled;
         must_change_password = user.must_change_password;
         username = Some(user.username);
+        role = Some(user.role);
+        uid = Some(user.id);
     }
 
     Json(json!({
         "initialized": initialized,
         "authenticated": username.is_some(),
         "username": username,
+        "user_id": uid,
+        "role": role,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
         "version": env!("CARGO_PKG_VERSION"),
@@ -725,6 +787,17 @@ pub async fn login(
         );
     }
 
+    // 停用账号拒绝登录（对齐 Navidrome 的 disabled user 语义）。
+    // 放在密码校验之后：不泄露「账号存在但被停用」给密码错误的人。
+    if !user.is_active {
+        record_login_failure(&state.login_guard, &keys);
+        return json_error_code(
+            StatusCode::FORBIDDEN,
+            "E_ACCOUNT_DISABLED",
+            "Account is disabled",
+        );
+    }
+
     // 可选双因素（设计文档 3.1.4）：6 位数字走 TOTP，其余当一次性恢复码
     if user.totp_enabled {
         let Some(secret) = secret else {
@@ -776,6 +849,7 @@ pub async fn login(
     let mut response = Json(json!({
         "status": "ok",
         "username": user.username,
+        "role": user.role,
         "must_change_password": user.must_change_password,
     }))
     .into_response();
@@ -824,6 +898,7 @@ pub async fn me(auth_user: AuthUser) -> Response {
     Json(json!({
         "id": auth_user.id,
         "username": auth_user.username,
+        "role": auth_user.role,
         "must_change_password": auth_user.must_change_password,
     }))
     .into_response()
@@ -869,6 +944,69 @@ pub async fn change_password(
     };
 
     let mut response = Json(json!({ "status": "ok" })).into_response();
+    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
+    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
+        &token,
+        crate::core::auth::SESSION_TTL,
+        &path,
+        secure,
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UsernameRequest {
+    pub current: String,
+    pub username: String,
+}
+
+/// POST /api/auth/username（受保护）：改自己的用户名。
+///
+/// 对齐 Navidrome / Immich 的「账号名可改」：验当前密码 → 改名 → 该用户
+/// 全部会话失效（其他设备强制重新登录），当前浏览器补发新会话 Cookie。
+/// 一次性密码会话期间也可用（首登顺手把 admin 改成自己想要的Name）。
+pub async fn change_username(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    auth_user: AuthUser,
+    Json(body): Json<UsernameRequest>,
+) -> Response {
+    let found = match state.auth.find_user(&auth_user.username) {
+        Ok(found) => found,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    let Some((user, hash, _)) = found else {
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_USER_MISSING",
+            "User not found",
+        );
+    };
+
+    if !verify_password(&hash, &body.current) {
+        return json_error_code(
+            StatusCode::BAD_REQUEST,
+            "PASSWORD_WRONG",
+            "Current password is incorrect",
+        );
+    }
+
+    if let Err(err) = state.auth.rename_user(user.id, &body.username) {
+        return json_error(StatusCode::BAD_REQUEST, err);
+    }
+
+    // 改名让旧身份 everywhere 失效，当前浏览器补一个新的（含新用户名的会话）
+    let token = match state.auth.create_session(user.id) {
+        Ok(token) => token,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    let mut response =
+        Json(json!({ "status": "ok", "username": body.username.trim() })).into_response();
     let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
     if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
         &token,

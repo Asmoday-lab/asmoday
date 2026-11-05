@@ -10,17 +10,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use super::auth::AdminUser;
 use crate::AppState;
 use crate::core::config::Config;
 
 /// GET /api/config
-pub async fn get_config(State(state): State<AppState>) -> Json<Config> {
+pub async fn get_config(State(state): State<AppState>, _admin: AdminUser) -> Json<Config> {
     let config = state.config.read().await;
     Json(config.clone())
 }
 
 /// GET /api/config/safety：危险配置自检结果（设置页警告条，设计文档 3.5 / 9.3）
-pub async fn get_safety(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn get_safety(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Json<serde_json::Value> {
     let config = state.config.read().await;
     Json(serde_json::json!({ "issues": config.safety_issues() }))
 }
@@ -28,6 +32,7 @@ pub async fn get_safety(State(state): State<AppState>) -> Json<serde_json::Value
 /// POST /api/config
 pub async fn update_config(
     State(state): State<AppState>,
+    _admin: AdminUser,
     payload: Result<Json<Config>, JsonRejection>,
 ) -> Response {
     let Json(incoming) = match payload {
@@ -80,7 +85,7 @@ fn error_code(status: StatusCode, code: &str, message: impl Into<String>) -> Res
 }
 
 /// GET /api/config/raw：返回 config.toml 原文（源码模式）
-pub async fn get_config_raw(State(state): State<AppState>) -> Response {
+pub async fn get_config_raw(State(state): State<AppState>, _admin: AdminUser) -> Response {
     match tokio::fs::read_to_string(&state.config_path).await {
         Ok(text) => (
             StatusCode::OK,
@@ -99,7 +104,11 @@ pub async fn get_config_raw(State(state): State<AppState>) -> Response {
 }
 
 /// POST /api/config/raw：接收 TOML 原文，校验后原子写入并热更新
-pub async fn update_config_raw(State(state): State<AppState>, body: String) -> Response {
+pub async fn update_config_raw(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    body: String,
+) -> Response {
     let parsed: Config = match toml::from_str(&body) {
         Ok(config) => config,
         Err(err) => {

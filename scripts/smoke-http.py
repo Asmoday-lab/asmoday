@@ -219,6 +219,11 @@ def main() -> int:
 
     print("[8] 删除级联")
     target = f"{work}/pic.png"
+    # 基线对比（多用户后账号名下可能有别的收藏，不能假设「删完归零」）
+    _, favs = c.json("GET", "/api/media/favorites")
+    base_fav = len(favs.get("items", [])) if isinstance(favs, dict) else 0
+    _, hist = c.json("GET", "/api/media/history")
+    base_hist = len(hist.get("items", [])) if isinstance(hist, dict) else 0
     c.json("POST", "/api/media/favorite", {"path": target, "favorite": True})
     c.json("POST", "/api/media/progress", {"path": target, "progress": 42})
     _, favs = c.json("GET", "/api/media/favorites")
@@ -230,9 +235,9 @@ def main() -> int:
     _, hist = c.json("GET", "/api/media/history")
     after_hist = len(hist.get("items", [])) if isinstance(hist, dict) else 0
     check(
-        "删除后收藏 / 历史归零",
-        before_fav >= 1 and after_fav == 0 and after_hist == 0,
-        f"fav {before_fav}→{after_fav}, hist→{after_hist}",
+        "删除后收藏 / 历史回落到基线",
+        before_fav == base_fav + 1 and after_fav == base_fav and after_hist == base_hist,
+        f"fav {base_fav}→{before_fav}→{after_fav}, hist {base_hist}→{after_hist}",
     )
 
     print("[9] 清理")

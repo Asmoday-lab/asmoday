@@ -373,7 +373,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     if auth.user_count().unwrap_or(1) == 0 {
         let password = core::auth::random_password();
         let user = auth
-            .create_user("admin", &password)
+            .create_user("admin", &password, "admin")
             .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
         auth.set_must_change_password(user.id, true)?;
         println!(
@@ -668,6 +668,13 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/system/test-ffmpeg", post(api::system::test_ffmpeg))
         .route("/api/auth/password", post(api::auth::change_password))
+        .route("/api/auth/username", post(api::auth::change_username))
+        // 用户管理（v4.9.24 多用户）：AdminUser 提取器拦非管理员
+        .route("/api/users", get(api::users::list).post(api::users::create))
+        .route(
+            "/api/users/{id}",
+            axum::routing::patch(api::users::update).delete(api::users::remove),
+        )
         .route(
             "/api/auth/verify-password",
             post(api::auth::reverify_password),
@@ -1049,7 +1056,7 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path) -> Result<(), String
     }
 
     let password = core::auth::random_password();
-    let user = auth.create_user("admin", &password)?;
+    let user = auth.create_user("admin", &password, "admin")?;
     auth.set_must_change_password(user.id, true)?;
     crate::log_info!("administrator created: {}", user.username);
     // 一次性密码只打控制台（stdout），绝不走 log_*!——那会落进

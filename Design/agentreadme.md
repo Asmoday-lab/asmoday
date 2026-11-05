@@ -319,26 +319,18 @@ stateDiagram-v2
 
 错误展示：**行内**（输入框下方红色小字），不用 toast。限流 429 → 底部提示条 `"请求过于频繁，请在 {seconds}s 后重试"` 倒计时。
 
-登录页同构，去掉令牌/用户名（或保留用户名用于多用户未来兼容，但表只允许单行）。
+登录页同构，只有用户名 + 密码 + TOTP 输入。多用户已落地（v4.9.24）：首启只建 admin，其余账号走设置页「用户管理」。
 
 #### API 契约
 
-```http
-POST /api/auth/init
-Content-Type: application/json
-{ "init_token": "string", "username": "string", "password": "string" }
-
-200 { ok:true, data: { user: { id, username }, must_change_password: 1 } }
-403 E_FORBIDDEN  （token 错）
-429 E_TOO_MANY_REQUESTS
-```
+（v4.9.23 已删除 setup/init 链路：首启自动创建 admin + 一次性密码打印控制台，无 `/api/auth/init`。）
 
 ```http
 POST /api/auth/login
 { "username": "string", "password": "string", "totp": "string?" }
 
 200 { ok:true, data: {
-  user: { id, username, is_totp_enabled },
+  user: { id, username, role, is_totp_enabled },
   must_change_password: 0 | 1,
   needs_reauth: false
 }}
@@ -379,6 +371,13 @@ GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任�
 GWT-AUTH-09 Given 初始化完成  When 用同一令牌再 POST /api/auth/setup  Then 403（令牌一次性，成功即作废；重启后重新生成）
 GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问日志  Then 无初始化令牌、无一次性密码明文（两者只打 stdout）
 GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When 客户端连发登录失败  Then 防爆破池按「最右不可信地址」计数，伪造值换不动桶
+GWT-AUTH-12 Given admin  When POST /api/users 建 user 账号  Then 新号 must_change_password=1，首次登录被强制改密；改密后管理员无法再知道其密码（v4.9.24）
+GWT-AUTH-13 Given 普通用户 Cookie  When 访问 /api/config、/api/system/cleanup/*、/api/users  Then 一律 403 E_ADMIN_REQUIRED（AdminUser 门，v4.9.24）
+GWT-AUTH-14 Given 用户 A 与 B 各自收藏  When A 拉取 /api/media/favorites  Then 只见 A 自己的；B 的进度/收藏/令牌/分享互不可见（v4.9.24）
+GWT-AUTH-15 Given 用户 A 已登录  When A 用当前密码 POST /api/auth/username 改名  Then 改名成功、A 全部会话失效、当前浏览器补发新 Cookie 保持登录（v4.9.24）
+GWT-AUTH-16 Given 实例只有 admin 一个可用管理员  When admin 停用/降级/删除自己  Then 400 E_LAST_ADMIN 拒绝；不能删自己（v4.9.24）
+GWT-AUTH-17 Given admin 停用用户 B  When B 的现有 Cookie 访问 API  Then 401/403 被踢出；重新登录返回 403 E_ACCOUNT_DISABLED 且不泄露账号存在性（v4.9.24）
+GWT-AUTH-18 Given admin 删除用户 B  When 检查数据  Then B 的 sessions/favorites/history/tokens 级联删除，B 的 shares 置 tombstone，其他用户数据不受影响（v4.9.24）
 ```
 
 #### 依赖红线

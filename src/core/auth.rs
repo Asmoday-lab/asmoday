@@ -35,6 +35,10 @@ pub const MAX_ATTEMPTS: u32 = 5;
 pub const BAN_DURATION: Duration = Duration::from_secs(15 * 60);
 
 /// 建表语句，字段与设计文档 4.1 对齐（sessions 为会话所必需，文档未列，此处补上）
+///
+/// v4.9.24 起为**最终结构**：多用户角色（role/is_active）与按用户隔离
+/// （favorites/play_history/shares 的 user_id）一步到位。存量库由 v16 迁移补齐
+/// （按缺列判断幂等），新库在 v1 就拿到最终结构、v16 钩子空跑。
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -44,7 +48,11 @@ CREATE TABLE IF NOT EXISTS users (
     is_totp_enabled BOOLEAN DEFAULT 0,
     totp_recovery_codes TEXT,
     must_change_password BOOLEAN NOT NULL DEFAULT 0,
-    created_at DATETIME
+    created_at DATETIME,
+    -- 多用户（v4.9.24）：'admin' | 'user'。管理类端点（用户/系统配置/备份）只放行 admin
+    role TEXT NOT NULL DEFAULT 'user',
+    -- 停用的用户拒绝登录，已有会话一并失效；记录保留，启用即恢复
+    is_active BOOLEAN NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS access_tokens (
@@ -68,25 +76,29 @@ CREATE TABLE IF NOT EXISTS shares (
     allow_download BOOLEAN DEFAULT 1,
     expires_at INTEGER,
     created_at INTEGER,
-    deleted_at INTEGER
+    deleted_at INTEGER,
+    -- 归属（v4.9.24）：创建者；列表/删除按归属过滤，公开访问仍按 token 匿名
+    user_id INTEGER NOT NULL DEFAULT 1
 );
 
--- 收藏与播放历史（设计文档 4.1）：主键是 (mount_id, file_path)。
--- file_path 一直是绝对路径，单主键其实不会撞；带 mount_id 是为了「按挂载点
--- 批量清理 / 分组展示」，也让将来改成挂载点内相对路径时不用再迁一次表。
+-- 收藏与播放历史（设计文档 4.1）：主键是 (user_id, mount_id, file_path)。
+-- file_path 一直是绝对路径；mount_id 用于「按挂载点批量清理 / 分组展示」；
+-- user_id 让同一份共享文件库里每个人有独立的收藏与播放进度（v4.9.24）。
 CREATE TABLE IF NOT EXISTS favorites (
+    user_id INTEGER NOT NULL DEFAULT 1,
     mount_id TEXT NOT NULL DEFAULT '',
     file_path TEXT NOT NULL,
     created_at INTEGER,
-    PRIMARY KEY (mount_id, file_path)
+    PRIMARY KEY (user_id, mount_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS play_history (
+    user_id INTEGER NOT NULL DEFAULT 1,
     mount_id TEXT NOT NULL DEFAULT '',
     file_path TEXT NOT NULL,
     last_played_at INTEGER,
     progress INTEGER,
-    PRIMARY KEY (mount_id, file_path)
+    PRIMARY KEY (user_id, mount_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -116,8 +128,18 @@ pub struct User {
     pub id: i64,
     pub username: String,
     pub totp_enabled: bool,
-    /// 一次性密码（--init / --reset-password）登录后必须改密
+    /// 一次性密码（--init / --reset-password / 管理员代设）登录后必须改密
     pub must_change_password: bool,
+    /// 'admin' | 'user'（v4.9.24 多用户）
+    pub role: String,
+    /// 停用的账号拒绝登录（记录保留，启用即恢复）
+    pub is_active: bool,
+}
+
+impl User {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
 }
 
 pub struct AuthStore {
@@ -402,7 +424,76 @@ fn migrations() -> Migrations<'static> {
         // v15：同理清掉标签缓存里的 verbatim 键。v11 是整表清空，但已经跑过 v11 的库
         // 不会重跑，只有这一条能保证「开发机中途升级」也不会留双份。
         M::up("DELETE FROM media_tags WHERE instr(path, '\\') > 0;"),
+        // v16：多用户（v4.9.24）。三件事，全部按缺列判断幂等（新库在 v1 已是最终结构）：
+        // ① users 补 role / is_active，id 最小的存量用户升为 admin；
+        // ② favorites / play_history 重建主键为 (user_id, mount_id, file_path)，
+        //    存量行归属到第一个用户（单用户时代本来也只有他一个人在用）；
+        // ③ shares 补 user_id（owner），access_tokens 的 NULL user_id 回填。
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            migrate_multi_user(tx)?;
+            Ok(())
+        }),
     ])
+}
+
+/// v16 钩子：见上面迁移注释。**不要**在这里写 `BEGIN`/`COMMIT`——迁移本身跑在事务里。
+fn migrate_multi_user(conn: &Connection) -> rusqlite::Result<()> {
+    // ① users 角色 + 启停
+    if !table_has_column(conn, "users", "role") {
+        conn.execute_batch(
+            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
+             ALTER TABLE users ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1;
+             UPDATE users SET role = 'admin' WHERE id = (SELECT MIN(id) FROM users);",
+        )?;
+    }
+    // ② 收藏 / 播放历史：主键加 user_id，需重建表
+    let owner = "(SELECT COALESCE(MIN(id), 1) FROM users)";
+    if !table_has_column(conn, "favorites", "user_id") {
+        conn.execute_batch(&format!(
+            "CREATE TABLE favorites_v17 (
+                 user_id INTEGER NOT NULL DEFAULT 1,
+                 mount_id TEXT NOT NULL DEFAULT '',
+                 file_path TEXT NOT NULL,
+                 created_at INTEGER,
+                 PRIMARY KEY (user_id, mount_id, file_path)
+             );
+             INSERT OR IGNORE INTO favorites_v17 (user_id, mount_id, file_path, created_at)
+                 SELECT {owner}, mount_id, file_path, created_at FROM favorites;
+             DROP TABLE favorites;
+             ALTER TABLE favorites_v17 RENAME TO favorites;"
+        ))?;
+    }
+    if !table_has_column(conn, "play_history", "user_id") {
+        conn.execute_batch(&format!(
+            "CREATE TABLE play_history_v17 (
+                 user_id INTEGER NOT NULL DEFAULT 1,
+                 mount_id TEXT NOT NULL DEFAULT '',
+                 file_path TEXT NOT NULL,
+                 last_played_at INTEGER,
+                 progress INTEGER,
+                 PRIMARY KEY (user_id, mount_id, file_path)
+             );
+             INSERT OR IGNORE INTO play_history_v17 (user_id, mount_id, file_path, last_played_at, progress)
+                 SELECT {owner}, mount_id, file_path, last_played_at, progress FROM play_history;
+             DROP TABLE play_history;
+             ALTER TABLE play_history_v17 RENAME TO play_history;"
+        ))?;
+    }
+    // ③ 分享归属 + 令牌归属
+    if !table_has_column(conn, "shares", "user_id") {
+        conn.execute_batch(&format!(
+            "ALTER TABLE shares ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1;
+             UPDATE shares SET user_id = {owner} WHERE user_id IS NULL OR user_id = 0;"
+        ))?;
+    }
+    if table_has_column(conn, "access_tokens", "user_id") {
+        conn.execute(
+            "UPDATE access_tokens SET user_id = (SELECT COALESCE(MIN(id), 1) FROM users)
+             WHERE user_id IS NULL",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 impl AuthStore {
@@ -747,18 +838,27 @@ impl AuthStore {
         }
     }
 
-    pub fn create_user(&self, username: &str, password: &str) -> Result<User, String> {
+    /// 创建用户（管理员建号 / 首启自动引导共用）。
+    ///
+    /// `role` 为 `"admin"` 或 `"user"`。管理员代建与一次性引导都置
+    /// `must_change_password = 1`——初始密码经由控制台/管理员传递，
+    /// 登录后强制换掉（对齐 FileBrowser Quantum 的 requirePasswordChange）。
+    pub fn create_user(&self, username: &str, password: &str, role: &str) -> Result<User, String> {
         let username = username.trim();
-        if username.len() < 2 {
-            return Err("用户名至少 2 个字符".to_string());
+        if !valid_username(username) {
+            return Err("用户名需 2~32 个字符，可含中文、字母、数字与 _ - . @".to_string());
+        }
+        if role != "admin" && role != "user" {
+            return Err(format!("未知角色：{role}"));
         }
         check_password_strength(password)?;
 
         let hash = hash_password(password)?;
         let conn = self.connect()?;
         conn.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-            params![username, hash, now_secs()],
+            "INSERT INTO users (username, password_hash, created_at, role, must_change_password)
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            params![username, hash, now_secs(), role],
         )
         .map_err(|e| {
             if e.to_string().contains("UNIQUE") {
@@ -772,7 +872,9 @@ impl AuthStore {
             id: conn.last_insert_rowid(),
             username: username.to_string(),
             totp_enabled: false,
-            must_change_password: false,
+            must_change_password: true,
+            role: role.to_string(),
+            is_active: true,
         })
     }
 
@@ -782,7 +884,9 @@ impl AuthStore {
     ) -> Result<Option<(User, String, Option<String>)>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password FROM users WHERE username = ?1",
+            "SELECT id, username, password_hash, totp_secret, is_totp_enabled, must_change_password,
+                    role, is_active
+             FROM users WHERE username = ?1",
             params![username],
             |row| {
                 Ok((
@@ -791,6 +895,8 @@ impl AuthStore {
                         username: row.get(1)?,
                         totp_enabled: row.get::<_, i64>(4).unwrap_or(0) != 0,
                         must_change_password: row.get::<_, i64>(5).unwrap_or(0) != 0,
+                        role: row.get::<_, String>(6).unwrap_or_else(|_| "user".into()),
+                        is_active: row.get::<_, i64>(7).unwrap_or(1) != 0,
                     },
                     row.get::<_, String>(2).unwrap_or_default(),
                     row.get::<_, Option<String>>(3).unwrap_or(None),
@@ -804,7 +910,8 @@ impl AuthStore {
     pub fn first_user(&self) -> Result<Option<User>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, is_totp_enabled, must_change_password FROM users ORDER BY id LIMIT 1",
+            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active
+             FROM users ORDER BY id LIMIT 1",
             [],
             |row| {
                 Ok(User {
@@ -812,6 +919,8 @@ impl AuthStore {
                     username: row.get(1)?,
                     totp_enabled: row.get::<_, i64>(2).unwrap_or(0) != 0,
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
+                    role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
+                    is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
                 })
             },
         )
@@ -822,7 +931,8 @@ impl AuthStore {
     pub fn user_by_id(&self, id: i64) -> Result<Option<User>, String> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, username, is_totp_enabled, must_change_password FROM users WHERE id = ?1",
+            "SELECT id, username, is_totp_enabled, must_change_password, role, is_active
+             FROM users WHERE id = ?1",
             params![id],
             |row| {
                 Ok(User {
@@ -830,11 +940,140 @@ impl AuthStore {
                     username: row.get(1)?,
                     totp_enabled: row.get::<_, i64>(2).unwrap_or(0) != 0,
                     must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
+                    role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
+                    is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
                 })
             },
         )
         .optional()
         .map_err(|e| format!("查询用户失败：{e}"))
+    }
+
+    /// 用户清单（管理页）：按 id 排序，附账号状态。不含密码哈希等敏感列。
+    pub fn list_users(&self) -> Result<Vec<User>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, username, is_totp_enabled, must_change_password, role, is_active
+                 FROM users ORDER BY id",
+            )
+            .map_err(|e| format!("查询用户失败：{e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(User {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    totp_enabled: row.get::<_, i64>(2).unwrap_or(0) != 0,
+                    must_change_password: row.get::<_, i64>(3).unwrap_or(0) != 0,
+                    role: row.get::<_, String>(4).unwrap_or_else(|_| "user".into()),
+                    is_active: row.get::<_, i64>(5).unwrap_or(1) != 0,
+                })
+            })
+            .map_err(|e| format!("查询用户失败：{e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("读取用户失败：{e}"))
+    }
+
+    /// 改名。UNIQUE 冲突返回「用户名已存在」；改名后由调用方负责让该用户全部会话失效
+    /// （旧会话里缓存的用户名/身份要重新登录确认）。
+    pub fn rename_user(&self, user_id: i64, new_username: &str) -> Result<(), String> {
+        let username = new_username.trim();
+        if !valid_username(username) {
+            return Err("用户名需 2~32 个字符，可含中文、字母、数字与 _ - . @".to_string());
+        }
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE users SET username = ?1 WHERE id = ?2",
+            params![username, user_id],
+        )
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE") {
+                "用户名已存在".to_string()
+            } else {
+                format!("改名失败：{e}")
+            }
+        })?;
+        Ok(())
+    }
+
+    /// 启用 / 停用账号。停用即踢掉该用户全部会话。
+    /// **最后一个 admin 不能停用**（否则没有人能再进管理页）。
+    pub fn set_user_active(&self, user_id: i64, active: bool) -> Result<(), String> {
+        let conn = self.connect()?;
+        if !active {
+            ensure_not_last_admin(&conn, user_id, "不能停用最后一个管理员")?;
+        }
+        conn.execute(
+            "UPDATE users SET is_active = ?1 WHERE id = ?2",
+            params![if active { 1 } else { 0 }, user_id],
+        )
+        .map_err(|e| format!("更新账号状态失败：{e}"))?;
+        if !active {
+            conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
+                .map_err(|e| format!("清理会话失败：{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// 调整角色。**最后一个 admin 不能降级**。
+    pub fn set_user_role(&self, user_id: i64, role: &str) -> Result<(), String> {
+        if role != "admin" && role != "user" {
+            return Err(format!("未知角色：{role}"));
+        }
+        let conn = self.connect()?;
+        if role != "admin" {
+            ensure_not_last_admin(&conn, user_id, "不能降级最后一个管理员")?;
+        }
+        conn.execute(
+            "UPDATE users SET role = ?1 WHERE id = ?2",
+            params![role, user_id],
+        )
+        .map_err(|e| format!("更新角色失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 管理员代设密码：与自助改密不同，这里保留 must_change_password=1，
+    /// 让用户下次登录自己换掉（管理员不该知道用户的长期密码）。
+    pub fn admin_set_password(&self, user_id: i64, password: &str) -> Result<(), String> {
+        check_password_strength(password)?;
+        let hash = hash_password(password)?;
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE users SET password_hash = ?1, must_change_password = 1 WHERE id = ?2",
+            params![hash, user_id],
+        )
+        .map_err(|e| format!("设置密码失败：{e}"))?;
+        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
+            .map_err(|e| format!("清理会话失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 删除用户及其全部归属数据（会话/收藏/播放历史/分享/令牌）。
+    /// 不能删自己；**不能删最后一个 admin**。
+    pub fn delete_user(&self, user_id: i64, caller_id: i64) -> Result<(), String> {
+        if user_id == caller_id {
+            return Err("不能删除当前登录的账号".to_string());
+        }
+        let conn = self.connect()?;
+        ensure_not_last_admin(&conn, user_id, "不能删除最后一个管理员")?;
+        for sql in [
+            "DELETE FROM sessions WHERE user_id = ?1",
+            "DELETE FROM favorites WHERE user_id = ?1",
+            "DELETE FROM play_history WHERE user_id = ?1",
+            "DELETE FROM access_tokens WHERE user_id = ?1",
+        ] {
+            conn.execute(sql, params![user_id])
+                .map_err(|e| format!("清理用户数据失败：{e}"))?;
+        }
+        // 分享不物理删：转 tombstone（30 天后 janitor 回收），公开链接立即 410
+        conn.execute(
+            "UPDATE shares SET deleted_at = ?2 WHERE user_id = ?1 AND deleted_at IS NULL",
+            params![user_id, now_secs()],
+        )
+        .map_err(|e| format!("清理用户分享失败：{e}"))?;
+        conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])
+            .map_err(|e| format!("删除用户失败：{e}"))?;
+        Ok(())
     }
 
     pub fn update_password(&self, user_id: i64, password: &str) -> Result<(), String> {
@@ -1097,6 +1336,46 @@ fn check_password_strength(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 用户名规则：2~32 个字符；中文/字母/数字与 `_ - . @`；不能全是空格或控制字符。
+/// 中文按字符计宽（一个汉字算 1 个，不按字节），与前端展示一致。
+pub fn valid_username(username: &str) -> bool {
+    let trimmed = username.trim();
+    let len = trimmed.chars().count();
+    if !(2..=32).contains(&len) {
+        return false;
+    }
+    trimmed.chars().all(|c| {
+        !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    })
+}
+
+/// 守护「系统里至少留一个可登录的 admin」：停用/降级/删除目标前调用。
+/// 单行检查与写操作之间没有事务包裹——管理操作是人工低频动作，
+/// 且最坏结果（两个 admin 同时被降）需要两个管理员并发操作自己，可接受。
+fn ensure_not_last_admin(conn: &Connection, user_id: i64, message: &str) -> Result<(), String> {
+    let is_admin: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE id = ?1 AND role = 'admin'",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("查询角色失败：{e}"))?;
+    if is_admin == 0 {
+        return Ok(());
+    }
+    let other_admins: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND id != ?1 AND is_active != 0",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("查询管理员数失败：{e}"))?;
+    if other_admins == 0 {
+        return Err(message.to_string());
+    }
+    Ok(())
+}
+
 /// 32 字节随机 token（16 进制）
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
@@ -1253,6 +1532,98 @@ mod tests {
     }
 
     #[test]
+    fn user_crud_roles_and_last_admin_guard() {
+        let store = temp_store("multi-user");
+        let admin = store.create_user("boss", "Asmoday#2026", "admin").unwrap();
+        assert!(admin.is_admin());
+        assert!(admin.must_change_password, "建号即待改密");
+
+        let member = store.create_user("member", "Asmoday#2026", "user").unwrap();
+        assert!(!member.is_admin());
+
+        // 清掉待改密标志（模拟用户已完成首登改密）
+        store.update_password(admin.id, "Asmoday#2026").unwrap();
+
+        // 最后一个 admin 不能被降级 / 停用 / 删除
+        assert!(store.set_user_role(admin.id, "user").is_err());
+        assert!(store.set_user_active(admin.id, false).is_err());
+        assert!(store.delete_user(admin.id, admin.id).is_err());
+
+        // 普通 admin 存在时，另一名 admin 可以被降级
+        let second = store.create_user("boss2", "Asmoday#2026", "admin").unwrap();
+        store.update_password(second.id, "Asmoday#2026").unwrap();
+        store.set_user_role(second.id, "user").unwrap();
+        assert!(!store.user_by_id(second.id).unwrap().unwrap().is_admin());
+
+        // 删除用户级联清理归属数据
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites (user_id, mount_id, file_path, created_at)
+             VALUES (?1, 'm', '/m/x.mp4', 1)",
+            params![member.id],
+        )
+        .unwrap();
+        drop(conn);
+        store.delete_user(member.id, admin.id).unwrap();
+        assert!(store.user_by_id(member.id).unwrap().is_none());
+        let conn = store.connect().unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM favorites WHERE user_id = ?1",
+                params![member.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "删除用户应级联清掉收藏");
+    }
+
+    #[test]
+    fn rename_rejects_duplicates_and_bad_names() {
+        let store = temp_store("rename");
+        let admin = store.create_user("boss", "Asmoday#2026", "admin").unwrap();
+        store.create_user("member", "Asmoday#2026", "user").unwrap();
+
+        // 重名拒绝
+        assert!(store.rename_user(admin.id, "member").is_err());
+        // 非法字符（路径分隔符）拒绝
+        assert!(store.rename_user(admin.id, "a/b").is_err());
+        assert!(store.rename_user(admin.id, "x").is_err());
+        // 正常改名生效
+        store.rename_user(admin.id, "chief").unwrap();
+        assert_eq!(
+            store.user_by_id(admin.id).unwrap().unwrap().username,
+            "chief"
+        );
+    }
+
+    #[test]
+    fn disabled_users_are_excluded_from_login_lookup_guards() {
+        let store = temp_store("disabled");
+        let admin = store.create_user("boss", "Asmoday#2026", "admin").unwrap();
+        let member = store.create_user("member", "Asmoday#2026", "user").unwrap();
+        store.set_user_active(member.id, false).unwrap();
+
+        let found = store.find_user("member").unwrap().unwrap();
+        assert!(
+            !found.0.is_active,
+            "find_user 仍能找到行（审计需要），但 is_active=false"
+        );
+        assert!(
+            store
+                .user_by_id(member.id)
+                .unwrap()
+                .unwrap()
+                .must_change_password
+        );
+
+        // 重新启用后恢复
+        store.set_user_active(member.id, true).unwrap();
+        assert!(store.user_by_id(member.id).unwrap().unwrap().is_active);
+        // admin 未被误伤
+        assert!(store.user_by_id(admin.id).unwrap().unwrap().is_active);
+    }
+
+    #[test]
     fn media_tables_upgrade_to_composite_key() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1351,7 +1722,7 @@ mod tests {
     #[test]
     fn backup_writes_a_usable_copy_and_never_overwrites() {
         let store = temp_store("backup");
-        store.create_user("admin", "Asmoday#2026").unwrap();
+        store.create_user("admin", "Asmoday#2026", "admin").unwrap();
 
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -1386,7 +1757,7 @@ mod tests {
         let store = temp_store("session");
         assert_eq!(store.user_count().unwrap(), 0);
 
-        let user = store.create_user("admin", "Asmoday#2026").unwrap();
+        let user = store.create_user("admin", "Asmoday#2026", "admin").unwrap();
         assert_eq!(store.user_count().unwrap(), 1);
 
         let (found, hash, _) = store.find_user("admin").unwrap().unwrap();
@@ -1403,9 +1774,9 @@ mod tests {
     #[test]
     fn weak_passwords_are_rejected() {
         let store = temp_store("weak");
-        assert!(store.create_user("a", "Asmoday#2026").is_err()); // 用户名太短
-        assert!(store.create_user("admin", "short").is_err());
-        assert!(store.create_user("admin", "12345678").is_err());
+        assert!(store.create_user("a", "Asmoday#2026", "user").is_err()); // 用户名太短
+        assert!(store.create_user("admin", "short", "user").is_err());
+        assert!(store.create_user("admin", "12345678", "user").is_err());
     }
 
     #[test]
@@ -1468,7 +1839,9 @@ mod tests {
     #[test]
     fn recovery_codes_are_hashed_and_single_use() {
         let store = temp_store("recovery");
-        let user = store.create_user("vfy_recovery", "Abcd1234").unwrap();
+        let user = store
+            .create_user("vfy_recovery", "Abcd1234", "user")
+            .unwrap();
         let codes = generate_recovery_codes(10);
         assert_eq!(codes.len(), 10);
         for code in &codes {
@@ -1505,7 +1878,7 @@ mod tests {
     #[test]
     fn session_slides_but_never_past_absolute_cap() {
         let store = temp_store("session-slide");
-        let user = store.create_user("vfy_slide", "Abcd1234").unwrap();
+        let user = store.create_user("vfy_slide", "Abcd1234", "user").unwrap();
         let token = store.create_session(user.id).unwrap();
         let now = now_secs();
 
