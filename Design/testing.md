@@ -72,12 +72,20 @@ python probes/run_login.py --case=http --keep-data   # 排障：保留数据目�
 - **端口**：`free_port()` 让内核分配，不再写死 4299/4300（曾经撞过一次）。
 - **代理**：本机探测必须 `ProxyHandler({})` / `NO_PROXY=127.0.0.1`，否则会被
   `http_proxy` 劫持成 502。
+- **工作区里的删除会进回收站（2026-11-06 实测）**：在本机构建时，被执行环境接管的
+  工作区把**任何**删除（含 `DeleteFileW` / `fs::remove_file` 这类底层 unlink）重定向到
+  回收站——同一个 `[System.IO.File]::Delete()` 在 `%TEMP%` 里 `delta=0`，在
+  `asmoday/target` 里 `delta=1`。后果：`cargo` 每次清理上一轮增量产物都会在回收站留下
+  上千条目（实测一次 `cargo build` = **1767 条 / 539 MB**，几乎全是
+  `target/debug/incremental/*.pre-lto.bc` 与 `target/debug/deps/*.o`）。
+  这不是项目的 bug，也改不了；**别为此写脚本去「删回收站」**，能做的只是少触发重编
+  （见第 4 节）。要释放空间时用 `Clear-RecycleBin` 或按 `$I` 记录里原路径精准挑，别整盘清。
 
 ## 4. 明确不做的事
 
 | 反模式 | 为什么不行 |
 | --- | --- |
-| `touch src/main.rs` 只为看 warning | 白等一轮编译；`cargo build` 本来就会打 |
+| `touch src/main.rs` 只为看 warning | 白等一轮编译；`cargo build` 本来就会打。而且一次重编 = 1000+ 个增量产物进回收站（第 3 节），代价比它省下的几秒大得多 |
 | 每个 bug 新建一套 `probe-vXXXX.py` + 一套 `data-vXXXX` | 90% 重复，还会在源码目录堆一堆一次性目录 |
 | `rmtree` 源码目录下的 `data-*` / `dist` | 删一大片再重建，正是「频繁删除」的来源 |
 | `git add -A` | 容易把临时产物带进提交，显式列路径 |
@@ -94,6 +102,9 @@ python probes/run_login.py --case=http --keep-data   # 排障：保留数据目�
 
 ## 6. 变更记录
 
+- **v2（v4.9.49 后）**：记下「工作区里的删除会被重定向到回收站」这一环境事实与实测代价
+  （一次重编 1767 条 / 539 MB），`touch` 反模式补上这条后果；口径改为「少触发重编」而不是
+  去清回收站。
 - **v1（v4.9.48）**：从 `.asmoday-probe` 里四份「按版本号」的脚本收敛为
   `probes/run_login.py` 一套；数据根从「源码目录 + 每次 rmtree」改为
   `target/probe/<时间戳>`；截图改固定名；明确 L0~L3 分层与六条反模式。
