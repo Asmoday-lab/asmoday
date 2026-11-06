@@ -101,10 +101,17 @@ pub async fn create(
         .map(str::trim)
         .filter(|p| !p.is_empty())
     {
-        Some(password) => match hash_password(password) {
-            Ok(hash) => Some(hash),
-            Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
-        },
+        Some(password) => {
+            // 口令与账号密码同一字符集（v4.9.51）：不许空格、不许非 ASCII——
+            // 访客手输的东西更不能带看不见的差异。长度只管上限，短口令照旧可用。
+            if let Err(message) = crate::core::auth::validate_password_charset(password) {
+                return error_code(StatusCode::BAD_REQUEST, "E_PASSWORD_CHARSET", message);
+            }
+            match hash_password(password) {
+                Ok(hash) => Some(hash),
+                Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err),
+            }
+        }
         None => None,
     };
 

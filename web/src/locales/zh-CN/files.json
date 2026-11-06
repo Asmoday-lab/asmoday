@@ -122,7 +122,7 @@
     "create": "创建分享",
     "created": "分享已创建",
     "password": "访问口令（留空 = 无需口令）",
-    "passwordPlaceholder": "可选",
+    "passwordPlaceholder": "可选，仅字母数字符号",
     "expiry": "有效期",
     "days1": "1 天",
     "days7": "7 天",

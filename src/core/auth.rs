@@ -867,7 +867,7 @@ impl AuthStore {
         }
         // 首尾空白不进哈希（与 verify_password_lenient 同一口径，v4.9.50）
         let password = password.trim();
-        check_password_strength(password)?;
+        validate_password(password)?;
 
         let hash = hash_password(password)?;
         let conn = self.connect()?;
@@ -982,7 +982,7 @@ impl AuthStore {
     pub fn update_password(&self, user_id: i64, password: &str) -> Result<(), String> {
         // 首尾空白不进哈希（与 verify_password_lenient 同一口径，v4.9.50）
         let password = password.trim();
-        check_password_strength(password)?;
+        validate_password(password)?;
         let hash = hash_password(password)?;
         let conn = self.connect()?;
         conn.execute(
@@ -1267,7 +1267,9 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 /// - 再试原样（规则落地前设的带首尾空格密码，用原样输入仍能登；
 ///   网页端已经 trim 过，这类存量密码需走 `--reset-password`）。
 ///
-/// 中间的空格始终保留：`my pass phrase` 是合法密码。
+/// 中间的空格不再合法（v4.9.51 起写入侧只收可见 ASCII，见 [`validate_password_charset`]）：
+/// 「原样」这条分支纯粹留给规则落地前设的存量密码（WebDAV / CLI 里带空格敲进来仍能过），
+/// 网页端输入框会把空格滤掉，这类账号改一次密码就自然对齐。
 pub fn verify_password_lenient(hash: &str, raw: &str) -> bool {
     let trimmed = raw.trim();
     // 账号密码不可能为空（强度要求 ≥8 位），空白输入直接判失败，
@@ -1281,14 +1283,108 @@ pub fn verify_password_lenient(hash: &str, raw: &str) -> bool {
     verify_password(hash, trimmed) || verify_password(hash, raw)
 }
 
-fn check_password_strength(password: &str) -> Result<(), String> {
-    if password.chars().count() < 8 {
-        return Err("密码至少 8 个字符".to_string());
+/// 密码长度上下限。上限对齐 OWASP（128）：再长的输入对 Argon2 没有收益，只是白烧 CPU。
+pub const PASSWORD_MIN_CHARS: usize = 8;
+pub const PASSWORD_MAX_CHARS: usize = 128;
+
+/// 密码规则违例。判定只此一份，文案分语言（网页用中文、CLI 用英文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordRule {
+    ContainsSpace,
+    NotVisibleAscii,
+    TooShort,
+    TooLong,
+    AllDigits,
+}
+
+impl PasswordRule {
+    /// 稳定的错误码：前端按 `errors.<CODE>` 出本地化文案（设计文档 3.8）
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ContainsSpace => "PASSWORD_SPACE",
+            Self::NotVisibleAscii => "PASSWORD_CHARSET",
+            Self::TooShort => "PASSWORD_TOO_SHORT",
+            Self::TooLong => "PASSWORD_TOO_LONG",
+            Self::AllDigits => "PASSWORD_ALL_DIGITS",
+        }
+    }
+
+    pub fn zh(self) -> String {
+        match self {
+            Self::ContainsSpace => "密码不能包含空格".to_string(),
+            Self::NotVisibleAscii => "密码只能使用字母、数字和英文符号".to_string(),
+            Self::TooShort => format!("密码至少 {PASSWORD_MIN_CHARS} 个字符"),
+            Self::TooLong => format!("密码最多 {PASSWORD_MAX_CHARS} 个字符"),
+            Self::AllDigits => "密码不能全是数字".to_string(),
+        }
+    }
+
+    pub fn en(self) -> String {
+        match self {
+            Self::ContainsSpace => "password must not contain spaces".to_string(),
+            Self::NotVisibleAscii => {
+                "password may only use letters, digits and ASCII punctuation".to_string()
+            }
+            Self::TooShort => format!("password must be at least {PASSWORD_MIN_CHARS} characters"),
+            Self::TooLong => format!("password must be at most {PASSWORD_MAX_CHARS} characters"),
+            Self::AllDigits => "password must not be all digits".to_string(),
+        }
+    }
+}
+
+/// 字符集：**可见 ASCII**，即 `char::is_ascii_graphic()`（`!`..=`~`），**不含空格**。
+///
+/// 为什么卡死这个集合：密码是跨设备、跨输入法输入的——手机上长按空格、中文输入法留下的
+/// 全角符号、macOS 的智能引号，屏幕上看「一模一样」，码点却完全不同。限定可见 ASCII 之后，
+/// 「打出来是什么」与「服务器收到什么」永远一一对应，粘贴、密码管理器互导、语音输入都不会
+/// 再引入看不见的差异（v4.9.50 只是把两头空白抹掉，中间的 `my pass phrase` 仍然是雷）。
+///
+/// 首尾空白已由写入侧的 `trim()` 吃掉，这里只负责拒掉中间的空格、控制字符与非 ASCII。
+pub fn check_password_charset(password: &str) -> Option<PasswordRule> {
+    if password.chars().any(char::is_whitespace) {
+        return Some(PasswordRule::ContainsSpace);
+    }
+    if !password.chars().all(|c| c.is_ascii_graphic()) {
+        return Some(PasswordRule::NotVisibleAscii);
+    }
+    None
+}
+
+/// 完整规则：字符集 + 长度 + 「不能全是数字」。
+pub fn check_password_rules(password: &str) -> Option<PasswordRule> {
+    // 字符集先判：`12 34 5678` 报「不能包含空格」比报「不能全是数字」更贴近真实原因
+    if let Some(rule) = check_password_charset(password) {
+        return Some(rule);
+    }
+    let count = password.chars().count();
+    if count < PASSWORD_MIN_CHARS {
+        return Some(PasswordRule::TooShort);
+    }
+    if count > PASSWORD_MAX_CHARS {
+        return Some(PasswordRule::TooLong);
     }
     if password.chars().all(|c| c.is_ascii_digit()) {
-        return Err("密码不能全是数字".to_string());
+        return Some(PasswordRule::AllDigits);
     }
-    Ok(())
+    None
+}
+
+/// 账号密码的写入校验（中文文案）。`create_user` / `update_password` 与分享口令共用。
+pub fn validate_password(password: &str) -> Result<(), String> {
+    check_password_rules(password)
+        .map(PasswordRule::zh)
+        .map_or(Ok(()), Err)
+}
+
+/// 只校验字符集与长度上限，**不要求 8 位**：分享口令这类「发给访客手动输」的短口令
+/// 同样是密码，但不该被账号密码的强度门槛卡住；空格与非 ASCII 一样不许。
+pub fn validate_password_charset(password: &str) -> Result<(), String> {
+    check_password_charset(password)
+        .or_else(|| {
+            (password.chars().count() > PASSWORD_MAX_CHARS).then_some(PasswordRule::TooLong)
+        })
+        .map(PasswordRule::zh)
+        .map_or(Ok(()), Err)
 }
 
 /// 用户名规则：2~32 个字符；中文/字母/数字与 `_ - . @`；不能全是空格或控制字符。
@@ -1498,18 +1594,63 @@ mod tests {
         ));
         assert!(!verify_password_lenient(&hash, "Asmoday#2027"));
 
-        // 中间的空格是真内容，不许动
-        store.update_password(admin.id, "my pass phrase").unwrap();
-        let (_, hash, _) = store.find_user("boss").unwrap().unwrap();
-        assert!(verify_password_lenient(&hash, "my pass phrase"));
-        assert!(
-            !verify_password_lenient(&hash, "mypassphrase"),
-            "内部空格必须保留"
+        // 中间的空格不再合法（v4.9.51）：写入侧直接拒，而不是悄悄 trim 成另一个密码
+        assert_eq!(
+            store
+                .update_password(admin.id, "my pass phrase")
+                .unwrap_err(),
+            "密码不能包含空格"
         );
+        // 存量里的带空格密码（规则落地前落的库）仍可原样登录：raw 分支就是为它们留的
+        let legacy = hash_password("my pass phrase").unwrap();
+        assert!(verify_password_lenient(&legacy, "my pass phrase"));
 
         // 全空白不是密码（trim 后不足 8 位，强度校验会拦）
         assert!(store.update_password(admin.id, "        ").is_err());
         assert!(store.create_user("boss2", "  x  ").is_err());
+    }
+
+    #[test]
+    /// 密码只能是可见 ASCII 且不含空格（v4.9.51）：跨设备、跨输入法都不留隐形差异
+    fn passwords_must_stay_within_visible_ascii() {
+        let store = temp_store("password-charset");
+
+        // 中文、全角符号一律拒绝：屏幕上像「密码」，码点却各是各的
+        assert_eq!(
+            store
+                .create_user("boss", "密码密码密码密码")
+                .unwrap_err()
+                .as_str(),
+            "密码只能使用字母、数字和英文符号"
+        );
+        // 中间的空格：`trim()` 只吃两头，中间的必须拦下，否则「看起来一样」的两个密码
+        // 在手机上（长按空格）和电脑上敲出来并不等价
+        assert_eq!(
+            store
+                .create_user("boss", "Asmoday 2026")
+                .unwrap_err()
+                .as_str(),
+            "密码不能包含空格"
+        );
+        // 制表符同为空白，但肉眼完全看不见
+        assert_eq!(
+            store
+                .create_user("boss", "Asmoday\t2026")
+                .unwrap_err()
+                .as_str(),
+            "密码不能包含空格"
+        );
+        // 上限 128：再长的输入对 Argon2 没收益
+        let long = "a".repeat(PASSWORD_MAX_CHARS + 1);
+        assert_eq!(
+            store.create_user("boss", &long).unwrap_err().as_str(),
+            "密码最多 128 个字符"
+        );
+
+        // 可见 ASCII 全量可用：字母、数字、标点都在
+        store
+            .create_user("boss", "aZ09!#$%&'()*+,-./:;<=>?@[]^_`{|}~")
+            .unwrap();
     }
 
     #[test]

@@ -1663,12 +1663,9 @@ fn prompt_line(label: &str) -> Result<String, String> {
     Ok(value)
 }
 
-/// CLI 重置时的最低强度要求（与网页注册保持一致：至少 8 位且不全是数字）
+/// CLI 重置时的密码规则（与网页同一个判定函数，文案走英文——控制台编码不保证）
 fn check_password_strength(password: &str) -> Result<(), String> {
-    if password.chars().count() < 8 || password.chars().all(|c| c.is_ascii_digit()) {
-        return Err("password must be at least 8 characters and not all digits".to_string());
-    }
-    Ok(())
+    core::auth::check_password_rules(password).map_or(Ok(()), |rule| Err(rule.en()))
 }
 
 /// `.asmoday-part` 启动清理：后台执行，失败只记 WARN，绝不阻止服务起来

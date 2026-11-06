@@ -10,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 import { sharesApi } from '../api/shares'
 import { closeShare, shareTarget } from '../stores/share'
 import { useScrollLock } from '../composables/useScrollLock'
+import { filterPasswordChars } from '../lib/password'
 
 const { t } = useI18n()
 
@@ -19,6 +20,14 @@ const result = ref<{ url: string; token: string } | null>(null)
 const copied = ref(false)
 
 const form = reactive({ password: '', days: 7, allowDownload: true })
+
+/** 口令同样只收可见 ASCII（v4.9.51）：访客手输的东西更不能带看不见的差异 */
+function onPasswordInput(event: Event) {
+  const el = event.target as HTMLInputElement
+  const cleaned = filterPasswordChars(el.value)
+  if (cleaned !== el.value) el.value = cleaned
+  form.password = cleaned
+}
 
 const isOpen = computed(() => shareTarget.value !== null)
 useScrollLock(isOpen)
@@ -81,10 +90,11 @@ async function copyLink() {
           <label class="mt-4 block text-[12px] text-muted">
             {{ t('files.share.password') }}
             <input
-              v-model="form.password"
+              :value="form.password"
               type="text"
               :placeholder="t('files.share.passwordPlaceholder')"
               class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+              @input="onPasswordInput"
             />
           </label>
 

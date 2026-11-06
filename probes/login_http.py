@@ -113,6 +113,31 @@ def run(server: Server) -> int:
 
     status, payload = caller.call("POST", "/api/auth/login", {"password": "  NewPass#2026  "})
     checks("改密后带空格也能登录（同一口径）", status == 200, (status, payload))
+
+    # 密码字符集（v4.9.51）：只收可见 ASCII。空格、中文、超长、纯数字都要在写入侧
+    # 就被拒，并且给稳定的错误码——前端按 code 出文案，不依赖后端的中文 message
+    caller.call("POST", "/api/auth/logout")
+    caller.call("POST", "/api/auth/login", {"password": "NewPass#2026"})
+    for label, candidate, code in [
+        ("含空格", "with space 2026", "PASSWORD_SPACE"),
+        ("含中文", "密码密码密码密码", "PASSWORD_CHARSET"),
+        ("含全角符号", "Passw0rd！2026", "PASSWORD_CHARSET"),
+        ("超 128 位", "a" * 129, "PASSWORD_TOO_LONG"),
+        ("全是数字", "1234567890", "PASSWORD_ALL_DIGITS"),
+    ]:
+        status, payload = caller.call(
+            "POST", "/api/auth/password", {"current": "NewPass#2026", "next": candidate}
+        )
+        checks(
+            f"新密码{label} → 400 {code}",
+            status == 400 and payload.get("code") == code,
+            (status, payload),
+        )
+
+    # 被拒的改密不能有副作用：旧密码照旧能登，会话也没被清掉
+    caller.call("POST", "/api/auth/logout")
+    status, payload = caller.call("POST", "/api/auth/login", {"password": "NewPass#2026"})
+    checks("被拒的改密不影响原密码", status == 200 and payload.get("status") == "ok", (status, payload))
     caller.call("POST", "/api/auth/logout")
 
     return checks.summary()

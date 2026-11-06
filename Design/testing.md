@@ -36,7 +36,7 @@
 probes/
   run_login.py     统一入口：--case=http|ui-password|ui-code、--build、--keep-data
   lib_probe.py     公共件：Server（临时数据 + 随机空闲端口 + 独立日志）、Caller、Checks、totp
-  login_http.py    L2：登录 API 18 条断言（GWT-AUTH-02/05/22/23）
+  login_http.py    L2：登录 API 29 条断言（GWT-AUTH-02/05/22/23/24/25）
   login_ui.cjs     L3：登录页两形态（password / code），playwright-core
   shots/           截图输出（git 忽略，固定文件名）
 ```
@@ -58,8 +58,8 @@ python probes/run_login.py --case=http --keep-data   # 排障：保留数据目�
 
 | case | 覆盖 | 对应条目 |
 | --- | --- | --- |
-| `http` | 一次性密码 → 改密 → 开 2FA → `{totp}` / `{password}` / 恢复码 / 严格双因子 / 空凭证 / 关 2FA 后失效 | GWT-AUTH-02/05/22/23 |
-| `ui-password` | 未开 2FA：只有一个密码框、无切换入口、无 2FA 字样、密码能登 | GWT-AUTH-02 |
+| `http` | 一次性密码 → 改密 → 开 2FA → `{totp}` / `{password}` / 恢复码 / 严格双因子 / 空凭证 / 关 2FA 后失效 → 首尾空白宽容 → 密码字符集（空格/中文/全角/超长/纯数字被拒） | GWT-AUTH-02/05/22/23/24/25 |
+| `ui-password` | 未开 2FA：只有一个密码框、无切换入口、无 2FA 字样、首尾空白自动消失、非法字符被滤掉、密码能登 | GWT-AUTH-02/24/25 |
 | `ui-code` | 开 2FA：默认密码框 + 切换入口 → 同框变动态码样式（居中/明文/占位 000000）→ 切换清空 → 动态码模式填密码进不去 → 输满自动提交 → 密码模式仍能登 | GWT-AUTH-06 |
 
 ## 3. 数据与产物

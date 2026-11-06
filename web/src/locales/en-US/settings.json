@@ -73,7 +73,7 @@
     "next": "New password (8+ characters)",
     "confirm": "Confirm new password",
     "submit": "Update password",
-    "hint": "Changing the password invalidates all existing sessions immediately",
+    "hint": "Letters, digits and ASCII symbols only, no spaces. All old sessions are signed out after the change.",
     "mismatch": "The two passwords do not match",
     "changed": "Password updated",
     "failed": "Change failed",

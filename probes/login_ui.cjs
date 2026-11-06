@@ -149,6 +149,17 @@ async function shot(page, name) {
     const trimmed = (await inputInfo(page)).value
     check('密码框失焦自动去掉首尾空白', trimmed === PASSWORD, JSON.stringify(trimmed))
 
+    // 字符集（v4.9.51）：空格、中文、全角符号在输入当场就该消失——屏幕上看不出来的
+    // 差异留在密码里，换个设备就再也打不出来了
+    await page.fill('form input', `ab c${PASSWORD}密码！　`)
+    const filtered = (await inputInfo(page)).value
+    check(
+      '密码框只留可见 ASCII（空格、中文、全角符号被滤掉）',
+      filtered === `abc${PASSWORD}`,
+      JSON.stringify(filtered),
+    )
+
+    await page.fill('form input', PASSWORD)
     await page.click('form button[type="submit"]')
     const login = await waitLeave(page)
     check('密码模式能登录', login.ok, login)

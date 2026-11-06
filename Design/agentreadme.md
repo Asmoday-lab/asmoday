@@ -390,7 +390,8 @@ GWT-AUTH-20 Given 任意实例  When 带 `--open`（或 `ASMODAY_OPEN=1`）启�
 GWT-AUTH-21 Given Linux 服务器 / 无图形会话  When 不带 `--open` 启动  Then 不尝试拉起浏览器；带 `--open` 且 `xdg-open` 不存在时只 WARN（`could not open a browser …; open … manually`），服务照常起（v4.9.45 / v4.9.49）
 GWT-AUTH-22 Given 任意实例（未登录）  When GET /api/auth/status  Then 回设备级 `totp_enabled`（只说明本机账号开没开 2FA，不含密钥）：没开时登录页没有任何「动态验证码 / 恢复码」字样、也没有切换入口；开了才出现切换入口，**框始终只有 1 个**（v4.9.46 / v4.9.48）
 GWT-AUTH-23 Given 2FA 账号  When POST /api/auth/login  Then `{password}` 与 `{totp}` 各自 200（前者密码模式，后者动态码 / 恢复码模式）；`{password,totp}` 是严格双因子（缺一或码错 401）；两字段都空 401 AUTH_INVALID；用过的恢复码 401；未开 2FA 的账号 `{totp}` 一律 401（v4.9.48）
-GWT-AUTH-24 Given 已设正式密码的账号  When 登录 / 改密 / 关 2FA / WebDAV 时把密码写成「首尾带空格或全角空格」  Then 一律按 trim 后的值校验并通过（`{password: "  Secret#2026 "}` → 200）；纯空白 → 401 `AUTH_INVALID`；改密时 `next` 的首尾空白不进入哈希（事后用不带空格的密码能登）；中间的空格照留（`my pass phrase` != `mypassphrase`）；登录页密码框失焦 / 按回车时首尾空白自动消失（v4.9.50）
+GWT-AUTH-24 Given 已设正式密码的账号  When 登录 / 改密 / 关 2FA / WebDAV 时把密码写成「首尾带空格或全角空格」  Then 一律按 trim 后的值校验并通过（`{password: "  Secret#2026 "}` → 200）；纯空白 → 401 `AUTH_INVALID`；改密时 `next` 的首尾空白不进入哈希（事后用不带空格的密码能登）；登录页密码框失焦 / 按回车时首尾空白自动消失（v4.9.50）
+GWT-AUTH-25 Given 任意账号（或创建分享）  When 把密码 / 口令设成含空格、中文、全角符号、超过 128 位或纯数字  Then 写入侧 400 + 稳定 code：`PASSWORD_SPACE` / `PASSWORD_CHARSET` / `PASSWORD_TOO_LONG` / `PASSWORD_ALL_DIGITS`（过短为 `PASSWORD_TOO_SHORT`）；被拒的改密不影响原密码、也不清会话；网页密码框与分享口令框在输入、粘贴、输入法落定时把非可见 ASCII 直接滤掉（`ab cSecret#2026密码！` → `abcSecret#2026`）（v4.9.51）
 GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码；用户拿它登录后在强制改密弹窗换正式密码，网页端全程无用户名（v4.9.34）
 GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
 GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v20 跑完  Then 只留「启用中 id 最小的账号」（无启停列时取 id 最小），其余账号从 users 表物理删除，其 sessions / favorites / play_history / shares / access_tokens 一并删掉（含 user_id 为 NULL 的遗留令牌）；再次启动幂等（v4.9.30）

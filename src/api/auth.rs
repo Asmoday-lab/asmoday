@@ -974,6 +974,12 @@ pub async fn change_password(
         );
     }
 
+    // 密码规则先结构化判一次：页面按 code 出本地化文案，不把中文 message 直接甩出去
+    // （与 `update_password` 里的写入校验同一个函数，见 `core::auth::check_password_rules`）
+    if let Some(rule) = crate::core::auth::check_password_rules(body.next.trim()) {
+        return crate::api::error::api_error(StatusCode::BAD_REQUEST, rule.code(), rule.en());
+    }
+
     if let Err(err) = state.auth.update_password(user.id, &body.next) {
         return json_error(StatusCode::BAD_REQUEST, err);
     }

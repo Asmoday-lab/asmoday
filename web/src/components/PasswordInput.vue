@@ -11,29 +11,54 @@
  * - 按钮必须 `type="button"`，否则放在 <form> 里点一下就把表单提交了；
  * - `@pointerdown.prevent` 让 input 保持焦点：桌面上不闪、移动端小键盘不收起；
  * - 除 class / 监听器外，placeholder、autocomplete、autofocus 等原样透传给 input。
+ * - **只留可见 ASCII**（v4.9.51，可用 `:ascii-only="false"` 关掉）：密码里不该出现空格、
+ *   中文或全角符号——屏幕上看一样，码点却不同，粘贴/输入法一掺进来就是「密码对却 401」。
+ *   输入与粘贴时直接把非法字符滤掉（后端 `core::auth::check_password_charset` 同一口径），
+ *   连输入法组合中的候选也等 `compositionend` 后再清，避免中途裁剪打断输入。
  * - **失焦 / 回车时抹掉首尾空白**（v4.9.50，可用 `:trim="false"` 关掉）：密码里最常
  *   出的事故是从密码管理器、聊天记录里粘贴时多带一个空格，以及中文输入法留下的全角
  *   空格（`String.trim()` 会一并吃掉 `U+3000`）。这类字符看不见，却让人一直 401。
- *   不在 `input` 事件里改：那样每敲一个空格光标就跳一下，中间的空格也打不进去。
- *   中间的空格是真内容，`trim()` 只动两头。
+ *   不在 `input` 事件里 trim：那样光标会乱跳（空格本身已由字符集过滤拦掉）。
  */
 import { ref, useAttrs } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AppIcon from './AppIcon.vue'
+import { filterPasswordChars } from '../lib/password'
 
 defineOptions({ inheritAttrs: false })
 
-const props = withDefaults(defineProps<{ modelValue: string; trim?: boolean }>(), {
-  trim: true,
-})
+const props = withDefaults(
+  defineProps<{ modelValue: string; trim?: boolean; asciiOnly?: boolean }>(),
+  { trim: true, asciiOnly: true },
+)
 const emit = defineEmits<{ 'update:modelValue': [string] }>()
 
 const attrs = useAttrs()
 const { t } = useI18n()
 const reveal = ref(false)
 
+/** 滤掉非法字符（字符集收口在 `filterPasswordChars`）；确实删了东西就把 DOM 也改掉，
+ *  否则界面上还留着「已删掉」的字符 */
+function filterValue(value: string, el?: HTMLInputElement): string {
+  if (!props.asciiOnly) return value
+  const cleaned = filterPasswordChars(value)
+  if (el && cleaned !== value) el.value = cleaned
+  return cleaned
+}
+
 function onInput(event: Event) {
-  emit('update:modelValue', (event.target as HTMLInputElement).value)
+  const el = event.target as HTMLInputElement
+  // 输入法组合中不裁剪：会把候选打断。中文本来就不在允许集里，等落定再统一清。
+  if ((event as InputEvent).isComposing) {
+    emit('update:modelValue', el.value)
+    return
+  }
+  emit('update:modelValue', filterValue(el.value, el))
+}
+
+function onCompositionEnd(event: Event) {
+  const el = event.target as HTMLInputElement
+  emit('update:modelValue', filterValue(el.value, el))
 }
 
 /** 失焦与回车时收口：这两个时机改值不会打断输入，也不会挪光标 */
@@ -52,6 +77,7 @@ function trimValue() {
       :type="reveal ? 'text' : 'password'"
       class="w-full"
       @input="onInput"
+      @compositionend="onCompositionEnd"
       @blur="trimValue"
       @keydown.enter="trimValue"
     />
