@@ -226,6 +226,8 @@ cargo run                                   # http://127.0.0.1:4242
 cd web && pnpm run build && cd .. && cargo build --release
 ```
 
+Test flow (gate levels, probe suite, data/artifact rules): [`Design/testing.md`](Design/testing.md).
+
 Before submitting, run the same gates CI uses:
 
 ```bash
@@ -240,6 +242,7 @@ Layout:
 ```
 src/            Rust backend (api/ routes and handlers, core/ config, auth, filesystem, logging)
 web/            Vue 3 frontend (views/, components/, locales/)
+probes/         login probe suite (L2 HTTP smoke + L3 UI, see Design/testing.md)
 Design/         product and system design notes
 .github/        release workflow (triggered by v* tags)
 ```

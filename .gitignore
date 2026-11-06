@@ -3,8 +3,12 @@
 # 会话临时脚本 / 测试沙箱（跑完即删，绝不入库）
 /.scratch
 
-# 真机探针（playwright / 冒烟脚本与临时数据目录，绝不入库）
+# 历史探针目录（已被 probes/ 取代，留作本地参考，绝不入库）
 /.asmoday-probe
+
+# 探针产物（截图固定名覆盖写；脚本本身入库，见 Design/testing.md）
+/probes/shots/
+/probes/__pycache__/
 
 # 前端产物（由 vite build 输出，供 rust-embed 打包）
 /dist
