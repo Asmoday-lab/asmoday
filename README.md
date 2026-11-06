@@ -56,7 +56,7 @@ tar -xzf asmoday-*.tar.gz && chmod +x asmoday
 asmoday.exe
 ```
 
-Open `http://127.0.0.1:4242`, sign in with the **one-time password printed in the console** (no username anywhere in the web UI), then set your real password in the prompt that appears. The banner also prints the address as a terminal hyperlink — Ctrl/⌘+click it in Windows Terminal, iTerm2 or the VS Code terminal. Missed the password? As long as no real password has been set yet, restarting the process **issues a fresh one** (the old one stops working) and prints the banner again.
+Open `http://127.0.0.1:4242`, sign in with the **one-time password printed in the console** (no username anywhere in the web UI), then set your real password in the prompt that appears. The banner also prints the address as a terminal hyperlink — Ctrl/⌘+click it in Windows Terminal, iTerm2 or the VS Code terminal; the legacy console you get by double-clicking the exe cannot open links, so on first boot it launches the browser for you (later starts: `asmoday --open`). With `host = "0.0.0.0"` the startup log also prints a second `network:` line with the LAN address other devices should use. Missed the password? As long as no real password has been set yet, restarting the process **issues a fresh one** (the old one stops working) and prints the banner again.
 
 The first start writes `config.toml` and `data/` into the current directory. With no mount configured, the working directory is used as a fallback root; to manage other disks, add a mount under Settings → Advanced or edit the config:
 
@@ -165,6 +165,7 @@ Environment variables (take precedence over the config file):
 | `asmoday --reset-2fa` | Clear the TOTP secret and disable 2FA (requires the current password) |
 | `asmoday --check-config` | Validate the config and exit without starting the server |
 | `asmoday --backup ./asmoday-backup.db` | Write a consistent database copy and exit (works while running) |
+| `asmoday --open` | Start and open the web UI in the default browser (same as `ASMODAY_OPEN=1`) |
 | `asmoday -c ./config.toml -d ./data -p 4242 -H 0.0.0.0` | Custom config, data directory, port and address |
 
 ## WebDAV

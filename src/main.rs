@@ -142,6 +142,10 @@ struct Cli {
     /// 只校验配置文件语法与危险配置，不启动服务
     #[arg(long = "check-config")]
     check_config: bool,
+    /// 启动后用系统默认浏览器打开入口地址（经典控制台里点不动链接时用；
+    /// 也可用环境变量 ASMODAY_OPEN=1）
+    #[arg(long)]
+    open: bool,
     /// 把数据库热备份到指定文件后退出（不启动服务；服务在跑时也能执行）
     #[arg(long, value_name = "PATH")]
     backup: Option<PathBuf>,
@@ -213,6 +217,19 @@ async fn run(cli: Cli) -> Result<(), String> {
     if let Some(port) = cli.port {
         config.server.port = port;
     }
+
+    // `--open` / `ASMODAY_OPEN=1`：起完服务直接用默认浏览器打开入口（v4.9.45）。
+    // 双击 exe 的用户拿不到可点的链接（经典 conhost 不实现 OSC 8），这条是唯一
+    // 可靠的出路；做成开关而不是默认行为，免得 NAS / 服务器上凭空拉起一个浏览器。
+    let manual_open = cli.open
+        || std::env::var("ASMODAY_OPEN")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
 
     // `--check-config`：只校验语法与危险配置，不碰数据库、不监听端口（设计文档 5）
     if cli.check_config {
@@ -318,13 +335,13 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     // 控制台入口地址：一次性密码横幅与启动日志共用同一份（v4.9.42）。
     // 放在 CLI 分支之前——`--init` 也要把它印在密码下面。
-    let url = access_url(&config.server);
+    let urls = access_urls(&config.server);
 
     if cli.init {
-        return bootstrap_admin(&auth, &data_dir, &url).await;
+        return bootstrap_admin(&auth, &data_dir, &urls).await;
     }
     if cli.reset_password {
-        return reset_admin_password(&auth, &url).await;
+        return reset_admin_password(&auth, &urls).await;
     }
     if cli.reset_2fa {
         return reset_two_factor(&auth).await;
@@ -560,6 +577,10 @@ async fn run(cli: Cli) -> Result<(), String> {
     // 一次性密码就是「守在控制台前的人」的所有权凭证，没有它，先打开页面的
     // 路人就能抢注成主人。密码只走 println（不进 asmoday.log）——日志文件会被
     // 轮转/采集，明文凭据不能落盘；与 --reset-password 口径一致。
+    // 这台机器会不会在起完服务后自动拉起浏览器：`--open` / `ASMODAY_OPEN=1`，或者
+    // 「双击 exe 打开的是经典 conhost、又刚打印了一次性密码」——那种窗口里谁都点不动
+    // 链接，而人此刻正需要进页面把密码设掉（v4.9.45）。
+    let mut password_shown = false;
     if auth.user_count().unwrap_or(1) == 0 {
         let password = core::auth::random_password();
         let user = auth
@@ -567,7 +588,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
         auth.set_must_change_password(user.id, true)?;
         crate::log_info!("no administrator yet; created user 'admin'");
-        print_one_time_password(&password, Some(&url), None);
+        print_one_time_password(
+            &password,
+            Some(&urls),
+            None,
+            manual_open || legacy_console(),
+        );
+        password_shown = true;
     } else if let Some(password) = auth.reissue_pending_password()? {
         // 账号建好了、但还没人用一次性密码登录过（must_change_password 仍是 1）。
         // 上一次打的那串只在控制台出现过一次；用户没记下来就把进程关掉的话，重启后
@@ -579,11 +606,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         );
         print_one_time_password(
             &password,
-            Some(&url),
+            Some(&urls),
             Some(
                 "issued again because no password has been set yet; an earlier one is now invalid.",
             ),
+            manual_open || legacy_console(),
         );
+        password_shown = true;
     }
 
     state
@@ -679,8 +708,30 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
     // 带 scheme 的完整 URL，并且用 OSC 8 包成终端超链接：Windows Terminal / iTerm /
     // VS Code / GNOME Terminal 里直接 Ctrl（⌘）+ 点击就能打开；不支持的终端只看到
-    // 普通 URL（`0.0.0.0:4242` 这种裸地址则连自动识别都过不了，v4.9.42/43）
-    crate::log_info!("open in browser: {}", core::logging::link(&url));
+    // 普通 URL（`0.0.0.0:4242` 这种裸地址则连自动识别都过不了，v4.9.42/43）。
+    //
+    // 本机 + 局域网各一条（v4.9.45）：Vite / Next / Jellyfin 都是这个格式，绑
+    // `0.0.0.0` 时只打 localhost，用户得自己去 ipconfig 里翻该填哪个地址。
+    crate::log_info!("local:   {}", crate::core::logging::link(&urls.local));
+    if let Some(network) = &urls.network {
+        crate::log_info!("network: {}", crate::core::logging::link(network));
+    }
+    // 要不要替用户拉浏览器：手动开了开关，或者「刚打印一次性密码 + 经典 conhost」
+    // ——双击 exe 那种窗口里链接点不动（不认 OSC 8），人此刻正需要进页面设密码。
+    let open_browser = manual_open || (password_shown && legacy_console());
+    if open_browser {
+        let target = urls.primary().to_string();
+        // 稍等一下让 axum::serve 真正开始 accept，否则浏览器可能拿到 connection refused
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            match launch_browser(&target) {
+                Ok(()) => crate::log_info!("opened the default browser: {target}"),
+                Err(err) => {
+                    crate::log_warn!("could not open a browser ({err}); open {target} manually")
+                }
+            }
+        });
+    }
     crate::log_info!(
         "frontend build: {}",
         option_env!("ASMODAY_BUILD_ID").unwrap_or("dev")
@@ -752,29 +803,129 @@ fn warn_nested_mounts(set: &core::path_guard::MountSet) {
     }
 }
 
-/// 控制台里给出的入口地址：**必须带 scheme**，终端才会把它识别成可点击链接。
+/// 控制台要打印的入口地址（v4.9.45）。
 ///
-/// 通配地址（0.0.0.0 / ::）不能直接给人点——浏览器打开 `http://0.0.0.0:4242` 会被
-/// 拒（v4.9.42），所以换成 `localhost`；绑具体网卡地址时原样用它，那种配置下用户
-/// 本来就是要从别的设备访问。`base_url` 已经是完整 URL 时直接返回它（反代场景）。
-fn access_url(server: &core::config::ServerConfig) -> String {
+/// 社区惯例（Vite / Next.js / Nuxt / Jellyfin）都是**本机 + 局域网各打一条**：
+/// 只打 `localhost` 的话，用户把 `host` 改成 `0.0.0.0` 也看不出「手机该填什么
+/// 地址」，只能自己去 ipconfig 里翻（2026-11-06 反馈）。
+struct AccessUrls {
+    /// 本机可用的地址：回环监听 / 具体网卡 / 反代域名都是这一条
+    local: String,
+    /// 局域网内其它设备能用的地址：只有绑通配地址时才去探测，探测不到就是 None
+    network: Option<String>,
+}
+
+impl AccessUrls {
+    /// `--open` 拉浏览器用哪个：本机地址永远可用（localhost 在宿主上必然可解析）
+    fn primary(&self) -> &str {
+        &self.local
+    }
+}
+
+/// 通配地址不能直接给人点：浏览器打开 `http://0.0.0.0:4242` 会被拒（v4.9.42），
+/// 所以本机那条换成 `localhost`；绑具体网卡地址时原样用它。`base_url` 已经是
+/// 完整 URL 时直接用它（反代场景，本机/局域网都是同一个域名）。
+fn access_urls(server: &core::config::ServerConfig) -> AccessUrls {
     let base = server.proxy.base_url.trim();
     if base.starts_with("http://") || base.starts_with("https://") {
-        return base.trim_end_matches('/').to_string();
+        let url = base.trim_end_matches('/').to_string();
+        return AccessUrls {
+            local: url,
+            network: None,
+        };
     }
-    let host = match server.host.trim().parse::<std::net::IpAddr>() {
-        Ok(ip) if ip.is_unspecified() || ip.is_loopback() => "localhost".to_string(),
-        // IPv6 字面量在 URL 里必须加方括号，否则解析器会把端口当成地址的一部分
-        Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
-        Ok(ip) => ip.to_string(),
-        Err(_) => "localhost".to_string(),
-    };
     let scheme = if server.ssl.enabled { "https" } else { "http" };
-    format!(
-        "{scheme}://{host}:{}{}",
-        server.port,
-        base.trim_end_matches('/')
-    )
+    let suffix = base.trim_end_matches('/');
+    let build = |host: &str| format!("{scheme}://{host}:{}{suffix}", server.port);
+
+    let host = server.host.trim();
+    match host.parse::<std::net::IpAddr>() {
+        // 通配地址：本机走 localhost，局域网地址实测（0.0.0.0 本身谁都连不上）
+        Ok(ip) if ip.is_unspecified() => AccessUrls {
+            local: build("localhost"),
+            network: lan_ip().map(|ip| build(&ip.to_string())),
+        },
+        Ok(ip) if ip.is_loopback() => AccessUrls {
+            local: build("localhost"),
+            network: None,
+        },
+        // IPv6 字面量在 URL 里必须加方括号，否则解析器会把端口当成地址的一部分
+        Ok(std::net::IpAddr::V6(ip)) => AccessUrls {
+            local: build(&format!("[{ip}]")),
+            network: None,
+        },
+        Ok(ip) => AccessUrls {
+            local: build(&ip.to_string()),
+            network: None,
+        },
+        // 配置校验只放行 IP 字面量，这里兜底主机名 / 空值
+        Err(_) => AccessUrls {
+            local: build(if host.is_empty() { "localhost" } else { host }),
+            network: None,
+        },
+    }
+}
+
+/// 本机的出口地址：**不发包**的 UDP `connect` 只做一次路由查找。
+///
+/// 不用 `getifaddrs` / `GetAdaptersAddresses`：那要按平台写两套 unsafe，还得在
+/// 代理容器 / VPN / 多网卡里挑「哪块才算局域网」。这里要回答的只是「别的设备大概
+/// 该填哪个地址」，默认路由那块网卡就够（Vite / Next 也只打一条 Network）。
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // TEST-NET-1（RFC 5737，保留给文档）：没有默认路由时这里返回 ENETUNREACH，
+    // 有路由时也只完成绑定/选路，不会真的发出一个包
+    socket.connect("192.0.2.1:9").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        ip if ip.is_loopback() || ip.is_unspecified() => None,
+        ip => Some(ip),
+    }
+}
+
+/// 双击 exe 打开的**经典 conhost** 不实现 OSC 8：文本就是一堆字符，点不动。
+///
+/// 判断依据是「Windows 且没有 Windows Terminal / VS Code 这类宿主留下的环境变量」——
+/// conhost 不设 `WT_SESSION` 也不设 `TERM_PROGRAM`。只在真控制台里提示，重定向
+/// 到文件时不打（那里本来就没有「点」这回事）。
+fn legacy_console() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    if std::env::var_os("WT_SESSION").is_some() || std::env::var_os("TERM_PROGRAM").is_some() {
+        return false;
+    }
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+/// 用系统默认浏览器打开 URL（`--open` / `ASMODAY_OPEN=1`，v4.9.45）。
+///
+/// 经典 conhost 里任何程序都做不出可点的链接，唯一可靠的出路就是「替用户打开」。
+#[cfg(windows)]
+fn launch_browser(url: &str) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    // `start` 是 cmd 的内建命令；它把**第一个带引号的参数**当窗口标题，所以要补一个 ""
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn launch_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
 }
 
 /// 一次性密码必须「一眼看见」：框起来、单独成行、附上能直接点的入口地址。
@@ -787,7 +938,19 @@ fn access_url(server: &core::config::ServerConfig) -> String {
 ///
 /// `note` 是横幅里多出来的一句交代（例如「上一个一次性密码已作废」）：重启补发时
 /// 必须说清楚，否则用户会拿旧密码反复试。（v4.9.44）
-fn print_one_time_password(password: &str, url: Option<&str>, note: Option<&str>) {
+///
+/// 入口地址按「本机 / 局域网」两行给（v4.9.45）：绑 `0.0.0.0` 时只打 localhost，
+/// 手机 / 平板那头根本不知道该填什么。
+///
+/// `skip_hint`：不用再补「这个控制台点不动链接」的提示。两种情况下为 true——
+/// 已经决定替用户拉起浏览器，或者根本不起服务（`--init` / `--reset-password`，
+/// 那时 URL 也不通，提示 `--open` 只会误导）。
+fn print_one_time_password(
+    password: &str,
+    urls: Option<&AccessUrls>,
+    note: Option<&str>,
+    skip_hint: bool,
+) {
     let color = crate::core::logging::color_enabled();
     let (title, value, dim, reset) = if color {
         ("\x1b[1;36m", "\x1b[1;7;33m", "\x1b[90m", "\x1b[0m")
@@ -810,9 +973,19 @@ fn print_one_time_password(password: &str, url: Option<&str>, note: Option<&str>
         println!("      {password}");
     }
     println!();
-    if let Some(url) = url {
+    if let Some(urls) = urls {
         // OSC 8：支持的终端里是可点的真链接；不支持则原样打 URL（v4.9.43）
-        println!("  Open: {}", crate::core::logging::link(url));
+        println!("  Open: {}", crate::core::logging::link(&urls.local));
+        if let Some(network) = &urls.network {
+            println!("  LAN:  {}", crate::core::logging::link(network));
+        }
+        // 经典 conhost 里链接点不动，干脆明说一句出路（v4.9.45）；
+        // 只在真控制台提示，重定向到文件时这行没有意义
+        if legacy_console() && !skip_hint {
+            println!(
+                "{dim}        (this classic console cannot open links; add --open to launch the browser){reset}"
+            );
+        }
     }
     if let Some(note) = note {
         println!("{dim}  Note: {note}{reset}");
@@ -1354,7 +1527,11 @@ fn spawn_media_janitor(state: AppState) {
 }
 
 /// `--init`：确保有管理员账号，并打印一次性密码
-async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result<(), String> {
+async fn bootstrap_admin(
+    auth: &AuthStore,
+    data_dir: &Path,
+    urls: &AccessUrls,
+) -> Result<(), String> {
     crate::log_info!("data directory: {}", data_dir.display());
     match auth.user_count() {
         Ok(0) => {}
@@ -1368,10 +1545,11 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result
                 );
                 print_one_time_password(
                     &password,
-                    Some(url),
+                    Some(urls),
                     Some(
                         "re-issued because no password has been set yet; an earlier one is invalid.",
                     ),
+                    true,
                 );
             } else {
                 crate::log_info!(
@@ -1390,7 +1568,7 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result
     crate::log_info!("administrator created: {}", user.username);
     // 一次性密码只打控制台（stdout），绝不走 log_*!——那会落进
     // data/logs/asmoday.log 并随轮转留存（2026-11-04 审查）
-    print_one_time_password(&password, Some(url), None);
+    print_one_time_password(&password, Some(urls), None, true);
     Ok(())
 }
 
@@ -1400,7 +1578,7 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result
 /// 1. 环境变量 `ASMODAY_RESET_PASSWORD`——**只在带 `--reset-password` 启动时生效**，
 ///    且同一个值只能用一次（指纹存库，重复出现拒绝并记 WARN，设计文档 3.1.2）；
 /// 2. 未提供环境变量时随机生成一次性密码并打印。
-async fn reset_admin_password(auth: &AuthStore, url: &str) -> Result<(), String> {
+async fn reset_admin_password(auth: &AuthStore, urls: &AccessUrls) -> Result<(), String> {
     let Some(user) = auth.first_user()? else {
         return Err("no user yet; run with --init first".to_string());
     };
@@ -1434,7 +1612,7 @@ async fn reset_admin_password(auth: &AuthStore, url: &str) -> Result<(), String>
             auth.set_must_change_password(user.id, true)?;
             crate::log_info!("password reset for {}", user.username);
             // 同 bootstrap_admin：只打 stdout，不落日志文件
-            print_one_time_password(&password, Some(url), Some("password was reset."));
+            print_one_time_password(&password, Some(urls), Some("password was reset."), true);
         }
     }
     Ok(())
@@ -1550,37 +1728,51 @@ mod tests {
         assert!(config.auth.local_enabled);
     }
 
-    /// 控制台入口地址（v4.9.42）：终端只认带 scheme 的完整 URL，通配地址换成 localhost。
+    /// 控制台入口地址（v4.9.45）：带 scheme、通配地址换成 localhost，局域网另给一条。
     #[test]
-    fn console_url_is_clickable_and_never_a_wildcard() {
+    fn console_urls_cover_local_and_lan() {
         let mut server = core::config::ServerConfig::default();
         assert_eq!(server.host, "127.0.0.1");
-        assert_eq!(access_url(&server), "http://localhost:4242");
+        let urls = access_urls(&server);
+        assert_eq!(urls.local, "http://localhost:4242");
+        assert_eq!(urls.primary(), "http://localhost:4242");
+        // 只监听回环时，报任何局域网地址都是假的
+        assert!(urls.network.is_none());
 
-        // 0.0.0.0 / :: 浏览器打不开，必须换成 localhost
-        server.host = "0.0.0.0".to_string();
-        assert_eq!(access_url(&server), "http://localhost:4242");
-        server.host = "::".to_string();
-        assert_eq!(access_url(&server), "http://localhost:4242");
+        // 0.0.0.0 / ::：本机那条仍是 localhost（浏览器拒绝 http://0.0.0.0:4242），
+        // 局域网那条要么是探测到的网卡地址，要么没有 —— 绝不能把通配地址打给人
+        for wildcard in ["0.0.0.0", "::"] {
+            server.host = wildcard.to_string();
+            let urls = access_urls(&server);
+            assert_eq!(urls.local, "http://localhost:4242");
+            if let Some(network) = urls.network {
+                assert!(network.starts_with("http://"), "{network}");
+                assert!(!network.contains("0.0.0.0"), "{network}");
+                assert!(!network.contains("localhost"), "{network}");
+            }
+        }
 
         // 绑具体网卡地址时原样用它（那种配置就是要从别的设备访问）
         server.host = "192.168.1.50".to_string();
-        assert_eq!(access_url(&server), "http://192.168.1.50:4242");
+        assert_eq!(access_urls(&server).local, "http://192.168.1.50:4242");
 
         // IPv6 字面量必须加方括号，否则端口会被当成地址的一部分
         server.host = "fd00::1".to_string();
-        assert_eq!(access_url(&server), "http://[fd00::1]:4242");
+        assert_eq!(access_urls(&server).local, "http://[fd00::1]:4242");
 
         // 子路径部署与 SSL
         server.host = "127.0.0.1".to_string();
         server.proxy.base_url = "/asmoday/".to_string();
-        assert_eq!(access_url(&server), "http://localhost:4242/asmoday");
+        assert_eq!(access_urls(&server).local, "http://localhost:4242/asmoday");
         server.ssl.enabled = true;
-        assert_eq!(access_url(&server), "https://localhost:4242/asmoday");
+        assert_eq!(access_urls(&server).local, "https://localhost:4242/asmoday");
 
         // base_url 已经是完整 URL（反代域名）时原样给出
         server.proxy.base_url = "https://nas.example.com/asmoday".to_string();
-        assert_eq!(access_url(&server), "https://nas.example.com/asmoday");
+        assert_eq!(
+            access_urls(&server).local,
+            "https://nas.example.com/asmoday"
+        );
     }
 
     #[test]
