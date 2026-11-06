@@ -420,6 +420,7 @@ GWT-DL-27 Given aria2 客户端  When `aria2.getGlobalOption`  Then 返回 `bt-t
 GWT-DL-28 Given 引擎设置里改了参数 / 保存目录 / Tracker 任一项没保存  Then 页头出现「有未保存改动」徽标；点「返回下载列表」弹确认层并逐条列出会丢的东西（引擎参数 / 允许的保存目录 / BitTorrent Tracker 各自只在脏时列出）；「继续编辑」关掉确认、仍在设置视图且草稿不丢；「放弃改动并返回」才回任务列表，再进设置三块草稿都回到已保存值、徽标消失（v4.9.40）
 GWT-DL-29 Given 有未保存改动  When 点侧边栏或浏览器后退离开 `/downloads`  Then 同样弹确认；取消则 URL 仍在 `/downloads`，确认放弃才真正跳转且草稿回滚。放弃目录改动时 `GET /api/downloads/engine` 的 `roots` 条数不变（没有偷偷写库）（v4.9.40）
 GWT-DL-30 Given 设置页滚到最底部  Then 底部还有一颗「返回下载列表」，点击走同一套未保存确认；390 宽无横向溢出，底部按钮可见（v4.9.40）
+GWT-DL-31 Given 在引擎设置视图  When 按系统返回键 / 浏览器后退（不是点按钮）  Then **先回到下载任务列表**，URL 仍停在 `/downloads`，不出现「直接退回聚合主页」；有未保存改动时先弹确认，选「继续编辑」后视图与草稿都不变、再按一次仍能拦住；切到任务视图后再按返回才真的离开本页（v4.9.41）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

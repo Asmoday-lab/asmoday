@@ -25,6 +25,7 @@ import {
   type Snapshot,
 } from '../api/downloads'
 import { filesApi, type MountPoint } from '../api/files'
+import { useBackClose } from '../composables/useBackClose'
 import { useScrollLock } from '../composables/useScrollLock'
 import { APP_BASE } from '../lib/base'
 import { readApiError } from '../lib/errors'
@@ -469,6 +470,20 @@ function discardDrafts() {
 function scrollToTop() {
   document.getElementById('app-scroll')?.scrollTo({ top: 0 })
 }
+
+/**
+ * 系统返回键先回任务列表，而不是直接离开本页（v4.9.41）。
+ *
+ * 设置是**页内视图**、不在路由里：不接管的话 Android 物理返回 / 浏览器后退 /
+ * 边缘滑动手势会一步跳过任务列表，直接退回进入下载页之前那页（通常是首页），
+ * 用户看到的就是「点返回掉到聚合主页」。压一条同 URL 哨兵后，返回键等价于点
+ * 「返回下载列表」——有未保存改动同样先确认，取消则视图不变、哨兵由
+ * useBackClose 自动重挂。
+ */
+useBackClose(
+  computed(() => view.value === 'settings'),
+  () => void showTasks(),
+)
 
 /** 侧边栏跳走同样要拦：草稿只在内存里，离开就没了 */
 onBeforeRouteLeave(async () => {
