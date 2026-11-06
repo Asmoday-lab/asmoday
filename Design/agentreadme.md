@@ -381,6 +381,9 @@ GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When
 GWT-AUTH-12 Given 全新数据目录首次启动  When 看控制台  Then 一次性密码出现在 `====` 边框的 `ASMODAY - ADMINISTRATOR CREDENTIAL` 横幅里、单独成行（TTY 下反显高亮），下面一行 `Open: http://localhost:4242`；整段只有 ASCII，重定向到文件时无转义码（v4.9.42）
 GWT-AUTH-13 Given 任意启动  When 看启动日志  Then 有一行 `open in browser: http://localhost:<port><base_url>`（host 配 `0.0.0.0` / `::` 时仍是 localhost，绑具体 IP 时用该 IP）；默认监听 `127.0.0.1`，`netstat` 里没有 `0.0.0.0:<port>`（v4.9.42）
 GWT-AUTH-14 Given 端口已被占用  When 再启动一个实例  Then 控制台全英文：`failed to bind …: address already in use (os error 10048)` + `Hint: the port is already taken…`，不出现系统本地化的中文（v4.9.42）
+GWT-AUTH-15 Given 在 Windows Terminal / iTerm2 / VS Code 终端里首次启动  When 看密码横幅的 `Open:` 行与启动日志的 `open in browser:` 行  Then URL 是 OSC 8 超链接（Ctrl/⌘+点击直接打开浏览器），显示文本仍是纯 URL；`data/logs/asmoday.log` 与 JSON 通道里**没有** `\x1b]8;;` 残留（v4.9.43）
+GWT-AUTH-16 Given 输出被重定向（`> out.log`、管道、CI 采集）  When 启动  Then 横幅与日志都不含任何转义码；文件日志为纯 UTF-8 正文（v4.9.43）
+GWT-AUTH-17 Given 启动完成  When 看 `data/logs/asmoday.log` 的 DEBUG 行  Then 有 `console: tty=<bool> vt=<bool> color=<bool> hyperlink=<bool> (TERM=… TERM_PROGRAM=…)`，可据此判断「没链接」是被主动关掉还是终端不支持（v4.9.43）
 GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码；用户拿它登录后在强制改密弹窗换正式密码，网页端全程无用户名（v4.9.34）
 GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
 GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v20 跑完  Then 只留「启用中 id 最小的账号」（无启停列时取 id 最小），其余账号从 users 表物理删除，其 sessions / favorites / play_history / shares / access_tokens 一并删掉（含 user_id 为 NULL 的遗留令牌）；再次启动幂等（v4.9.30）

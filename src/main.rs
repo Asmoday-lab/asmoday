@@ -661,9 +661,10 @@ async fn run(cli: Cli) -> Result<(), String> {
     } else {
         crate::log_info!("listening on {addr} (local interface only)");
     }
-    // 带 scheme 的完整 URL：终端（Windows Terminal / iTerm / VS Code）会把它变成
-    // 可点击链接，`0.0.0.0:4242` 这种裸地址点不了也打不开（v4.9.42）
-    crate::log_info!("open in browser: {url}");
+    // 带 scheme 的完整 URL，并且用 OSC 8 包成终端超链接：Windows Terminal / iTerm /
+    // VS Code / GNOME Terminal 里直接 Ctrl（⌘）+ 点击就能打开；不支持的终端只看到
+    // 普通 URL（`0.0.0.0:4242` 这种裸地址则连自动识别都过不了，v4.9.42/43）
+    crate::log_info!("open in browser: {}", core::logging::link(&url));
     crate::log_info!(
         "frontend build: {}",
         option_env!("ASMODAY_BUILD_ID").unwrap_or("dev")
@@ -781,11 +782,18 @@ fn print_one_time_password(password: &str, url: Option<&str>) {
     println!("{dim}{bar}{reset}");
     println!("  One-time password (sign in with it, then set your own):");
     println!();
-    // 密码整行反显：深色终端里是一块亮色，眼睛不用在日志里找
-    println!("      {value} {password} {reset}");
+    // 密码整行反显：深色终端里是一块亮色，眼睛不用在日志里找。
+    // 无色模式下退回纯缩进，别留行尾空格（复制密码时会带进去）
+    if color {
+        // 行尾不留空格：反显块收在密码最后一个字符上，复制时不带多余空白
+        println!("      {value} {password}{reset}");
+    } else {
+        println!("      {password}");
+    }
     println!();
     if let Some(url) = url {
-        println!("  Open: {url}");
+        // OSC 8：支持的终端里是可点的真链接；不支持则原样打 URL（v4.9.43）
+        println!("  Open: {}", crate::core::logging::link(url));
     }
     println!("{dim}  Shown only once; it is never written to the log file.{reset}");
     println!("{dim}{bar}{reset}");

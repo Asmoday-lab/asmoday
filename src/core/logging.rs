@@ -122,12 +122,132 @@ static MAIN_SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 static ERROR_SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 /// 控制台颜色开关：TTY 且非 JSON 输出时才着色。初始化时探测一次。
 static COLOR: AtomicBool = AtomicBool::new(false);
+/// 超链接开关：TTY 且终端**明确**支持 OSC 8 时才打开（白名单，见 [`hyperlinks_supported`]）。
+static HYPERLINK: AtomicBool = AtomicBool::new(false);
 
 /// 控制台是否支持颜色（已含 Windows conhost 的 VT 开启）。
 ///
 /// 一次性密码横幅这类非日志输出也要按同一判据着色：重定向到文件时不能带转义码。
 pub fn color_enabled() -> bool {
     COLOR.load(Ordering::Relaxed)
+}
+
+/// 控制台是否支持 OSC 8 超链接。
+pub fn hyperlink_enabled() -> bool {
+    HYPERLINK.load(Ordering::Relaxed)
+}
+
+/// 把 URL 渲染成**终端里能点的超链接**（OSC 8；终止符用 ST，即 `ESC \`）。
+///
+/// 光打一个裸 URL 是「看运气」：有的终端会自己识别，有的（Windows 经典 conhost、
+/// 部分 SSH 客户端）只当成普通文字，双击只选中一半。OSC 8 是终端侧的标准约定：
+/// 终端持有的真实目标与显示文本分开，Ctrl/⌘+点击一定打开 URL 本身。
+///
+/// 终端不支持时**原样返回** URL —— 宁可不可点，也绝不把 `]8;;…` 这种控制序列
+/// 当垃圾字符糊在屏幕上（老 conhost / 重定向到文件的场景）。
+pub fn link(url: &str) -> String {
+    wrap_link(url, hyperlink_enabled())
+}
+
+/// [`link`] 的纯函数内核（可单测，不碰全局开关）。
+fn wrap_link(url: &str, enabled: bool) -> String {
+    // URL 里出现控制字符会提前终止开链接序列、把剩下的字节当正文打出来
+    let clean: String = url.chars().filter(|c| !c.is_control()).collect();
+    if !enabled {
+        return clean;
+    }
+    format!("\x1b]8;;{clean}\x1b\\{clean}\x1b]8;;\x1b\\")
+}
+
+/// 探测终端是否支持 OSC 8。
+///
+/// 判据是「能不能安全地吐转义序列」，而不是去穷举支持超链接的终端名单：
+///
+/// * 不是 TTY（重定向到文件 / 管道 / CI 采集）→ 一律不放，否则日志文件里全是控制码；
+/// * 没有 VT 处理能力（老 conhost 的 `SetConsoleMode` 失败）→ 不放，那时 ESC 会被
+///   当成可见字符打成乱码，比不能点更糟；
+/// * `TERM=dumb` → 不放，它连光标控制都不认；
+/// * Apple Terminal → 不放：它不实现 OSC 8（点了没反应，反而像坏了），但它自己会
+///   识别裸 URL 并用 ⌘+点击打开，纯文本体验更好。
+///
+/// 其余 TTY 一律放行：OSC 是标准序列族，不认识 OSC 8 的终端按规范要**静默跳过**
+/// 到终止符，最差结果只是「链接不生效、看起来和纯文本一样」。反过来做白名单的话，
+/// 名单外的终端（tmux、各种国产终端、远程串口工具）永远点不了，而用户完全无从
+/// 得知是被我们主动关掉了。
+fn hyperlinks_supported(tty: bool, vt: bool, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if !tty || !vt {
+        return false;
+    }
+    let get = |key: &str| {
+        env(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(program) = get("TERM_PROGRAM")
+        && program == "Apple_Terminal"
+    {
+        return false;
+    }
+    // Windows 只看 VT 闸门：`TERM` 是 MSYS/ConPTY 包装层留下的环境变量，
+    // 哪怕是 `dumb`，只要 `SetConsoleMode` 拿到了 VT，控制台就能正确解析 OSC
+    if cfg!(windows) {
+        return true;
+    }
+    match get("TERM") {
+        Some(term) if term.eq_ignore_ascii_case("dumb") => false,
+        Some(_) => true,
+        // TERM 为空说明不是真正的终端（串口 / 裸 pipe 包装），别赌
+        None => false,
+    }
+}
+
+/// 去掉 CSI / OSC 转义序列。**只用于文件与 JSON 通道**：控制台可以有颜色和超链接，
+/// 日志文件里出现 `\x1b]8;;` 只会让人以为是程序写坏了（设计文档 3.7）。
+fn strip_escapes(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !text.contains('\x1b') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current != '\x1b' {
+            out.push(current);
+            continue;
+        }
+        match chars.peek().copied() {
+            // CSI：参数字节一直到 0x40..=0x7e 的最终字节
+            Some('[') => {
+                chars.next();
+                for byte in chars.by_ref() {
+                    if ('@'..='~').contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            // OSC：正文以 BEL 或 ST（ESC \）结束
+            Some(']') => {
+                chars.next();
+                while let Some(inner) = chars.next() {
+                    if inner == '\x07' {
+                        break;
+                    }
+                    if inner == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // 其它双字节转义（ESC 7 / ESC = 之类）：连字符一起丢
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    Cow::Owned(out)
 }
 /// 服务器本地时区偏移（秒）+ 探测来源（秒）
 static LOCAL_OFFSET: OnceLock<(i64, &'static str)> = OnceLock::new();
@@ -187,9 +307,16 @@ pub fn init(data_dir: &Path) {
 
     // 控制台颜色：仅 TTY；Windows 经典 conhost 需要先开 VT 处理
     #[cfg(windows)]
-    enable_windows_vt();
+    let vt = enable_windows_vt();
+    #[cfg(not(windows))]
+    let vt = true;
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    COLOR.store(tty, Ordering::Relaxed);
+    // VT 没开成时颜色与超链接都会变成可见乱码，一起关掉
+    COLOR.store(tty && vt, Ordering::Relaxed);
+    HYPERLINK.store(
+        hyperlinks_supported(tty, vt, &|key| std::env::var(key).ok()),
+        Ordering::Relaxed,
+    );
 
     // 时区探错会让整份日志的时间对不上系统时间，留一条可核对的记录：
     // 出现「日志比系统时间早/晚几小时」时，先看这行的 source 是 libc 还是 date
@@ -199,12 +326,28 @@ pub fn init(data_dir: &Path) {
         concat!(file!(), ":", line!()),
         &format!("log timezone: {} (source: {source})", offset_label(offset)),
     );
+    // 「控制台里为什么没有颜色 / 链接」是只能现场看的现象：把探测结果写进文件日志，
+    // 用户贴一行就能判断是被我们主动关掉了，还是终端本身不支持（v4.9.43）
+    debug(
+        module_path!(),
+        concat!(file!(), ":", line!()),
+        &format!(
+            "console: tty={tty} vt={vt} color={} hyperlink={} (TERM={:?} TERM_PROGRAM={:?})",
+            COLOR.load(Ordering::Relaxed),
+            HYPERLINK.load(Ordering::Relaxed),
+            std::env::var("TERM").unwrap_or_default(),
+            std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        ),
+    );
 }
 
 /// Windows 经典 conhost 默认关闭 ANSI 转义，需显式打开
 /// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`；Windows Terminal / 重定向场景不受影响。
+///
+/// 返回是否拿到 VT 处理能力：拿不到就说明 ESC 会被当普通字符打出来，颜色与超链接
+/// 都必须关掉（v4.9.43）。
 #[cfg(windows)]
-fn enable_windows_vt() {
+fn enable_windows_vt() -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
         CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
@@ -213,12 +356,16 @@ fn enable_windows_vt() {
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-            return;
+            return false;
         }
         let mut mode: CONSOLE_MODE = 0;
-        if GetConsoleMode(handle, &mut mode) != 0 {
-            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
         }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
     }
 }
 
@@ -293,7 +440,7 @@ fn render_console_text(
     format!("{ts} [{tag}] [{pid}] {module}: {message}{suffix}\n")
 }
 
-/// 文件文本行（服务器本地时间，无颜色）
+/// 文件文本行（服务器本地时间，无颜色、无超链接）
 fn render_file_text(
     level: Level,
     module: &str,
@@ -302,6 +449,7 @@ fn render_file_text(
     ts: &str,
     pid: u32,
 ) -> String {
+    let message = strip_escapes(message);
     let suffix = source.map(|s| format!(" ({s})")).unwrap_or_default();
     format!(
         "{ts} [{}] [{pid}] {module}: {message}{suffix}\n",
@@ -318,6 +466,7 @@ fn render_json(
     ts: &str,
     pid: u32,
 ) -> String {
+    let message = strip_escapes(message);
     let mut object = serde_json::json!({
         "ts": ts,
         "level": level.as_str(),
@@ -884,5 +1033,104 @@ mod tests {
         assert_eq!(settings.file, Level::Debug);
         assert_eq!(settings.api, Level::Info);
         assert!(!settings.json);
+    }
+
+    /// 假环境变量表：只认传进来的键，别的当作不存在
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key: &str| {
+            owned
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn hyperlinks_need_a_capable_terminal() {
+        let supports = |pairs: &[(&str, &str)], tty: bool, vt: bool| {
+            hyperlinks_supported(tty, vt, &env_of(pairs))
+        };
+        // 不是 TTY（重定向到文件 / 管道 / CI 采集）绝不吐转义码
+        assert!(!supports(&[("WT_SESSION", "x")], false, true));
+        // VT 没开成（老 conhost）：ESC 会变成可见乱码，颜色与链接一起关
+        assert!(!supports(&[("TERM", "xterm")], true, false));
+        // 真正的终端一律放行：不认识 OSC 8 的终端按规范静默跳到终止符，
+        // 最差只是「链接不生效、看着像纯文本」，不会打乱屏幕
+        assert!(supports(&[("TERM", "xterm-256color")], true, true));
+        assert!(supports(&[("TERM", "xterm-kitty")], true, true));
+        assert!(supports(&[("WT_SESSION", "9d1f")], true, true));
+        assert!(supports(&[("TERM_PROGRAM", "iTerm.app")], true, true));
+        assert!(supports(&[("TERM_PROGRAM", "vscode")], true, true));
+        // Windows 只看 VT 闸门：TERM 缺失或 `dumb`（ConPTY 包装层爱设这个值）都放行；
+        // Unix 上 TERM 缺失 / dumb 说明那不是真正的终端
+        assert_eq!(supports(&[], true, true), cfg!(windows));
+        assert_eq!(
+            supports(&[("TERM", "dumb")], true, true),
+            cfg!(windows),
+            "Windows 上 TERM 不能当判据"
+        );
+        // Apple Terminal 不实现 OSC 8：两平台都回落成纯文本
+        assert!(!supports(&[("TERM_PROGRAM", "Apple_Terminal")], true, true));
+        assert!(!supports(
+            &[
+                ("TERM_PROGRAM", "Apple_Terminal"),
+                ("TERM", "xterm-256color")
+            ],
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn link_follows_the_runtime_switch() {
+        let before = hyperlink_enabled();
+        HYPERLINK.store(false, Ordering::Relaxed);
+        assert_eq!(link("http://localhost:4242"), "http://localhost:4242");
+        HYPERLINK.store(true, Ordering::Relaxed);
+        assert!(link("http://localhost:4242").contains("\x1b]8;;"));
+        HYPERLINK.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn links_are_wrapped_only_when_enabled() {
+        let url = "http://localhost:4242";
+        // 支持 OSC 8：ESC ]8;;url ESC \ url ESC ]8;; ESC \（终止符用 ST）
+        assert_eq!(
+            wrap_link(url, true),
+            "\x1b]8;;http://localhost:4242\x1b\\http://localhost:4242\x1b]8;;\x1b\\"
+        );
+        // 不支持：原样输出，绝不留 `]8;;` 残字
+        assert_eq!(wrap_link(url, false), url);
+        // 控制字符不能借 URL 溜进转义流
+        assert_eq!(
+            wrap_link("http://localhost\x1b]8;;evil", true),
+            "\x1b]8;;http://localhost]8;;evil\x1b\\http://localhost]8;;evil\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn escapes_never_reach_file_or_json() {
+        let linked = wrap_link("http://localhost:4242", true);
+        let file_line = render_file_text(Level::Info, "core::x", &linked, None, "t", 1);
+        assert!(
+            !file_line.contains('\x1b'),
+            "日志文件里不能出现 OSC 8：{file_line:?}"
+        );
+        assert!(
+            file_line.contains("core::x: http://localhost:4242"),
+            "{file_line:?}"
+        );
+
+        let json_line = render_json(Level::Info, "core::x", &linked, None, "t", 1);
+        assert!(!json_line.contains('\x1b'), "JSON 行里不能出现转义码");
+        let value: serde_json::Value = serde_json::from_str(json_line.trim()).unwrap();
+        assert_eq!(value["message"], "http://localhost:4242");
+        // 颜色（CSI）同样剥掉，顺带覆盖带参数的写法
+        assert_eq!(strip_escapes("\x1b[1;7;33mABC\x1b[0m done"), "ABC done");
+        assert_eq!(strip_escapes("plain"), "plain");
     }
 }
