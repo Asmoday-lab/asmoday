@@ -134,6 +134,11 @@ thumb_preheat_per_scan = 200
 # bt_listen_port_max = 6999
 # Tracker-only mode without DHT.
 # bt_disable_dht = false
+# Additional trackers appended to every new torrent's announce list (same idea
+# as aria2's bt-tracker). Deprecated since v4.9.39: the download engine page
+# owns this list now (applies immediately to new downloads, stored in the
+# database). When the database has no value yet, this list is imported once.
+# bt_trackers = []
 
 [log]
 # debug | info | warn | error | off
@@ -317,6 +322,12 @@ pub struct DownloadConfig {
     pub bt_listen_port_max: u16,
     /// 只走 tracker、不跑 DHT（隐私 / 内网环境）
     pub bt_disable_dht: bool,
+    /// **已废弃（v4.9.39）**：Tracker 列表改存 `settings.download_trackers`
+    /// （下载引擎页可改、立即对新任务生效）。这里只在库里还没有值时当一次性种子。
+    /// 保留字段只为兼容存量 `config.toml`（`deny_unknown_fields` 会让删掉字段的
+    /// 旧配置解析失败）。
+    #[serde(default)]
+    pub bt_trackers: Vec<String>,
 }
 
 impl DownloadConfig {
@@ -343,6 +354,7 @@ impl Default for DownloadConfig {
             bt_listen_port_min: 6881,
             bt_listen_port_max: 6999,
             bt_disable_dht: false,
+            bt_trackers: Vec::new(),
         }
     }
 }

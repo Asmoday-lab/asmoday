@@ -496,7 +496,43 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
             Ok(Value::String("OK".into()))
         }
         "aria2.getGlobalOption" => Ok(manager.global_options()),
-        "aria2.changeGlobalOption" => Ok(Value::String("OK".into())),
+        "aria2.changeGlobalOption" => {
+            // 只兑现真正支持的那一个键：`bt-tracker`（v4.9.39）。
+            // 其余键保持 aria2 的 OK 语义（客户端会据此判定「已保存」），
+            // 但逐条 WARN —— 假装成功比报错更难排查。
+            let options = args.first().cloned().unwrap_or(Value::Null);
+            if let Some(list) = option_str(&options, "bt-tracker") {
+                let update = crate::core::download::normalize_trackers(&[list]);
+                let encoded = serde_json::to_string(&update.trackers)
+                    .map_err(|e| RpcError::new(1, format!("encode trackers failed: {e}")))?;
+                state
+                    .auth
+                    .put_setting(crate::core::download::TRACKERS_SETTING, &encoded)
+                    .map_err(|e| RpcError::new(1, format!("persist trackers failed: {e}")))?;
+                state.downloads.replace_trackers(update.trackers.clone());
+                for rejected in &update.rejected {
+                    crate::log_warn!("bt-tracker: dropped {rejected}");
+                }
+                crate::log_info!(
+                    "bt-tracker updated over RPC ({} entries, applies to new torrents)",
+                    update.trackers.len()
+                );
+            }
+            if let Some(map) = options.as_object() {
+                let ignored: Vec<&str> = map
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|key| *key != "bt-tracker")
+                    .collect();
+                if !ignored.is_empty() {
+                    crate::log_warn!(
+                        "changeGlobalOption ignored unsupported keys: {}",
+                        ignored.join(", ")
+                    );
+                }
+            }
+            Ok(Value::String("OK".into()))
+        }
 
         // -- 结果维护 -------------------------------------------------------
         "aria2.purgeDownloadResult" => {

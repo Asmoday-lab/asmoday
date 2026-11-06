@@ -77,6 +77,8 @@ export interface EngineInfo {
   segments: number
   max_concurrent: number
   roots: EngineRoot[]
+  /** 追加到新任务 announce 列表的 Tracker（aria2 bt-tracker 语义，v4.9.39） */
+  trackers: string[]
   rpc_path: string
   /** 仅管理端返回：给用户填 AriaNg */
   rpc_secret: string
@@ -107,6 +109,20 @@ export const downloadsApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roots }),
     }),
+
+  /**
+   * 保存 BT Tracker 列表：写库 + 热替换，**对新任务立即生效**（v4.9.39）。
+   * `rejected` 是被丢弃的条目（scheme 不合法 / 超上限），逐条给用户看。
+   */
+  setTrackers: (trackers: string[]) =>
+    request<{ status: string; trackers: string[]; rejected: string[] }>(
+      '/api/downloads/trackers',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trackers }),
+      },
+    ),
 
   addUri: (payload: { uri: string; dir?: string }) =>
     request<{ gid: string }>('/api/downloads', {

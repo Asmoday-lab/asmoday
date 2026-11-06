@@ -413,6 +413,10 @@ GWT-DL-20 Given 保存目录填 `../escape` / 盘符 / UNC  When 保存  Then 40
 GWT-DL-21 Given 数据库里已有 `download_roots`  When 重启进程  Then `engine.roots` 与重启前一致；Given 库里没有值但 `config.toml` 的 `[download].roots` 有绝对路径  Then 能映射到挂载点的导入为子路径、映射不上的 WARN 丢弃，一个都没剩下时取第一个在线可写挂载点 + `downloads`（v4.9.37）
 GWT-DL-22 Given 点页头「引擎设置」  Then **以页内视图切换，不出现遮挡层**（DOM 里没有 `.fixed.inset-0` 弹窗），右侧按钮变「返回任务」；点它回到任务列表且分段数字、轮询照常（v4.9.38）
 GWT-DL-23 Given 在设置视图改了参数没保存  When 切回任务再进设置  Then 草稿仍在（只有首次进入才拉 `/api/config` 与挂载点清单，不会重置填了一半的值）；「保存目录」在无改动时禁用，加/删行后提示「目录有改动，记得保存」（v4.9.38）
+GWT-DL-24 Given 「引擎设置 → BitTorrent Tracker」  Then 通栏一张卡：多行输入框（一行一个）、「填入常用列表」「清空」「保存 Tracker」三个按钮，标题旁标「对新任务生效」；BT 关闭时输入框与按钮禁用并提示先启用（v4.9.39）
+GWT-DL-25 Given 保存 Tracker  `udp://a.example:1337/announce` + `ftp://nope/x` + `udp://`  Then 只留合法项，`rejected` 逐条显示「已丢弃 …」；写 `settings.download_trackers` 并热替换，`POST` 后立刻 `GET /api/downloads/engine` 就返回新列表；重启进程仍是新值（v4.9.39）
+GWT-DL-26 Given 实例里有 Tracker 列表  When 添加一个不含 `tr=` 的 magnet 或 `.torrent`  Then 该任务的 announce 列表含这些地址（`.torrent` 走 `AddTorrentOptions::trackers`，magnet 走 URI 追加 `&tr=`，重复项不重复追加）；添加前已在跑的任务不受影响，`tellStatus.bittorrent.announceList` 仍是旧的（v4.9.39）
+GWT-DL-27 Given aria2 客户端  When `aria2.getGlobalOption`  Then 返回 `bt-tracker`（逗号分隔，与页面同一份）；`aria2.changeGlobalOption {"bt-tracker":"…"}` 返回 OK 且真的写库 + 换内存，随后 `getGlobalOption` 与页面都反映新值；不支持的键（如 `max-overall-download-limit`）也回 OK，但日志逐条 WARN（v4.9.39）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

@@ -122,15 +122,24 @@ impl BtEngine {
     }
 
     /// 加一个种子。返回的句柄随任务一起保存，后续 pause/unpause/delete 都用它。
+    ///
+    /// `trackers` 是实例级的追加列表（aria2 `bt-tracker` 语义）：
+    /// - `.torrent` 走 `AddTorrentOptions::trackers`，librqbit 会把它拼进种子
+    ///   自带的 announce 列表；
+    /// - magnet 只能改 URI——librqbit 8.1.1 的 magnet 分支忽略
+    ///   `AddTorrentOptions::trackers`，只读链接里的 `tr=`。
     pub async fn add(
         &self,
         source: TorrentSource,
         dir: &Path,
         only_files: Option<Vec<usize>>,
         paused: bool,
+        trackers: &[String],
     ) -> Result<TorrentHandle, String> {
         let add = match source {
-            TorrentSource::Magnet(uri) => AddTorrent::from_url(uri),
+            TorrentSource::Magnet(uri) => {
+                AddTorrent::from_url(crate::core::download::magnet_with_trackers(&uri, trackers))
+            }
             TorrentSource::Bytes(bytes) => AddTorrent::from_bytes(bytes),
         };
         let options = AddTorrentOptions {
@@ -139,6 +148,8 @@ impl BtEngine {
             overwrite: true,
             paused,
             only_files,
+            // 空列表给 None：别把「没配 tracker」变成「显式空列表」
+            trackers: (!trackers.is_empty()).then(|| trackers.to_vec()),
             ..Default::default()
         };
         match self
@@ -282,6 +293,55 @@ mod tests {
             .unwrap();
 
         (base, payload, seeder, seeding, downloader, downloading)
+    }
+
+    /// 实例级 Tracker 必须真的落到种子上（v4.9.39）。
+    ///
+    /// 只验「加进会话的种子带上了这些 announce」——真正的 announce 需要外网，
+    /// 这里不测网络；`paused` 让种子停在元信息阶段，不会尝试连 peer。
+    #[tokio::test]
+    async fn instance_trackers_are_attached_to_added_torrents() {
+        let base = std::env::temp_dir().join(format!("bt-trackers-{:016x}", rand::random::<u64>()));
+        let seed_dir = base.join("seed");
+        let out_dir = base.join("out");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(seed_dir.join("payload.bin"), vec![7u8; 64 * 1024]).unwrap();
+        let torrent = create_torrent(
+            &seed_dir.join("payload.bin"),
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(32 * 1024),
+            },
+        )
+        .await
+        .unwrap();
+        let bytes = torrent.as_bytes().unwrap();
+
+        let engine = BtEngine::start(out_dir.clone(), &base, None, true)
+            .await
+            .unwrap();
+        let handle = engine
+            .add(
+                TorrentSource::Bytes(bytes.to_vec()),
+                &out_dir,
+                None,
+                true,
+                &["udp://tracker.example:6969/announce".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 种子自带 announce 为空，所以这里应该正好只有我们追加的那条
+        let announce: Vec<String> = handle
+            .shared()
+            .trackers
+            .iter()
+            .map(|url| url.as_str().to_string())
+            .collect();
+        assert_eq!(announce, vec!["udp://tracker.example:6969/announce"]);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

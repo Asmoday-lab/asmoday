@@ -108,5 +108,17 @@
     "rotating": "Rotating…",
     "rotateHint": "The server generates this secret and keeps it in the database. Rotating invalidates the old one immediately — connected clients must be updated.",
     "rotated": "Secret rotated; the old one no longer works"
+  },
+  "trackers": {
+    "title": "BitTorrent trackers",
+    "live": "applies to new torrents",
+    "hint": "One per line, appended to every new download's announce list (same as aria2's bt-tracker); trackers inside the torrent are kept. Torrents already running are not touched — re-add them to pick up the new list.",
+    "placeholder": "udp://tracker.example.org:1337/announce",
+    "fillCommon": "Fill common list",
+    "clear": "Clear",
+    "save": "Save trackers",
+    "saved": "Trackers saved, effective for new torrents",
+    "btOff": "BitTorrent is off — enable it above and restart asmoday.",
+    "rejected": "Dropped {entry}"
   }
 }

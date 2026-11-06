@@ -108,5 +108,17 @@
     "rotating": "刷新中…",
     "rotateHint": "密钥由服务自动生成、存在数据库里；刷新后旧密钥立刻失效，已连接的客户端需要重新填写。",
     "rotated": "密钥已刷新，旧密钥已失效"
+  },
+  "trackers": {
+    "title": "BitTorrent Tracker",
+    "live": "对新任务生效",
+    "hint": "一行一个，追加到每个新下载的 announce 列表（同 aria2 的 bt-tracker）；种子自带的 tracker 不受影响。已经在跑的任务不追溯，重新添加才会用上新列表。",
+    "placeholder": "udp://tracker.example.org:1337/announce",
+    "fillCommon": "填入常用列表",
+    "clear": "清空",
+    "save": "保存 Tracker",
+    "saved": "Tracker 已保存，对新任务生效",
+    "btOff": "BitTorrent 未启用，先在上面打开「启用 BitTorrent」并重启 asmoday。",
+    "rejected": "已丢弃 {entry}"
   }
 }

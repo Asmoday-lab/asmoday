@@ -310,6 +310,105 @@ pub const RPC_SECRET_SETTING: &str = "download_rpc_secret";
 /// 实例设置里「允许的保存目录」的键名（JSON 数组，v4.9.37）。
 pub const ROOTS_SETTING: &str = "download_roots";
 
+/// 实例设置里 BT Tracker 列表的键名（JSON 字符串数组，v4.9.39）。
+///
+/// 语义对齐 aria2 的 `bt-tracker`：**追加**到每个新任务的 announce 列表里，
+/// 不替换种子自带的那份。运行中的任务不会被追溯修改 —— librqbit 8.1.1 只在
+/// `add_torrent` 时构造 tracker 轮询流，没有运行时增删接口（aria2 的全局选项
+/// 同样是给「之后添加的种子」用的）。
+pub const TRACKERS_SETTING: &str = "download_trackers";
+
+/// Tracker 列表的上限：防止一次粘贴几万行把 UI 和种子添加拖死。
+/// qBittorrent 默认列表约 30 条，公开列表（ngosang）也就 100 条上下。
+pub const MAX_TRACKERS: usize = 200;
+
+/// Tracker 归一化结果：留下合法的，报出丢弃的（附原因）。
+pub struct TrackersUpdate {
+    pub trackers: Vec<String>,
+    pub rejected: Vec<String>,
+}
+
+/// 归一化 Tracker 列表：去空白、去重、按 scheme 白名单过滤。
+///
+/// 只放行 BT tracker 真正会用的协议（http / https / udp / ws / wss）。
+/// 不做「聪明纠正」——`udp://` 写错成 `udp//` 的用户需要看见错误，而不是被
+/// 悄悄改成另一个地址去 announce。
+pub fn normalize_trackers(raw: &[String]) -> TrackersUpdate {
+    let mut trackers: Vec<String> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    for entry in raw {
+        // 允许一行粘贴多个（空格 / 逗号分隔，与 aria2 的 bt-tracker 同形）
+        for candidate in entry.split(['\n', '\r', ',', ' ', '\t']) {
+            let url = candidate.trim();
+            if url.is_empty() {
+                continue;
+            }
+            let lower = url.to_ascii_lowercase();
+            let scheme_ok = ["http://", "https://", "udp://", "ws://", "wss://"]
+                .iter()
+                .any(|scheme| lower.starts_with(scheme));
+            // announce 地址必须比 scheme 长，「udp://」这种空主机名没有意义
+            if !scheme_ok || lower.len() < 10 {
+                rejected.push(url.to_string());
+                continue;
+            }
+            if trackers.iter().any(|kept| kept == url) {
+                continue;
+            }
+            if trackers.len() >= MAX_TRACKERS {
+                rejected.push(format!("{url}（超过 {MAX_TRACKERS} 条上限）"));
+                continue;
+            }
+            trackers.push(url.to_string());
+        }
+    }
+    TrackersUpdate { trackers, rejected }
+}
+
+/// 把 Tracker 追加到 magnet 链接上（缺什么补什么）。
+///
+/// 为什么必须改 URI：librqbit 8.1.1 的 `AddTorrentOptions::trackers` **只对
+/// `.torrent` 字节生效**，magnet 分支只读链接里的 `tr=`（见其 `add_torrent`）。
+/// 40 位裸 info hash 先补成完整 magnet 再追加。
+pub fn magnet_with_trackers(uri: &str, trackers: &[String]) -> String {
+    if trackers.is_empty() {
+        return uri.to_string();
+    }
+    let mut base = uri.trim().to_string();
+    if base.len() == 40 && !base.contains(':') {
+        base = format!("magnet:?xt=urn:btih:{base}");
+    }
+    // 已经有的一律不加：同一个 tracker 重复 announce 会被服务端当成滥用
+    let existing = librqbit::Magnet::parse(&base)
+        .map(|magnet| magnet.trackers)
+        .unwrap_or_default();
+    let mut out = base;
+    for tracker in trackers {
+        if existing.iter().any(|have| have == tracker) {
+            continue;
+        }
+        out.push_str(if out.contains('?') { "&tr=" } else { "?tr=" });
+        out.push_str(&percent_encode(tracker));
+    }
+    out
+}
+
+/// 只转义会破坏查询串的字符（RFC 3986 unreserved 之外）。
+///
+/// 不引 `percent-encoding`：这里只有一个用途，多一个依赖不值得。
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// 落盘目录配置的持久化形态：挂载点稳定 id + 相对子路径。
 ///
 /// 为什么存 id 而不是绝对路径：挂载点路径是可改的（换盘、改配置），`m0`
@@ -524,6 +623,9 @@ pub struct DownloadManager {
     /// 允许落盘的根白名单（挂载点子路径，v4.9.37）。运行中可整体替换：
     /// 页面保存目录后写库 + 换内存，下一个任务即生效，不需要重启。
     roots: Arc<RwLock<Vec<DownloadRoot>>>,
+    /// BT Tracker 列表（v4.9.39）。语义同 aria2 的 `bt-tracker`：追加到
+    /// 每个**新**任务的 announce 列表；运行中可整体替换，下一个任务即生效。
+    trackers: Arc<RwLock<Vec<String>>>,
     /// 每任务最大连接数
     pub segments: usize,
     /// `[download].enable=false` 时为 false：RPC handler 直接 404，无协议暴露面
@@ -586,6 +688,7 @@ impl DownloadManager {
             http,
             secret: Arc::new(RwLock::new(secret)),
             roots: Arc::new(RwLock::new(roots)),
+            trackers: Arc::new(RwLock::new(Vec::new())),
             segments: segments.clamp(1, 32),
             enabled,
             max_concurrent: Arc::new(Semaphore::new(max_concurrent_count)),
@@ -664,6 +767,25 @@ impl DownloadManager {
     /// 已存在的任务不受影响（它们已经记了自己的 `dir`），新任务按新白名单校验。
     pub fn replace_roots(&self, next: Vec<DownloadRoot>) {
         if let Ok(mut guard) = self.roots.write() {
+            *guard = next;
+        }
+    }
+
+    /// 当前 BT Tracker 列表（追加到新任务 announce 列表的那份）。
+    pub fn trackers(&self) -> Vec<String> {
+        self.trackers
+            .read()
+            .map(|trackers| trackers.clone())
+            .unwrap_or_default()
+    }
+
+    /// 运行中替换 Tracker 列表（页面 / RPC 保存后调用；调用方负责先写库）。
+    ///
+    /// 只影响之后添加的任务：librqbit 在 `add_torrent` 时就把 tracker 轮询流
+    /// 建好了，运行中的种子没有增删入口（aria2 的 `bt-tracker` 也只作用于
+    /// 新种子）。
+    pub fn replace_trackers(&self, next: Vec<String>) {
+        if let Ok(mut guard) = self.trackers.write() {
             *guard = next;
         }
     }
@@ -1287,6 +1409,8 @@ impl DownloadManager {
         {
             map.insert("enable-dht".into(), json!("true"));
             map.insert("bt-max-peers".into(), json!("55"));
+            // 与 aria2 同形：逗号分隔的 announce 列表；空列表时给空串
+            map.insert("bt-tracker".into(), json!(self.trackers().join(",")));
         }
         options
     }
@@ -1401,7 +1525,9 @@ async fn run_bt_task(
     let gid = handle.state.lock().await.gid.clone();
     let dir = handle.state.lock().await.dir.clone();
 
-    let torrent = match bt.add(source, &dir, only_files, paused).await {
+    // Tracker 列表在这一刻取快照：页面上改完只影响之后添加的任务
+    let trackers = manager.trackers();
+    let torrent = match bt.add(source, &dir, only_files, paused, &trackers).await {
         Ok(torrent) => torrent,
         Err(err) => {
             let mut state = handle.state.lock().await;
@@ -2020,6 +2146,96 @@ mod tests {
             path: path.to_path_buf(),
             online: true,
         }
+    }
+
+    #[test]
+    fn trackers_are_normalized_and_deduped() {
+        // 换行 / 逗号 / 空格混写都要能吃下（前端一行一个，aria2 是逗号）
+        let raw = vec![
+            "udp://tracker.example:6969/announce\nhttps://t2.example/announce".to_string(),
+            "  https://t2.example/announce  ".to_string(),
+            "ftp://nope.example/announce".to_string(),
+            "udp://".to_string(),
+        ];
+        let update = normalize_trackers(&raw);
+        assert_eq!(
+            update.trackers,
+            vec![
+                "udp://tracker.example:6969/announce",
+                "https://t2.example/announce"
+            ]
+        );
+        // 非法 scheme 与空主机名都要报出来，而不是静默吞掉
+        assert_eq!(update.rejected.len(), 2);
+        // 上限：第 201 条开始丢弃
+        let many: Vec<String> = (0..MAX_TRACKERS + 5)
+            .map(|i| format!("udp://t{i}.example:6969/announce"))
+            .collect();
+        let capped = normalize_trackers(&many);
+        assert_eq!(capped.trackers.len(), MAX_TRACKERS);
+        assert_eq!(capped.rejected.len(), 5);
+        // 空输入 = 清空列表（合法请求）
+        assert!(normalize_trackers(&[]).trackers.is_empty());
+    }
+
+    #[test]
+    fn magnet_gets_trackers_appended_once() {
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ubuntu";
+        let once = magnet_with_trackers(magnet, &["udp://tracker.example:6969/announce".into()]);
+        assert!(once.starts_with(magnet));
+        assert!(once.ends_with("&tr=udp%3A%2F%2Ftracker.example%3A6969%2Fannounce"));
+
+        // 重复保存同一份列表不能把同一条 tracker 加两遍
+        let twice = magnet_with_trackers(&once, &["udp://tracker.example:6969/announce".into()]);
+        assert_eq!(once.matches("tr=").count(), 1);
+        assert_eq!(twice.matches("tr=").count(), 1);
+
+        // 40 位裸 info hash 先补成 magnet 再追加
+        let bare = "0123456789abcdef0123456789abcdef01234567";
+        let from_bare = magnet_with_trackers(bare, &["https://t.example/announce".into()]);
+        assert!(from_bare.starts_with("magnet:?xt=urn:btih:"));
+        assert!(from_bare.ends_with("&tr=https%3A%2F%2Ft.example%2Fannounce"));
+
+        // 编码后的形态必须能被 librqbit 解回原值（否则 tracker 会被静默丢掉）
+        let parsed = librqbit::Magnet::parse(&once).expect("rewritten magnet parses");
+        assert_eq!(
+            parsed.trackers,
+            vec!["udp://tracker.example:6969/announce".to_string()]
+        );
+
+        // 没有配置时不改原串（别给客户端造出一个「被我们改过」的 URI）
+        assert_eq!(magnet_with_trackers(magnet, &[]), magnet);
+    }
+
+    #[test]
+    fn tracker_list_is_runtime_replaceable() {
+        let dir = std::env::temp_dir().join(format!("asmoday-trackers-{}", new_gid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = DownloadManager::new(
+            reqwest::Client::new(),
+            "secret".into(),
+            vec![test_root(&dir)],
+            4,
+            2,
+            true,
+            None,
+        );
+        assert!(manager.trackers().is_empty());
+        manager.replace_trackers(vec!["udp://t.example:6969/announce".into()]);
+        assert_eq!(
+            manager.trackers(),
+            vec!["udp://t.example:6969/announce".to_string()]
+        );
+        // 全局选项按 aria2 形状暴露（逗号分隔），客户端据此回显
+        assert_eq!(
+            manager
+                .global_options()
+                .get("bt-tracker")
+                .and_then(Value::as_str),
+            None,
+            "BT 关掉时不声明 bt-tracker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -126,6 +126,8 @@ pub async fn engine(State(state): State<AppState>, _admin: AdminUser) -> Respons
         "segments": manager.segments,
         "max_concurrent": manager.max_concurrent(),
         "roots": roots,
+        // 追加到新任务 announce 列表的 Tracker（aria2 bt-tracker 语义，v4.9.39）
+        "trackers": manager.trackers(),
         "rpc_path": "/jsonrpc",
         // 以下各项是启动时快照，改配置必须重启（页面据此打「重启生效」标记）。
         // `roots` 不在其中：它走 POST /api/downloads/roots 热替换（v4.9.37）。
@@ -221,6 +223,57 @@ pub async fn rotate_secret(State(state): State<AppState>, _admin: AdminUser) -> 
     state.downloads.replace_secret(secret.clone());
     crate::log_info!("download RPC secret rotated (old token invalidated)");
     Json(json!({ "status": "ok", "rpc_secret": secret })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrackersRequest {
+    /// 允许混写分隔符（换行 / 逗号 / 空格），前端是一行一个
+    pub trackers: Vec<String>,
+}
+
+/// POST /api/downloads/trackers：改 BT Tracker 列表（v4.9.39）
+///
+/// 语义对齐 aria2 的 `bt-tracker`：**追加**到每个新任务的 announce 列表，
+/// 不替换种子自带的那些。保存后立即对之后添加的种子生效（不需要重启）；
+/// 已经在跑的任务不追溯——librqbit 在加种子时就把 tracker 轮询流建好了，
+/// 没有运行时增删接口。这一块不写 `config.toml`：数据库才是唯一真相。
+pub async fn set_trackers(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Json(body): Json<TrackersRequest>,
+) -> Response {
+    if !state.downloads.enabled() {
+        return disabled();
+    }
+    if !state.downloads.bt_enabled() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "BitTorrent 未启用（config.toml 的 [download].enable_bt = false）",
+        );
+    }
+    let update = crate::core::download::normalize_trackers(&body.trackers);
+    let encoded = match serde_json::to_string(&update.trackers) {
+        Ok(encoded) => encoded,
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    // 先落库再换内存：写失败就整体失败，避免「这次生效、重启回旧值」
+    if let Err(err) = state
+        .auth
+        .put_setting(crate::core::download::TRACKERS_SETTING, &encoded)
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    state.downloads.replace_trackers(update.trackers.clone());
+    crate::log_info!(
+        "download trackers updated ({} entries, applies to new torrents)",
+        update.trackers.len()
+    );
+    Json(json!({
+        "status": "ok",
+        "trackers": update.trackers,
+        "rejected": update.rejected,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]

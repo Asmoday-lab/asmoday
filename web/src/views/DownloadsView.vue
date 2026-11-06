@@ -108,6 +108,28 @@ const rootsDirty = ref(false)
 const newRootMount = ref('')
 const newRootRel = ref('downloads')
 
+/** Tracker 编辑态：一行一个，保存时交给后端归一化（v4.9.39） */
+const trackerText = ref('')
+const trackersBusy = ref(false)
+const trackerWarnings = ref<string[]>([])
+
+/**
+ * 「填入常用列表」的底稿：公开 tracker（ngosang/trackerslist 常青项）。
+ * 只是起点，不是默认值——不替用户静默 announce 到第三方。
+ */
+const COMMON_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.tracker.cl:1337/announce',
+  'udp://open.demonii.com:1337/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://explodie.org:6969/announce',
+  'http://tracker.openbittorrent.com:80/announce',
+  'https://tracker.tamersunion.org:443/announce',
+  'udp://tracker.dler.org:6969/announce',
+]
+
 useScrollLock(computed(() => addOpen.value))
 
 const groups = computed(() => ({
@@ -332,6 +354,7 @@ async function openSettings() {
       rel: root.rel,
     }))
     newRootMount.value = writableMounts.value.find((mount) => mount.online)?.id ?? ''
+    trackerText.value = (engine.value?.trackers ?? []).join('\n')
   } catch (err) {
     settingsError.value = err instanceof Error ? err.message : t('downloads.loadFailed')
   }
@@ -376,6 +399,37 @@ async function saveRoots() {
   } finally {
     rootsBusy.value = false
   }
+}
+
+/**
+ * 保存 Tracker 列表（v4.9.39）。
+ *
+ * 语义同 aria2 的 `bt-tracker`：追加到**新**任务的 announce 列表，运行中的
+ * 种子不追溯（librqbit 没有运行时增删 tracker 的接口）。写库 + 换内存，
+ * 不需要重启。
+ */
+async function saveTrackers() {
+  if (trackersBusy.value) return
+  trackersBusy.value = true
+  trackerWarnings.value = []
+  settingsError.value = ''
+  try {
+    const result = await downloadsApi.setTrackers(
+      trackerText.value.split('\n').map((line) => line.trim()).filter(Boolean),
+    )
+    trackerText.value = result.trackers.join('\n')
+    trackerWarnings.value = result.rejected
+    if (engine.value) engine.value.trackers = result.trackers
+    showToast(t('downloads.trackers.saved'))
+  } catch (err) {
+    settingsError.value = err instanceof Error ? err.message : t('downloads.actionFailed')
+  } finally {
+    trackersBusy.value = false
+  }
+}
+
+function fillCommonTrackers() {
+  trackerText.value = COMMON_TRACKERS.join('\n')
 }
 
 async function saveSettings() {
@@ -769,7 +823,7 @@ onUnmounted(() => {
         <div class="skeleton h-32 rounded-xl" />
       </div>
 
-      <div v-if="settings" class="mt-5 grid gap-4 lg:grid-cols-2">
+      <div v-if="settings" class="mt-5 grid items-start gap-4 lg:grid-cols-2">
         <!-- 引擎参数：进程启动时读取，改动需重启 -->
         <section class="flex flex-col rounded-xl border border-line bg-panel p-4">
           <div class="flex items-center justify-between gap-2">
@@ -867,8 +921,62 @@ onUnmounted(() => {
           </div>
         </section>
 
+        <!-- Tracker：追加到新任务的 announce 列表（aria2 bt-tracker 语义） -->
+        <section class="rounded-xl border border-line bg-panel p-4 lg:col-span-2">
+          <div class="flex items-center justify-between gap-2">
+            <p class="text-[13px] font-medium text-ink">{{ t('downloads.trackers.title') }}</p>
+            <span class="shrink-0 rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent">
+              {{ t('downloads.trackers.live') }}
+            </span>
+          </div>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted">
+            {{ t('downloads.trackers.hint') }}
+          </p>
+
+          <textarea
+            v-model="trackerText"
+            rows="6"
+            spellcheck="false"
+            :disabled="!engine?.bt"
+            :placeholder="t('downloads.trackers.placeholder')"
+            class="mt-2 w-full resize-y rounded-lg border border-line bg-elevated px-3 py-2 font-mono text-[11px] leading-relaxed text-ink outline-none focus:border-accent disabled:opacity-60"
+          />
+
+          <div class="mt-2 flex flex-wrap items-center gap-1.5">
+            <button
+              class="rounded-md border border-line px-2 py-1 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
+              :disabled="!engine?.bt"
+              @click="fillCommonTrackers"
+            >
+              {{ t('downloads.trackers.fillCommon') }}
+            </button>
+            <button
+              class="rounded-md border border-line px-2 py-1 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
+              :disabled="!engine?.bt || !trackerText"
+              @click="trackerText = ''"
+            >
+              {{ t('downloads.trackers.clear') }}
+            </button>
+            <button
+              class="ml-auto rounded-lg border border-line px-2.5 py-1 text-[11px] text-ink transition-colors hover:border-accent/50 disabled:opacity-50"
+              :disabled="trackersBusy || !engine?.bt"
+              data-testid="download-save-trackers"
+              @click="saveTrackers"
+            >
+              {{ trackersBusy ? t('downloads.settings.saving') : t('downloads.trackers.save') }}
+            </button>
+          </div>
+
+          <p v-if="!engine?.bt" class="mt-1.5 text-[11px] fg-warn">
+            {{ t('downloads.trackers.btOff') }}
+          </p>
+          <p v-for="warning in trackerWarnings" :key="warning" class="mt-1 text-[11px] fg-warn">
+            {{ t('downloads.trackers.rejected', { entry: warning }) }}
+          </p>
+        </section>
+
         <!-- 右列：保存目录在前（常用），RPC 接入在后 -->
-        <div class="space-y-4">
+        <div class="space-y-4 lg:col-start-2 lg:row-start-1">
           <!-- 保存目录：挂载点子路径，写库 + 热替换，立即生效 -->
           <section class="rounded-xl border border-line bg-panel p-4">
             <div class="flex items-center justify-between gap-2">

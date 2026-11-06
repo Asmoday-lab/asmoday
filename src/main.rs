@@ -457,8 +457,55 @@ async fn run(cli: Cli) -> Result<(), String> {
         None
     };
 
+    // BT Tracker 列表（v4.9.39）：数据库是唯一真相，`[download].bt_trackers` 只在
+    // 库里还没有值时当一次性种子。语义对齐 aria2 的 `bt-tracker`——追加到每个**新**
+    // 任务的 announce 列表；改完立即对之后添加的种子生效，运行中的种子不追溯
+    // （librqbit 在 add_torrent 时就把 tracker 轮询流建好了）。
+    let download_trackers: Vec<String> = {
+        const KEY: &str = core::download::TRACKERS_SETTING;
+        let stored = auth
+            .setting(KEY)
+            .map_err(|e| format!("read download trackers failed: {e}"))?;
+        match stored.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|e| format!("stored {KEY} is not valid JSON: {e}"))?,
+            None => {
+                let update = core::download::normalize_trackers(&download_config.bt_trackers);
+                for rejected in &update.rejected {
+                    crate::log_warn!("[download].bt_trackers: dropped {rejected}");
+                }
+                if !download_config.bt_trackers.is_empty() {
+                    crate::log_warn!(
+                        "[download].bt_trackers is deprecated: imported into the database once; \
+                         edit the list on the download engine page from now on"
+                    );
+                }
+                let json = serde_json::to_string(&update.trackers)
+                    .map_err(|e| format!("encode download trackers failed: {e}"))?;
+                auth.put_setting(KEY, &json)
+                    .map_err(|e| format!("persist download trackers failed: {e}"))?;
+                update.trackers
+            }
+        }
+    };
+
     // 缩略图缓存根：缩略器与索引共用同一个串（索引靠它回收外部删除的缓存单元）
     let thumb_dir = data_dir.join("thumbnails");
+    let downloads = Arc::new(core::download::DownloadManager::new(
+        reqwest::Client::builder()
+            .user_agent("aria2/1.37.0")
+            .build()
+            .map_err(|e| format!("failed to build download HTTP client: {e}"))?,
+        download_secret,
+        download_roots,
+        download_config.segments,
+        download_config.max_concurrent,
+        download_config.enable,
+        bt_engine,
+    ));
+    // 启动时装载 Tracker 列表（之后改列表走页面 / RPC，不重启）
+    downloads.replace_trackers(download_trackers);
+
     let state = AppState {
         config_path: config_path.clone(),
         data_dir: data_dir.clone(),
@@ -491,18 +538,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         path_locks: Arc::new(core::locks::PathLocks::new()),
         dav: Arc::new(api::webdav::DavCache::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
-        downloads: Arc::new(core::download::DownloadManager::new(
-            reqwest::Client::builder()
-                .user_agent("aria2/1.37.0")
-                .build()
-                .map_err(|e| format!("failed to build download HTTP client: {e}"))?,
-            download_secret,
-            download_roots,
-            download_config.segments,
-            download_config.max_concurrent,
-            download_config.enable,
-            bt_engine,
-        )),
+        downloads,
         tus: Arc::new(api::upload_tus::TusStore::new(data_dir.join("uploads_tmp"))),
         hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         started,
@@ -785,6 +821,10 @@ fn protected_routes() -> Router<AppState> {
         .route("/api/downloads/engine", get(api::downloads::engine))
         .route("/api/downloads/roots", post(api::downloads::set_roots))
         .route("/api/downloads/secret", post(api::downloads::rotate_secret))
+        .route(
+            "/api/downloads/trackers",
+            post(api::downloads::set_trackers),
+        )
         .route("/api/downloads/torrents", post(api::downloads::add_torrent))
         .route("/api/downloads/stopped", delete(api::downloads::purge))
         .route("/api/downloads/{gid}/pause", post(api::downloads::pause))
