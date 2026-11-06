@@ -567,7 +567,23 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
         auth.set_must_change_password(user.id, true)?;
         crate::log_info!("no administrator yet; created user 'admin'");
-        print_one_time_password(&password, Some(&url));
+        print_one_time_password(&password, Some(&url), None);
+    } else if let Some(password) = auth.reissue_pending_password()? {
+        // 账号建好了、但还没人用一次性密码登录过（must_change_password 仍是 1）。
+        // 上一次打的那串只在控制台出现过一次；用户没记下来就把进程关掉的话，重启后
+        // 既没有密码也没有提示 —— 永久锁死（2026-11-06 用户反馈）。能重启进程的人
+        // 就在控制台前，按这条凭证的语义重新签发一个，并明确告知旧的已作废。
+        crate::log_info!(
+            "administrator has not set a password yet; issued a new one-time password \
+             (an earlier one is now invalid)"
+        );
+        print_one_time_password(
+            &password,
+            Some(&url),
+            Some(
+                "issued again because no password has been set yet; an earlier one is now invalid.",
+            ),
+        );
     }
 
     state
@@ -768,7 +784,10 @@ fn access_url(server: &core::config::ServerConfig) -> String {
 ///
 /// 颜色跟着日志系统同一个判据（`logging::color_enabled()`：TTY 且非 JSON），
 /// 重定向到文件时不带任何转义码；正文字符全 ASCII，GBK 代码页的 cmd 也不会乱码。
-fn print_one_time_password(password: &str, url: Option<&str>) {
+///
+/// `note` 是横幅里多出来的一句交代（例如「上一个一次性密码已作废」）：重启补发时
+/// 必须说清楚，否则用户会拿旧密码反复试。（v4.9.44）
+fn print_one_time_password(password: &str, url: Option<&str>, note: Option<&str>) {
     let color = crate::core::logging::color_enabled();
     let (title, value, dim, reset) = if color {
         ("\x1b[1;36m", "\x1b[1;7;33m", "\x1b[90m", "\x1b[0m")
@@ -794,6 +813,9 @@ fn print_one_time_password(password: &str, url: Option<&str>) {
     if let Some(url) = url {
         // OSC 8：支持的终端里是可点的真链接；不支持则原样打 URL（v4.9.43）
         println!("  Open: {}", crate::core::logging::link(url));
+    }
+    if let Some(note) = note {
+        println!("{dim}  Note: {note}{reset}");
     }
     println!("{dim}  Shown only once; it is never written to the log file.{reset}");
     println!("{dim}{bar}{reset}");
@@ -1337,9 +1359,26 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result
     match auth.user_count() {
         Ok(0) => {}
         Ok(_) => {
-            crate::log_info!(
-                "administrator already exists; --init does not overwrite the password"
-            );
+            // 账号已存在。正式密码绝不覆盖；但如果它还停在「待改密」状态，说明上次
+            // 打印的一次性密码没人用过——此时补发一个，正是 `--init` 想达成的效果
+            // （v4.9.44：以前这里只说「不覆盖」，用户手里没密码就只能干瞪眼）。
+            if let Some(password) = auth.reissue_pending_password()? {
+                crate::log_info!(
+                    "administrator exists without a set password; re-issued a one-time password"
+                );
+                print_one_time_password(
+                    &password,
+                    Some(url),
+                    Some(
+                        "re-issued because no password has been set yet; an earlier one is invalid.",
+                    ),
+                );
+            } else {
+                crate::log_info!(
+                    "administrator already exists; --init does not overwrite the password \
+                     (use --reset-password for a new one-time password)"
+                );
+            }
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -1351,7 +1390,7 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result
     crate::log_info!("administrator created: {}", user.username);
     // 一次性密码只打控制台（stdout），绝不走 log_*!——那会落进
     // data/logs/asmoday.log 并随轮转留存（2026-11-04 审查）
-    print_one_time_password(&password, Some(url));
+    print_one_time_password(&password, Some(url), None);
     Ok(())
 }
 
@@ -1395,7 +1434,7 @@ async fn reset_admin_password(auth: &AuthStore, url: &str) -> Result<(), String>
             auth.set_must_change_password(user.id, true)?;
             crate::log_info!("password reset for {}", user.username);
             // 同 bootstrap_admin：只打 stdout，不落日志文件
-            print_one_time_password(&password, Some(url));
+            print_one_time_password(&password, Some(url), Some("password was reset."));
         }
     }
     Ok(())

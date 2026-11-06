@@ -371,6 +371,9 @@ GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 控制
 GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 登录页只有 1 个密码框且无用户名（无初始化页）；一次性密码登录成功后弹「设置新密码」对话框（v4.9.34）
 GWT-AUTH-03 Given 待初始化实例  When 登录页输入错误密码  Then 401 并计入 IP 防爆破池；换成正式密码后旧一次性密码登录 401（v4.9.34）
 GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框（只有新密码 + 确认，无需再填一次性密码，v4.9.33）
+GWT-AUTH-18 Given 首启打印了一次性密码但没人登录（must_change_password=1），进程被关掉  When 再次启动  Then 控制台**重新打印一个一次性密码**并在横幅里注明「上一个已作废」；旧密码登录 401、新密码登录 200；库里仍只有一行账号、`must_change_password=1`、既有会话不被清掉（v4.9.44）
+GWT-AUTH-19 Given 账号已设正式密码（must_change_password=0）  When 重启任意次  Then 不打印任何横幅（补发只针对从未设过密码的账号）；`--init` 只输出「already exists; does not overwrite the password (use --reset-password)」；`--reset-password` 仍能发放新的一次性密码（v4.9.44）
+GWT-AUTH-20 Given 待改密账号  When 执行 `--init`  Then 与普通启动一致：补发一个新的一次性密码并打印横幅（不再只说「不覆盖」就把人晾在那里）（v4.9.44）
 GWT-AUTH-05 Given 登录页  When 密码错误  Then 行内错误「密码错误」，不泄露账号是否存在
 GWT-AUTH-06 Given 登录页  When 密码正确但 TOTP 开启  Then 弹出 6 位 TOTP 输入，输入错误回登录页
 GWT-AUTH-07 Given 已登录  When 密码重置成功（CLI --reset-password）  Then 前端下一个请求返回 401 E_UNAUTHORIZED → 跳登录

@@ -56,7 +56,7 @@ tar -xzf asmoday-*.tar.gz && chmod +x asmoday
 asmoday.exe
 ```
 
-Open `http://127.0.0.1:4242`, sign in with the **one-time password printed in the console** (no username anywhere in the web UI), then set your real password in the prompt that appears. The banner also prints the address as a terminal hyperlink — Ctrl/⌘+click it in Windows Terminal, iTerm2 or the VS Code terminal.
+Open `http://127.0.0.1:4242`, sign in with the **one-time password printed in the console** (no username anywhere in the web UI), then set your real password in the prompt that appears. The banner also prints the address as a terminal hyperlink — Ctrl/⌘+click it in Windows Terminal, iTerm2 or the VS Code terminal. Missed the password? As long as no real password has been set yet, restarting the process **issues a fresh one** (the old one stops working) and prints the banner again.
 
 The first start writes `config.toml` and `data/` into the current directory. With no mount configured, the working directory is used as a fallback root; to manage other disks, add a mount under Settings → Advanced or edit the config:
 

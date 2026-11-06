@@ -992,6 +992,34 @@ impl AuthStore {
         Ok(())
     }
 
+    /// 账号仍停在「首次登录必须改密」状态时，重新签发一次性密码。
+    ///
+    /// 一次性密码只打印一次、且明文不落盘（那是「守在控制台前的人」的所有权凭证）。
+    /// 用户没记下来就把进程关掉的话，重启后既拿不到密码也没有任何提示——账号永久锁死
+    /// （2026-11-06 用户反馈）。能重启进程的人本来就坐在控制台前，正是这条凭证要证明
+    /// 的东西，所以每次启动都重新签发是自洽的：旧的一次性密码即刻作废。
+    ///
+    /// 与 [`update_password`](Self::update_password) 的区别：只换 `password_hash`，
+    /// 不清会话、不落 `must_change_password`——否则重启会顺手把人踢下线，还要再写一次
+    /// 那个标志位。已经设好正式密码的账号永远不会走到这里。
+    pub fn reissue_pending_password(&self) -> Result<Option<String>, String> {
+        let Some(user) = self.first_user()? else {
+            return Ok(None);
+        };
+        if !user.must_change_password {
+            return Ok(None);
+        }
+        let password = random_password();
+        let hash = hash_password(&password)?;
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+            params![hash, user.id],
+        )
+        .map_err(|e| format!("重新签发一次性密码失败：{e}"))?;
+        Ok(Some(password))
+    }
+
     pub fn set_totp(&self, user_id: i64, secret: &str, enabled: bool) -> Result<(), String> {
         let conn = self.connect()?;
         conn.execute(
@@ -1390,11 +1418,23 @@ mod tests {
     use super::*;
 
     fn temp_store(name: &str) -> AuthStore {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join("test-scratch")
-            .join(format!("auth-{name}.db"));
-        let _ = std::fs::remove_file(&path);
+            .join("test-scratch");
+        let mut path = base.join(format!("auth-{name}.db"));
+        // 连 -wal / -shm 一起删：只删主文件时，残留 WAL 会把上一次跑到一半的迁移
+        // 重放一遍，下一个用例直接死在 `duplicate column name`（2026-11-06 踩到）
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        // Windows 上句柄可能还没释放，删不掉就换个名字：宁可多一个文件，
+        // 也不要让「用户名已存在」这种脏状态把用例带偏
+        if path.exists() {
+            path = base.join(format!("auth-{name}-{}.db", std::process::id()));
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
         let store = AuthStore::new(path);
         store.init().unwrap();
         store
@@ -1421,6 +1461,43 @@ mod tests {
                 .unwrap()
                 .must_change_password
         );
+    }
+
+    #[test]
+    /// 重启补发：账号还停在「待改密」时换一个新的，旧的一次性密码立即作废（v4.9.44）
+    fn pending_one_time_password_is_reissued_on_restart() {
+        let store = temp_store("reissue-pending");
+        assert!(
+            store.reissue_pending_password().unwrap().is_none(),
+            "还没有账号时不该签发"
+        );
+
+        let admin = store.create_user("boss", "Asmoday#2026").unwrap();
+        assert!(admin.must_change_password, "建号即待改密");
+        let (_, first_hash, _) = store.find_user("boss").unwrap().unwrap();
+
+        let fresh = store
+            .reissue_pending_password()
+            .unwrap()
+            .expect("待改密状态下重启应补发");
+        let (user, new_hash, _) = store.find_user("boss").unwrap().unwrap();
+        assert!(verify_password(&new_hash, &fresh), "新密码能登录");
+        assert!(
+            !verify_password(&new_hash, "Asmoday#2026"),
+            "旧密码必须作废"
+        );
+        assert_ne!(first_hash, new_hash);
+        assert!(user.must_change_password, "补发后仍要求首登改密");
+        assert_eq!(user.id, admin.id, "不能顺手新建账号");
+
+        // 补发不清会话：只换 password_hash，重启不该把人踢下线
+        let first = store.create_session().unwrap();
+        store.reissue_pending_password().unwrap();
+        assert!(store.session_active(&first).unwrap(), "已有会话保持有效");
+
+        // 设了正式密码之后就不再补发
+        store.update_password(admin.id, "Asmoday@2026x").unwrap();
+        assert!(store.reissue_pending_password().unwrap().is_none());
     }
 
     #[test]
