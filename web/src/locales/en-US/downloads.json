@@ -1,5 +1,5 @@
 {
-  "heading": "Downloads",
+  "heading": "Download engine",
   "loadFailed": "Failed to load the download queue",
   "actionFailed": "Action failed",
   "connections": "{count} connections",
@@ -45,7 +45,7 @@
   },
   "disabled": {
     "title": "Download engine is disabled",
-    "hint": "Set [download].enable to true in config.toml and restart, or turn it on below in Engine settings and restart."
+    "hint": "Open \"Engine settings\" at the top right, turn on \"Enable download engine\" and restart asmoday."
   },
   "dialog": {
     "title": "New download",
@@ -83,7 +83,16 @@
     "saveRoots": "Save directories",
     "rootsSaved": "Save directories updated, effective immediately",
     "offline": "offline",
-    "roots": "Allowed save directories"
+    "roots": "Allowed save directories",
+    "subtitle": "Parameters take effect after a restart; save directories apply immediately",
+    "paramsTitle": "Engine parameters",
+    "restartBadge": "Restart needed",
+    "saveParams": "Save parameters",
+    "rootsDirty": "Unsaved directory changes",
+    "back": "Back to tasks",
+    "enableHint": "When off, this page is read-only and RPC is disabled too",
+    "enableBtHint": "Required for magnets and .torrent files; without it only HTTP links work",
+    "disableDhtHint": "Find peers through trackers only — useful on restricted or DHT-polluted networks"
   },
   "rpc": {
     "title": "RPC access",

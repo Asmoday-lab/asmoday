@@ -1,5 +1,5 @@
 {
-  "heading": "下载任务",
+  "heading": "下载引擎",
   "loadFailed": "读取下载队列失败",
   "actionFailed": "操作失败",
   "connections": "{count} 个连接",
@@ -45,7 +45,7 @@
   },
   "disabled": {
     "title": "下载引擎未启用",
-    "hint": "在 config.toml 里把 [download].enable 设为 true 并重启服务，或在下方引擎设置中打开后重启。"
+    "hint": "点右上角「引擎设置」，打开「启用下载引擎」并重启 asmoday 后可用。"
   },
   "dialog": {
     "title": "新建下载",
@@ -83,7 +83,16 @@
     "saveRoots": "保存目录",
     "rootsSaved": "保存目录已更新，立即生效",
     "offline": "离线",
-    "roots": "允许的保存目录"
+    "roots": "允许的保存目录",
+    "subtitle": "参数改动需重启；保存目录即时生效",
+    "paramsTitle": "引擎参数",
+    "restartBadge": "需重启",
+    "saveParams": "保存参数",
+    "rootsDirty": "目录有改动，记得保存",
+    "back": "返回任务",
+    "enableHint": "关闭后本页只读，新建下载与 RPC 一起停用",
+    "enableBtHint": "磁力链与种子文件需要它；关闭后只做 HTTP 直链",
+    "disableDhtHint": "只用 Tracker 找 peer，适合网络受限或被 DHT 干扰的环境"
   },
   "rpc": {
     "title": "RPC 接入",

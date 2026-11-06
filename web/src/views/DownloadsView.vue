@@ -1,12 +1,16 @@
 <script setup lang="ts">
 /**
- * 下载页（v4.9.31，设计文档 3.10）。
+ * 下载引擎页（v4.9.31 起，v4.9.38 把设置从弹窗搬进页内）。
  *
  * 内置引擎是**一级功能**（与文件管理、媒体库同级）：任务列表、新建下载、引擎参数
  * 与 RPC 接入信息都在这里，不用去 config.toml 手写 TOML。
  *
+ * 页面只有两个视图：`tasks`（任务）与 `settings`（引擎设置）。设置曾经是弹窗，
+ * 字段一多就要在固定高度里滚，且没法一边看列表一边改；现在整页切换，宽屏下
+ * 参数卡与目录卡并排，底部是 RPC 接入卡。
+ *
  * 两个通道共用同一个 DownloadManager：本页走 Cookie 会话的 `/api/downloads*`，
- * AriaNg 等外部客户端走 `/jsonrpc` + `token:<secret>`。密钥只在「引擎设置」里
+ * AriaNg 等外部客户端走 `/jsonrpc` + `token:<secret>`。密钥只在设置视图里
  * 给出供复制，不落 localStorage。
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
@@ -40,6 +44,10 @@ interface DownloadConfig {
 type Tab = 'active' | 'queue' | 'done'
 const TABS: Tab[] = ['active', 'queue', 'done']
 
+/** 页内视图：任务 / 引擎设置（v4.9.38；设置不再走弹窗） */
+type View = 'tasks' | 'settings'
+const view = ref<View>('tasks')
+
 const { t } = useI18n()
 
 const snapshot = ref<Snapshot | null>(null)
@@ -64,7 +72,6 @@ interface RootDraft {
   rel: string
 }
 
-const settingsOpen = ref(false)
 const settings = ref<DownloadConfig | null>(null)
 const settingsBusy = ref(false)
 const settingsError = ref('')
@@ -77,6 +84,21 @@ let armTimer: number | undefined
 const fullConfig = ref<Record<string, unknown> | null>(null)
 const savedNeedsRestart = ref(false)
 
+/** 三个开关的元数据：模板里 v-for 一次，省得写三段几乎一样的行 */
+const toggleFields: {
+  key: 'enable' | 'enable_bt' | 'bt_disable_dht'
+  label: string
+  hint: string
+}[] = [
+  { key: 'enable', label: 'downloads.settings.enable', hint: 'downloads.settings.enableHint' },
+  { key: 'enable_bt', label: 'downloads.settings.enableBt', hint: 'downloads.settings.enableBtHint' },
+  {
+    key: 'bt_disable_dht',
+    label: 'downloads.settings.disableDht',
+    hint: 'downloads.settings.disableDhtHint',
+  },
+]
+
 /** 挂载点清单（保存目录只能从这里选，v4.9.37） */
 const mounts = ref<MountPoint[]>([])
 const rootDrafts = ref<RootDraft[]>([])
@@ -86,7 +108,7 @@ const rootsDirty = ref(false)
 const newRootMount = ref('')
 const newRootRel = ref('downloads')
 
-useScrollLock(computed(() => addOpen.value || settingsOpen.value))
+useScrollLock(computed(() => addOpen.value))
 
 const groups = computed(() => ({
   active: snapshot.value?.tasks?.active ?? [],
@@ -282,8 +304,15 @@ async function submitAdd() {
   }
 }
 
+/**
+ * 进设置视图（v4.9.38：页内第二视图，不再是弹窗）。
+ *
+ * 只有第一次进入才拉配置与挂载点：来回切换时保留用户正在编辑的草稿，
+ * 不会把填了一半的参数重置掉。
+ */
 async function openSettings() {
-  settingsOpen.value = true
+  view.value = 'settings'
+  if (settings.value) return
   settingsError.value = ''
   savedNeedsRestart.value = false
   rootsDirty.value = false
@@ -306,6 +335,10 @@ async function openSettings() {
   } catch (err) {
     settingsError.value = err instanceof Error ? err.message : t('downloads.loadFailed')
   }
+}
+
+function showTasks() {
+  view.value = 'tasks'
 }
 
 function addRoot() {
@@ -428,11 +461,17 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-4xl px-4 py-6 md:px-8 md:py-10">
-    <div class="flex flex-wrap items-center gap-3">
+  <section class="mx-auto w-full max-w-5xl px-4 py-6 md:px-8 md:py-10">
+    <!-- 页头：任务 / 引擎设置共用一行，右侧按钮随视图换 -->
+    <div class="flex flex-wrap items-start gap-3">
       <div class="min-w-0 flex-1">
-        <p class="text-sm font-semibold text-ink">{{ t('downloads.heading') }}</p>
-        <p class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-muted">
+        <p class="text-sm font-semibold text-ink">
+          {{ t(view === 'tasks' ? 'downloads.heading' : 'downloads.settings.title') }}
+        </p>
+        <p
+          v-if="view === 'tasks'"
+          class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-muted"
+        >
           <span class="inline-flex items-center gap-1">
             <AppIcon name="download" :size="12" />
             {{ formatSpeed(stat.downloadSpeed) }}
@@ -446,163 +485,177 @@ onUnmounted(() => {
             BT {{ engine.bt_port }}
           </span>
         </p>
+        <p v-else class="mt-1 text-[12px] text-muted">{{ t('downloads.settings.subtitle') }}</p>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex shrink-0 items-center gap-2">
+        <template v-if="view === 'tasks'">
+          <button
+            class="flex h-9 items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            :disabled="!enabled"
+            data-testid="download-add"
+            @click="openAdd"
+          >
+            <AppIcon name="plus" :size="13" />
+            {{ t('downloads.add') }}
+          </button>
+          <button
+            class="flex h-9 items-center gap-1.5 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:border-accent/50 hover:text-ink"
+            data-testid="download-settings"
+            @click="openSettings"
+          >
+            <AppIcon name="gear" :size="13" />
+            {{ t('downloads.settingsButton') }}
+          </button>
+        </template>
         <button
-          class="flex h-9 items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          :disabled="!enabled"
-          data-testid="download-add"
-          @click="openAdd"
-        >
-          <AppIcon name="plus" :size="13" />
-          {{ t('downloads.add') }}
-        </button>
-        <button
+          v-else
           class="flex h-9 items-center gap-1.5 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:border-accent/50 hover:text-ink"
-          data-testid="download-settings"
-          @click="openSettings"
+          data-testid="download-back"
+          @click="showTasks"
         >
-          <AppIcon name="gear" :size="13" />
-          {{ t('downloads.settingsButton') }}
+          <AppIcon name="arrowLeft" :size="13" />
+          {{ t('downloads.settings.back') }}
         </button>
       </div>
     </div>
 
-    <!-- 引擎关闭：整页没有可用操作，直接说清楚去哪开 -->
-    <div
-      v-if="!enabled && !loading"
-      class="mt-6 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-[12px] leading-relaxed fg-warn"
-    >
-      <p class="font-medium">{{ t('downloads.disabled.title') }}</p>
-      <p class="mt-1">{{ t('downloads.disabled.hint') }}</p>
-    </div>
-
-    <template v-else>
-      <div class="mt-5 flex items-center gap-1 border-b border-line">
-        <button
-          v-for="item in TABS"
-          :key="item"
-          class="relative -mb-px border-b-2 px-3 py-2 text-xs transition-colors"
-          :class="
-            tab === item
-              ? 'border-accent font-medium text-ink'
-              : 'border-transparent text-muted hover:text-ink'
-          "
-          @click="tab = item"
-        >
-          {{ t(`downloads.tabs.${item}`) }}
-          <span class="ml-1 text-[11px] text-muted">{{ groups[item].length }}</span>
-        </button>
-        <button
-          v-if="tab === 'done' && groups.done.length"
-          class="ml-auto mb-1 rounded-md px-2 py-1 text-[11px] text-muted transition-colors hover:text-ink"
-          @click="purgeStopped"
-        >
-          {{ t('downloads.clearDone') }}
-        </button>
+    <template v-if="view === 'tasks'">
+      <!-- 引擎关闭：任务视图下没有可用操作，直接说清楚去哪开 -->
+      <div
+        v-if="!enabled && !loading"
+        class="mt-6 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-[12px] leading-relaxed fg-warn"
+      >
+        <p class="font-medium">{{ t('downloads.disabled.title') }}</p>
+        <p class="mt-1">{{ t('downloads.disabled.hint') }}</p>
       </div>
 
-      <div v-if="loading" class="mt-4 space-y-2">
-        <div v-for="i in 3" :key="i" class="skeleton h-16 rounded-xl" />
-      </div>
-
-      <div v-else class="mt-3 overflow-hidden rounded-xl border border-line">
-        <div
-          v-for="(task, index) in rows"
-          :key="task.gid"
-          class="flex items-start gap-3 border-b border-line/60 px-4 py-3 last:border-b-0"
-          :class="index % 2 === 1 ? 'bg-elevated/40' : ''"
-          :data-gid="task.gid"
-        >
-          <span class="mt-0.5 shrink-0 text-muted">
-            <AppIcon :name="task.kind === 'bt' ? 'link' : 'download'" :size="15" />
-          </span>
-
-          <div class="min-w-0 flex-1">
-            <div class="flex items-baseline gap-2">
-              <span class="min-w-0 flex-1 truncate text-sm text-ink" :title="taskPath(task)">
-                {{ taskName(task) }}
-              </span>
-              <span
-                v-if="task.seeder && task.status === 'complete'"
-                class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted"
-              >
-                {{ t('downloads.seeding') }}
-              </span>
-              <span v-if="task.kind === 'bt'" class="shrink-0 text-[10px] font-mono text-muted">BT</span>
-            </div>
-
-            <div class="mt-2 h-1 overflow-hidden rounded-full bg-elevated">
-              <div
-                class="h-full rounded-full transition-[width] duration-300"
-                :class="task.status === 'error' ? 'bg-red-500/70' : 'bg-accent'"
-                :style="{ width: `${percent(task)}%` }"
-              />
-            </div>
-
-            <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
-              <span class="font-mono">
-                {{ formatBytes(task.completedLength) }} / {{ formatBytes(task.totalLength) }}
-                · {{ percent(task) }}%
-              </span>
-              <span v-if="task.status === 'active'" class="font-mono">
-                ↓ {{ formatSpeed(task.downloadSpeed) }}
-              </span>
-              <span v-if="task.uploadSpeed > 0" class="font-mono">
-                ↑ {{ formatSpeed(task.uploadSpeed) }}
-              </span>
-              <span v-if="task.connections">
-                {{ t('downloads.connections', { count: task.connections }) }}
-              </span>
-              <span>{{ t('downloads.status.' + task.status) }}</span>
-            </div>
-
-            <p v-if="task.errorMessage" class="mt-1 text-[11px] fg-danger">
-              {{ task.errorMessage }}
-            </p>
-          </div>
-
-          <div class="flex shrink-0 items-center gap-0.5">
-            <button
-              v-if="task.status === 'active' || task.status === 'waiting' || task.status === 'paused'"
-              class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover:text-ink disabled:opacity-40"
-              :disabled="busyGid === task.gid"
-              :title="t(task.status === 'paused' ? 'downloads.actions.resume' : 'downloads.actions.pause')"
-              @click="togglePause(task)"
-            >
-              <AppIcon :name="task.status === 'paused' ? 'play' : 'pause'" :size="14" />
-            </button>
-            <button
-              v-else
-              class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover:text-ink"
-              :title="t('downloads.actions.copyPath')"
-              @click="copyPath(task)"
-            >
-              <AppIcon name="copy" :size="13" />
-            </button>
-            <button
-              class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover-danger disabled:opacity-40"
-              :disabled="busyGid === task.gid"
-              :title="t('downloads.actions.remove')"
-              @click="removeTask(task)"
-            >
-              <AppIcon name="trash" :size="14" />
-            </button>
-          </div>
+      <template v-else>
+        <div class="mt-5 flex items-center gap-1 border-b border-line">
+          <button
+            v-for="item in TABS"
+            :key="item"
+            class="relative -mb-px border-b-2 px-3 py-2 text-xs transition-colors"
+            :class="
+              tab === item
+                ? 'border-accent font-medium text-ink'
+                : 'border-transparent text-muted hover:text-ink'
+            "
+            @click="tab = item"
+          >
+            {{ t(`downloads.tabs.${item}`) }}
+            <span class="ml-1 text-[11px] text-muted">{{ groups[item].length }}</span>
+          </button>
+          <button
+            v-if="tab === 'done' && groups.done.length"
+            class="ml-auto mb-1 rounded-md px-2 py-1 text-[11px] text-muted transition-colors hover:text-ink"
+            @click="purgeStopped"
+          >
+            {{ t('downloads.clearDone') }}
+          </button>
         </div>
 
-        <p v-if="!rows.length" class="px-4 py-6 text-center text-[12px] text-muted">
-          {{ t(`downloads.empty.${tab}`) }}
-        </p>
-      </div>
-    </template>
+        <div v-if="loading" class="mt-4 space-y-2">
+          <div v-for="i in 3" :key="i" class="skeleton h-16 rounded-xl" />
+        </div>
 
-    <p
-      v-if="error"
-      class="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
-    >
-      {{ error }}
-    </p>
+        <div v-else class="mt-3 overflow-hidden rounded-xl border border-line">
+          <div
+            v-for="(task, index) in rows"
+            :key="task.gid"
+            class="flex items-start gap-3 border-b border-line/60 px-4 py-3 last:border-b-0"
+            :class="index % 2 === 1 ? 'bg-elevated/40' : ''"
+            :data-gid="task.gid"
+          >
+            <span class="mt-0.5 shrink-0 text-muted">
+              <AppIcon :name="task.kind === 'bt' ? 'link' : 'download'" :size="15" />
+            </span>
+
+            <div class="min-w-0 flex-1">
+              <div class="flex items-baseline gap-2">
+                <span class="min-w-0 flex-1 truncate text-sm text-ink" :title="taskPath(task)">
+                  {{ taskName(task) }}
+                </span>
+                <span
+                  v-if="task.seeder && task.status === 'complete'"
+                  class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted"
+                >
+                  {{ t('downloads.seeding') }}
+                </span>
+                <span v-if="task.kind === 'bt'" class="shrink-0 text-[10px] font-mono text-muted">BT</span>
+              </div>
+
+              <div class="mt-2 h-1 overflow-hidden rounded-full bg-elevated">
+                <div
+                  class="h-full rounded-full transition-[width] duration-300"
+                  :class="task.status === 'error' ? 'bg-red-500/70' : 'bg-accent'"
+                  :style="{ width: `${percent(task)}%` }"
+                />
+              </div>
+
+              <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+                <span class="font-mono">
+                  {{ formatBytes(task.completedLength) }} / {{ formatBytes(task.totalLength) }}
+                  · {{ percent(task) }}%
+                </span>
+                <span v-if="task.status === 'active'" class="font-mono">
+                  ↓ {{ formatSpeed(task.downloadSpeed) }}
+                </span>
+                <span v-if="task.uploadSpeed > 0" class="font-mono">
+                  ↑ {{ formatSpeed(task.uploadSpeed) }}
+                </span>
+                <span v-if="task.connections">
+                  {{ t('downloads.connections', { count: task.connections }) }}
+                </span>
+                <span>{{ t('downloads.status.' + task.status) }}</span>
+              </div>
+
+              <p v-if="task.errorMessage" class="mt-1 text-[11px] fg-danger">
+                {{ task.errorMessage }}
+              </p>
+            </div>
+
+            <div class="flex shrink-0 items-center gap-0.5">
+              <button
+                v-if="task.status === 'active' || task.status === 'waiting' || task.status === 'paused'"
+                class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover:text-ink disabled:opacity-40"
+                :disabled="busyGid === task.gid"
+                :title="t(task.status === 'paused' ? 'downloads.actions.resume' : 'downloads.actions.pause')"
+                @click="togglePause(task)"
+              >
+                <AppIcon :name="task.status === 'paused' ? 'play' : 'pause'" :size="14" />
+              </button>
+              <button
+                v-else
+                class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover:text-ink"
+                :title="t('downloads.actions.copyPath')"
+                @click="copyPath(task)"
+              >
+                <AppIcon name="copy" :size="13" />
+              </button>
+              <button
+                class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover-danger disabled:opacity-40"
+                :disabled="busyGid === task.gid"
+                :title="t('downloads.actions.remove')"
+                @click="removeTask(task)"
+              >
+                <AppIcon name="trash" :size="14" />
+              </button>
+            </div>
+          </div>
+
+          <p v-if="!rows.length" class="px-4 py-6 text-center text-[12px] text-muted">
+            {{ t(`downloads.empty.${tab}`) }}
+          </p>
+        </div>
+      </template>
+
+      <p
+        v-if="error"
+        class="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger"
+      >
+        {{ error }}
+      </p>
+    </template>
 
     <!-- ================= 新建下载 ================= -->
     <Teleport to="body">
@@ -706,191 +759,210 @@ onUnmounted(() => {
       </div>
     </Teleport>
 
-    <!-- ================= 引擎设置 ================= -->
-    <Teleport to="body">
-      <div
-        v-if="settingsOpen"
-        class="fixed inset-0 z-[85] grid place-items-center modal-overlay bg-black/50 p-4"
-        data-testid="download-settings-dialog"
-        @click.self="settingsOpen = false"
-      >
-        <div
-          class="modal-card flex max-h-[88vh] w-full max-w-lg flex-col rounded-2xl border border-line bg-panel shadow-xl"
-        >
-          <div class="flex items-center justify-between border-b border-line px-5 py-3">
-            <p class="text-sm font-medium text-ink">{{ t('downloads.settings.title') }}</p>
-            <button class="rounded-md p-1 text-muted hover:text-ink" @click="settingsOpen = false">
-              <AppIcon name="close" :size="15" />
-            </button>
+    <!-- ================= 引擎设置（页内视图，v4.9.38） ================= -->
+    <template v-if="view === 'settings'">
+      <p v-if="settingsError && !settings" class="mt-5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger">
+        {{ settingsError }}
+      </p>
+      <div v-else-if="!settingsError && !settings" class="mt-5 space-y-3">
+        <div class="skeleton h-32 rounded-xl" />
+        <div class="skeleton h-32 rounded-xl" />
+      </div>
+
+      <div v-if="settings" class="mt-5 grid gap-4 lg:grid-cols-2">
+        <!-- 引擎参数：进程启动时读取，改动需重启 -->
+        <section class="flex flex-col rounded-xl border border-line bg-panel p-4">
+          <div class="flex items-center justify-between gap-2">
+            <p class="text-[13px] font-medium text-ink">{{ t('downloads.settings.paramsTitle') }}</p>
+            <span class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted">
+              {{ t('downloads.settings.restartBadge') }}
+            </span>
           </div>
 
-          <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-            <template v-if="settings">
-              <div class="space-y-2.5">
-                <label class="flex items-center justify-between gap-3 text-xs text-ink">
-                  <span>{{ t('downloads.settings.enable') }}</span>
-                  <input v-model="settings.enable" type="checkbox" class="accent-[var(--accent)]" />
-                </label>
-                <label class="flex items-center justify-between gap-3 text-xs text-ink">
-                  <span>{{ t('downloads.settings.enableBt') }}</span>
-                  <input v-model="settings.enable_bt" type="checkbox" class="accent-[var(--accent)]" />
-                </label>
-                <label class="flex items-center justify-between gap-3 text-xs text-ink">
-                  <span>{{ t('downloads.settings.disableDht') }}</span>
-                  <input
-                    v-model="settings.bt_disable_dht"
-                    type="checkbox"
-                    class="accent-[var(--accent)]"
-                  />
-                </label>
-              </div>
+          <div class="mt-3 divide-y divide-line/60 rounded-lg border border-line">
+            <label
+              v-for="item in toggleFields"
+              :key="item.key"
+              class="flex cursor-pointer items-center justify-between gap-3 px-3 py-2.5 text-xs text-ink transition-colors first:rounded-t-lg last:rounded-b-lg hover:bg-elevated/60"
+            >
+              <span class="min-w-0">
+                <span class="block">{{ t(item.label) }}</span>
+                <span class="mt-0.5 block text-[11px] leading-relaxed text-muted">{{ t(item.hint) }}</span>
+              </span>
+              <span class="relative inline-flex h-5 w-9 shrink-0 items-center">
+                <input
+                  v-model="settings[item.key]"
+                  type="checkbox"
+                  class="peer absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
+                />
+                <span
+                  class="h-5 w-9 rounded-full bg-elevated ring-1 ring-inset ring-line transition-colors peer-checked:bg-accent peer-checked:ring-accent peer-focus-visible:ring-2 peer-focus-visible:ring-accent/40"
+                />
+                <span
+                  class="pointer-events-none absolute left-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform peer-checked:translate-x-4"
+                />
+              </span>
+            </label>
+          </div>
 
-              <div class="mt-4 grid gap-3 sm:grid-cols-2">
-                <label class="block text-[12px] text-muted">
-                  {{ t('downloads.settings.segments') }}
-                  <input
-                    v-model.number="settings.segments"
-                    type="number"
-                    min="1"
-                    max="32"
-                    class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-                  />
-                </label>
-                <label class="block text-[12px] text-muted">
-                  {{ t('downloads.settings.maxConcurrent') }}
-                  <input
-                    v-model.number="settings.max_concurrent"
-                    type="number"
-                    min="1"
-                    max="32"
-                    class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-                  />
-                </label>
-                <label class="block text-[12px] text-muted">
-                  {{ t('downloads.settings.portMin') }}
-                  <input
-                    v-model.number="settings.bt_listen_port_min"
-                    type="number"
-                    min="0"
-                    max="65535"
-                    class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-                  />
-                </label>
-                <label class="block text-[12px] text-muted">
-                  {{ t('downloads.settings.portMax') }}
-                  <input
-                    v-model.number="settings.bt_listen_port_max"
-                    type="number"
-                    min="0"
-                    max="65535"
-                    class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-                  />
-                </label>
-              </div>
+          <div class="mt-3 grid gap-3 sm:grid-cols-2">
+            <label class="block text-[12px] text-muted">
+              {{ t('downloads.settings.segments') }}
+              <input
+                v-model.number="settings.segments"
+                type="number"
+                min="1"
+                max="32"
+                class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+              />
+            </label>
+            <label class="block text-[12px] text-muted">
+              {{ t('downloads.settings.maxConcurrent') }}
+              <input
+                v-model.number="settings.max_concurrent"
+                type="number"
+                min="1"
+                max="32"
+                class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+              />
+            </label>
+            <label class="block text-[12px] text-muted">
+              {{ t('downloads.settings.portMin') }}
+              <input
+                v-model.number="settings.bt_listen_port_min"
+                type="number"
+                min="0"
+                max="65535"
+                class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+              />
+            </label>
+            <label class="block text-[12px] text-muted">
+              {{ t('downloads.settings.portMax') }}
+              <input
+                v-model.number="settings.bt_listen_port_max"
+                type="number"
+                min="0"
+                max="65535"
+                class="mt-1 w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
+              />
+            </label>
+          </div>
 
-              <div class="mt-4 rounded-xl border border-line p-3">
-                <div class="flex items-center justify-between gap-2">
-                  <p class="text-[12px] font-medium text-ink">{{ t('downloads.settings.roots') }}</p>
-                  <span class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted">
-                    {{ t('downloads.settings.rootsLive') }}
-                  </span>
-                </div>
-                <p class="mt-1 text-[11px] leading-relaxed text-muted">
-                  {{ t('downloads.settings.rootsHint') }}
-                </p>
+          <p class="mt-3 rounded-lg bg-elevated/60 px-3 py-2 text-[11px] leading-relaxed text-muted">
+            {{ t('downloads.settings.restartHint') }}
+          </p>
 
-                <div class="mt-2 space-y-1">
-                  <div
-                    v-for="(root, index) in rootDrafts"
-                    :key="root.mount_id + root.rel"
-                    class="flex items-center gap-2 rounded-lg border border-line bg-elevated px-2 py-1.5"
-                  >
-                    <span class="min-w-0 flex-1 truncate text-[11px] text-ink">{{ rootLabel(root) }}</span>
-                    <button
-                      class="shrink-0 rounded p-0.5 text-muted transition-colors hover:text-ink"
-                      :title="t('downloads.settings.removeRoot')"
-                      @click="removeRoot(index)"
-                    >
-                      <AppIcon name="close" :size="12" />
-                    </button>
-                  </div>
-                  <p
-                    v-if="!rootDrafts.length"
-                    class="rounded-lg border border-dashed border-line px-2 py-1.5 text-[11px] text-muted"
-                  >
-                    {{ t('downloads.settings.rootsEmpty') }}
-                  </p>
-                </div>
+          <div class="mt-auto flex items-center justify-end gap-2 pt-3">
+            <span v-if="savedNeedsRestart" class="mr-auto text-[11px] text-accent">
+              {{ t('downloads.settings.restartPending') }}
+            </span>
+            <button
+              class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+              :disabled="settingsBusy"
+              data-testid="download-settings-save"
+              @click="saveSettings"
+            >
+              {{ settingsBusy ? t('downloads.settings.saving') : t('downloads.settings.saveParams') }}
+            </button>
+          </div>
+        </section>
 
-                <div class="mt-2 flex flex-wrap items-center gap-1.5">
-                  <select
-                    v-model="newRootMount"
-                    class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
-                  >
-                    <option value="" disabled>{{ t('downloads.settings.pickMount') }}</option>
-                    <option
-                      v-for="mount in writableMounts"
-                      :key="mount.id"
-                      :value="mount.id"
-                      :disabled="!mount.online"
-                    >
-                      {{
-                        mount.online
-                          ? mount.name
-                          : `${mount.name}（${t('downloads.settings.offline')}）`
-                      }}
-                    </option>
-                  </select>
-                  <input
-                    v-model="newRootRel"
-                    :placeholder="t('downloads.settings.subPath')"
-                    class="w-28 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
-                    @keyup.enter="addRoot"
-                  />
-                  <button
-                    class="rounded-lg border border-line px-2 py-1.5 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
-                    :disabled="!newRootMount"
-                    @click="addRoot"
-                  >
-                    {{ t('downloads.settings.addRoot') }}
-                  </button>
-                </div>
+        <!-- 右列：保存目录在前（常用），RPC 接入在后 -->
+        <div class="space-y-4">
+          <!-- 保存目录：挂载点子路径，写库 + 热替换，立即生效 -->
+          <section class="rounded-xl border border-line bg-panel p-4">
+            <div class="flex items-center justify-between gap-2">
+              <p class="text-[13px] font-medium text-ink">{{ t('downloads.settings.roots') }}</p>
+              <span class="shrink-0 rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent">
+                {{ t('downloads.settings.rootsLive') }}
+              </span>
+            </div>
+            <p class="mt-1 text-[11px] leading-relaxed text-muted">
+              {{ t('downloads.settings.rootsHint') }}
+            </p>
 
-                <p v-for="warning in rootWarnings" :key="warning" class="mt-1 text-[11px] fg-warn">
-                  {{ warning }}
-                </p>
-
+            <div class="mt-2 space-y-1">
+              <div
+                v-for="(root, index) in rootDrafts"
+                :key="root.mount_id + root.rel"
+                class="flex items-center gap-2 rounded-lg border border-line bg-elevated px-2.5 py-2"
+              >
+                <span class="min-w-0 flex-1 truncate text-[11px] text-ink">{{ rootLabel(root) }}</span>
                 <button
-                  class="mt-2 w-full rounded-lg border border-line px-2 py-1.5 text-[11px] transition-colors hover:text-ink disabled:opacity-50"
-                  :class="rootsDirty ? 'text-ink' : 'text-muted'"
-                  :disabled="rootsBusy"
-                  data-testid="download-save-roots"
-                  @click="saveRoots"
+                  class="shrink-0 rounded p-0.5 text-muted transition-colors hover:text-ink"
+                  :title="t('downloads.settings.removeRoot')"
+                  @click="removeRoot(index)"
                 >
-                  {{ rootsBusy ? t('downloads.settings.saving') : t('downloads.settings.saveRoots') }}
+                  <AppIcon name="close" :size="12" />
                 </button>
               </div>
-
               <p
-                class="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed fg-warn"
+                v-if="!rootDrafts.length"
+                class="rounded-lg border border-dashed border-line px-2.5 py-2 text-[11px] text-muted"
               >
-                {{ t('downloads.settings.restartHint') }}
+                {{ t('downloads.settings.rootsEmpty') }}
               </p>
-              <p v-if="savedNeedsRestart" class="mt-2 text-[11px] text-accent">
-                {{ t('downloads.settings.restartPending') }}
-              </p>
-            </template>
-            <p v-else class="text-xs text-muted">{{ t('common.action.loading') }}</p>
+            </div>
 
-            <div class="mt-5 rounded-xl border border-line p-3">
-              <p class="text-[12px] font-medium text-ink">{{ t('downloads.rpc.title') }}</p>
-              <p class="mt-1 text-[11px] leading-relaxed text-muted">{{ t('downloads.rpc.hint') }}</p>
+            <div class="mt-2 flex flex-wrap items-center gap-1.5">
+              <select
+                v-model="newRootMount"
+                class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
+              >
+                <option value="" disabled>{{ t('downloads.settings.pickMount') }}</option>
+                <option
+                  v-for="mount in writableMounts"
+                  :key="mount.id"
+                  :value="mount.id"
+                  :disabled="!mount.online"
+                >
+                  {{ mount.online ? mount.name : `${mount.name}（${t('downloads.settings.offline')}）` }}
+                </option>
+              </select>
+              <input
+                v-model="newRootRel"
+                :placeholder="t('downloads.settings.subPath')"
+                class="w-28 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
+                @keyup.enter="addRoot"
+              />
+              <button
+                class="rounded-lg border border-line px-2 py-1.5 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
+                :disabled="!newRootMount"
+                @click="addRoot"
+              >
+                {{ t('downloads.settings.addRoot') }}
+              </button>
+            </div>
 
-              <div class="mt-2 flex items-center gap-2">
-                <span class="w-12 shrink-0 text-[11px] text-muted">{{ t('downloads.rpc.address') }}</span>
-                <code class="min-w-0 flex-1 truncate rounded bg-elevated px-2 py-1 text-[11px] text-ink">{{
-                  rpcUrl
-                }}</code>
+            <p v-for="warning in rootWarnings" :key="warning" class="mt-1 text-[11px] fg-warn">
+              {{ warning }}
+            </p>
+
+            <div class="mt-3 flex items-center justify-end gap-2">
+              <span v-if="rootsDirty" class="mr-auto text-[11px] text-muted">
+                {{ t('downloads.settings.rootsDirty') }}
+              </span>
+              <button
+                class="rounded-lg border border-line px-3 py-1.5 text-xs transition-colors hover:text-ink disabled:opacity-50"
+                :class="rootsDirty ? 'text-ink' : 'text-muted'"
+                :disabled="rootsBusy || !rootsDirty"
+                data-testid="download-save-roots"
+                @click="saveRoots"
+              >
+                {{ rootsBusy ? t('downloads.settings.saving') : t('downloads.settings.saveRoots') }}
+              </button>
+            </div>
+          </section>
+
+          <!-- RPC 接入：外部客户端用同一份队列 -->
+          <section class="rounded-xl border border-line bg-panel p-4">
+            <p class="text-[13px] font-medium text-ink">{{ t('downloads.rpc.title') }}</p>
+            <p class="mt-1 text-[11px] leading-relaxed text-muted">{{ t('downloads.rpc.hint') }}</p>
+
+            <div class="mt-3 space-y-2">
+              <div class="flex items-center gap-2 rounded-lg border border-line bg-elevated px-2.5 py-2">
+                <span class="shrink-0 text-[11px] text-muted">{{ t('downloads.rpc.address') }}</span>
+                <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-ink">{{ rpcUrl }}</code>
                 <button
                   class="shrink-0 rounded-md p-1 text-muted hover:text-ink"
                   :title="t('downloads.rpc.copy')"
@@ -900,9 +972,9 @@ onUnmounted(() => {
                 </button>
               </div>
 
-              <div class="mt-1.5 flex items-center gap-2">
-                <span class="w-12 shrink-0 text-[11px] text-muted">{{ t('downloads.rpc.secret') }}</span>
-                <code class="min-w-0 flex-1 truncate rounded bg-elevated px-2 py-1 font-mono text-[11px] text-ink">{{
+              <div class="flex items-center gap-2 rounded-lg border border-line bg-elevated px-2.5 py-2">
+                <span class="shrink-0 text-[11px] text-muted">{{ t('downloads.rpc.secret') }}</span>
+                <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-ink">{{
                   secretShown ? engine?.rpc_secret : '••••••••••••'
                 }}</code>
                 <button
@@ -910,7 +982,7 @@ onUnmounted(() => {
                   :title="t(secretShown ? 'downloads.rpc.hide' : 'downloads.rpc.show')"
                   @click="secretShown = !secretShown"
                 >
-                  <AppIcon name="eye" :size="13" />
+                  <AppIcon :name="secretShown ? 'eyeOff' : 'eye'" :size="13" />
                 </button>
                 <button
                   class="shrink-0 rounded-md p-1 text-muted hover:text-ink"
@@ -920,49 +992,36 @@ onUnmounted(() => {
                   <AppIcon name="copy" :size="13" />
                 </button>
               </div>
-
-              <div class="mt-2 space-y-1">
-                <button
-                  class="rounded-md border border-line px-2 py-1 text-[11px] transition-colors hover:text-ink disabled:opacity-50"
-                  :class="rotateArmed ? 'fg-danger' : 'text-muted'"
-                  :disabled="secretRotating"
-                  data-testid="download-rotate-secret"
-                  @click="rotateSecret"
-                >
-                  {{
-                    secretRotating
-                      ? t('downloads.rpc.rotating')
-                      : rotateArmed
-                        ? t('downloads.rpc.rotateConfirm')
-                        : t('downloads.rpc.rotate')
-                  }}
-                </button>
-                <p class="text-[11px] leading-relaxed text-muted">{{ t('downloads.rpc.rotateHint') }}</p>
-              </div>
             </div>
 
-            <p v-if="settingsError" class="mt-3 text-xs fg-danger">{{ settingsError }}</p>
-          </div>
-
-          <div class="flex justify-end gap-2 border-t border-line px-5 py-3">
-            <button
-              class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-              @click="settingsOpen = false"
-            >
-              {{ t('common.action.close') }}
-            </button>
-            <button
-              class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-              :disabled="settingsBusy || !settings"
-              data-testid="download-settings-save"
-              @click="saveSettings"
-            >
-              {{ settingsBusy ? t('downloads.settings.saving') : t('common.action.save') }}
-            </button>
-          </div>
+            <div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <button
+                class="rounded-md border border-line px-2 py-1 text-[11px] transition-colors hover:text-ink disabled:opacity-50"
+                :class="rotateArmed ? 'fg-danger' : 'text-muted'"
+                :disabled="secretRotating"
+                data-testid="download-rotate-secret"
+                @click="rotateSecret"
+              >
+                {{
+                  secretRotating
+                    ? t('downloads.rpc.rotating')
+                    : rotateArmed
+                      ? t('downloads.rpc.rotateConfirm')
+                      : t('downloads.rpc.rotate')
+                }}
+              </button>
+              <p class="min-w-0 flex-1 text-[11px] leading-relaxed text-muted">
+                {{ t('downloads.rpc.rotateHint') }}
+              </p>
+            </div>
+          </section>
         </div>
+
+        <p v-if="settingsError" class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger lg:col-span-2">
+          {{ settingsError }}
+        </p>
       </div>
-    </Teleport>
+    </template>
 
     <Transition name="fade">
       <div
