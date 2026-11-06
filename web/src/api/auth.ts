@@ -95,6 +95,10 @@ export const authApi = {
   async logout() {
     await post('/api/auth/logout')
   },
+  /**
+   * 改密。正式密码会话必须带 current；一次性密码会话（must_change_password=1）
+   * 传空即可——登录时已验过一次性密码，后端不再重复校验（v4.9.33）。
+   */
   async changePassword(current: string, next: string) {
     await post('/api/auth/password', { current, next })
   },

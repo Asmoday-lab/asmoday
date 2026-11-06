@@ -650,6 +650,9 @@ pub struct SetupRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct PasswordRequest {
+    /// 正式密码会话必填；一次性密码会话（must_change_password=1）可省——
+    /// 登录时已验过一次性密码，不重复要「当前密码」（v4.9.33）
+    #[serde(default)]
     pub current: String,
     pub next: String,
 }
@@ -1010,7 +1013,10 @@ pub async fn change_password(
         );
     };
 
-    if !verify_password(&hash, &body.current) {
+    // 一次性密码会话（--init / --reset 发放后首次登录）：登录那一刻已经用
+    // 一次性密码验过身份，改密时不再重复要「当前密码」——那等于把同一个
+    // 密码连输两遍（v4.9.33）。正式密码会话仍必须带 current。
+    if !user.must_change_password && !verify_password(&hash, &body.current) {
         return json_error_code(
             StatusCode::BAD_REQUEST,
             "PASSWORD_WRONG",

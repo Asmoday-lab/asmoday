@@ -381,7 +381,7 @@ POST /api/auth/password
 GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 控制台打印一次性密码（stdout，不进日志文件），库里 admin 的 must_change_password=1，`/api/auth/status` 返回 needs_setup=true（v4.9.33）
 GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 初始化页有 2 个输入框（控制台一次性密码 / 新密码）且无用户名；一次性密码正确即换密+登录直达主界面，must_change_password=0（v4.9.33）
 GWT-AUTH-03 Given 待初始化实例  When 提交错误的一次性密码  Then 401 E_SETUP_TOKEN_INVALID 并计入 IP 防爆破池；换成正式密码后 `POST /api/auth/setup` 永久 409 E_ALREADY_INITIALIZED（v4.9.33）
-GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框
+GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框（只有新密码 + 确认，无需再填一次性密码，v4.9.33）
 GWT-AUTH-05 Given 登录页  When 密码错误  Then 行内错误「密码错误」，不泄露账号是否存在
 GWT-AUTH-06 Given 登录页  When 密码正确但 TOTP 开启  Then 弹出 6 位 TOTP 输入，输入错误回登录页
 GWT-AUTH-07 Given 已登录  When 密码重置成功（CLI --reset-password）  Then 前端下一个请求返回 401 E_UNAUTHORIZED → 跳登录

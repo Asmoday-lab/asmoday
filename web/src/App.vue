@@ -94,8 +94,8 @@ const mustChangePassword = computed(
   () => authApi.isAuthenticated.value && authApi.status.value.must_change_password === true,
 )
 
-// 强制改密表单
-const passwordForm = reactive({ current: '', next: '', confirm: '' })
+// 强制改密表单（一次性密码会话：登录时已验过一次性密码，无需再填「当前密码」）
+const passwordForm = reactive({ next: '', confirm: '' })
 const passwordBusy = ref(false)
 const passwordError = ref('')
 
@@ -112,8 +112,8 @@ async function submitPasswordChange() {
   }
   passwordBusy.value = true
   try {
-    await authApi.changePassword(passwordForm.current, passwordForm.next)
-    passwordForm.current = passwordForm.next = passwordForm.confirm = ''
+    await authApi.changePassword('', passwordForm.next)
+    passwordForm.next = passwordForm.confirm = ''
   } catch (err) {
     passwordError.value = err instanceof Error ? err.message : t('auth.forceChange.failed')
   } finally {
@@ -307,12 +307,6 @@ const playerSpace = computed(() => {
         <p class="mt-1 text-xs text-muted">{{ t('auth.forceChange.desc') }}</p>
 
         <div class="mt-4 space-y-2">
-          <PasswordInput
-            v-model="passwordForm.current"
-            :placeholder="t('auth.forceChange.current')"
-            autocomplete="current-password"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-xs text-ink outline-none focus:border-accent"
-          />
           <PasswordInput
             v-model="passwordForm.next"
             :placeholder="t('auth.forceChange.next')"
