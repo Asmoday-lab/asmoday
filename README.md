@@ -242,7 +242,6 @@ Layout:
 ```
 src/            Rust backend (api/ routes and handlers, core/ config, auth, filesystem, logging)
 web/            Vue 3 frontend (views/, components/, locales/)
-probes/         login probe suite (L2 HTTP smoke + L3 UI, see Design/testing.md)
 Design/         product and system design notes
 .github/        release workflow (triggered by v* tags)
 ```

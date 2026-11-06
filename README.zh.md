@@ -242,7 +242,6 @@ cd web && pnpm exec vue-tsc -b && pnpm run build
 ```
 src/            Rust 后端（api/ 路由与处理器，core/ 配置、认证、文件系统、日志）
 web/            Vue 3 前端（views/ 页面，components/ 组件，locales/ 中英文案）
-probes/         登录探针套件（L2 HTTP 冒烟 + L3 界面，见 Design/testing.md）
 Design/         产品与系统设计文档
 .github/        发布工作流（打 v* tag 触发）
 ```

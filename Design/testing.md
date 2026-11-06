@@ -32,6 +32,10 @@
 
 ## 2. 探针套件
 
+**这两个目录只在本机存在，不入库**（`.gitignore` 里 `/probes/`、`/scripts/`）：它们是调试脚手架，
+改一行断言就要跟着改业务流程，放进仓库只会让提交历史被「探针适配」淹没，也让 clone 出来的人
+误以为它们是产品的一部分。从仓库取到的树里没有这些文件，需要时按本节说明自建。
+
 ```
 probes/
   run_login.py     统一入口：--case=http|ui-password|ui-code、--build、--keep-data
@@ -39,7 +43,7 @@ probes/
   login_http.py    L2：登录 API 29 条断言（GWT-AUTH-02/05/22/23/24/25）
   login_ui.cjs     L3：登录页两形态（password / code），playwright-core
   aria2_explorer.py L2：Aria2 Explorer 发包形态 11 条断言（GWT-DL-32/33）
-  shots/           截图输出（git 忽略，固定文件名）
+  shots/           截图输出（固定文件名，本机产物）
 ```
 
 常用命令：

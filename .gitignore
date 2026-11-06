@@ -6,9 +6,10 @@
 # 历史探针目录（已被 probes/ 取代，留作本地参考，绝不入库）
 /.asmoday-probe
 
-# 探针产物（截图固定名覆盖写；脚本本身入库，见 Design/testing.md）
-/probes/shots/
-/probes/__pycache__/
+# 本机测试脚本（探针套件 + 冒烟/桩站脚本）：本机调试用，不入库。
+# 流程见 Design/testing.md，脚本由本机维护；新环境需要时照该文档自建。
+/probes/
+/scripts/
 
 # 前端产物（由 vite build 输出，供 rust-embed 打包）
 /dist
