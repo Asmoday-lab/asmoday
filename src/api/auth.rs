@@ -632,10 +632,12 @@ pub async fn require_auth(
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
-    /// 单用户后用户名不再是必填：网页端只剩密码框，留空即唯一账号。
+    /// 单用户后用户名不再是必填：网页端只剩一个输入框，留空即唯一账号。
     /// 保留字段是为了兼容 WebDAV/脚本等仍带用户名的调用方。
     #[serde(default)]
     pub username: String,
+    /// 开了 2FA 的账号可以留空——此时动态码本身就是凭证（v4.9.46）。
+    #[serde(default)]
     pub password: String,
     #[serde(default)]
     pub totp: Option<String>,
@@ -676,14 +678,18 @@ pub struct TotpDisableRequest {
 pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let initialized = state.auth.user_count().unwrap_or(0) > 0;
     let mut username: Option<String> = None;
-    let mut totp_enabled = false;
     let mut must_change_password = false;
+
+    // 是否开了 2FA 是「这台设备的账号状态」，未登录也要如实回答（v4.9.46）：
+    // 登录页据此决定画密码框还是动态码框。只在已登录时才告诉前端，页面只能退化成
+    // 「你自己点一个『已开启 2FA』开关」——没开的人也被诱导去点，开了的人还得先点开。
+    let account = state.auth.first_user().ok().flatten();
+    let totp_enabled = account.as_ref().is_some_and(|user| user.totp_enabled);
 
     if let Some(token) = cookie_token(&headers)
         && let Ok(true) = state.auth.session_active(&token)
-        && let Ok(Some(user)) = state.auth.first_user()
+        && let Some(user) = account
     {
-        totp_enabled = user.totp_enabled;
         must_change_password = user.must_change_password;
         username = Some(user.username);
     }
@@ -697,6 +703,14 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()
+}
+
+/// 开了 2FA 且没给密码 → 动态码本身就是凭证（v4.9.46）。
+///
+/// 抽成纯函数是为了让这条规则有测试兜底：反过来把「没开 2FA 的空密码」也放过去，
+/// 就是零凭证登录。
+fn totp_only_login(totp_enabled: bool, password: &str) -> bool {
+    totp_enabled && password.is_empty()
 }
 
 fn record_login_failure(guard: &crate::core::auth::LoginGuard, keys: &[String; 2]) {
@@ -765,7 +779,12 @@ pub async fn login(
         );
     };
 
-    if !verify_password(&hash, &body.password) {
+    // 开了 2FA 的账号可以只凭动态码登录（v4.9.46）：登录页此时只有一个动态码框，
+    // 前端传 `password: ""`。带密码的调用方（脚本、第三方客户端）仍是「密码 + 动态码」
+    // 双因子——少一道并不等于多一道，只是把「知道密码」换成「拿着验证器」。
+    if !totp_only_login(user.totp_enabled, &body.password)
+        && !verify_password(&hash, &body.password)
+    {
         record_login_failure(&state.login_guard, &keys);
         return json_error_code(
             StatusCode::UNAUTHORIZED,
@@ -1195,12 +1214,14 @@ pub async fn totp_disable(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginRequest, PasswordRequest, normalize_authority, origin_matches_host};
+    use super::{
+        LoginRequest, PasswordRequest, normalize_authority, origin_matches_host, totp_only_login,
+    };
     use axum::http::{HeaderMap, Method, header};
 
     #[test]
     fn login_request_username_is_optional() {
-        // v4.9.32 单用户：网页端只剩密码框，username 缺省即为空串；
+        // v4.9.32 单用户：网页端只剩一个输入框，username 缺省即为空串；
         // 带用户名的旧调用方（脚本 / WebDAV 客户端）照常解析。
         let without: LoginRequest =
             serde_json::from_str(r#"{"password":"secret-passphrase"}"#).unwrap();
@@ -1213,6 +1234,19 @@ mod tests {
         .unwrap();
         assert_eq!(with.username, "admin");
         assert_eq!(with.totp.as_deref(), Some("123456"));
+
+        // v4.9.46：开了 2FA 的账号只填动态码，password 缺省为空串
+        let code_only: LoginRequest = serde_json::from_str(r#"{"totp":"123456"}"#).unwrap();
+        assert_eq!(code_only.password, "");
+        assert_eq!(code_only.totp.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn password_is_skipped_only_for_2fa_accounts() {
+        // 动态码单独登录的前提是「这个账号开了 2FA」：否则空密码就是零凭证进站
+        assert!(totp_only_login(true, ""));
+        assert!(!totp_only_login(false, ""));
+        assert!(!totp_only_login(true, "secret-passphrase"));
     }
 
     #[test]

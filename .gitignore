@@ -3,6 +3,9 @@
 # 会话临时脚本 / 测试沙箱（跑完即删，绝不入库）
 /.scratch
 
+# 真机探针（playwright / 冒烟脚本与临时数据目录，绝不入库）
+/.asmoday-probe
+
 # 前端产物（由 vite build 输出，供 rust-embed 打包）
 /dist
 

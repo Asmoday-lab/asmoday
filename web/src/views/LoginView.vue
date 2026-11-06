@@ -2,11 +2,13 @@
 /**
  * 登录页。整页独立布局，不套侧边栏。
  *
- * 单用户后没有用户名可言（v4.9.32）：只剩密码框（2FA 可选展开）。
+ * 单用户后没有用户名可言（v4.9.32）：整页只有一个输入框。
+ * 开了 2FA 就只认动态码（服务端 `status` 未登录也回 `totp_enabled`），
+ * 没开就只有密码框——不再让用户自己点「已开启 2FA」把第二个框叫出来（v4.9.46）。
  * 首次部署用控制台打印的一次性密码登录，登录后 App.vue 会弹出
  * 「设置新密码」对话框完成建权——本页不再承担初始化形态（v4.9.34）。
  */
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -22,21 +24,28 @@ const router = useRouter()
 const route = useRoute()
 
 const password = ref('')
-const totp = ref('')
-const showTotp = ref(false)
+const code = ref('')
 const error = ref('')
 const submitting = ref(false)
+
+/** 2FA 开着时整页只有动态码框；6 位数字走 TOTP，其余当恢复码（与后端同一判据） */
+const totpMode = computed(() => authApi.status.value.totp_enabled)
 
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (!password.value) {
+  if (totpMode.value) {
+    if (!code.value.trim()) {
+      error.value = t('auth.login.totpRequired')
+      return
+    }
+  } else if (!password.value) {
     error.value = t('auth.login.required')
     return
   }
   submitting.value = true
   try {
-    await authApi.login(password.value, totp.value.trim())
+    await authApi.login(totpMode.value ? '' : password.value, totpMode.value ? code.value.trim() : '')
     const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(target)
   } catch (err) {
@@ -95,31 +104,29 @@ function changeLocale(event: Event) {
       </div>
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
-        <label class="block">
+        <label v-if="totpMode" class="block">
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
+          <input
+            v-model="code"
+            type="text"
+            autocomplete="one-time-code"
+            autocapitalize="characters"
+            spellcheck="false"
+            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-center text-base font-medium tracking-[0.4em] text-ink outline-none focus:border-accent"
+            placeholder="000000"
+            @input="error = ''"
+          />
+          <span class="mt-1.5 block text-[11px] leading-relaxed text-muted">
+            {{ t('auth.login.totpHint') }}
+          </span>
+        </label>
+        <label v-else class="block">
           <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
           <PasswordInput
             v-model="password"
             autocomplete="current-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             placeholder="••••••••"
-          />
-        </label>
-
-        <button
-          type="button"
-          class="text-[12px] text-muted transition-colors hover:text-ink"
-          @click="showTotp = !showTotp"
-        >
-          {{ showTotp ? t('auth.login.totpHide') : t('auth.login.totpToggle') }}
-        </button>
-        <label v-if="showTotp" class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
-          <input
-            v-model="totp"
-            type="text"
-            autocomplete="one-time-code"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm tracking-[0.2em] text-ink outline-none focus:border-accent"
-            placeholder="000000 / XXXXX-XXXXX"
           />
         </label>
 

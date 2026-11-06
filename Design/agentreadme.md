@@ -368,14 +368,14 @@ POST /api/auth/password
 
 ```gwt
 GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 控制台打印一次性密码（stdout，不进日志文件），库里 admin 的 must_change_password=1（v4.9.34）
-GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 登录页只有 1 个密码框且无用户名（无初始化页）；一次性密码登录成功后弹「设置新密码」对话框（v4.9.34）
+GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 登录页只有 1 个输入框且无用户名（无初始化页；未开 2FA 时是密码框）；一次性密码登录成功后弹「设置新密码」对话框（v4.9.34 / v4.9.46）
 GWT-AUTH-03 Given 待初始化实例  When 登录页输入错误密码  Then 401 并计入 IP 防爆破池；换成正式密码后旧一次性密码登录 401（v4.9.34）
 GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框（只有新密码 + 确认，无需再填一次性密码，v4.9.33）
 GWT-AUTH-18 Given 首启打印了一次性密码但没人登录（must_change_password=1），进程被关掉  When 再次启动  Then 控制台**重新打印一个一次性密码**并在横幅里注明「上一个已作废」；旧密码登录 401、新密码登录 200；库里仍只有一行账号、`must_change_password=1`、既有会话不被清掉（v4.9.44）
 GWT-AUTH-19 Given 账号已设正式密码（must_change_password=0）  When 重启任意次  Then 不打印任何横幅（补发只针对从未设过密码的账号）；`--init` 只输出「already exists; does not overwrite the password (use --reset-password)」；`--reset-password` 仍能发放新的一次性密码（v4.9.44）
 GWT-AUTH-20 Given 待改密账号  When 执行 `--init`  Then 与普通启动一致：补发一个新的一次性密码并打印横幅（不再只说「不覆盖」就把人晾在那里）（v4.9.44）
 GWT-AUTH-05 Given 登录页  When 密码错误  Then 行内错误「密码错误」，不泄露账号是否存在
-GWT-AUTH-06 Given 登录页  When 密码正确但 TOTP 开启  Then 弹出 6 位 TOTP 输入，输入错误回登录页
+GWT-AUTH-06 Given 账号已开 2FA  When 打开登录页  Then 表单**只有一个动态码框**（没有密码框、也没有「使用动态验证码（已开启 2FA）」开关），填对 6 位动态码或某个未用恢复码即进站；错误码行内提示「动态验证码不正确」并计入防爆破池（v4.9.46）
 GWT-AUTH-07 Given 已登录  When 密码重置成功（CLI --reset-password）  Then 前端下一个请求返回 401 E_UNAUTHORIZED → 跳登录
 GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任意页面  Then 401 跳登录，返回后回到原路径
 GWT-AUTH-09 Given 任意实例  When POST /api/auth/setup  Then 404（端点已随 v4.9.34 删除，初始化只走登录 + 改密链路）
@@ -390,6 +390,8 @@ GWT-AUTH-17 Given 启动完成  When 看 `data/logs/asmoday.log` 的 DEBUG 行  
 GWT-AUTH-19 Given Windows 双击 exe（经典 conhost，无 `WT_SESSION` / `TERM_PROGRAM`）且数据库里还没有正式密码  When 启动  Then 横幅照样打印（含 `Open:` / `LAN:`），横幅里有一行 `(this classic console cannot open links; add --open to launch the browser)`，起完服务后**自动用系统默认浏览器打开** `local` 地址，日志有 `opened the default browser: …`（v4.9.45）
 GWT-AUTH-20 Given 已设过正式密码  When 在任意控制台重启  Then 不打印横幅、**不**自动开浏览器（可以加 `--open` 手动开）；`ASMODAY_OPEN=1` 与 `--open` 等价（v4.9.45）
 GWT-AUTH-21 Given Linux 服务器 / 无图形会话  When 不带 `--open` 启动  Then 不尝试拉起浏览器；带 `--open` 且 `xdg-open` 不存在时只 WARN（`could not open a browser …; open … manually`），服务照常起（v4.9.45）
+GWT-AUTH-22 Given 任意实例（未登录）  When GET /api/auth/status  Then 回设备级 `totp_enabled`（只说明本机账号开没开 2FA，不含密钥）：没开时登录页一个「动态验证码」字样都没有，开了时页面只画动态码框（v4.9.46）
+GWT-AUTH-23 Given 2FA 账号但请求里 password 与 totp 都为空  When POST /api/auth/login  Then 401（空密码不是零凭证登录）；带密码但没有动态码 → 401 TOTP_REQUIRED；未开 2FA 的账号带空密码同样 401（v4.9.46）
 GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码；用户拿它登录后在强制改密弹窗换正式密码，网页端全程无用户名（v4.9.34）
 GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
 GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v20 跑完  Then 只留「启用中 id 最小的账号」（无启停列时取 id 最小），其余账号从 users 表物理删除，其 sessions / favorites / play_history / shares / access_tokens 一并删掉（含 user_id 为 NULL 的遗留令牌）；再次启动幂等（v4.9.30）
