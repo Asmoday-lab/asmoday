@@ -1,0 +1,31 @@
+# 只打包、不编译：给 CI 用（二进制来自 `cargo zigbuild` 的 musl 产物）。
+#
+#   cp target/x86_64-unknown-linux-musl/release/asmoday ./asmoday
+#   docker build -f docker/Dockerfile.prebuilt -t asmoday .
+#
+# 与 Dockerfile 的区别只有一个：不跑 node/rust 构建，因此几秒出镜像。
+# 发布流水线（.github/workflows/docker.yml）走的正是这条。
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata \
+ && adduser -D -u 10001 -h /data asmoday
+
+ARG BINARY=asmoday
+COPY ${BINARY} /usr/local/bin/asmoday
+
+USER asmoday
+WORKDIR /data
+VOLUME ["/data"]
+
+EXPOSE 4242
+EXPOSE 6881/tcp
+EXPOSE 6881/udp
+
+ENV ASMODAY_HOST=auto \
+    ASMODAY_PORT=4242
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:4242/api/health >/dev/null || exit 1
+
+ENTRYPOINT ["asmoday"]
+CMD ["-d", "/data"]

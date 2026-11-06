@@ -99,6 +99,31 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
   这不是项目的 bug，也改不了；**别为此写脚本去「删回收站」**，能做的只是少触发重编
   （见第 4 节）。要释放空间时用 `Clear-RecycleBin` 或按 `$I` 记录里原路径精准挑，别整盘清。
 
+## 3.5 容器与监听（手工，不进自动链）
+
+本机没有 Docker 时，监听相关的改动至少用二进制验一遍：
+
+```bash
+ASMODAY_HOST=auto ./target/debug/asmoday -d ../.probe/bind -p 45999
+# 期望：listening on [::]:45999 (dual stack: IPv4 + IPv6)，/api/health 200
+```
+
+再验「不降级」：先占住同一端口，`-H ::` 必须直接报
+`failed to bind [::]:<port>: address already in use (os error 10048)`，不能悄悄换到 `0.0.0.0`。
+
+有 Docker 的环境补一遍镜像层（首次构建十几分钟）：
+
+```bash
+docker build -t asmoday .
+docker run --rm -d --name asmoday-check -p 4242:4242 asmoday
+curl -s http://127.0.0.1:4242/api/health
+docker logs asmoday-check | grep -E "listening on|cannot listen"
+```
+
+判据：Docker 默认 bridge（无 IPv6）里出现
+`cannot listen on [::]:4242 (AddrNotAvailable); falling back to 0.0.0.0`，随后 healthcheck 变 healthy。
+镜像不在 CI 的 L0~L3 里跑，靠 `.github/workflows/docker.yml` 的构建 job 兜底（PR 只构建不推送）。
+
 ## 4. 明确不做的事
 
 | 反模式 | 为什么不行 |
@@ -120,10 +145,13 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
 
 ## 6. 变更记录
 
+- **v4（v4.9.53）**：新增 §3.5「容器与监听」——Docker 不在 L0~L3 自动链里，本机无 docker 时
+  用二进制验 `-H auto` 双栈与「端口被占不降级」；有 docker 时补一遍镜像与 healthcheck。
+  判据写死为日志里的 `cannot listen on [::]:… falling back to 0.0.0.0`。
 - **v2（v4.9.49 后）**：记下「工作区里的删除会被重定向到回收站」这一环境事实与实测代价
   （一次重编 1767 条 / 539 MB），`touch` 反模式补上这条后果；口径改为「少触发重编」而不是
   去清回收站。
-- **v3（v4.9.53）**：`target/` 只留 `debug` / `release`——探针数据根从
+- **v3（v4.9.52 前后）**：`target/` 只留 `debug` / `release`——探针数据根从
   `target/probe/<时间戳>` 迁到 `.probe/<时间戳>`，单测临时库从 `target/test-scratch/`
   迁到 `target/<profile>/test-scratch/`（`core::test_scratch_dir()`）；
   **`.probe/` 再挪到 `asmoday/` 的同级**（仓库里连运行期目录都不留），并写死边界规则：

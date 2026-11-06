@@ -1,0 +1,159 @@
+name: docker
+
+# 发布镜像：tag 时构建 amd64 + arm64 两个架构，合并成一个多架构 manifest 推到 GHCR。
+# 路径触发（PR）只做「能不能构建」的校验，不推送。
+#
+# 为什么不用 buildx 的 QEMU 多平台构建：Rust 在模拟层里编 20 分钟起步，且
+# ring / rusqlite(bundled) 的 C 编译在 QEMU 下偶发编译错误。这里改成在
+# x86 / arm64 两个原生 runner 上各自 `cargo zigbuild`，再用几秒的
+# Dockerfile.prebuilt 打包，最后 `docker manifest create` 合并。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    # 只有镜像/编排本身改动才验证：一个 PR 跑两架构的 musl 编译是二十分钟，
+    # 源码 PR 没必要为此付账（tag 时那条必跑，真编译不过也跑不掉）
+    paths:
+      - Dockerfile
+      - docker/**
+      - docker-compose.yml
+      - .dockerignore
+      - .github/workflows/docker.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================
+  # 每个原生架构：编前端 -> 编 musl 二进制 -> 打镜像
+  # ==========================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      # ghcr 的仓库名必须全小写；owner 里常带大写
+      - name: Resolve image name
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "TAG=sha-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # rust-embed 在编译期内联 dist，所以后端编译前必须先把前端产物放好
+      - name: Build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-${{ matrix.target }}
+
+      - name: Install Zig & cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Build binary (musl)
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # .dockerignore 排除了 target/（那是 GB 级目录，不能进上下文），
+      # 所以先把要打包的二进制放到上下文根目录
+      - name: Stage binary for packaging
+        run: cp "target/${{ matrix.target }}/release/asmoday" ./asmoday
+
+      - name: Package image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.prebuilt
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            BINARY=asmoday
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ==========================================
+  # 合并多架构 manifest（只有 tag 才推）
+  # ==========================================
+  merge:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          docker manifest create --amend "${IMAGE}:${TAG}" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
+          docker manifest push "${IMAGE}:${TAG}"
+
+          # 预发布 tag（v0.1.0-alpha.1 这类）不覆盖 latest
+          if [[ "$TAG" != *-* ]]; then
+            docker manifest create --amend "${IMAGE}:latest" \
+              "${IMAGE}:${TAG}-amd64" \
+              "${IMAGE}:${TAG}-arm64"
+            docker manifest push "${IMAGE}:latest"
+          fi

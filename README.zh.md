@@ -82,6 +82,31 @@ cd web && pnpm install && pnpm run build && cd ..
 cargo build --release          # 产物：target/release/asmoday
 ```
 
+### Docker
+
+```bash
+docker compose up -d --build     # 配置、数据库、缩略图缓存、下载都在 asmoday-data 卷里
+docker compose logs -f asmoday   # 首启的一次性管理员密码只在这里出现一次
+```
+
+不用 compose 也可以：
+
+```bash
+docker build -t asmoday .
+docker run -d --name asmoday \
+  -p 4242:4242 -p 6881:6881 -p 6881:6881/udp \
+  -v asmoday-data:/data \
+  asmoday
+```
+
+镜像默认 `ASMODAY_HOST=auto`：先试 IPv6 双栈，环境给不了（Docker 默认 bridge 就是 IPv4-only）就降到 `0.0.0.0`。别写死 `::`——那种网络里进程会直接起不来；写死 `0.0.0.0` 又在双栈宿主上丢掉了 IPv6。
+
+- 端口：`4242` Web UI / API，`6881` BT 的 TCP + UDP
+- 卷：`/data` 放 `config.toml`、`asmoday.db`、`thumbnails/`、`downloads/`
+- 运行层是 alpine，静态 musl 二进制、非 root（uid 10001）、自带 healthcheck
+- 首次构建要在 musl 上重编整棵依赖树，十几分钟属正常；之后走 BuildKit 缓存
+- 发版会推 `ghcr.io/<owner>/asmoday:<tag>` 的多架构镜像（amd64 + arm64）
+
 ### 用 systemd 托管（Linux）
 
 ```ini

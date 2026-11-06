@@ -28,3 +28,6 @@
 .DS_Store
 Thumbs.db
 *.tsbuildinfo
+
+# CI 打包镜像时从 target/ 拷到上下文根的二进制（见 .github/workflows/docker.yml）
+/asmoday

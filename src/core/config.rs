@@ -23,6 +23,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Asmoday configuration (TOML).
 # Listen address. Default "127.0.0.1": loopback only, reachable from this machine.
 # Use "0.0.0.0" to serve the LAN, or "::" for IPv4 + IPv6. When exposing it to
 # the internet, put a reverse proxy (Caddy/Nginx) in front.
+# "auto" tries "::" (dual stack) first and falls back to "0.0.0.0" when the
+# environment has no IPv6 -- the right choice for containers (Docker's default
+# bridge network is IPv4-only, where a literal "::" cannot be bound at all).
 # CLI -H / env ASMODAY_HOST take precedence.
 host = "127.0.0.1"
 # Listen port. CLI -p / env ASMODAY_PORT take precedence.
@@ -400,8 +403,11 @@ pub struct SharesConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// 监听地址（IPv4/IPv6 字面量）。默认 "127.0.0.1"（只监听回环，v4.9.42）：
+    /// 监听地址（IPv4/IPv6 字面量，或 `auto`）。默认 "127.0.0.1"（只监听回环，v4.9.42）：
     /// 首启不该把一个没设密码的服务暴露到局域网；要局域网访问显式改 "0.0.0.0" / "::"。
+    ///
+    /// `auto`（v4.9.53）：先试 `::` 双栈，环境不支持再降到 `0.0.0.0`，最后 `127.0.0.1`。
+    /// 容器必须用它——Docker 默认 bridge 没有 IPv6 地址，`host = "::"` 会直接起不来。
     pub host: String,
     pub port: u16,
     pub ssl: SslConfig,
@@ -1033,9 +1039,10 @@ impl Config {
         if self.server.port == 0 {
             return Err("server.port 必须在 1-65535 之间".to_string());
         }
-        if self.server.host.parse::<std::net::IpAddr>().is_err() {
+        let host = self.server.host.trim();
+        if !host.eq_ignore_ascii_case("auto") && host.parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
-                "server.host 必须是合法 IP 地址（如 0.0.0.0 / 127.0.0.1 / ::），当前为 {:?}",
+                "server.host 必须是合法 IP 地址（如 0.0.0.0 / 127.0.0.1 / ::）或 auto，当前为 {:?}",
                 self.server.host
             ));
         }

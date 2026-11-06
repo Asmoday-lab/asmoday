@@ -82,6 +82,31 @@ cd web && pnpm install && pnpm run build && cd ..
 cargo build --release          # output: target/release/asmoday
 ```
 
+### Docker
+
+```bash
+docker compose up -d --build     # config, database, thumbnail cache and downloads live in the asmoday-data volume
+docker compose logs -f asmoday   # the first-run one-time password is printed here, once
+```
+
+Without compose:
+
+```bash
+docker build -t asmoday .
+docker run -d --name asmoday \
+  -p 4242:4242 -p 6881:6881 -p 6881:6881/udp \
+  -v asmoday-data:/data \
+  asmoday
+```
+
+The image ships `ASMODAY_HOST=auto`: it tries the IPv6 dual-stack socket first and falls back to `0.0.0.0` when the environment has no IPv6 (Docker's default bridge is IPv4-only). Do not hardcode `::` there -- the process cannot bind at all; `0.0.0.0` on the other hand loses IPv6 on a dual-stack host.
+
+- Ports: `4242` web UI / API, `6881` BitTorrent TCP + UDP
+- Volume: `/data` holds `config.toml`, `asmoday.db`, `thumbnails/` and `downloads/`
+- Alpine runtime, static musl binary, non-root (uid 10001), healthcheck included
+- The first build recompiles the whole dependency tree against musl (10+ minutes); later builds reuse the BuildKit cache
+- Releases publish multi-arch images at `ghcr.io/<owner>/asmoday:<tag>` (amd64 + arm64)
+
 ### Run under systemd (Linux)
 
 ```ini

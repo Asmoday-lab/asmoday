@@ -127,7 +127,7 @@ struct Cli {
     /// 强制覆盖监听端口
     #[arg(short, long)]
     port: Option<u16>,
-    /// 强制覆盖监听地址（如 0.0.0.0 / 127.0.0.1）
+    /// 强制覆盖监听地址（0.0.0.0 / 127.0.0.1 / :: / auto）
     #[arg(short = 'H', long)]
     host: Option<String>,
     /// 生成默认配置与数据目录，并输出一次性管理员密码
@@ -660,13 +660,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     // `.asmoday-part` 残留清理：不阻塞启动（设计文档 3.2.6.4）
     spawn_part_cleanup(state.clone());
 
-    // 监听地址：配置校验已保证是合法 IP 字面量（设计文档 v2.7.0 3.1.1 / 5）
-    let host_ip: std::net::IpAddr = listen
-        .0
-        .parse()
-        .map_err(|e| format!("invalid server.host {}: {e}", listen.0))?;
-    let addr = SocketAddr::new(host_ip, port);
-    let listener = bind_listener(addr).await?;
+    // 监听地址：IP 字面量或 `auto`（容器里最常见的写法，见 BindPlan）。
+    // 返回的是**实际**绑上的地址：`::` 在无 IPv6 的环境里会降级成 `0.0.0.0`，
+    // 下面的日志与访问链接必须反映真实情况。
+    let plan = parse_bind_plan(&listen.0)?;
+    let (listener, addr) = bind_listener(plan, port).await?;
 
     crate::log_info!("config file: {}", config_path.display());
     crate::log_info!("data directory: {}", data_dir.display());
@@ -837,6 +835,15 @@ fn access_urls(server: &core::config::ServerConfig) -> AccessUrls {
     let build = |host: &str| format!("{scheme}://{host}:{}{suffix}", server.port);
 
     let host = server.host.trim();
+    // `auto` 的落点只有三种：双栈 → 纯 IPv4 → 回环。前两种都是通配地址，
+    // 链接形态与 `0.0.0.0` 完全一致（本机给 localhost，再探一条局域网地址）；
+    // 第三种只在容器里连 IPv4 都绑不上时才可能出现，那时没有第二条链接可给。
+    if host.eq_ignore_ascii_case("auto") {
+        return AccessUrls {
+            local: build("localhost"),
+            network: lan_ip().map(|ip| build(&ip.to_string())),
+        };
+    }
     match host.parse::<std::net::IpAddr>() {
         // 通配地址：本机走 localhost，局域网地址实测（0.0.0.0 本身谁都连不上）
         Ok(ip) if ip.is_unspecified() => AccessUrls {
@@ -1033,7 +1040,73 @@ fn bind_hint(err: &std::io::Error) -> &'static str {
     }
 }
 
-async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+/// 监听地址的解析结果。
+///
+/// `auto` 只服务一种场景：**不知道运行环境有没有 IPv6**。首当其冲是 Docker 的
+/// 默认 bridge 网络——那里压根没有 IPv6 地址，`bind("[::]:p")` 直接 EADDRNOTAVAIL，
+/// 进程起不来；而这个错误在宿主机上永远复现不了（开发机的 ::1 永远在）。
+///
+/// 显式写 `::` 也走同一条降级链（只降一级到 `0.0.0.0`）：用户要的是「对外监听」，
+/// 环境给不了双栈就给 v4，而不是让一个能跑的服务起不来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindPlan {
+    /// `::`：双栈（显式关掉 `IPV6_V6ONLY`），v4 连接的 peer 是 `::ffff:a.b.c.d`
+    DualStack,
+    /// `auto`：`::` → `0.0.0.0` → `127.0.0.1`，逐级降级
+    Auto,
+    /// 具体地址（`0.0.0.0` / `127.0.0.1` / 具体网卡），绑不上就是绑不上
+    Addr(std::net::IpAddr),
+}
+
+fn parse_bind_plan(raw: &str) -> Result<BindPlan, String> {
+    let text = raw.trim();
+    if text.eq_ignore_ascii_case("auto") {
+        return Ok(BindPlan::Auto);
+    }
+    let ip: std::net::IpAddr = text.parse().map_err(|_| {
+        format!(
+            "invalid listen address {text:?}: expected an IP literal \
+             (0.0.0.0, 127.0.0.1, 192.168.1.10, ::) or \"auto\""
+        )
+    })?;
+    Ok(match ip {
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => BindPlan::DualStack,
+        other => BindPlan::Addr(other),
+    })
+}
+
+/// 错误是不是「这个环境根本没有这个协议族」，而不是「端口被占」「没权限」。
+///
+/// 只有前者才允许降级：`AddrInUse` 换地址照样占不上，降级只会把真正的原因藏起来
+/// （用户看到「绑 0.0.0.0 失败」，却猜不到是 4242 已被别的程序占了）。
+fn family_unavailable(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        err.kind(),
+        ErrorKind::AddrNotAvailable | ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    // Windows: WSAEAFNOSUPPORT 10047 / WSAEADDRNOTAVAIL 10049
+    // Linux:   EAFNOSUPPORT 97 / EADDRNOTAVAIL 99
+    matches!(
+        err.raw_os_error(),
+        Some(10047) | Some(10049) | Some(97) | Some(99)
+    )
+}
+
+/// `io::Error` 的 Display 在 Windows 上是**系统语言**的本地化文本
+/// （「通常每个套接字地址…」），控制台要全英文就得按错误码自己写常见项。
+fn bind_error_text(err: &std::io::Error) -> String {
+    match err.raw_os_error() {
+        Some(10048) => "address already in use (os error 10048)".to_string(),
+        Some(10013) => "permission denied (os error 10013)".to_string(),
+        Some(10049) => "cannot assign the requested address (os error 10049)".to_string(),
+        _ => err.to_string(),
+    }
+}
+
+async fn bind_one(addr: SocketAddr) -> Result<tokio::net::TcpListener, (std::io::Error, String)> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::STREAM,
@@ -1049,19 +1122,63 @@ async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, Stri
         Ok(socket)
     })
     .map_err(|e| {
-        // `io::Error` 的 Display 在 Windows 上是**系统语言**的本地化文本
-        // （「通常每个套接字地址…」），控制台要全英文就得按错误码自己写常见项
-        let detail = match e.raw_os_error() {
-            Some(10048) => "address already in use (os error 10048)".to_string(),
-            Some(10013) => "permission denied (os error 10013)".to_string(),
-            Some(10049) => "cannot assign the requested address (os error 10049)".to_string(),
-            _ => e.to_string(),
-        };
-        format!("failed to bind {addr}: {detail}{}", bind_hint(&e))
+        let message = format!(
+            "failed to bind {addr}: {}{}",
+            bind_error_text(&e),
+            bind_hint(&e)
+        );
+        (e, message)
     })?;
     let std_listener: std::net::TcpListener = socket.into();
-    tokio::net::TcpListener::from_std(std_listener)
-        .map_err(|e| format!("failed to register listener for {addr}: {e}"))
+    tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+        let message = format!("failed to register listener for {addr}: {e}");
+        (e, message)
+    })
+}
+
+/// 按计划逐个尝试，返回**实际**绑上的地址（后续日志与链接都用它，而不是配置值）。
+async fn bind_listener(
+    plan: BindPlan,
+    port: u16,
+) -> Result<(tokio::net::TcpListener, SocketAddr), String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let candidates: Vec<SocketAddr> = match plan {
+        BindPlan::DualStack => vec![
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        ],
+        BindPlan::Auto => vec![
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        ],
+        BindPlan::Addr(ip) => vec![SocketAddr::new(ip, port)],
+    };
+
+    let count = candidates.len();
+    let mut previous: Option<(SocketAddr, std::io::Error)> = None;
+    for (index, addr) in candidates.iter().enumerate() {
+        match bind_one(*addr).await {
+            Ok(listener) => {
+                if let Some((failed, err)) = previous {
+                    // 只打 kind：Display 在 Windows 上是本地化文本，日志要全英文
+                    crate::log_warn!(
+                        "cannot listen on {failed} ({:?}); falling back to {addr}",
+                        err.kind()
+                    );
+                }
+                return Ok((listener, *addr));
+            }
+            Err((err, message)) => {
+                if index + 1 == count || !family_unavailable(&err) {
+                    return Err(message);
+                }
+                previous = Some((*addr, err));
+            }
+        }
+    }
+    unreachable!("bind_listener always has at least one candidate")
 }
 
 /// 公开路由（无需登录）
@@ -1723,6 +1840,64 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 监听地址解析（v4.9.53）：`auto` 是唯一允许降级的写法。
+    #[test]
+    fn bind_plan_parses_auto_and_ip_literals() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        assert_eq!(parse_bind_plan("auto").unwrap(), BindPlan::Auto);
+        assert_eq!(parse_bind_plan("AUTO ").unwrap(), BindPlan::Auto);
+        assert_eq!(parse_bind_plan("::").unwrap(), BindPlan::DualStack);
+        assert_eq!(
+            parse_bind_plan("0.0.0.0").unwrap(),
+            BindPlan::Addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            parse_bind_plan("127.0.0.1").unwrap(),
+            BindPlan::Addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_bind_plan("::1").unwrap(),
+            BindPlan::Addr(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        // 主机名不是合法值：解析失败会拖成「启动时卡住等 DNS」，不如直接拒绝
+        for bad in ["localhost", "", "0.0.0.0:4242"] {
+            let err = parse_bind_plan(bad).unwrap_err();
+            assert!(err.contains("invalid listen address"), "{bad}: {err}");
+        }
+    }
+
+    /// 只有「协议族不可用」才降级；端口被占必须直接失败，否则真正原因会被藏起来。
+    #[test]
+    fn only_missing_family_triggers_fallback() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(family_unavailable(&Error::from(
+            ErrorKind::AddrNotAvailable
+        )));
+        assert!(family_unavailable(&Error::from(ErrorKind::Unsupported)));
+        assert!(family_unavailable(&Error::from_raw_os_error(10049)));
+        assert!(!family_unavailable(&Error::from(ErrorKind::AddrInUse)));
+        assert!(!family_unavailable(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+    }
+
+    /// `auto` 的链接形态与通配地址一致：本机 localhost，局域网另给一条
+    #[test]
+    fn auto_host_advertises_local_and_lan() {
+        let mut config = core::config::Config::default();
+        config.server.host = "auto".to_string();
+        config.validate().expect("auto 必须被配置校验放行");
+
+        let urls = access_urls(&config.server);
+        assert_eq!(urls.local, "http://localhost:4242");
+        if let Some(network) = urls.network {
+            assert!(network.starts_with("http://"), "{network}");
+            assert!(!network.contains("0.0.0.0"), "{network}");
+        }
+    }
 
     #[test]
     fn default_config_parses_and_validates() {

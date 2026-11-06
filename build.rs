@@ -1,10 +1,23 @@
 //! 构建期信息注入（设计文档 3.7.1：启动日志必须能看出前端构建版本）。
 //!
 //! 只读 `git`，不引任何依赖；取不到就退化为 `dev`，绝不让构建失败。
+//! 容器镜像里没有 `.git`（进构建上下文只会让每次 build 都重传一遍），
+//! 版本信息改由 `ASMODAY_BUILD_ID` 传入（Dockerfile 的 BUILD_ID 构建参数）。
 
 use std::process::Command;
 
 fn main() {
+    // 显式注入优先：CI 的 Docker 构建走这条路
+    if let Ok(preset) = std::env::var("ASMODAY_BUILD_ID") {
+        let preset = preset.trim();
+        if !preset.is_empty() {
+            println!("cargo:rustc-env=ASMODAY_BUILD_ID={preset}");
+            println!("cargo:rerun-if-env-changed=ASMODAY_BUILD_ID");
+            println!("cargo:rerun-if-changed=dist");
+            return;
+        }
+    }
+
     let hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

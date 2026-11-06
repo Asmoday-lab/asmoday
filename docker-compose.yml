@@ -1,0 +1,47 @@
+# Asmoday 单容器部署：配置、数据库、缩略图缓存、下载文件都在一个卷里。
+#
+#   docker compose up -d --build      # 首次构建约十几分钟（musl 上重编依赖树）
+#   docker compose logs -f asmoday    # 首启的一次性密码只在这里出现一次
+#
+# 已经有构建好的镜像时，把 build 换成 image 即可（如 ghcr.io/<owner>/asmoday:latest）。
+
+services:
+  asmoday:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: asmoday:local
+    container_name: asmoday
+    restart: unless-stopped
+
+    ports:
+      - "4242:4242"      # Web UI / API
+      - "6881:6881"      # BT：TCP
+      - "6881:6881/udp"  # BT：UDP（DHT / Peer）
+
+    environment:
+      # 有 IPv6 就双栈，没有就降到 0.0.0.0。
+      # Docker 默认 bridge 网络没有 IPv6，写死 "::" 会直接起不来。
+      ASMODAY_HOST: auto
+      ASMODAY_PORT: "4242"
+      # 容器时钟跟宿主时区一致，日志里的时间才和别处对得上
+      TZ: Asia/Shanghai
+
+    volumes:
+      # config.toml / asmoday.db / thumbnails / downloads
+      - asmoday-data:/data
+      # 想下到宿主机的某块盘：把目录挂进来，再到「下载」页把挂载点指到 /downloads
+      # - /mnt/disk1/downloads:/downloads
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4242/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    # 下载/媒体库要遍历大量文件时，默认的 64 MB /dev/shm 可能不够
+    shm_size: "256mb"
+
+volumes:
+  asmoday-data:
