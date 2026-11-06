@@ -2,9 +2,10 @@
 /**
  * 登录页。整页独立布局，不套侧边栏。
  *
- * 单用户后没有用户名可言（v4.9.32）：整页只有一个输入框。
- * 开了 2FA 就只认动态码（服务端 `status` 未登录也回 `totp_enabled`），
- * 没开就只有密码框——不再让用户自己点「已开启 2FA」把第二个框叫出来（v4.9.46）。
+ * 单用户后没有用户名可言（v4.9.32）：整页只有一个输入框，**这个框同时接受
+ * 密码、6 位动态码和一次性恢复码**（v4.9.47）——由填的内容决定走哪条校验，
+ * 页面不先问「你是哪种」。开了 2FA 只是把标签与提示换掉，不会把框变成两个、
+ * 也不会把密码这条路关掉；没开 2FA 时那颗「已开启 2FA」的开关也不再出现（v4.9.46）。
  * 首次部署用控制台打印的一次性密码登录，登录后 App.vue 会弹出
  * 「设置新密码」对话框完成建权——本页不再承担初始化形态（v4.9.34）。
  */
@@ -23,29 +24,25 @@ const { t, locale } = useI18n()
 const router = useRouter()
 const route = useRoute()
 
-const password = ref('')
-const code = ref('')
+/** 单框凭证：密码 / 动态码 / 恢复码都填这里，原样提交，不在前端猜类型 */
+const credential = ref('')
 const error = ref('')
 const submitting = ref(false)
 
-/** 2FA 开着时整页只有动态码框；6 位数字走 TOTP，其余当恢复码（与后端同一判据） */
-const totpMode = computed(() => authApi.status.value.totp_enabled)
+/** 只影响文案（标签、占位、提示）；框的个数与后端校验路径都由内容决定 */
+const totpEnabled = computed(() => authApi.status.value.totp_enabled)
 
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (totpMode.value) {
-    if (!code.value.trim()) {
-      error.value = t('auth.login.totpRequired')
-      return
-    }
-  } else if (!password.value) {
-    error.value = t('auth.login.required')
+  if (!credential.value) {
+    error.value = t(totpEnabled.value ? 'auth.login.credentialRequired' : 'auth.login.required')
     return
   }
   submitting.value = true
   try {
-    await authApi.login(totpMode.value ? '' : password.value, totpMode.value ? code.value.trim() : '')
+    // 不 trim：密码可能真带首尾空格，动态码的归一化交给后端
+    await authApi.login(credential.value)
     const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(target)
   } catch (err) {
@@ -104,30 +101,21 @@ function changeLocale(event: Event) {
       </div>
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
-        <label v-if="totpMode" class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
-          <input
-            v-model="code"
-            type="text"
-            autocomplete="one-time-code"
-            autocapitalize="characters"
-            spellcheck="false"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-center text-base font-medium tracking-[0.4em] text-ink outline-none focus:border-accent"
-            placeholder="000000"
-            @input="error = ''"
-          />
-          <span class="mt-1.5 block text-[11px] leading-relaxed text-muted">
-            {{ t('auth.login.totpHint') }}
+        <label class="block">
+          <span class="mb-1 block text-[12px] text-muted">
+            {{ t(totpEnabled ? 'auth.login.credential' : 'auth.login.password') }}
           </span>
-        </label>
-        <label v-else class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
+          <!-- 一个框，三种凭证：密码 / 6 位动态码 / 恢复码。输入默认遮住（可能是密码），
+               右侧眼睛可随时看明文——填动态码时不用再猜自己有没有打错 -->
           <PasswordInput
-            v-model="password"
+            v-model="credential"
             autocomplete="current-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-            placeholder="••••••••"
+            :placeholder="totpEnabled ? t('auth.login.credentialPlaceholder') : '••••••••'"
           />
+          <span v-if="totpEnabled" class="mt-1.5 block text-[11px] leading-relaxed text-muted">
+            {{ t('auth.login.totpHint') }}
+          </span>
         </label>
 
         <p

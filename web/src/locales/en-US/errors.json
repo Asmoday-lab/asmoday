@@ -1,7 +1,7 @@
 {
   "UNKNOWN": "Something went wrong, please try again",
   "AUTH_REQUIRED": "Please sign in first",
-  "AUTH_INVALID": "Incorrect username or password",
+  "AUTH_INVALID": "Incorrect password or one-time code",
   "AUTH_RATE_LIMITED": "Too many failures — please try again later",
   "AUTH_USER_MISSING": "Account does not exist",
   "AUTH_ALREADY_INITIALIZED": "Already initialized — please sign in",

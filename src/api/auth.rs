@@ -636,9 +636,12 @@ pub struct LoginRequest {
     /// 保留字段是为了兼容 WebDAV/脚本等仍带用户名的调用方。
     #[serde(default)]
     pub username: String,
-    /// 开了 2FA 的账号可以留空——此时动态码本身就是凭证（v4.9.46）。
+    /// 单框凭证（v4.9.47）：网页端只提交这一个字段，里面可能是密码，也可能是
+    /// 6 位动态码 / 一次性恢复码——由内容决定哪条校验通过。
     #[serde(default)]
     pub password: String,
+    /// 可选第二因子。只有「显式分开传」的调用方才会带它，此时按严格双因子
+    /// （密码 + 动态码）校验，不再接受单框那种「二选一」。
     #[serde(default)]
     pub totp: Option<String>,
 }
@@ -705,12 +708,31 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     .into_response()
 }
 
-/// 开了 2FA 且没给密码 → 动态码本身就是凭证（v4.9.46）。
+/// 一次性码校验：6 位纯数字走 TOTP，其余当一次性恢复码（设计文档 3.1.4）。
 ///
-/// 抽成纯函数是为了让这条规则有测试兜底：反过来把「没开 2FA 的空密码」也放过去，
-/// 就是零凭证登录。
-fn totp_only_login(totp_enabled: bool, password: &str) -> bool {
-    totp_enabled && password.is_empty()
+/// 恢复码命中即从存储里删掉（`consume_recovery_code`），所以调用方必须只在
+/// 「这一次真的是拿它当凭证」时调用，不要拿它做格式探测。
+fn verify_one_time_code(state: &AppState, user_id: i64, secret: &str, code: &str) -> bool {
+    let normalized = crate::core::auth::normalize_recovery_code(code);
+    if looks_like_totp(&normalized) {
+        normalized
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|number| totp::verify(secret, number, now_secs() as u64))
+    } else {
+        state
+            .auth
+            .consume_recovery_code(user_id, code)
+            .unwrap_or(false)
+    }
+}
+
+/// 归一化后的码是不是 6 位 TOTP（恢复码是 10 位字母数字，两者不会撞车）。
+///
+/// 抽出来是为了让这条分界有测试兜底：判错就会把 TOTP 码丢去查恢复码表，
+/// 既不报错也登不进去。
+fn looks_like_totp(normalized: &str) -> bool {
+    normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit())
 }
 
 fn record_login_failure(guard: &crate::core::auth::LoginGuard, keys: &[String; 2]) {
@@ -779,58 +801,45 @@ pub async fn login(
         );
     };
 
-    // 开了 2FA 的账号可以只凭动态码登录（v4.9.46）：登录页此时只有一个动态码框，
-    // 前端传 `password: ""`。带密码的调用方（脚本、第三方客户端）仍是「密码 + 动态码」
-    // 双因子——少一道并不等于多一道，只是把「知道密码」换成「拿着验证器」。
-    if !totp_only_login(user.totp_enabled, &body.password)
-        && !verify_password(&hash, &body.password)
-    {
-        record_login_failure(&state.login_guard, &keys);
-        return json_error_code(
-            StatusCode::UNAUTHORIZED,
-            "AUTH_INVALID",
-            "Invalid username or password",
-        );
-    }
-
-    // 可选双因素（设计文档 3.1.4）：6 位数字走 TOTP，其余当一次性恢复码
-    if user.totp_enabled {
-        let Some(secret) = secret else {
+    // 单框凭证（v4.9.47）：登录页只有一个输入框，里面可能填的是密码，也可能是
+    // 6 位动态码 / 一次性恢复码——三者同等有效，由内容决定走哪条校验，不由页面
+    // 先问「你是哪种」。
+    // 带独立 `totp` 字段的调用方（脚本 / 第三方客户端）仍走**严格双因子**：
+    // 密码 + 动态码，缺一不可。
+    let code_field = body.totp.as_deref().map(str::trim).unwrap_or("");
+    // 不 trim：密码里可能真带首尾空格，只有一次性码才需要归一化（它自己会剥符号）
+    let credential = body.password.as_str();
+    let authentic = if user.totp_enabled {
+        let Some(secret) = secret.as_deref() else {
             return json_error_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "TOTP_CONFIG_MISSING",
                 "TOTP secret missing",
             );
         };
-        let code = body.totp.as_deref().unwrap_or("").trim();
-        if code.is_empty() {
-            return json_error_code(
-                StatusCode::UNAUTHORIZED,
-                "TOTP_REQUIRED",
-                "TOTP code required",
-            );
-        }
-        let normalized = crate::core::auth::normalize_recovery_code(code);
-        let is_totp = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit());
-        let valid = if is_totp {
-            normalized
-                .parse::<u32>()
-                .ok()
-                .is_some_and(|number| totp::verify(&secret, number, now_secs() as u64))
+        if code_field.is_empty() {
+            // 单框：先按一次性码试（6 位数字 → TOTP，其余 → 恢复码），不中再按密码比
+            !credential.is_empty()
+                && (verify_one_time_code(&state, user.id, secret, credential)
+                    || verify_password(&hash, credential))
         } else {
-            state
-                .auth
-                .consume_recovery_code(user.id, code)
-                .unwrap_or(false)
-        };
-        if !valid {
-            record_login_failure(&state.login_guard, &keys);
-            return json_error_code(
-                StatusCode::UNAUTHORIZED,
-                "TOTP_INVALID",
-                "Invalid TOTP code",
-            );
+            verify_password(&hash, &body.password)
+                && verify_one_time_code(&state, user.id, secret, code_field)
         }
+    } else {
+        // 没开 2FA：只有密码这一条路（顺带挡掉空凭证）
+        !credential.is_empty() && verify_password(&hash, credential)
+    };
+
+    if !authentic {
+        record_login_failure(&state.login_guard, &keys);
+        // 不区分「密码错」还是「动态码错」：单框里两者本就是同级凭证，
+        // 分开报只会给爆破者一个「密码已对」的确认信号。
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_INVALID",
+            "Invalid password or one-time code",
+        );
     }
 
     clear_login_failures(&state.login_guard, &keys);
@@ -1215,7 +1224,7 @@ pub async fn totp_disable(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoginRequest, PasswordRequest, normalize_authority, origin_matches_host, totp_only_login,
+        LoginRequest, PasswordRequest, looks_like_totp, normalize_authority, origin_matches_host,
     };
     use axum::http::{HeaderMap, Method, header};
 
@@ -1242,11 +1251,17 @@ mod tests {
     }
 
     #[test]
-    fn password_is_skipped_only_for_2fa_accounts() {
-        // 动态码单独登录的前提是「这个账号开了 2FA」：否则空密码就是零凭证进站
-        assert!(totp_only_login(true, ""));
-        assert!(!totp_only_login(false, ""));
-        assert!(!totp_only_login(true, "secret-passphrase"));
+    fn one_time_codes_are_split_by_shape() {
+        // 6 位数字 → TOTP；10 位字母数字（恢复码）→ 恢复码表。判错就会把码丢错表
+        assert!(looks_like_totp("123456"));
+        assert!(!looks_like_totp("12345"));
+        assert!(!looks_like_totp("1234567"));
+        assert!(!looks_like_totp("12A456"));
+        assert!(!looks_like_totp("AB12CD34EF"));
+        // 归一化顺手把 I/L/O 折成 1/0，手抄验证码写错字母也能过
+        let normalized = crate::core::auth::normalize_recovery_code("12O 456");
+        assert_eq!(normalized, "120456");
+        assert!(looks_like_totp(&normalized));
     }
 
     #[test]
