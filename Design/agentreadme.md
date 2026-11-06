@@ -372,8 +372,6 @@ GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 登录页只有 1 
 GWT-AUTH-03 Given 待初始化实例  When 登录页输入错误密码  Then 401 并计入 IP 防爆破池；换成正式密码后旧一次性密码登录 401（v4.9.34）
 GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框（只有新密码 + 确认，无需再填一次性密码，v4.9.33）
 GWT-AUTH-18 Given 首启打印了一次性密码但没人登录（must_change_password=1），进程被关掉  When 再次启动  Then 控制台**重新打印一个一次性密码**并在横幅里注明「上一个已作废」；旧密码登录 401、新密码登录 200；库里仍只有一行账号、`must_change_password=1`、既有会话不被清掉（v4.9.44）
-GWT-AUTH-19 Given 账号已设正式密码（must_change_password=0）  When 重启任意次  Then 不打印任何横幅（补发只针对从未设过密码的账号）；`--init` 只输出「already exists; does not overwrite the password (use --reset-password)」；`--reset-password` 仍能发放新的一次性密码（v4.9.44）
-GWT-AUTH-20 Given 待改密账号  When 执行 `--init`  Then 与普通启动一致：补发一个新的一次性密码并打印横幅（不再只说「不覆盖」就把人晾在那里）（v4.9.44）
 GWT-AUTH-05 Given 登录页  When 密码 / 动态码错误  Then 行内统一提示「密码或动态验证码不正确」，不区分是哪一种、不泄露账号是否存在（v4.9.48）
 GWT-AUTH-06 Given 账号已开 2FA  When 打开登录页  Then 默认是**密码框**，框下方有一行「使用动态验证码登录」；点它同一个框变成动态码样式（明文、居中、字距拉开、占位 000000、`autocomplete=one-time-code`），标签变「动态验证码」并提示恢复码这条出路，入口变「使用密码登录」；再点回密码框且切换会清空已填内容。动态码模式下填 6 位码（输满自动提交）或恢复码都能进站，填密码进不去；密码模式下密码能进站（v4.9.48）
 GWT-AUTH-07 Given 已登录  When 密码重置成功（CLI --reset-password）  Then 前端下一个请求返回 401 E_UNAUTHORIZED → 跳登录
@@ -387,9 +385,9 @@ GWT-AUTH-14 Given 端口已被占用  When 再启动一个实例  Then 控制台
 GWT-AUTH-15 Given 在 Windows Terminal / iTerm2 / VS Code 终端里首次启动  When 看密码横幅的 `Open:` / `LAN:` 行与启动日志的 `local:` / `network:` 行  Then URL 是 OSC 8 超链接（Ctrl/⌘+点击直接打开浏览器），显示文本仍是纯 URL；`data/logs/asmoday.log` 与 JSON 通道里**没有** `\x1b]8;;` 残留（v4.9.43）
 GWT-AUTH-16 Given 输出被重定向（`> out.log`、管道、CI 采集）  When 启动  Then 横幅与日志都不含任何转义码；文件日志为纯 UTF-8 正文（v4.9.43）
 GWT-AUTH-17 Given 启动完成  When 看 `data/logs/asmoday.log` 的 DEBUG 行  Then 有 `console: tty=<bool> vt=<bool> color=<bool> hyperlink=<bool> (TERM=… TERM_PROGRAM=…)`，可据此判断「没链接」是被主动关掉还是终端不支持（v4.9.43）
-GWT-AUTH-19 Given Windows 双击 exe（经典 conhost，无 `WT_SESSION` / `TERM_PROGRAM`）且数据库里还没有正式密码  When 启动  Then 横幅照样打印（含 `Open:` / `LAN:`），横幅里有一行 `(this classic console cannot open links; add --open to launch the browser)`，起完服务后**自动用系统默认浏览器打开** `local` 地址，日志有 `opened the default browser: …`（v4.9.45）
-GWT-AUTH-20 Given 已设过正式密码  When 在任意控制台重启  Then 不打印横幅、**不**自动开浏览器（可以加 `--open` 手动开）；`ASMODAY_OPEN=1` 与 `--open` 等价（v4.9.45）
-GWT-AUTH-21 Given Linux 服务器 / 无图形会话  When 不带 `--open` 启动  Then 不尝试拉起浏览器；带 `--open` 且 `xdg-open` 不存在时只 WARN（`could not open a browser …; open … manually`），服务照常起（v4.9.45）
+GWT-AUTH-19 Given Windows 双击 exe（经典 conhost，无 `WT_SESSION` / `TERM_PROGRAM`）且数据库里还没有正式密码  When 启动  Then 横幅照样打印（含 `Open:` / `LAN:`）并多一行 `(this classic console cannot open links; copy the address above, or start with --open)`，但**不会**自己拉起浏览器——日志里没有 `opened the default browser`，也不会有浏览器窗口 / UAC 或 Edge 的「提权实例」弹窗（v4.9.49）
+GWT-AUTH-20 Given 任意实例  When 带 `--open`（或 `ASMODAY_OPEN=1`）启动  Then 监听成功后延迟 400ms 用默认浏览器打开 `local` 地址，日志有 `opened the default browser: …`；Windows 走 `explorer.exe <url>` 交回登录用户 shell（浏览器为普通权限，不随本进程提权），`explorer` 不可用时才退到 shell 的 `start` 内建；**不带该参数时任何情况下都不开**（v4.9.49）
+GWT-AUTH-21 Given Linux 服务器 / 无图形会话  When 不带 `--open` 启动  Then 不尝试拉起浏览器；带 `--open` 且 `xdg-open` 不存在时只 WARN（`could not open a browser …; open … manually`），服务照常起（v4.9.45 / v4.9.49）
 GWT-AUTH-22 Given 任意实例（未登录）  When GET /api/auth/status  Then 回设备级 `totp_enabled`（只说明本机账号开没开 2FA，不含密钥）：没开时登录页没有任何「动态验证码 / 恢复码」字样、也没有切换入口；开了才出现切换入口，**框始终只有 1 个**（v4.9.46 / v4.9.48）
 GWT-AUTH-23 Given 2FA 账号  When POST /api/auth/login  Then `{password}` 与 `{totp}` 各自 200（前者密码模式，后者动态码 / 恢复码模式）；`{password,totp}` 是严格双因子（缺一或码错 401）；两字段都空 401 AUTH_INVALID；用过的恢复码 401；未开 2FA 的账号 `{totp}` 一律 401（v4.9.48）
 GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码；用户拿它登录后在强制改密弹窗换正式密码，网页端全程无用户名（v4.9.34）

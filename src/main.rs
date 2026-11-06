@@ -577,10 +577,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     // 一次性密码就是「守在控制台前的人」的所有权凭证，没有它，先打开页面的
     // 路人就能抢注成主人。密码只走 println（不进 asmoday.log）——日志文件会被
     // 轮转/采集，明文凭据不能落盘；与 --reset-password 口径一致。
-    // 这台机器会不会在起完服务后自动拉起浏览器：`--open` / `ASMODAY_OPEN=1`，或者
-    // 「双击 exe 打开的是经典 conhost、又刚打印了一次性密码」——那种窗口里谁都点不动
-    // 链接，而人此刻正需要进页面把密码设掉（v4.9.45）。
-    let mut password_shown = false;
     if auth.user_count().unwrap_or(1) == 0 {
         let password = core::auth::random_password();
         let user = auth
@@ -588,13 +584,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
         auth.set_must_change_password(user.id, true)?;
         crate::log_info!("no administrator yet; created user 'admin'");
-        print_one_time_password(
-            &password,
-            Some(&urls),
-            None,
-            manual_open || legacy_console(),
-        );
-        password_shown = true;
+        print_one_time_password(&password, Some(&urls), None, manual_open);
     } else if let Some(password) = auth.reissue_pending_password()? {
         // 账号建好了、但还没人用一次性密码登录过（must_change_password 仍是 1）。
         // 上一次打的那串只在控制台出现过一次；用户没记下来就把进程关掉的话，重启后
@@ -610,9 +600,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             Some(
                 "issued again because no password has been set yet; an earlier one is now invalid.",
             ),
-            manual_open || legacy_console(),
+            manual_open,
         );
-        password_shown = true;
     }
 
     state
@@ -716,9 +705,14 @@ async fn run(cli: Cli) -> Result<(), String> {
     if let Some(network) = &urls.network {
         crate::log_info!("network: {}", crate::core::logging::link(network));
     }
-    // 要不要替用户拉浏览器：手动开了开关，或者「刚打印一次性密码 + 经典 conhost」
-    // ——双击 exe 那种窗口里链接点不动（不认 OSC 8），人此刻正需要进页面设密码。
-    let open_browser = manual_open || (password_shown && legacy_console());
+    // 替用户拉浏览器**只在显式要求时**发生（v4.9.49）：`--open` / `ASMODAY_OPEN=1`。
+    //
+    // v4.9.45 曾经让它「首启 + 经典 conhost」也自动触发，结果是双击 exe 首启时
+    // 从本进程链下去拉起浏览器 —— 本进程若带提权 token（右键以管理员身份运行、
+    // 或从提权终端里启动），浏览器会跟着提权，于是撞上「已有一个提权 Edge 实例」，
+    // Edge 弹「现有实例正在以提升的权限运行，是否用普通权限重启」（2026-11-06 反馈）。
+    // 隐式副作用换不来那点便利：地址已经打在横幅和日志里，用户自己点/复制即可。
+    let open_browser = manual_open;
     if open_browser {
         let target = urls.primary().to_string();
         // 稍等一下让 axum::serve 真正开始 accept，否则浏览器可能拿到 connection refused
@@ -897,13 +891,27 @@ fn legacy_console() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdout())
 }
 
-/// 用系统默认浏览器打开 URL（`--open` / `ASMODAY_OPEN=1`，v4.9.45）。
+/// 用系统默认浏览器打开 URL（仅 `--open` / `ASMODAY_OPEN=1`，v4.9.45）。
 ///
-/// 经典 conhost 里任何程序都做不出可点的链接，唯一可靠的出路就是「替用户打开」。
+/// 经典 conhost 里任何程序都做不出可点的链接，所以留了这条显式出路。
+///
+/// Windows 上**先交给 shell**（`explorer.exe <url>`）而不是 `cmd /C start`（v4.9.49）：
+/// explorer 是登录用户的普通权限进程，URL 经它转给默认浏览器时，浏览器也就落在普通
+/// 权限上。由 `cmd start` 直接拉，浏览器会继承本进程的 token——本进程一旦是提权运行
+/// 的（右键「以管理员身份运行」、从提权终端里启动），就会出现「已有一个提权实例」的
+/// 混权冲突：Edge 弹「现有实例正在以提升的权限运行，是否用普通权限重启」，Chrome 则
+/// 干脆以管理员身份跑（等于把浏览器暴露给本机任意代码）。
 #[cfg(windows)]
 fn launch_browser(url: &str) -> std::io::Result<()> {
+    if std::process::Command::new("explorer.exe")
+        .arg(url)
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
     use std::os::windows::process::CommandExt;
-    // `start` 是 cmd 的内建命令；它把**第一个带引号的参数**当窗口标题，所以要补一个 ""
+    // 退回 cmd 内建 `start`：它把**第一个带引号的参数**当窗口标题，所以要补一个 ""
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new("cmd")
         .args(["/C", "start", "", url])
@@ -943,8 +951,8 @@ fn launch_browser(url: &str) -> std::io::Result<()> {
 /// 手机 / 平板那头根本不知道该填什么。
 ///
 /// `skip_hint`：不用再补「这个控制台点不动链接」的提示。两种情况下为 true——
-/// 已经决定替用户拉起浏览器，或者根本不起服务（`--init` / `--reset-password`，
-/// 那时 URL 也不通，提示 `--open` 只会误导）。
+/// 已经决定替用户拉起浏览器（`--open`），或者根本不起服务（`--init` /
+/// `--reset-password`，那时 URL 也不通，提示 `--open` 只会误导）。
 fn print_one_time_password(
     password: &str,
     urls: Option<&AccessUrls>,
@@ -979,11 +987,11 @@ fn print_one_time_password(
         if let Some(network) = &urls.network {
             println!("  LAN:  {}", crate::core::logging::link(network));
         }
-        // 经典 conhost 里链接点不动，干脆明说一句出路（v4.9.45）；
-        // 只在真控制台提示，重定向到文件时这行没有意义
+        // 经典 conhost 里链接点不动，干脆明说一句出路（v4.9.45）：地址就在上面，
+        // 抄走即可；不想抄下次带 `--open`。只在真控制台提示，重定向到文件时没意义
         if legacy_console() && !skip_hint {
             println!(
-                "{dim}        (this classic console cannot open links; add --open to launch the browser){reset}"
+                "{dim}        (this classic console cannot open links; copy the address above, or start with --open){reset}"
             );
         }
     }
