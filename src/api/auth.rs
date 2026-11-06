@@ -632,10 +632,18 @@ pub async fn require_auth(
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
+    /// 单用户后用户名不再是必填：网页端只剩密码框，留空即唯一账号。
+    /// 保留字段是为了兼容 WebDAV/脚本等仍带用户名的调用方。
+    #[serde(default)]
     pub username: String,
     pub password: String,
     #[serde(default)]
     pub totp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupRequest {
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -712,13 +720,28 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
+    // 单用户：username 留空即代表唯一账号（网页端已不展示用户名输入框）；
+    // 未初始化时直接挡回，与中间件的 503 口径一致。
+    let username = if body.username.trim().is_empty() {
+        match state.auth.first_user() {
+            Ok(Some(user)) => user.username,
+            Ok(None) => {
+                return json_error_code(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "E_INIT_REQUIRED",
+                    "Instance is not initialized yet",
+                );
+            }
+            Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        }
+    } else {
+        body.username.trim().to_string()
+    };
+
     // 计数维度（设计文档 3.1.5）：纯 IP（防用户名枚举）+ IP|用户名（挡单账号爆破）。
     // 两者都落在主登录池里，与分享口令、WebDAV 的独立池互不影响。
     let ip = client_ip(&state, &headers, Some(peer)).await;
-    let keys = [
-        ip.clone(),
-        format!("{ip}|{}", body.username.trim().to_lowercase()),
-    ];
+    let keys = [ip.clone(), format!("{ip}|{}", username.to_lowercase())];
 
     for key in &keys {
         if let Err(remaining) = state.login_guard.check(key) {
@@ -730,7 +753,7 @@ pub async fn login(
         }
     }
 
-    let found = match state.auth.find_user(body.username.trim()) {
+    let found = match state.auth.find_user(&username) {
         Ok(found) => found,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -805,6 +828,86 @@ pub async fn login(
         "status": "ok",
         "username": user.username,
         "must_change_password": user.must_change_password,
+    }))
+    .into_response();
+    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
+    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
+        &token,
+        crate::core::auth::SESSION_TTL,
+        &path,
+        secure,
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// POST /api/auth/setup（公开，仅实例未初始化时可用；设计文档 3.1.1）
+///
+/// 单用户回归后，初始化就是「设一个密码」：网页首访直达初始化页，
+/// 提交即建号 + 登录，不再经过控制台一次性密码与强制改密两步。
+/// 先到先得——谁能先打开页面谁就是主人（与 FileBrowser 一致）；
+/// 第一个账号诞生后这个入口永久 409 关闭。
+pub async fn setup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<SetupRequest>,
+) -> Response {
+    // 公开写操作：浏览器请求必须同源（与 logout 同一套 CSRF 判定）
+    if !origin_matches_host(&headers, &Method::POST) {
+        return json_error_code(
+            StatusCode::FORBIDDEN,
+            "E_FORBIDDEN",
+            "Cross-site request rejected",
+        );
+    }
+
+    match state.auth.user_count() {
+        Ok(0) => {}
+        Ok(_) => {
+            return json_error_code(
+                StatusCode::CONFLICT,
+                "E_ALREADY_INITIALIZED",
+                "Instance is already initialized",
+            );
+        }
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+
+    // 初始化口子开着的时间窗极短，但也不该被人拿去刷 argon2：按 IP 限流
+    let ip = client_ip(&state, &headers, Some(peer)).await;
+    if let Err(remaining) = state.login_guard.check(&ip) {
+        return json_error_code(
+            StatusCode::TOO_MANY_REQUESTS,
+            "AUTH_RATE_LIMITED",
+            format!("Too many attempts, retry in {remaining}s"),
+        );
+    }
+
+    // 强度校验在 create_user 里（≥8 位且不能全是数字），弱密码直接 400
+    let user = match state.auth.create_user("admin", body.password.trim()) {
+        Ok(user) => user,
+        Err(err) => {
+            state.login_guard.record_failure(&ip);
+            return json_error(StatusCode::BAD_REQUEST, err);
+        }
+    };
+    // 这里设的就是正式密码，不走 must_change_password 强改流程；
+    // create_user 默认置位是给一次性密码（--init / --reset）用的，这里清掉。
+    if let Err(err) = state.auth.set_must_change_password(user.id, false) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    let _ = state.auth.purge_expired();
+    let token = match state.auth.create_session() {
+        Ok(token) => token,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    let mut response = Json(json!({
+        "status": "ok",
+        "username": user.username,
+        "must_change_password": false,
     }))
     .into_response();
     let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
@@ -1171,8 +1274,32 @@ pub async fn totp_disable(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_authority, origin_matches_host};
+    use super::{LoginRequest, SetupRequest, normalize_authority, origin_matches_host};
     use axum::http::{HeaderMap, Method, header};
+
+    #[test]
+    fn login_request_username_is_optional() {
+        // v4.9.32 单用户：网页端只剩密码框，username 缺省即为空串；
+        // 带用户名的旧调用方（脚本 / WebDAV 客户端）照常解析。
+        let without: LoginRequest =
+            serde_json::from_str(r#"{"password":"secret-passphrase"}"#).unwrap();
+        assert_eq!(without.username, "");
+        assert_eq!(without.totp, None);
+
+        let with: LoginRequest = serde_json::from_str(
+            r#"{"username":"admin","password":"secret-passphrase","totp":"123456"}"#,
+        )
+        .unwrap();
+        assert_eq!(with.username, "admin");
+        assert_eq!(with.totp.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn setup_request_only_needs_password() {
+        let req: SetupRequest =
+            serde_json::from_str(r#"{"password":"secret-passphrase"}"#).unwrap();
+        assert_eq!(req.password, "secret-passphrase");
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();

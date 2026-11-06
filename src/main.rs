@@ -467,23 +467,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         cwd,
     };
 
-    // 首启自动引导（设计文档 3.1.1，对齐 FileBrowser）：还没有管理员时直接
-    // 生成 admin + 一次性随机密码，打印到控制台。网页端没有任何 setup 表单，
-    // 首次登录强制改密（must_change_password，中间件只放行改密接口）。
-    // 抢注问题天然消失：初始密码本身就是凭证，不存在「先到先得」的窗口。
-    // 密码只走 println（不进 asmoday.log）——日志文件会被轮转/采集，明文凭据
-    // 不能落盘；这与 --reset-password 的口径一致（2026-11-04 审查）。
-    if auth.user_count().unwrap_or(1) == 0 {
-        let password = core::auth::random_password();
-        let user = auth
-            .create_user("admin", &password)
-            .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
-        auth.set_must_change_password(user.id, true)?;
-        println!(
-            "[asmoday] no administrator yet; created user 'admin' with a one-time password: {password}"
-        );
-        println!("[asmoday] sign in with 'admin' + this password, you will be asked to change it.");
-    }
+    // 初始化改走网页（设计文档 3.1.1）：首启不建号、不打印一次性密码，
+    // 第一个访客在 /login 初始化页设一个密码即建号登录（POST /api/auth/setup，
+    // 仅未初始化时可用）。中间件对未初始化实例仍全程 503，不存在匿名暴露。
+    // 抢注问题与 FileBrowser 口径一致：先到先得，初始化完成即关闭入口；
+    // 锁死后的找回仍走 --reset-password / ASMODAY_RESET_PASSWORD。
 
     state
         .thumbnails
@@ -695,6 +683,7 @@ fn public_routes() -> Router<AppState> {
         .route("/api/health", get(status))
         .route("/api/auth/status", get(api::auth::status))
         .route("/api/auth/login", post(api::auth::login))
+        .route("/api/auth/setup", post(api::auth::setup))
         .route("/api/auth/logout", post(api::auth::logout))
         // 公开分享（令牌/口令/有效期/防盗链由处理器自行校验）
         .route("/api/public/share/{token}", get(api::shares::info))

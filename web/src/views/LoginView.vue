@@ -1,10 +1,11 @@
 <script setup lang="ts">
 /**
- * 登录页。整页独立布局，不套侧边栏。
+ * 登录 / 初始化一体页。整页独立布局，不套侧边栏。
  *
- * 初始化不再走网页表单（v4.9.23，对齐 FileBrowser）：首启时服务端自动创建
- * admin + 一次性随机密码并打印在控制台，这里就是普通登录页；一次性密码
- * 会话登录后由 App.vue 的强制改密对话框接管。
+ * 单用户回归后没有用户名可言（v4.9.32）：
+ * - 未初始化：这里就是初始化页，一个密码框直达——提交即建号并登录，
+ *   不再有「控制台一次性密码 → 强制改密」两步；
+ * - 已初始化：普通登录页，只剩密码框（2FA 可选展开）。
  */
 import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -21,7 +22,7 @@ const { t, locale } = useI18n()
 const router = useRouter()
 const route = useRoute()
 
-const username = ref('')
+const mode = ref<'loading' | 'setup' | 'login'>('loading')
 const password = ref('')
 const totp = ref('')
 const showTotp = ref(false)
@@ -31,13 +32,21 @@ const submitting = ref(false)
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (!username.value.trim() || !password.value) {
+  if (!password.value) {
     error.value = t('auth.login.required')
+    return
+  }
+  if (mode.value === 'setup' && password.value.length < 8) {
+    error.value = t('auth.setup.tooShort')
     return
   }
   submitting.value = true
   try {
-    await authApi.login(username.value.trim(), password.value, totp.value.trim())
+    if (mode.value === 'setup') {
+      await authApi.setup(password.value)
+    } else {
+      await authApi.login(password.value, totp.value.trim())
+    }
     const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(target)
   } catch (err) {
@@ -49,7 +58,7 @@ async function submit() {
 
 onMounted(async () => {
   await authApi.ensureAuth()
-  username.value = 'admin'
+  mode.value = authApi.initialized.value ? 'login' : 'setup'
 })
 
 /** 语言切换：登录前也能改（首次运行可能整站是英文环境） */
@@ -93,39 +102,37 @@ function changeLocale(event: Event) {
           <AppIcon name="sparkle" :size="48" :stroke-width="1.75" />
         </span>
         <h1 class="text-xl font-semibold text-ink">Asmoday</h1>
-        <p class="mt-1 text-xs text-muted">{{ t('auth.login.tagline') }}</p>
+        <p class="mt-1 text-xs text-muted">
+          {{ mode === 'setup' ? t('auth.setup.tagline') : t('auth.login.tagline') }}
+        </p>
       </div>
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
-        <label class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.username') }}</span>
-          <input
-            v-model="username"
-            type="text"
-            autocomplete="username"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-            placeholder="admin"
-          />
-        </label>
+        <p v-if="mode === 'setup'" class="text-[12px] leading-relaxed text-muted">
+          {{ t('auth.setup.desc') }}
+        </p>
 
         <label class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
+          <span class="mb-1 block text-[12px] text-muted">
+            {{ mode === 'setup' ? t('auth.setup.password') : t('auth.login.password') }}
+          </span>
           <PasswordInput
             v-model="password"
-            autocomplete="current-password"
+            :autocomplete="mode === 'setup' ? 'new-password' : 'current-password'"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             placeholder="••••••••"
           />
         </label>
 
         <button
+          v-if="mode === 'login'"
           type="button"
           class="text-[12px] text-muted transition-colors hover:text-ink"
           @click="showTotp = !showTotp"
         >
           {{ showTotp ? t('auth.login.totpHide') : t('auth.login.totpToggle') }}
         </button>
-        <label v-if="showTotp" class="block">
+        <label v-if="mode === 'login' && showTotp" class="block">
           <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
           <input
             v-model="totp"
@@ -148,11 +155,17 @@ function changeLocale(event: Event) {
           :disabled="submitting"
           class="w-full rounded-lg bg-accent py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
         >
-          {{ submitting ? t('auth.login.submitting') : t('auth.login.submit') }}
+          {{
+            submitting
+              ? t('auth.login.submitting')
+              : mode === 'setup'
+                ? t('auth.setup.submit')
+                : t('auth.login.submit')
+          }}
         </button>
 
         <p class="pt-1 text-center text-[12px] leading-relaxed text-muted">
-          {{ t('auth.login.footerLogin') }}
+          {{ mode === 'setup' ? t('auth.setup.footer') : t('auth.login.footerLogin') }}
         </p>
       </form>
     </div>

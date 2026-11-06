@@ -77,8 +77,18 @@ export const authApi = {
   initialized: computed(() => status.value.initialized),
   ensureAuth,
   refresh,
-  async login(username: string, password: string, totp?: string) {
-    await post('/api/auth/login', { username, password, totp: totp || undefined })
+  /**
+   * 登录。单用户后没有用户名输入框：username 由后端按唯一账号解析（留空即可）。
+   */
+  async login(password: string, totp?: string) {
+    await post('/api/auth/login', { password, totp: totp || undefined })
+  },
+  /**
+   * 初始化：仅实例未初始化时可用。设置密码即建号并直接拿到会话，
+   * 不再有「控制台一次性密码 → 强制改密」两步。
+   */
+  async setup(password: string) {
+    await post('/api/auth/setup', { password })
   },
   async logout() {
     await post('/api/auth/logout')
