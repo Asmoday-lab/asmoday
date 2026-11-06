@@ -376,7 +376,7 @@ pub(crate) fn verify_admin_with(
             mount_scope: None,
         });
     }
-    if !crate::core::auth::verify_password(&hash, password) {
+    if !crate::core::auth::verify_password_lenient(&hash, password) {
         return None;
     }
     cache.insert(key, hash, now);

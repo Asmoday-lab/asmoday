@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
-use crate::core::auth::{now_secs, verify_password};
+use crate::core::auth::{now_secs, verify_password_lenient};
 use crate::core::totp;
 
 /// 会话 Cookie 名
@@ -832,7 +832,9 @@ pub async fn login(
     // - 动态码模式：只传 totp，password 为空
     // - 两个都给：脚本 / 第三方客户端显式要求的**严格双因子**
     let code_field = body.totp.as_deref().map(str::trim).unwrap_or("");
-    // 不 trim：密码里可能真带首尾空格，只有一次性码才需要归一化（它自己会剥符号）
+    // 密码原样交给 verify_password_lenient：它自己会容忍首尾空白（v4.9.50）。
+    // 这里不先 trim，是因为 `credential_mode()` 要靠「空 / 非空」分派——只有空白字符
+    // 的密码属于「填了但填错」，不该被当成零凭证的 Empty。
     let credential = body.password.as_str();
     let mode = credential_mode(credential.is_empty(), code_field.is_empty());
     let authentic = if user.totp_enabled {
@@ -851,18 +853,18 @@ pub async fn login(
             }
             // 严格双因子：先比密码，密码错就别去碰恢复码（避免白耗一个）
             CredentialMode::TwoFactor => {
-                verify_password(&hash, credential)
+                verify_password_lenient(&hash, credential)
                     && verify_one_time_code(&state, user.id, secret, code_field)
             }
             // 密码模式：先按一次性码试（有人会把码填进密码框），不中再比密码
             CredentialMode::Password => {
                 verify_one_time_code(&state, user.id, secret, credential)
-                    || verify_password(&hash, credential)
+                    || verify_password_lenient(&hash, credential)
             }
         }
     } else {
         // 没开 2FA：只有密码这一条路；只有 totp 字段的请求直接算失败
-        mode == CredentialMode::Password && verify_password(&hash, credential)
+        mode == CredentialMode::Password && verify_password_lenient(&hash, credential)
     };
 
     if !authentic {
@@ -964,7 +966,7 @@ pub async fn change_password(
     // 一次性密码会话（--init / --reset 发放后首次登录）：登录那一刻已经用
     // 一次性密码验过身份，改密时不再重复要「当前密码」——那等于把同一个
     // 密码连输两遍（v4.9.33）。正式密码会话仍必须带 current。
-    if !user.must_change_password && !verify_password(&hash, &body.current) {
+    if !user.must_change_password && !verify_password_lenient(&hash, &body.current) {
         return json_error_code(
             StatusCode::BAD_REQUEST,
             "PASSWORD_WRONG",
@@ -1026,7 +1028,7 @@ pub async fn change_username(
         );
     };
 
-    if !verify_password(&hash, &body.current) {
+    if !verify_password_lenient(&hash, &body.current) {
         return json_error_code(
             StatusCode::BAD_REQUEST,
             "PASSWORD_WRONG",
@@ -1095,7 +1097,7 @@ pub async fn reverify_password(
             "User not found",
         );
     };
-    if !verify_password(&hash, &body.password) {
+    if !verify_password_lenient(&hash, &body.password) {
         record_login_failure(&state.login_guard, &keys);
         return json_error_code(
             StatusCode::BAD_REQUEST,
@@ -1207,7 +1209,7 @@ pub async fn totp_disable(
         );
     };
 
-    if !verify_password(&hash, &body.password) {
+    if !verify_password_lenient(&hash, &body.password) {
         return json_error_code(
             StatusCode::BAD_REQUEST,
             "PASSWORD_WRONG",

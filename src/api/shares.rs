@@ -20,7 +20,7 @@ use tokio_util::io::ReaderStream;
 
 use super::auth::AuthUser;
 use crate::AppState;
-use crate::core::auth::{hash_password, now_secs, random_token, verify_password};
+use crate::core::auth::{hash_password, now_secs, random_token, verify_password_lenient};
 use crate::core::fs;
 
 /// 细节型错误（4xx 参数类）
@@ -343,13 +343,13 @@ fn check_password(
     }
 
     let provided = query.password.as_deref().unwrap_or("");
-    if verify_password(hash, provided) {
+    if verify_password_lenient(hash, provided) {
         state.share_guard.record_success(key);
         return Ok(());
     }
 
     // 没填 = 需要口令（不计失败）；填了但不匹配 = 口令错误（计失败）
-    if provided.is_empty() {
+    if provided.trim().is_empty() {
         return Err(error_code(
             StatusCode::UNAUTHORIZED,
             "SHARE_PASSWORD_REQUIRED",

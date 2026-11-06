@@ -1636,7 +1636,7 @@ async fn reset_two_factor(auth: &AuthStore) -> Result<(), String> {
         return Err("user row not found".to_string());
     };
     let password = prompt_line("current password")?;
-    if !core::auth::verify_password(&hash, &password) {
+    if !core::auth::verify_password_lenient(&hash, &password) {
         return Err("wrong password, 2FA not reset".to_string());
     }
     auth.clear_totp(user.id)?;

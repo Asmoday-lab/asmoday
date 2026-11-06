@@ -61,7 +61,9 @@ function toggleMode() {
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  const value = codeMode.value ? code.value.trim() : password.value
+  // 两种凭证都按 trim 后的值判空与提交：粘贴带空格（含中文输入法的全角空格）时
+  // 不该被当成「没填」，也不该把那个看不见的空格带进密码比对（v4.9.50）
+  const value = codeMode.value ? code.value.trim() : password.value.trim()
   if (!value) {
     error.value = t(codeMode.value ? 'auth.login.codeRequired' : 'auth.login.required')
     return

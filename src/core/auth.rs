@@ -865,6 +865,8 @@ impl AuthStore {
         if !valid_username(username) {
             return Err("用户名需 2~32 个字符，可含中文、字母、数字与 _ - . @".to_string());
         }
+        // 首尾空白不进哈希（与 verify_password_lenient 同一口径，v4.9.50）
+        let password = password.trim();
         check_password_strength(password)?;
 
         let hash = hash_password(password)?;
@@ -978,6 +980,8 @@ impl AuthStore {
     }
 
     pub fn update_password(&self, user_id: i64, password: &str) -> Result<(), String> {
+        // 首尾空白不进哈希（与 verify_password_lenient 同一口径，v4.9.50）
+        let password = password.trim();
         check_password_strength(password)?;
         let hash = hash_password(password)?;
         let conn = self.connect()?;
@@ -1250,6 +1254,33 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
         .is_ok()
 }
 
+/// 账号密码的**唯一**校验入口：容忍首尾空白（v4.9.50）。
+///
+/// 为什么要宽容：密码输入框里最常出的事故不是打错字，而是**粘贴时多带了一个空格**
+/// （从密码管理器、聊天记录、便签里复制），以及中文输入法留下的全角空格
+/// （`U+3000` 也属 `char::is_whitespace`，`trim()` 一并吃掉）。这类「看不见的字符」
+/// 让人明明密码是对的却一直 401，而且完全无从排查。
+///
+/// 口径：**首尾空白不算密码的一部分**——写入侧（`create_user` / `update_password`）
+/// 先 `trim()` 再哈希，校验侧兜住「trim 后」与「原样」两种输入：
+/// - 先试 `trim` 后的值（现在库里存的都是它），带空格粘贴也能一次进；
+/// - 再试原样（规则落地前设的带首尾空格密码，用原样输入仍能登；
+///   网页端已经 trim 过，这类存量密码需走 `--reset-password`）。
+///
+/// 中间的空格始终保留：`my pass phrase` 是合法密码。
+pub fn verify_password_lenient(hash: &str, raw: &str) -> bool {
+    let trimmed = raw.trim();
+    // 账号密码不可能为空（强度要求 ≥8 位），空白输入直接判失败，
+    // 省掉一次没意义的 Argon2 运算
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == raw {
+        return verify_password(hash, raw);
+    }
+    verify_password(hash, trimmed) || verify_password(hash, raw)
+}
+
 fn check_password_strength(password: &str) -> Result<(), String> {
     if password.chars().count() < 8 {
         return Err("密码至少 8 个字符".to_string());
@@ -1438,6 +1469,63 @@ mod tests {
         let store = AuthStore::new(path);
         store.init().unwrap();
         store
+    }
+
+    #[test]
+    /// 密码首尾空白不算密码的一部分（v4.9.50）：写入时 trim，校验时两向宽容
+    fn password_surrounding_whitespace_is_ignored() {
+        let store = temp_store("password-space");
+        // 建号时带首尾空白（全角空格也算）：落库前就被 trim 掉
+        let admin = store
+            .create_user("boss", "  \u{3000}Asmoday#2026 \u{3000} ")
+            .unwrap();
+        let (_, hash, _) = store.find_user("boss").unwrap().unwrap();
+        assert!(
+            verify_password(&hash, "Asmoday#2026"),
+            "写入侧必须先 trim 再哈希"
+        );
+        assert!(
+            !verify_password(&hash, " Asmoday#2026"),
+            "原样比对不该命中（证明存的是 trim 后的值）"
+        );
+
+        // 登录侧：粘贴带空格 / 全角空格都要能进
+        assert!(verify_password_lenient(&hash, "Asmoday#2026"));
+        assert!(verify_password_lenient(&hash, "  Asmoday#2026  "));
+        assert!(verify_password_lenient(
+            &hash,
+            "\u{3000}Asmoday#2026\u{3000}"
+        ));
+        assert!(!verify_password_lenient(&hash, "Asmoday#2027"));
+
+        // 中间的空格是真内容，不许动
+        store.update_password(admin.id, "my pass phrase").unwrap();
+        let (_, hash, _) = store.find_user("boss").unwrap().unwrap();
+        assert!(verify_password_lenient(&hash, "my pass phrase"));
+        assert!(
+            !verify_password_lenient(&hash, "mypassphrase"),
+            "内部空格必须保留"
+        );
+
+        // 全空白不是密码（trim 后不足 8 位，强度校验会拦）
+        assert!(store.update_password(admin.id, "        ").is_err());
+        assert!(store.create_user("boss2", "  x  ").is_err());
+    }
+
+    #[test]
+    /// 存量语义：规则落地前设的「带首尾空格」密码，只有**原样输入**能登。
+    ///
+    /// 网页端提交前已经 trim，所以这类存量密码（若有）得走 `--reset-password`。
+    /// 这是有意的取舍：宁可让极少数「有意在密码首尾放空格」的人重置一次，
+    /// 也不让绝大多数被粘贴空格坑住的人无从登录。
+    fn password_hash_with_spaces_accepts_only_raw_input() {
+        let hash = hash_password(" padded-secret ").unwrap();
+        assert!(verify_password_lenient(&hash, " padded-secret "));
+        assert!(!verify_password_lenient(&hash, "padded-secret"));
+        assert!(!verify_password_lenient(&hash, "padded-secret2"));
+        // 空白输入直接判失败，不白跑 Argon2
+        assert!(!verify_password_lenient(&hash, "   "));
+        assert!(!verify_password_lenient(&hash, ""));
     }
 
     #[test]

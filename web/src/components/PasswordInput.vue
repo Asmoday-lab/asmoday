@@ -11,6 +11,11 @@
  * - 按钮必须 `type="button"`，否则放在 <form> 里点一下就把表单提交了；
  * - `@pointerdown.prevent` 让 input 保持焦点：桌面上不闪、移动端小键盘不收起；
  * - 除 class / 监听器外，placeholder、autocomplete、autofocus 等原样透传给 input。
+ * - **失焦 / 回车时抹掉首尾空白**（v4.9.50，可用 `:trim="false"` 关掉）：密码里最常
+ *   出的事故是从密码管理器、聊天记录里粘贴时多带一个空格，以及中文输入法留下的全角
+ *   空格（`String.trim()` 会一并吃掉 `U+3000`）。这类字符看不见，却让人一直 401。
+ *   不在 `input` 事件里改：那样每敲一个空格光标就跳一下，中间的空格也打不进去。
+ *   中间的空格是真内容，`trim()` 只动两头。
  */
 import { ref, useAttrs } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -18,7 +23,9 @@ import AppIcon from './AppIcon.vue'
 
 defineOptions({ inheritAttrs: false })
 
-defineProps<{ modelValue: string }>()
+const props = withDefaults(defineProps<{ modelValue: string; trim?: boolean }>(), {
+  trim: true,
+})
 const emit = defineEmits<{ 'update:modelValue': [string] }>()
 
 const attrs = useAttrs()
@@ -27,6 +34,13 @@ const reveal = ref(false)
 
 function onInput(event: Event) {
   emit('update:modelValue', (event.target as HTMLInputElement).value)
+}
+
+/** 失焦与回车时收口：这两个时机改值不会打断输入，也不会挪光标 */
+function trimValue() {
+  if (!props.trim) return
+  const trimmed = props.modelValue.trim()
+  if (trimmed !== props.modelValue) emit('update:modelValue', trimmed)
 }
 </script>
 
@@ -38,6 +52,8 @@ function onInput(event: Event) {
       :type="reveal ? 'text' : 'password'"
       class="w-full"
       @input="onInput"
+      @blur="trimValue"
+      @keydown.enter="trimValue"
     />
     <!-- tabindex=-1：不参与 Tab 焦点链，Tab 应在输入框之间直接跳转 -->
     <button

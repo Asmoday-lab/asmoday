@@ -142,7 +142,13 @@ async function shot(page, name) {
     check('页面无 JS 报错', errors.length === 0, errors)
     await shot(page, 'login-password')
 
-    await page.fill('form input', PASSWORD)
+    // 首尾空白（v4.9.50）：粘贴时多带的空格看不见，失焦后就该被抹掉，
+    // 而不是带着它去撞一次 401
+    await page.fill('form input', `  ${PASSWORD}  `)
+    await page.evaluate(() => document.querySelector('form input').blur())
+    const trimmed = (await inputInfo(page)).value
+    check('密码框失焦自动去掉首尾空白', trimmed === PASSWORD, JSON.stringify(trimmed))
+
     await page.click('form button[type="submit"]')
     const login = await waitLeave(page)
     check('密码模式能登录', login.ok, login)

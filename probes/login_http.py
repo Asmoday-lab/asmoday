@@ -76,6 +76,15 @@ def run(server: Server) -> int:
     checks("严格双因子：密码 + 动态码 → 200", status == 200, (status, payload))
     caller.call("POST", "/api/auth/logout")
 
+    # 首尾空白不算密码的一部分（v4.9.50）：粘贴多带空格、中文输入法留下的全角空格
+    # 都该照常进站——这类字符看不见，不宽容就等于「密码对却一直 401」
+    status, payload = caller.call("POST", "/api/auth/login", {"password": f"  {PASSWORD}\u3000 "})
+    checks("密码带首尾空白（含全角空格）→ 200", status == 200 and payload.get("status") == "ok", (status, payload))
+    caller.call("POST", "/api/auth/logout")
+
+    status, payload = caller.call("POST", "/api/auth/login", {"password": "   "})
+    checks("纯空白密码 → 401（不是零凭证放行）", status == 401 and payload.get("code") == "AUTH_INVALID", (status, payload))
+
     # 关掉 2FA 后只剩密码这一条路
     caller.call("POST", "/api/auth/login", {"password": PASSWORD})
     status, payload = caller.call("POST", "/api/auth/totp/disable", {"password": PASSWORD, "code": totp(secret)})
@@ -87,6 +96,24 @@ def run(server: Server) -> int:
 
     status, payload = caller.call("POST", "/api/auth/login", {"totp": totp(secret)})
     checks("没开 2FA 时动态码模式一律 401", status == 401, (status, payload))
+
+    # 写入侧同样 trim：改密时多打的空格不会变成密码的一部分（v4.9.50）
+    caller.call("POST", "/api/auth/login", {"password": PASSWORD})
+    status, payload = caller.call(
+        "POST",
+        "/api/auth/password",
+        {"current": f" {PASSWORD} ", "next": "  NewPass#2026  "},
+    )
+    checks("改密：当前密码带空格也认，新密码首尾空格被 trim", status == 200, (status, payload))
+    caller.call("POST", "/api/auth/logout")
+
+    status, payload = caller.call("POST", "/api/auth/login", {"password": "NewPass#2026"})
+    checks("改密后用不带空格的密码登录 200", status == 200 and payload.get("status") == "ok", (status, payload))
+    caller.call("POST", "/api/auth/logout")
+
+    status, payload = caller.call("POST", "/api/auth/login", {"password": "  NewPass#2026  "})
+    checks("改密后带空格也能登录（同一口径）", status == 200, (status, payload))
+    caller.call("POST", "/api/auth/logout")
 
     return checks.summary()
 
