@@ -22,7 +22,7 @@
 | --- | --- | --- | --- |
 | **L0** | 改一处 Rust 逻辑，边写边验 | `cargo test <模块名>`（单模块） | 秒级 |
 | **L1** | 准备提交 | `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test`；**动过前端**再加 `vue-tsc -b` | 20~40s |
-| **L2** | 动了认证 / 会话 / API 契约 / 配置默认值 | `python probes/run_login.py --case=http`（HTTP 冒烟） | 一次构建 + 5s |
+| **L2** | 动了认证 / 会话 / API 契约 / 配置默认值 / 下载引擎 | `python probes/run_login.py --case=http`（HTTP 冒烟），动了下载再加 `python probes/aria2_explorer.py` | 一次构建 + 5s（下载 +8s） |
 | **L3** | 动了交互、样式、路由、空状态 | `python probes/run_login.py --case=ui-password --case=ui-code` | 一次构建 + 6s |
 
 规矩：
@@ -38,6 +38,7 @@ probes/
   lib_probe.py     公共件：Server（临时数据 + 随机空闲端口 + 独立日志）、Caller、Checks、totp
   login_http.py    L2：登录 API 29 条断言（GWT-AUTH-02/05/22/23/24/25）
   login_ui.cjs     L3：登录页两形态（password / code），playwright-core
+  aria2_explorer.py L2：Aria2 Explorer 发包形态 11 条断言（GWT-DL-32/33）
   shots/           截图输出（git 忽略，固定文件名）
 ```
 
@@ -48,7 +49,12 @@ python probes/run_login.py --build            # 一轮开头：构建 + 全跑
 python probes/run_login.py --case=http        # 只验认证后端
 python probes/run_login.py --case=ui-code     # 只看 2FA 切换后的动态码形态
 python probes/run_login.py --case=http --keep-data   # 排障：保留数据目录并打印日志尾部
+python probes/aria2_explorer.py               # 下载：插件请求头 / 探测回退 / 跨源跳转
+python probes/aria2_explorer.py --build       # 同上，先 cargo build
 ```
+
+下载类探针为什么要自备桩站：它验的正是「站点不配合」的三种形态（HEAD 405、
+缺 Referer/Cookie 就 403、302 跳到另一个源），用真实外网站点既不稳定也没法断言。
 
 依赖：`playwright-core` 装在 `.asmoday-probe/node_modules`（`run_login.py` 会自动把它
 塞进 `NODE_PATH`）；浏览器优先用 `CHROME_PATH`，否则扫 `ms-playwright/chromium-*`。

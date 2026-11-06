@@ -296,9 +296,14 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
             let dir = option_str(&options, "dir");
             let out = option_str(&options, "out");
             let user_agent = option_str(&options, "user-agent");
+            // `referer` 是独立选项（Aria2 Explorer 就发这个键，不往 header 里塞）；
+            // 连接数两种写法都收：`max-connection-per-server` 与 `split`
+            let referer = option_str(&options, "referer");
             let segments = option_str(&options, "max-connection-per-server")
+                .or_else(|| option_str(&options, "split"))
                 .and_then(|v| v.parse::<usize>().ok());
             let headers = option_header_list(&options);
+            let pause = option_bool(&options, "pause");
             // magnet 走 BT 分支时把 select-file 一起带过去（0 基）
             let only_files = option_select_files(&options);
             if let Some(first) = uris.first()
@@ -310,14 +315,29 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
                         dir,
                         out,
                         only_files,
-                        false,
+                        pause,
                     )
                     .await?;
                 return Ok(Value::String(gid));
             }
             let gid = manager
-                .add_uri(uris, dir, out, user_agent, headers, segments)
+                .add_uri(
+                    uris,
+                    crate::core::download::UriOptions {
+                        dir,
+                        out,
+                        user_agent,
+                        referer,
+                        headers,
+                        segments,
+                    },
+                )
                 .await?;
+            // aria2 的 `pause=true`：加进列表但不起跑（AriaNg / Aria2 Explorer 的
+            // 「添加后暂停」都走这个键，忽略它就会「点了暂停还是立刻开始下」）
+            if pause {
+                manager.pause(&gid).await?;
+            }
             Ok(Value::String(gid))
         }
         "aria2.addTorrent" => {
@@ -724,17 +744,17 @@ fn option_select_files(options: &Value) -> Option<Vec<usize>> {
 fn option_header_list(options: &Value) -> Vec<(String, String)> {
     options
         .get("header")
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(Value::as_str)
-                .filter_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    Some((name.trim().to_string(), value.trim().to_string()))
-                })
-                .collect()
-        })
+        .and_then(crate::core::download::parse_header_option)
         .unwrap_or_default()
+}
+
+/// 布尔型选项：aria2 的 RPC 客户端两种写法都有（`true` 与 `"true"`）
+fn option_bool(options: &Value, key: &str) -> bool {
+    match options.get(key) {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => matches!(text.trim(), "true" | "1" | "yes"),
+        _ => false,
+    }
 }
 
 fn percent_decode(input: &str) -> String {

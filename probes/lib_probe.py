@@ -91,15 +91,21 @@ class Caller:
 
 
 class Server:
-    """一次性服务实例：临时数据目录 + 空闲端口 + 独立日志。"""
+    """一次性服务实例：临时数据目录 + 空闲端口 + 独立日志。
 
-    def __init__(self, tag: str, data_root: str) -> None:
+    `config` 给定时用 `-c` 指定配置文件（不指定就落到进程工作目录的
+    `config.toml`）——下载类探针要在配置里写 `[[system.mounts]]`，
+    不能让探针去改仓库根的那份。
+    """
+
+    def __init__(self, tag: str, data_root: str, *, config: str | None = None) -> None:
         self.tag = tag
         self.data = os.path.join(data_root, tag)
         os.makedirs(self.data, exist_ok=True)
         self.log = os.path.join(self.data, "server.log")
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
+        self.config = config
         self.proc: subprocess.Popen | None = None
 
     def __enter__(self) -> "Server":
@@ -110,8 +116,11 @@ class Server:
             env.pop(key, None)
         env["NO_PROXY"] = "127.0.0.1,localhost"
         self._out = open(self.log, "w", encoding="utf-8")
+        command = [EXE, "-d", self.data, "-p", str(self.port), "-H", "127.0.0.1"]
+        if self.config:
+            command += ["-c", self.config]
         self.proc = subprocess.Popen(
-            [EXE, "-d", self.data, "-p", str(self.port), "-H", "127.0.0.1"],
+            command,
             stdout=self._out,
             stderr=subprocess.STDOUT,
             cwd=ROOT,

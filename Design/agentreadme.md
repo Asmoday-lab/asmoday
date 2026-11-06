@@ -435,6 +435,8 @@ GWT-DL-28 Given 引擎设置里改了参数 / 保存目录 / Tracker 任一项�
 GWT-DL-29 Given 有未保存改动  When 点侧边栏或浏览器后退离开 `/downloads`  Then 同样弹确认；取消则 URL 仍在 `/downloads`，确认放弃才真正跳转且草稿回滚。放弃目录改动时 `GET /api/downloads/engine` 的 `roots` 条数不变（没有偷偷写库）（v4.9.40）
 GWT-DL-30 Given 设置页滚到最底部  Then 底部还有一颗「返回下载列表」，点击走同一套未保存确认；390 宽无横向溢出，底部按钮可见（v4.9.40）
 GWT-DL-31 Given 在引擎设置视图  When 按系统返回键 / 浏览器后退（不是点按钮）  Then **先回到下载任务列表**，URL 仍停在 `/downloads`，不出现「直接退回聚合主页」；有未保存改动时先弹确认，选「继续编辑」后视图与草稿都不变、再按一次仍能拦住；切到任务视图后再按返回才真的离开本页（v4.9.41）
+GWT-DL-32 Given Aria2 Explorer 形态的 addUri：`referer` 作为**独立选项**发、`header` 是 `"Name: value"` 数组  When 下载需要登录态的直链  Then 探测请求与**每一个分段请求**都带 `Referer` 与 `Cookie`（桩站缺任一头即 403）；`getOption` 回 `referer` 与 `header` 数组（含 `Cookie:` / `User-Agent:` 两行）；`header` 里显式写 `Referer:` 时以它为准；`header` 写成换行分隔的单串（AriaNg 设置里的形态）同样生效（v4.9.52）
+GWT-DL-33 Given 目标站点 `HEAD` 返 405/403 并 302 跳到另一个源  When 下同一个文件  Then 任务仍 `complete` 且落盘字节一致；重定向每一跳都重发同一份头与 `Range`（reqwest 自动跟随会删 `Cookie`，实测会被桩站 403）；`pause="true"` 加完停在 `paused`，`changeOption` 补 `header` / `referer` 后 `unpause` 能下完；`split` 等价于 `max-connection-per-server`；`header` 里名字非法的行被丢弃且任务照跑（不得因 panic 静默消失）；`dir` 越界时错误消息列出允许的根（v4.9.52）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

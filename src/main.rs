@@ -513,8 +513,12 @@ async fn run(cli: Cli) -> Result<(), String> {
     // 缩略图缓存根：缩略器与索引共用同一个串（索引靠它回收外部删除的缓存单元）
     let thumb_dir = data_dir.join("thumbnails");
     let downloads = Arc::new(core::download::DownloadManager::new(
+        // 重定向由 download::send_following 自己跟：reqwest 的自动跟随会在
+        // 跨源跳转时丢掉 Cookie / Referer / Authorization（插件传下来的鉴权头
+        // 就白给了），而 aria2 的 `--header` 是每一跳原样重发的
         reqwest::Client::builder()
             .user_agent("aria2/1.37.0")
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("failed to build download HTTP client: {e}"))?,
         download_secret,

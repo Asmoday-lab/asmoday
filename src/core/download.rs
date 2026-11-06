@@ -74,10 +74,100 @@ pub struct TaskOptions {
     pub dir: PathBuf,
     pub out: Option<String>,
     pub user_agent: Option<String>,
+    /// `referer` 选项（Aria2 Explorer 单独发这个键，而不是塞进 `header`）
+    pub referer: Option<String>,
     /// 请求头（"Name: value"），逐段请求都带
     pub headers: Vec<(String, String)>,
     /// changeOption 进来的其他键（getOption 原样回显，引擎不消费）
     pub extra: Vec<(String, String)>,
+}
+
+/// `aria2.addUri` 里引擎真正消费的参数（其余键由协议层吞掉）。
+///
+/// 收成一个结构体而不是七个位置参数：`dir` / `out` / `user-agent` / `referer`
+/// 全是 `Option<String>`，位置传参只要错一格就是「把 UA 当成保存名」这类事故。
+#[derive(Debug, Clone, Default)]
+pub struct UriOptions {
+    pub dir: Option<String>,
+    pub out: Option<String>,
+    pub user_agent: Option<String>,
+    /// aria2 的 `--referer`；与 `header` 里的 `Referer:` 等价，后者优先
+    pub referer: Option<String>,
+    pub headers: Vec<(String, String)>,
+    /// `max-connection-per-server` / `split` 的覆盖值（最终仍按全局上限收敛）
+    pub segments: Option<usize>,
+}
+
+/// `header` 选项解析：**字符串数组**（aria2 RPC 原生形态，Aria2 Explorer 就发这个）
+/// 与**换行分隔的单串**（AriaNg 设置里那格的写法）都收，返回 `None` 表示键不存在。
+///
+/// 按第一个 `:` 切分，值里的冒号原样保留 —— `Cookie: a=b; c=d`、`Referer: https://x/y:8080`
+/// 都是这种形状。没有冒号的行直接丢掉（aria2 也只是忽略）。
+pub(crate) fn parse_header_option(value: &serde_json::Value) -> Option<Vec<(String, String)>> {
+    let lines: Vec<&str> = match value {
+        serde_json::Value::String(text) => text.split('\n').collect(),
+        serde_json::Value::Array(list) => list.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    Some(
+        lines
+            .into_iter()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// 回显用：`header` 选项在 getOption / tellStatus 里仍是 `"Name: value"` 数组
+pub(crate) fn header_lines(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect()
+}
+
+/// 把任务的 UA / referer / 自定义头装配成 `HeaderMap`。
+///
+/// 为什么不让调用方直接 `request.header(name, value)`：`RequestBuilder::header`
+/// 遇到非法名字（`"Bad Header"`、中文、控制字符）会 **panic**，而那发生在任务协程里，
+/// 表现为「任务凭空消失」——插件传什么头不由我们决定，必须逐条校验后丢掉坏的。
+/// 同名头后写的覆盖先写的（UA 与 `header` 里的 `User-Agent` 撞车时以 `header` 为准，
+/// 与 aria2 一致：显式 `--header` 优先于 `--user-agent`）。
+pub(crate) fn task_header_map(
+    user_agent: Option<&str>,
+    referer: Option<&str>,
+    headers: &[(String, String)],
+) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut map = HeaderMap::new();
+    let put = |map: &mut HeaderMap, name: HeaderName, value: &str| {
+        match HeaderValue::from_str(value) {
+            Ok(parsed) => {
+                map.insert(name, parsed);
+            }
+            Err(_) => crate::log_warn!("dropped unusable header value for {}", name.as_str()),
+        };
+    };
+    if let Some(ua) = user_agent {
+        put(&mut map, reqwest::header::USER_AGENT, ua);
+    }
+    if let Some(referer) = referer {
+        put(&mut map, reqwest::header::REFERER, referer);
+    }
+    for (name, value) in headers {
+        match HeaderName::from_bytes(name.as_bytes()) {
+            Ok(parsed) => put(&mut map, parsed, value),
+            Err(_) => crate::log_warn!("dropped invalid header name: {name:?}"),
+        }
+    }
+    map
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,11 +925,15 @@ impl DownloadManager {
                 return Ok(canon);
             }
         }
+        // 报错时把允许的根一并列出：插件里配的「下载位置」不在挂载点内是最常见的
+        // 一类失败，只说「不在允许范围内」用户无从下手
+        let allowed: Vec<String> = roots.iter().map(|root| display_path(&root.path)).collect();
         Err(RpcError::new(
             2,
             format!(
-                "dir is not within allowed download roots: {}",
-                canon.display()
+                "dir is not within allowed download roots: {} (allowed: {})",
+                canon.display(),
+                allowed.join(", ")
             ),
         ))
     }
@@ -853,12 +947,16 @@ impl DownloadManager {
     pub async fn add_uri(
         self: &Arc<Self>,
         uris: Vec<String>,
-        dir: Option<String>,
-        out: Option<String>,
-        user_agent: Option<String>,
-        headers: Vec<(String, String)>,
-        segments_override: Option<usize>,
+        options: UriOptions,
     ) -> Result<String, RpcError> {
+        let UriOptions {
+            dir,
+            out,
+            user_agent,
+            referer,
+            headers,
+            segments: segments_override,
+        } = options;
         let uri = uris
             .first()
             .cloned()
@@ -885,6 +983,7 @@ impl DownloadManager {
             dir,
             out: Some(filename.clone()),
             user_agent,
+            referer,
             headers,
             extra: Vec::new(),
         };
@@ -982,6 +1081,7 @@ impl DownloadManager {
             dir: dir.clone(),
             out: out.clone(),
             user_agent: None,
+            referer: None,
             headers: Vec::new(),
             extra: Vec::new(),
         };
@@ -1339,6 +1439,9 @@ impl DownloadManager {
     }
 
     /// 任务选项回显（aria2.getOption）
+    ///
+    /// `header` 按 aria2 的形态回成字符串数组 —— AriaNg / Aria2 Explorer 的任务详情
+    /// 直接把这些值填回表单，回成单个字符串它们就显示成一整块。
     pub async fn option_of(&self, gid: &str) -> Option<serde_json::Value> {
         let handle = self.get(gid).await?;
         let state = handle.state.lock().await;
@@ -1350,6 +1453,12 @@ impl DownloadManager {
         if let Some(ua) = &state.options.user_agent {
             options.insert("user-agent".into(), ua.clone().into());
         }
+        if let Some(referer) = &state.options.referer {
+            options.insert("referer".into(), referer.clone().into());
+        }
+        if !state.options.headers.is_empty() {
+            options.insert("header".into(), header_lines(&state.options.headers).into());
+        }
         for (key, value) in &state.options.extra {
             options.insert(key.clone(), value.clone().into());
         }
@@ -1359,6 +1468,8 @@ impl DownloadManager {
     /// 修改选项（aria2.changeOption）。
     ///
     /// `dir` 必须仍过白名单；`dir` / `out` 只对未开跑（waiting/paused）的任务生效。
+    /// `header` / `referer` / `user-agent` **立刻替换**，运行中的任务在下一次重试或
+    /// 分段续传时用上新值（每段请求都从任务状态现取，不缓存）。
     /// 其余键原样存进 extra（getOption 回显），引擎不消费。
     pub async fn change_option(&self, gid: &str, options: &serde_json::Value) -> Option<()> {
         let handle = self.get(gid).await?;
@@ -1378,9 +1489,19 @@ impl DownloadManager {
         if let Some(ua) = options.get("user-agent").and_then(Value::as_str) {
             state.options.user_agent = Some(ua.to_string());
         }
+        if let Some(referer) = options.get("referer").and_then(Value::as_str) {
+            state.options.referer = Some(referer.to_string());
+        }
+        // 空数组视为「清空所有自定义头」，与 aria2 一致
+        if let Some(value) = options.get("header") {
+            state.options.headers = parse_header_option(value).unwrap_or_default();
+        }
         if let Some(map) = options.as_object() {
             for (key, value) in map {
-                if matches!(key.as_str(), "dir" | "out" | "user-agent" | "header") {
+                if matches!(
+                    key.as_str(),
+                    "dir" | "out" | "user-agent" | "referer" | "header"
+                ) {
                     continue;
                 }
                 if let Some(text) = value.as_str() {
@@ -1597,52 +1718,169 @@ async fn run_bt_task(
     }
 }
 
+/// 探测拿到的那几项：总长 / 是否支持 Range / ETag
+struct RemoteInfo {
+    total: Option<u64>,
+    accept_ranges: bool,
+    etag: Option<String>,
+}
+
+/// 重定向跳数上限（aria2 默认 5，浏览器 20，这里取中间偏宽的值）
+const MAX_REDIRECTS: usize = 10;
+
+/// 发一次请求并**自己**跟随 3xx，每一跳重新装上同一份请求头。
+///
+/// 为什么不用 reqwest 的自动跟随：它在跨源跳转时按规范删掉 `Cookie` /
+/// `Authorization` / `Proxy-Authorization`（`remove_sensitive_headers`），而且
+/// 这个行为不受 redirect policy 控制。浏览器插件抓下来的链接恰好最常跨源跳
+/// （短链 → CDN、图片站 → 图床、`/download?id=` → 对象存储），头一丢就是 403/401；
+/// 原版 aria2 的 `--header` 是**每一跳原样重发**的，这里对齐它。
+///
+/// Range 也逐跳重发：跳转后拿到的是同一个文件，续传语义不能断。
+async fn send_following(
+    engine: &EngineHandle,
+    method: reqwest::Method,
+    uri: &str,
+    headers: &reqwest::header::HeaderMap,
+    range: Option<&str>,
+) -> Result<reqwest::Response, FailKind> {
+    let mut url = reqwest::Url::parse(uri)
+        .map_err(|err| FailKind::Failed(1, format!("bad url {uri}: {err}")))?;
+    for _ in 0..=MAX_REDIRECTS {
+        let mut request = engine
+            .http
+            .request(method.clone(), url.clone())
+            .headers(headers.clone());
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|err| FailKind::Failed(1, err.to_string()))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            // 3xx 却没有 Location：交给调用方按状态码判定失败
+            return Ok(response);
+        };
+        let next = url
+            .join(location)
+            .map_err(|err| FailKind::Failed(1, format!("bad redirect target {location}: {err}")))?;
+        // http(s) 之外（file://、ftp://）不跟：那不是我们要下的东西
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err(FailKind::Failed(
+                1,
+                format!("redirected to unsupported scheme: {next}"),
+            ));
+        }
+        url = next;
+    }
+    Err(FailKind::Failed(
+        1,
+        format!("too many redirects (> {MAX_REDIRECTS})"),
+    ))
+}
+
+/// `bytes 0-0/12345` → `Some(12345)`；`bytes 0-0/*` → `None`
+fn content_range_total(value: &str) -> Option<u64> {
+    value.rsplit_once('/')?.1.trim().parse::<u64>().ok()
+}
+
+/// 从响应头读出探测结果
+fn remote_info_from(response: &reqwest::Response, ranged_probe: bool) -> RemoteInfo {
+    let headers = response.headers();
+    let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let accept_ranges = if ranged_probe {
+        // GET + Range 探到 200，说明服务器压根不认 Range，只能单流
+        partial
+    } else {
+        headers
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("bytes"))
+    };
+    let total = if partial {
+        headers
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(content_range_total)
+    } else {
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    RemoteInfo {
+        total,
+        accept_ranges,
+        etag,
+    }
+}
+
+/// 探测远端：先 HEAD，被拒就退回 `GET + Range: bytes=0-0`。
+///
+/// 大量站点（对象存储、防盗链、部分 CDN）对 HEAD 直接回 405 / 403 / 501，
+/// 原版 aria2 用的是 GET 探测，所以「HEAD 不通就当任务失败」会误杀能下的链接 ——
+/// 而浏览器插件抓来的链接恰好大量落在这些站点上。
+async fn probe_remote(
+    engine: &EngineHandle,
+    uri: &str,
+    headers: &reqwest::header::HeaderMap,
+) -> Result<RemoteInfo, FailKind> {
+    let head = send_following(engine, reqwest::Method::HEAD, uri, headers, None).await?;
+    if head.status().is_success() {
+        return Ok(remote_info_from(&head, false));
+    }
+    let status = head.status();
+    drop(head);
+    crate::log_warn!("HEAD {uri} returned {status}; retrying probe with GET + Range: bytes=0-0");
+    let response = send_following(
+        engine,
+        reqwest::Method::GET,
+        uri,
+        headers,
+        Some("bytes=0-0"),
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Err(FailKind::Failed(
+            response.status().as_u16() as u32,
+            format!("HTTP {}", response.status()),
+        ));
+    }
+    // 只要头，不要体：response 在这里 drop，连接随之中断
+    Ok(remote_info_from(&response, true))
+}
+
 async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskOutcome {
     let cancel = handle.current_token();
-    let (uri, ua, headers) = {
+    let (uri, headers) = {
         let state = handle.state.lock().await;
         (
             state.uris.first().cloned().unwrap_or_default(),
-            state.options.user_agent.clone(),
-            state.options.headers.clone(),
+            task_header_map(
+                state.options.user_agent.as_deref(),
+                state.options.referer.as_deref(),
+                &state.options.headers,
+            ),
         )
     };
 
     // 1. 探测：长度 / 续传能力 / ETag
-    let mut request = engine.http.head(&uri);
-    if let Some(ua) = &ua {
-        request = request.header(reqwest::header::USER_AGENT, ua);
-    }
-    for (name, value) in &headers {
-        request = request.header(name, value);
-    }
-    let (total, accept_ranges, etag) = match request.send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let total = resp
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-            let accept = resp
-                .headers()
-                .get(reqwest::header::ACCEPT_RANGES)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("bytes"));
-            let etag = resp
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            (total, accept, etag)
-        }
-        Ok(resp) => {
-            return Err(FailKind::Failed(
-                resp.status().as_u16() as u32,
-                format!("HTTP {}", resp.status()),
-            ));
-        }
-        Err(err) => return Err(FailKind::Failed(1, err.to_string())),
-    };
+    let probe = probe_remote(engine, &uri, &headers).await?;
+    let total = probe.total;
+    let accept_ranges = probe.accept_ranges;
+    let etag = probe.etag;
 
     {
         let mut state = handle.state.lock().await;
@@ -1754,12 +1992,10 @@ async fn download_segment(
     cancel: CancellationToken,
     mut seg: SegmentState,
 ) -> Result<(), FailKind> {
-    let (uri, ua, headers, path) = {
+    let (uri, path) = {
         let state = handle.state.lock().await;
         (
             state.uris.first().cloned().unwrap_or_default(),
-            state.options.user_agent.clone(),
-            state.options.headers.clone(),
             state.target_path(),
         )
     };
@@ -1778,21 +2014,26 @@ async fn download_segment(
             return Err(FailKind::Cancelled);
         }
         let ranged = seg.end != u64::MAX;
-        let mut request = engine.http.get(&uri);
-        if let Some(ua) = &ua {
-            request = request.header(reqwest::header::USER_AGENT, ua);
-        }
-        for (name, value) in &headers {
-            request = request.header(name, value);
-        }
-        if ranged {
-            request = request.header(
-                reqwest::header::RANGE,
-                format!("bytes={}-{}", seg.start + seg.done, seg.end),
-            );
-        }
+        // 每轮重试都从任务状态现取请求头：changeOption 补的 Cookie 在运行中的任务上也生效
+        let headers = {
+            let state = handle.state.lock().await;
+            task_header_map(
+                state.options.user_agent.as_deref(),
+                state.options.referer.as_deref(),
+                &state.options.headers,
+            )
+        };
+        let range = ranged.then(|| format!("bytes={}-{}", seg.start + seg.done, seg.end));
 
-        match request.send().await {
+        match send_following(
+            &engine,
+            reqwest::Method::GET,
+            &uri,
+            &headers,
+            range.as_deref(),
+        )
+        .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 // 服务器无视 Range 返回 200：多段任务会被写花，直接失败
                 if ranged && seg.start + seg.done > 0 && resp.status() == reqwest::StatusCode::OK {
@@ -1865,7 +2106,7 @@ async fn download_segment(
             Err(err) => {
                 retries += 1;
                 if retries > 3 {
-                    return Err(FailKind::Failed(1, err.to_string()));
+                    return Err(err);
                 }
                 tokio::time::sleep(Duration::from_secs(retries as u64)).await;
             }
@@ -2329,11 +2570,11 @@ mod tests {
         let gid = manager
             .add_uri(
                 vec!["http://127.0.0.1:9/nothing.bin".into()],
-                Some(base.to_str().unwrap().into()),
-                Some("nothing.bin".into()),
-                None,
-                Vec::new(),
-                None,
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("nothing.bin".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2396,11 +2637,11 @@ mod tests {
         let gid = manager
             .add_uri(
                 vec![format!("http://{addr}/slow.bin")],
-                Some(base.to_str().unwrap().into()),
-                Some("slow.bin".into()),
-                None,
-                Vec::new(),
-                None,
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("slow.bin".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2621,16 +2862,265 @@ mod tests {
         let err = manager
             .add_uri(
                 vec!["magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862".into()],
-                None,
-                None,
-                None,
-                Vec::new(),
-                None,
+                UriOptions::default(),
             )
             .await
             .unwrap_err();
         // 能力关闭时是「明确的拒绝」，而不是默默创建一个永远 waiting 的任务
         assert!(err.message.contains("bittorrent"));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    // -- Aria2 Explorer 兼容（v4.9.52）-------------------------------------
+
+    #[test]
+    fn header_option_accepts_array_and_newline_string() {
+        // Aria2 Explorer 发数组（`["Cookie: ...", "User-Agent: ..."]`）
+        let array = serde_json::json!(["Cookie: sid=abc; theme=dark", "User-Agent: Chrome/140"]);
+        let parsed = parse_header_option(&array).unwrap();
+        assert_eq!(
+            parsed[0],
+            ("Cookie".to_string(), "sid=abc; theme=dark".to_string())
+        );
+        assert_eq!(parsed[1].0, "User-Agent");
+
+        // AriaNg 设置里那格是换行分隔的单串，同一份解析
+        let text = serde_json::json!("Referer: https://a.example/p\nX-Token: a:b:c\n\nbogus");
+        let parsed = parse_header_option(&text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        // 值里的冒号必须保留（token 常见 `a:b:c`）
+        assert_eq!(parsed[1], ("X-Token".to_string(), "a:b:c".to_string()));
+
+        // 键不存在 -> None（changeOption 靠这个区分「不动」与「清空」）
+        assert!(parse_header_option(&serde_json::Value::Null).is_none());
+        assert_eq!(
+            parse_header_option(&serde_json::json!([])).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn task_headers_drop_bad_names_and_let_header_win() {
+        let headers = vec![
+            ("Cookie".to_string(), "sid=abc".to_string()),
+            ("Bad Name".to_string(), "x".to_string()),
+            ("User-Agent".to_string(), "Mozilla/5.0".to_string()),
+        ];
+        let map = task_header_map(
+            Some("aria2/1.37.0"),
+            Some("https://ref.example/p"),
+            &headers,
+        );
+        assert_eq!(map.get("cookie").unwrap(), "sid=abc");
+        assert_eq!(map.get("referer").unwrap(), "https://ref.example/p");
+        // 显式 header 覆盖 user-agent 选项（aria2 同口径）
+        assert_eq!(map.get("user-agent").unwrap(), "Mozilla/5.0");
+        // 非法名字整条丢掉，且不能 panic（否则任务协程会静默消失）
+        assert!(map.get("bad name").is_none());
+        assert_eq!(map.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn change_option_roundtrips_header_and_referer() {
+        let base = std::env::temp_dir().join("asmoday-dl-changeoption");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::new(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            4,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec!["http://127.0.0.1:9/nothing.bin".into()],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        manager
+            .change_option(
+                &gid,
+                &serde_json::json!({
+                    "referer": "https://site.example/page",
+                    "header": ["Cookie: sid=abc"],
+                }),
+            )
+            .await
+            .unwrap();
+        let options = manager.option_of(&gid).await.unwrap();
+        assert_eq!(options["referer"], "https://site.example/page");
+        assert_eq!(options["header"], serde_json::json!(["Cookie: sid=abc"]));
+
+        // 空数组 = 清空（aria2 语义），别把「清空」实现成「不动」
+        manager
+            .change_option(&gid, &serde_json::json!({ "header": [] }))
+            .await
+            .unwrap();
+        let options = manager.option_of(&gid).await.unwrap();
+        assert!(options.get("header").is_none());
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 极简 HTTP 桩：只解析请求行 + 头，把响应字节写回去。端口由内核分配。
+    fn spawn_stub(
+        handler: impl Fn(&str, &str, &std::collections::HashMap<String, String>) -> Vec<u8>
+        + Send
+        + Sync
+        + 'static,
+    ) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::Arc as StdArc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = StdArc::new(handler);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let handler = handler.clone();
+                std::thread::spawn(move || {
+                    let Ok(clone) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(clone);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        return;
+                    }
+                    let mut headers = std::collections::HashMap::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            return;
+                        }
+                        let line = line.trim_end();
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            headers
+                                .insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                        }
+                    }
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    let _ = stream.write_all(&handler(&method, &path, &headers));
+                    let _ = stream.flush();
+                });
+            }
+        });
+        port
+    }
+
+    /// 浏览器插件那条链路的重头戏，一次覆盖四件事：
+    /// 1. HEAD 被 405 拒 → 退回 `GET + Range: bytes=0-0` 探测；
+    /// 2. 跨端口 302（= 跨源）→ 每一跳都重带 `Cookie` / `Referer`（reqwest 自动跟随会丢）；
+    /// 3. `referer` 选项与 `header` 数组真的到达服务端；
+    /// 4. 分段 Range 请求同样带头。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explorer_headers_survive_head_405_and_cross_host_redirect() {
+        const BODY: &[u8] = b"asmoday-";
+        let content = spawn_stub(|method, _path, headers| {
+            let authorized = headers.get("referer").map(String::as_str)
+                == Some("https://site.example/page")
+                && headers.get("cookie").map(String::as_str) == Some("sid=abc; theme=dark");
+            if !authorized {
+                return b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            }
+            // 防盗链站点的典型表现：HEAD 直接 405
+            if method == "HEAD" {
+                return b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            }
+            let (start, end) = match headers.get("range") {
+                Some(raw) => {
+                    let spec = raw.trim_start_matches("bytes=");
+                    let (a, b) = spec.split_once('-').unwrap();
+                    let start: usize = a.parse().unwrap();
+                    let end: usize = b.parse().unwrap_or(BODY.len() - 1);
+                    (start.min(BODY.len()), end.min(BODY.len() - 1))
+                }
+                None => (0, BODY.len() - 1),
+            };
+            let slice = &BODY[start..=end];
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                BODY.len(),
+                slice.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(slice);
+            response
+        });
+        // 短链 / 图片站常见的形态：302 跳到另一个主机（这里用另一个端口模拟跨源）
+        let jump = spawn_stub(move |_method, _path, _headers| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{content}/file.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        });
+
+        let base = std::env::temp_dir().join(format!(
+            "asmoday-dl-explorer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            1,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{jump}/download?id=7")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("file.bin".into()),
+                    referer: Some("https://site.example/page".into()),
+                    headers: vec![("Cookie".into(), "sid=abc; theme=dark".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            let entry = manager.option_of(&gid).await.unwrap();
+            assert_eq!(entry["referer"], "https://site.example/page");
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                status = item["status"].as_str().unwrap_or_default().to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status, "complete", "task did not finish: {status}");
+        let written = tokio::fs::read(base.join("file.bin")).await.unwrap();
+        assert_eq!(written, BODY);
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

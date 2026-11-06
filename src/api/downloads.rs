@@ -298,11 +298,18 @@ pub async fn add(
     if uri.is_empty() {
         return error(StatusCode::BAD_REQUEST, "uri 不能为空");
     }
-    // 第二、三个参数都传 None：请求头与分段覆盖只在 RPC 层开放，
+    // 其余字段保持 None：请求头 / referer / 分段覆盖只在 RPC 层开放，
     // 页面没有对应输入，凭空给默认值会把客户端的语义悄悄改掉。
     match state
         .downloads
-        .add_uri(vec![uri], body.dir, body.out, None, Vec::new(), None)
+        .add_uri(
+            vec![uri],
+            crate::core::download::UriOptions {
+                dir: body.dir,
+                out: body.out,
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(gid) => Json(json!({ "gid": gid })).into_response(),
