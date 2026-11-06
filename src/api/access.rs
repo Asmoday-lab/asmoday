@@ -51,6 +51,15 @@ fn trackable(path: &str) -> bool {
         || path.starts_with("/proxy/")
 }
 
+/// 高频轮询豁免：浏览器开着下载页时每秒 `GET /api/downloads` 拉一次任务快照
+/// （对齐 aria2 客户端的进度轮询习惯，AriaNg 默认也是 1s），记访问日志就是
+/// 每秒一条刷屏（2026-11-06 日志审查）。任务的真实动作——add / add_torrent /
+/// pause / unpause / remove / purge，全是 POST/DELETE——照常记录；外部 aria2
+/// 客户端打 `/jsonrpc`，本来就不在 trackable 范围里。
+fn poll_exempt(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::GET && path == "/api/downloads"
+}
+
 /// 把 `%XX` 解码成字节（只用于**参数名**比较，参数值一律原样保留）。
 fn decode_key(key: &str) -> String {
     let bytes = key.as_bytes();
@@ -132,7 +141,7 @@ pub async fn track(
 ) -> Response {
     let method = req.method().clone();
     let path = redact_path(req.uri().path());
-    let interesting = trackable(&path);
+    let interesting = trackable(&path) && !poll_exempt(req.method(), &path);
     // 只在需要记日志时克隆请求头与查询串；请求体全程不读（设计文档 3.7）
     let (headers, query) = if interesting {
         (
@@ -178,7 +187,7 @@ pub async fn track(
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_path, redact_query};
+    use super::{poll_exempt, redact_path, redact_query};
 
     #[test]
     fn share_tokens_never_reach_the_log() {
@@ -190,6 +199,20 @@ mod tests {
         // 非分享路径原样保留
         assert_eq!(redact_path("/api/files/list"), "/api/files/list");
         assert_eq!(redact_path("/api/shares"), "/api/shares");
+    }
+
+    #[test]
+    fn downloads_snapshot_poll_is_exempt_but_actions_are_logged() {
+        use axum::http::Method;
+        // 下载页每秒的快照轮询不记访问日志（2026-11-06 日志审查）
+        assert!(poll_exempt(&Method::GET, "/api/downloads"));
+        // 任务动作照常记录
+        assert!(!poll_exempt(&Method::POST, "/api/downloads/add"));
+        assert!(!poll_exempt(&Method::POST, "/api/downloads/pause"));
+        assert!(!poll_exempt(&Method::DELETE, "/api/downloads/purge"));
+        // 快照路径之外的同名请求也不豁免
+        assert!(!poll_exempt(&Method::GET, "/api/downloads/engine"));
+        assert!(!poll_exempt(&Method::GET, "/api/files/list"));
     }
 
     #[test]
