@@ -1062,7 +1062,7 @@ mod symlink_escape_tests {
         std::fs::write(outside.join("note.txt"), b"hi").unwrap();
         let link = root.join("link");
         if !link_dir(&outside, &link) {
-            eprintln!("环境不支持创建目录链接，跳过");
+            eprintln!("skipping: this environment cannot create directory links");
             let _ = std::fs::remove_dir_all(&base);
             return;
         }
@@ -1122,7 +1122,7 @@ mod symlink_escape_tests {
         std::fs::create_dir_all(&outside).unwrap();
         let link = root.join("link");
         if !link_dir(&outside, &link) {
-            eprintln!("环境不支持创建目录链接，跳过");
+            eprintln!("skipping: this environment cannot create directory links");
             let _ = std::fs::remove_dir_all(&base);
             return;
         }

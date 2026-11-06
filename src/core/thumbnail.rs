@@ -817,7 +817,7 @@ fn register_heif_hook() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         if !heifer::image_crate::register_image_decoder_hooks() {
-            crate::log_warn!("HEIC 解码器注册失败：同名扩展名已被其它解码器占用");
+            crate::log_warn!("HEIC decoder hook not registered: the extension is already taken by another decoder");
         }
     });
 }

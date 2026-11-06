@@ -103,7 +103,7 @@ where
             match WebSocketUpgrade::from_request_parts(parts, state).await {
                 Ok(upgrade) => Ok(MaybeWs(Some(upgrade))),
                 Err(err) => {
-                    eprintln!("[asmoday] WebSocket 升级被拒绝：{err:?}");
+                    eprintln!("[asmoday] websocket upgrade rejected: {err:?}");
                     Ok(MaybeWs(None))
                 }
             }
@@ -458,7 +458,7 @@ async fn bridge_ws(socket: WebSocket, target: String, inject: Vec<(String, Strin
     let upstream = match tokio_tungstenite::connect_async(request).await {
         Ok((stream, _)) => stream,
         Err(err) => {
-            eprintln!("[asmoday] 反代 WebSocket 连接上游失败（{target}）：{err}");
+            eprintln!("[asmoday] proxied websocket failed to reach upstream ({target}): {err}");
             return;
         }
     };

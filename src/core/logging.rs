@@ -122,6 +122,13 @@ static MAIN_SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 static ERROR_SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 /// 控制台颜色开关：TTY 且非 JSON 输出时才着色。初始化时探测一次。
 static COLOR: AtomicBool = AtomicBool::new(false);
+
+/// 控制台是否支持颜色（已含 Windows conhost 的 VT 开启）。
+///
+/// 一次性密码横幅这类非日志输出也要按同一判据着色：重定向到文件时不能带转义码。
+pub fn color_enabled() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
 /// 服务器本地时区偏移（秒）+ 探测来源（秒）
 static LOCAL_OFFSET: OnceLock<(i64, &'static str)> = OnceLock::new();
 

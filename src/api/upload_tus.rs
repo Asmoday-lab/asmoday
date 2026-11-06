@@ -76,7 +76,7 @@ impl TusStore {
         if let Err(err) = std::fs::remove_dir_all(&tmp_dir)
             && err.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!("warn: 清理分块上传临时目录失败：{err}");
+            eprintln!("warn: failed to clean the chunked-upload temp dir: {err}");
         }
         Self {
             tmp_dir,

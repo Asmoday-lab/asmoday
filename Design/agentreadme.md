@@ -378,6 +378,9 @@ GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任�
 GWT-AUTH-09 Given 任意实例  When POST /api/auth/setup  Then 404（端点已随 v4.9.34 删除，初始化只走登录 + 改密链路）
 GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问日志  Then 无一次性密码明文（只打 stdout）、无初始化令牌
 GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When 客户端连发登录失败  Then 防爆破池按「最右不可信地址」计数，伪造值换不动桶
+GWT-AUTH-12 Given 全新数据目录首次启动  When 看控制台  Then 一次性密码出现在 `====` 边框的 `ASMODAY - ADMINISTRATOR CREDENTIAL` 横幅里、单独成行（TTY 下反显高亮），下面一行 `Open: http://localhost:4242`；整段只有 ASCII，重定向到文件时无转义码（v4.9.42）
+GWT-AUTH-13 Given 任意启动  When 看启动日志  Then 有一行 `open in browser: http://localhost:<port><base_url>`（host 配 `0.0.0.0` / `::` 时仍是 localhost，绑具体 IP 时用该 IP）；默认监听 `127.0.0.1`，`netstat` 里没有 `0.0.0.0:<port>`（v4.9.42）
+GWT-AUTH-14 Given 端口已被占用  When 再启动一个实例  Then 控制台全英文：`failed to bind …: address already in use (os error 10048)` + `Hint: the port is already taken…`，不出现系统本地化的中文（v4.9.42）
 GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码；用户拿它登录后在强制改密弹窗换正式密码，网页端全程无用户名（v4.9.34）
 GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
 GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v20 跑完  Then 只留「启用中 id 最小的账号」（无启停列时取 id 最小），其余账号从 users 表物理删除，其 sessions / favorites / play_history / shares / access_tokens 一并删掉（含 user_id 为 NULL 的遗留令牌）；再次启动幂等（v4.9.30）
@@ -1561,7 +1564,7 @@ GWT-DAV-12 Given 子路径部署 base_url=/asmoday  When PROPFIND  Then href 带
 │ [通用] [媒体] [安全] [高级]                │
 │ ────────────────────────────────────────   │
 │  服务监听                                  │
-│   地址 [0.0.0.0    ]  端口 [8080]          │
+│   地址 [127.0.0.1  ]  端口 [4242]          │
 │   提示：0.0.0.0 + 未启用 SSL 有风险 ⚠      │
 │                                            │
 │  [保存]  [恢复默认]                        │

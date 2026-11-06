@@ -20,10 +20,11 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Asmoday configuration (TOML).
 # Written on first start; edit here or through Settings in the web UI.
 
 [server]
-# Listen address. "0.0.0.0" exposes every interface; use "127.0.0.1" behind a
-# reverse proxy. "::" listens on IPv4 + IPv6.
+# Listen address. Default "127.0.0.1": loopback only, reachable from this machine.
+# Use "0.0.0.0" to serve the LAN, or "::" for IPv4 + IPv6. When exposing it to
+# the internet, put a reverse proxy (Caddy/Nginx) in front.
 # CLI -H / env ASMODAY_HOST take precedence.
-host = "0.0.0.0"
+host = "127.0.0.1"
 # Listen port. CLI -p / env ASMODAY_PORT take precedence.
 port = 4242
 
@@ -399,7 +400,8 @@ pub struct SharesConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// 监听地址（IPv4/IPv6 字面量）。默认 "0.0.0.0"（设计文档 v2.7.0 3.1.1）
+    /// 监听地址（IPv4/IPv6 字面量）。默认 "127.0.0.1"（只监听回环，v4.9.42）：
+    /// 首启不该把一个没设密码的服务暴露到局域网；要局域网访问显式改 "0.0.0.0" / "::"。
     pub host: String,
     pub port: u16,
     pub ssl: SslConfig,
@@ -411,7 +413,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: DEFAULT_PORT,
             ssl: SslConfig::default(),
             proxy: ProxyConfig::default(),

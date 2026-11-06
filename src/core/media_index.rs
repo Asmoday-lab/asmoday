@@ -196,7 +196,7 @@ impl MediaIndex {
             *guard = open(&self.db_path);
         }
         f(guard.as_ref()?)
-            .map_err(|err| crate::log_debug!("媒体索引不可用：{err}"))
+            .map_err(|err| crate::log_debug!("media index unavailable: {err}"))
             .ok()
     }
 }

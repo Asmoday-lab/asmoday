@@ -181,7 +181,7 @@ Add the server in your file manager, Cyberduck, rclone or a phone sync app:
 Run `asmoday --reset-password` on the server — there is no passwordless backdoor in the config. Lost your TOTP device? `asmoday --reset-2fa`.
 
 **Other devices on my LAN cannot connect.**
-Make sure `[server].host` is `0.0.0.0` and the firewall allows the port. If you use a reverse proxy, narrow it back to `127.0.0.1`.
+The default listens on loopback only (`[server].host = "127.0.0.1"`). Set it to `0.0.0.0` (or `::`) and allow the port in the firewall; keep `127.0.0.1` behind a reverse proxy.
 
 **The port is already in use.**
 Override it with `asmoday -p 8080`, or change `[server].port`.

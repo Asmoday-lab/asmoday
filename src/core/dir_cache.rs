@@ -274,7 +274,7 @@ impl DirCache {
         f(guard.as_ref()?)
             .map_err(|err| {
                 // 缓存坏了不影响搜索，只在 debug 级别留一行
-                crate::log_debug!("目录快照缓存不可用：{err}");
+                crate::log_debug!("directory snapshot cache unavailable: {err}");
             })
             .ok()
     }

@@ -454,7 +454,7 @@ fn collapse_multi_user_columns(conn: &Connection) -> rusqlite::Result<()> {
         let accounts = conn.execute("DELETE FROM users WHERE id <> ?1", params![keep])?;
         if accounts > 0 {
             crate::log_info!(
-                "已删除 {} 个多余账号（保留 #{keep}）及其 {child_rows} 条会话/令牌/分享/收藏/播放历史",
+                "removed {} extra account(s) (kept #{keep}) and their {child_rows} session/token/share/favorite/play-history rows",
                 accounts
             );
         }
@@ -645,7 +645,7 @@ impl AuthStore {
         // 启动日志里得有一条能对上号的原因（NAS 上两万条要跑几分钟）。
         if before < 6 {
             crate::log_info!(
-                "数据库已升级到 v6：媒体索引将在后台重建（补全名称排序键），期间按时间排序不受影响"
+                "database upgraded to v6: media index will rebuild in the background (sort-name keys); date sorting is unaffected"
             );
         }
         // 数据库文件权限 0600（设计文档 4.1）：里面是密码哈希、TOTP 密钥与会话，

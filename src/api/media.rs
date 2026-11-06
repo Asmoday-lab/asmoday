@@ -535,7 +535,7 @@ pub async fn thumb(
     let total_ms = started.elapsed().as_millis();
     if total_ms >= 200 {
         crate::log_warn!(
-            "缩略图偏慢 {}ms（路径解析 {} / 元数据 {} / 取图 {}）{}",
+            "slow thumbnail {}ms (path resolve {} / metadata {} / read {}) {}",
             total_ms,
             resolve_ms,
             meta_ms - resolve_ms,
@@ -1436,7 +1436,7 @@ pub(crate) fn sync_index(
         Ok(false)
     })?;
     if window_hit {
-        crate::log_debug!("媒体索引命中窗口：{}", scope.root);
+        crate::log_debug!("media index: scan window hit for {}", scope.root);
         return Some(0);
     }
 
@@ -1445,7 +1445,7 @@ pub(crate) fn sync_index(
     // 末尾一个短事务收尾（尾批 flush + prune + mark_synced）。
     let outcome = walk_into_index(index, root, &scope, refresh, cache)?;
     crate::log_debug!(
-        "媒体索引同步完成：{} {} 条，{}ms",
+        "media index synced: {} ({} entries, {}ms)",
         scope.root,
         outcome.0,
         started.elapsed().as_millis()
@@ -1456,7 +1456,7 @@ pub(crate) fn sync_index(
     if let Some(cache_dir) = index.thumb_cache() {
         let units = crate::core::thumbnail::purge_paths(cache_dir, &outcome.1);
         if units > 0 {
-            crate::log_debug!("外部删除回收缩略图缓存：{units} 个单元");
+            crate::log_debug!("thumbnail cache: purged {units} units for externally deleted files");
         }
     }
     Some(outcome.0)
@@ -1681,7 +1681,7 @@ fn walk_into_index(
     })?;
 
     crate::log_debug!(
-        "媒体索引走树：{} 个目录（{} 个命中旧行，跳过写库），读目录耗时 {}ms",
+        "media index walk: {} dirs ({} reused from mtime, write skipped), read_dir {}ms",
         dirs,
         reused,
         io_time.as_millis()
@@ -2014,7 +2014,7 @@ fn build_items(
                 page.writes.dims.extend(fresh);
             }
             crate::log_debug!(
-                "像素宽高：{} 张图（缓存命中 {}，读盘 {}）耗时 {}ms",
+                "image dimensions: {} files (cache hits {}, disk reads {}) in {}ms",
                 dim_candidates.len(),
                 cached_hits,
                 disk_reads,
@@ -2215,7 +2215,7 @@ fn build_items(
 
     if !tags_by_pos.is_empty() || !subtitle_by_pos.is_empty() {
         crate::log_debug!(
-            "音频标签 / 字幕歌词探测：{} 条音频、{} 条视频、{} 条歌词，耗时 {}ms",
+            "tags/lyrics probe: {} audio, {} video, {} lyrics in {}ms",
             tags_by_pos.len(),
             subtitle_by_pos.len(),
             lyrics_by_pos.values().filter(|found| **found).count(),

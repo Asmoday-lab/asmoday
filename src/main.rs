@@ -316,11 +316,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         Err(err) => crate::log_warn!("failed to purge share tombstones: {err}"),
     }
 
+    // 控制台入口地址：一次性密码横幅与启动日志共用同一份（v4.9.42）。
+    // 放在 CLI 分支之前——`--init` 也要把它印在密码下面。
+    let url = access_url(&config.server);
+
     if cli.init {
-        return bootstrap_admin(&auth, &data_dir).await;
+        return bootstrap_admin(&auth, &data_dir, &url).await;
     }
     if cli.reset_password {
-        return reset_admin_password(&auth).await;
+        return reset_admin_password(&auth, &url).await;
     }
     if cli.reset_2fa {
         return reset_two_factor(&auth).await;
@@ -562,10 +566,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             .create_user("admin", &password)
             .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
         auth.set_must_change_password(user.id, true)?;
-        println!(
-            "[asmoday] no administrator yet; created user 'admin' with a one-time password: {password}"
-        );
-        println!("[asmoday] sign in with this password, you will be asked to set a new one.");
+        crate::log_info!("no administrator yet; created user 'admin'");
+        print_one_time_password(&password, Some(&url));
     }
 
     state
@@ -659,6 +661,9 @@ async fn run(cli: Cli) -> Result<(), String> {
     } else {
         crate::log_info!("listening on {addr} (local interface only)");
     }
+    // 带 scheme 的完整 URL：终端（Windows Terminal / iTerm / VS Code）会把它变成
+    // 可点击链接，`0.0.0.0:4242` 这种裸地址点不了也打不开（v4.9.42）
+    crate::log_info!("open in browser: {url}");
     crate::log_info!(
         "frontend build: {}",
         option_env!("ASMODAY_BUILD_ID").unwrap_or("dev")
@@ -730,6 +735,63 @@ fn warn_nested_mounts(set: &core::path_guard::MountSet) {
     }
 }
 
+/// 控制台里给出的入口地址：**必须带 scheme**，终端才会把它识别成可点击链接。
+///
+/// 通配地址（0.0.0.0 / ::）不能直接给人点——浏览器打开 `http://0.0.0.0:4242` 会被
+/// 拒（v4.9.42），所以换成 `localhost`；绑具体网卡地址时原样用它，那种配置下用户
+/// 本来就是要从别的设备访问。`base_url` 已经是完整 URL 时直接返回它（反代场景）。
+fn access_url(server: &core::config::ServerConfig) -> String {
+    let base = server.proxy.base_url.trim();
+    if base.starts_with("http://") || base.starts_with("https://") {
+        return base.trim_end_matches('/').to_string();
+    }
+    let host = match server.host.trim().parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() || ip.is_loopback() => "localhost".to_string(),
+        // IPv6 字面量在 URL 里必须加方括号，否则解析器会把端口当成地址的一部分
+        Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        Ok(ip) => ip.to_string(),
+        Err(_) => "localhost".to_string(),
+    };
+    let scheme = if server.ssl.enabled { "https" } else { "http" };
+    format!(
+        "{scheme}://{host}:{}{}",
+        server.port,
+        base.trim_end_matches('/')
+    )
+}
+
+/// 一次性密码必须「一眼看见」：框起来、单独成行、附上能直接点的入口地址。
+///
+/// 只走 stdout —— 绝不 log_*!，那会落进 data/logs/asmoday.log 并随轮转留存
+/// （明文凭据不落盘，2026-11-04 审查）。
+///
+/// 颜色跟着日志系统同一个判据（`logging::color_enabled()`：TTY 且非 JSON），
+/// 重定向到文件时不带任何转义码；正文字符全 ASCII，GBK 代码页的 cmd 也不会乱码。
+fn print_one_time_password(password: &str, url: Option<&str>) {
+    let color = crate::core::logging::color_enabled();
+    let (title, value, dim, reset) = if color {
+        ("\x1b[1;36m", "\x1b[1;7;33m", "\x1b[90m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+    let bar = "=".repeat(68);
+    println!();
+    println!("{dim}{bar}{reset}");
+    println!("{title}  ASMODAY - ADMINISTRATOR CREDENTIAL{reset}");
+    println!("{dim}{bar}{reset}");
+    println!("  One-time password (sign in with it, then set your own):");
+    println!();
+    // 密码整行反显：深色终端里是一块亮色，眼睛不用在日志里找
+    println!("      {value} {password} {reset}");
+    println!();
+    if let Some(url) = url {
+        println!("  Open: {url}");
+    }
+    println!("{dim}  Shown only once; it is never written to the log file.{reset}");
+    println!("{dim}{bar}{reset}");
+    println!();
+}
+
 /// 绑定失败时补一句人话（v4.9.5）。
 ///
 /// Windows 上 `PermissionDenied`（WSAEACCES 10013）最常见的来源**不是**端口被监听
@@ -737,16 +799,21 @@ fn warn_nested_mounts(set: &core::path_guard::MountSet) {
 /// 出站连接临时占了源端口 —— 浏览器 / WebView2 / 代理动辄几百条长连接，撞上就起不来，
 /// 连接一断又能绑定。用户只看到一句「以一种访问权限不允许的方式做了一个访问套接字的
 /// 尝试」，完全无从下手，所以这里把原因和两条出路直接打出来。
+///
+/// 这段会出现在控制台（`startup failed: …` 后面），所以逐条用英文：控制台不保证
+/// UTF-8 代码页，中文在 GBK 的 cmd 里是乱码（v4.9.42）。
 fn bind_hint(err: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
     match err.kind() {
         ErrorKind::AddrInUse => {
-            "\n提示：端口已被其它程序监听。关掉那个程序，或改 [server] port 换一个端口。"
+            "\nHint: the port is already taken by another program. Close it, or change [server] port."
         }
         ErrorKind::PermissionDenied if cfg!(windows) => {
-            "\n提示：Windows 报「拒绝访问」通常不是没权限，而是这个端口落在系统动态端口范围里，\n             被别的程序（浏览器 / 代理 / WebView）当作临时源端口占用了。可以：\n             · 换一个端口（改 [server] port，比如 42420）；\n             · 或在管理员命令行把动态端口范围改回默认：\n             netsh int ipv4 set dynamicport tcp start=49152 num=16384\n             netsh int ipv6 set dynamicport tcp start=49152 num=16384"
+            "\nHint: on Windows \"access denied\" usually does not mean missing privileges: the port\n             sits inside the system's dynamic port range and was temporarily taken as an outbound\n             source port by another program (browser / proxy / WebView). Either:\n             - pick another port ([server] port, e.g. 42420); or\n             - as administrator, restore the default dynamic range:\n             netsh int ipv4 set dynamicport tcp start=49152 num=16384\n             netsh int ipv6 set dynamicport tcp start=49152 num=16384"
         }
-        ErrorKind::PermissionDenied => "\n提示：没有权限绑定该端口（1024 以下通常需要 root）。",
+        ErrorKind::PermissionDenied => {
+            "\nHint: no permission to bind this port (ports below 1024 usually need root)."
+        }
         _ => "",
     }
 }
@@ -766,7 +833,17 @@ async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, Stri
         socket.listen(1024)?;
         Ok(socket)
     })
-    .map_err(|e| format!("failed to bind {addr}: {e}{}", bind_hint(&e)))?;
+    .map_err(|e| {
+        // `io::Error` 的 Display 在 Windows 上是**系统语言**的本地化文本
+        // （「通常每个套接字地址…」），控制台要全英文就得按错误码自己写常见项
+        let detail = match e.raw_os_error() {
+            Some(10048) => "address already in use (os error 10048)".to_string(),
+            Some(10013) => "permission denied (os error 10013)".to_string(),
+            Some(10049) => "cannot assign the requested address (os error 10049)".to_string(),
+            _ => e.to_string(),
+        };
+        format!("failed to bind {addr}: {detail}{}", bind_hint(&e))
+    })?;
     let std_listener: std::net::TcpListener = socket.into();
     tokio::net::TcpListener::from_std(std_listener)
         .map_err(|e| format!("failed to register listener for {addr}: {e}"))
@@ -1247,7 +1324,7 @@ fn spawn_media_janitor(state: AppState) {
 }
 
 /// `--init`：确保有管理员账号，并打印一次性密码
-async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path) -> Result<(), String> {
+async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path, url: &str) -> Result<(), String> {
     crate::log_info!("data directory: {}", data_dir.display());
     match auth.user_count() {
         Ok(0) => {}
@@ -1266,7 +1343,7 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path) -> Result<(), String
     crate::log_info!("administrator created: {}", user.username);
     // 一次性密码只打控制台（stdout），绝不走 log_*!——那会落进
     // data/logs/asmoday.log 并随轮转留存（2026-11-04 审查）
-    println!("[asmoday] one-time password (must be changed after login): {password}");
+    print_one_time_password(&password, Some(url));
     Ok(())
 }
 
@@ -1276,7 +1353,7 @@ async fn bootstrap_admin(auth: &AuthStore, data_dir: &Path) -> Result<(), String
 /// 1. 环境变量 `ASMODAY_RESET_PASSWORD`——**只在带 `--reset-password` 启动时生效**，
 ///    且同一个值只能用一次（指纹存库，重复出现拒绝并记 WARN，设计文档 3.1.2）；
 /// 2. 未提供环境变量时随机生成一次性密码并打印。
-async fn reset_admin_password(auth: &AuthStore) -> Result<(), String> {
+async fn reset_admin_password(auth: &AuthStore, url: &str) -> Result<(), String> {
     let Some(user) = auth.first_user()? else {
         return Err("no user yet; run with --init first".to_string());
     };
@@ -1310,7 +1387,7 @@ async fn reset_admin_password(auth: &AuthStore) -> Result<(), String> {
             auth.set_must_change_password(user.id, true)?;
             crate::log_info!("password reset for {}", user.username);
             // 同 bootstrap_admin：只打 stdout，不落日志文件
-            println!("[asmoday] one-time password (must be changed after login): {password}");
+            print_one_time_password(&password, Some(url));
         }
     }
     Ok(())
@@ -1419,9 +1496,44 @@ mod tests {
             toml::from_str(core::config::DEFAULT_CONFIG_TOML).expect("默认配置必须能被自己解析");
         config.validate().expect("默认配置必须通过校验");
         assert_eq!(config.server.port, 4242);
+        // 首启默认只监听回环（v4.9.42）：把这行钉住，别让模板和 Default 又漂回 0.0.0.0
+        assert_eq!(config.server.host, "127.0.0.1");
         assert!(config.system.mounts.is_empty());
         assert!(config.services.is_empty());
         assert!(config.auth.local_enabled);
+    }
+
+    /// 控制台入口地址（v4.9.42）：终端只认带 scheme 的完整 URL，通配地址换成 localhost。
+    #[test]
+    fn console_url_is_clickable_and_never_a_wildcard() {
+        let mut server = core::config::ServerConfig::default();
+        assert_eq!(server.host, "127.0.0.1");
+        assert_eq!(access_url(&server), "http://localhost:4242");
+
+        // 0.0.0.0 / :: 浏览器打不开，必须换成 localhost
+        server.host = "0.0.0.0".to_string();
+        assert_eq!(access_url(&server), "http://localhost:4242");
+        server.host = "::".to_string();
+        assert_eq!(access_url(&server), "http://localhost:4242");
+
+        // 绑具体网卡地址时原样用它（那种配置就是要从别的设备访问）
+        server.host = "192.168.1.50".to_string();
+        assert_eq!(access_url(&server), "http://192.168.1.50:4242");
+
+        // IPv6 字面量必须加方括号，否则端口会被当成地址的一部分
+        server.host = "fd00::1".to_string();
+        assert_eq!(access_url(&server), "http://[fd00::1]:4242");
+
+        // 子路径部署与 SSL
+        server.host = "127.0.0.1".to_string();
+        server.proxy.base_url = "/asmoday/".to_string();
+        assert_eq!(access_url(&server), "http://localhost:4242/asmoday");
+        server.ssl.enabled = true;
+        assert_eq!(access_url(&server), "https://localhost:4242/asmoday");
+
+        // base_url 已经是完整 URL（反代域名）时原样给出
+        server.proxy.base_url = "https://nas.example.com/asmoday".to_string();
+        assert_eq!(access_url(&server), "https://nas.example.com/asmoday");
     }
 
     #[test]
