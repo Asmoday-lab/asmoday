@@ -8,8 +8,8 @@
 
 1. **一轮只构建一次**。`web/dist` 被 rust-embed 内嵌进二进制，所以改了前端必须
    `npm run build` → `cargo build`，但这一串在一轮验证里只做一次，中间不重复。
-2. **不删仓库里的任何既有文件**。探针数据只写 `target/probe/<时间戳>`（已 ignore、
-   与仓库同卷），跑完只删自己创建的那一个时间戳目录；缩略图缓存、`dist/assets` 之类
+2. **不删仓库里的任何既有文件**。探针数据只写 `.probe/<时间戳>`（已 ignore、与仓库
+   同卷），跑完只删自己创建的那一个时间戳目录；缩略图缓存、`dist/assets` 之类
    的既有产物一律不动。
 3. **产物固定命名，覆盖写**。截图 `probes/shots/login-code.png` 这种名字，同一状态
    永远同一张；不再出现 `shot-login-*-v4947.png` / `-v4948.png` 一路增殖。
@@ -74,11 +74,14 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
 
 ## 3. 数据与产物
 
-- **数据根**：`target/probe/<YYYYmmdd-HHMMSS>/<case>/`。套件结束 `rmtree` 这一个根，
-  不碰 `target/` 里其它编译产物；`--keep-data` 保留它并打印 `server.log` 尾部。
+- **数据根**：`.probe/<YYYYmmdd-HHMMSS>/<case>/`。套件结束 `rmtree` 这一个根，
+  不碰仓库里其它任何东西；`--keep-data` 保留它并打印 `server.log` 尾部。
 - **为什么不用系统 `%TEMP%`**：Windows 上二进制在 `%TEMP%` 里建实例锁会拿到
   `os error 5`（`cannot open instance lock`），同一份 exe 在仓库盘上正常。数据根固定
-  放 `target/`，既绕开这个坑，又天然被 `.gitignore` 忽略。
+  放仓库根的 `.probe/`，既绕开这个坑，又天然被 `.gitignore` 忽略。
+- **为什么不再放 `target/`**：`target/` 下只留 `debug` / `release` 两个 profile 目录，
+  谁往里塞东西（探针、临时库、打包产物）就等于制造「`cargo clean` 也清不干净的杂物」。
+  单测的临时库同理，落在 `target/<profile>/test-scratch/`（`core::test_scratch_dir()`）。
 - **端口**：`free_port()` 让内核分配，不再写死 4299/4300（曾经撞过一次）。
 - **代理**：本机探测必须 `ProxyHandler({})` / `NO_PROXY=127.0.0.1`，否则会被
   `http_proxy` 劫持成 502。
@@ -115,6 +118,9 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
 - **v2（v4.9.49 后）**：记下「工作区里的删除会被重定向到回收站」这一环境事实与实测代价
   （一次重编 1767 条 / 539 MB），`touch` 反模式补上这条后果；口径改为「少触发重编」而不是
   去清回收站。
+- **v3（v4.9.53）**：`target/` 只留 `debug` / `release`——探针数据根从
+  `target/probe/<时间戳>` 迁到 `.probe/<时间戳>`，单测临时库从 `target/test-scratch/`
+  迁到 `target/<profile>/test-scratch/`（`core::test_scratch_dir()`），文档同步。
 - **v1（v4.9.48）**：从 `.asmoday-probe` 里四份「按版本号」的脚本收敛为
   `probes/run_login.py` 一套；数据根从「源码目录 + 每次 rmtree」改为
-  `target/probe/<时间戳>`；截图改固定名；明确 L0~L3 分层与六条反模式。
+  `target/probe/<时间戳>`（v3 又迁出 `target/`）；截图改固定名；明确 L0~L3 分层与六条反模式。

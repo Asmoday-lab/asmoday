@@ -1545,9 +1545,7 @@ mod tests {
     use super::*;
 
     fn temp_store(name: &str) -> AuthStore {
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-scratch");
+        let base = crate::core::test_scratch_dir();
         let mut path = base.join(format!("auth-{name}.db"));
         // 连 -wal / -shm 一起删：只删主文件时，残留 WAL 会把上一次跑到一半的迁移
         // 重放一遍，下一个用例直接死在 `duplicate column name`（2026-11-06 踩到）
@@ -1965,10 +1963,7 @@ mod tests {
         let store = temp_store("backup");
         store.create_user("admin", "Asmoday#2026").unwrap();
 
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-scratch")
-            .join("auth-backup-copy.db");
+        let out = crate::core::test_scratch_dir().join("auth-backup-copy.db");
         let _ = std::fs::remove_file(&out);
 
         let bytes = store.backup_to(&out).unwrap();

@@ -244,11 +244,7 @@ mod tests {
     use super::*;
 
     fn scratch_dir() -> std::path::PathBuf {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-scratch");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+        crate::core::test_scratch_dir()
     }
 
     /// ID3v2.3 文本帧（编码字节 3 = UTF-8）

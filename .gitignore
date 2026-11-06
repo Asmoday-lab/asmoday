@@ -10,6 +10,8 @@
 # 流程见 Design/testing.md，脚本由本机维护；新环境需要时照该文档自建。
 /probes/
 /scripts/
+# 探针运行期数据根（一次套件一个时间戳目录，跑完即删）
+/.probe/
 
 # 前端产物（由 vite build 输出，供 rust-embed 打包）
 /dist

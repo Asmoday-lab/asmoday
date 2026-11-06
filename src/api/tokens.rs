@@ -392,10 +392,7 @@ mod tests {
     use crate::core::auth::AuthStore;
 
     fn temp_store(name: &str) -> AuthStore {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-scratch")
-            .join(format!("tokens-{name}.db"));
+        let path = crate::core::test_scratch_dir().join(format!("tokens-{name}.db"));
         let _ = std::fs::remove_file(&path);
         let store = AuthStore::new(path);
         store.init().unwrap();

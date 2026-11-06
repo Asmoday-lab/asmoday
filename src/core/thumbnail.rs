@@ -1237,12 +1237,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// 测试用临时目录：放在 target/ 下，避免系统临时目录的权限差异
+    /// 测试用临时目录：放在 `target/<profile>/` 下，避免系统临时目录的权限差异
     fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-scratch")
-            .join(name);
+        let dir = crate::core::test_scratch_dir().join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
