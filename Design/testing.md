@@ -8,9 +8,9 @@
 
 1. **一轮只构建一次**。`web/dist` 被 rust-embed 内嵌进二进制，所以改了前端必须
    `npm run build` → `cargo build`，但这一串在一轮验证里只做一次，中间不重复。
-2. **不删仓库里的任何既有文件**。探针数据只写 `.probe/<时间戳>`（已 ignore、与仓库
-   同卷），跑完只删自己创建的那一个时间戳目录；缩略图缓存、`dist/assets` 之类
-   的既有产物一律不动。
+2. **不删仓库里的任何既有文件**。探针数据只写 `<工作区>/.probe/<时间戳>`
+   （`asmoday/` 的上一级，与仓库同级），跑完只删自己创建的那一个时间戳目录；
+   缩略图缓存、`dist/assets` 之类的既有产物一律不动。
 3. **产物固定命名，覆盖写**。截图 `probes/shots/login-code.png` 这种名字，同一状态
    永远同一张；不再出现 `shot-login-*-v4947.png` / `-v4948.png` 一路增殖。
 4. **断言跟着 GWT 走**。新增/改动的验收条目先写进 `Design/agentreadme.md`，探针里的
@@ -60,9 +60,9 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
 下载类探针为什么要自备桩站：它验的正是「站点不配合」的三种形态（HEAD 405、
 缺 Referer/Cookie 就 403、302 跳到另一个源），用真实外网站点既不稳定也没法断言。
 
-依赖：`playwright-core` 装在 `.asmoday-probe/node_modules`（`run_login.py` 会自动把它
-塞进 `NODE_PATH`）；浏览器优先用 `CHROME_PATH`，否则扫 `ms-playwright/chromium-*`。
-缺了会直接报一句「npm i playwright-core --prefix .asmoday-probe」，不会静默跳过。
+依赖：`playwright-core` 装在 `asmoday/` 同级的 `.probe/node_modules`（仓库外面；`run_login.py`
+会自动把它塞进 `NODE_PATH`）；浏览器优先用 `CHROME_PATH`，否则扫 `ms-playwright/chromium-*`。
+缺了会直接报一句「npm i playwright-core --prefix ../.probe」，不会静默跳过。
 
 用例与断言口径：
 
@@ -74,12 +74,17 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
 
 ## 3. 数据与产物
 
-- **数据根**：`.probe/<YYYYmmdd-HHMMSS>/<case>/`。套件结束 `rmtree` 这一个根，
+- **数据根**：`<工作区>/.probe/<YYYYmmdd-HHMMSS>/<case>/`，即 `asmoday/` 的**同级**
+  目录（`<工作区>\.probe\...`，例如 `C:\AimerFiles\deepseekworkspace\.probe\20261106-204500`）。套件结束 `rmtree` 这一个根，
   不碰仓库里其它任何东西；`--keep-data` 保留它并打印 `server.log` 尾部。
+- **边界规则（唯一一条，别的都是它的推论）**：`asmoday/` 里只放前后端源码 + `target/`；
+  运行期要写的东西一律放 `asmoday/` 同级，且**不得越出工作区**——`%TEMP%`、用户目录、
+  `C://` 根、`C://AimerFiles` 根都不写。工具链自己的缓存（`~/.cargo`、`~/.cargo/bin`、
+  playwright 的 `ms-playwright` 浏览器包）是环境级安装，不在此列。
 - **为什么不用系统 `%TEMP%`**：Windows 上二进制在 `%TEMP%` 里建实例锁会拿到
-  `os error 5`（`cannot open instance lock`），同一份 exe 在仓库盘上正常。数据根固定
-  放仓库根的 `.probe/`，既绕开这个坑，又天然被 `.gitignore` 忽略。
-- **为什么不再放 `target/`**：`target/` 下只留 `debug` / `release` 两个 profile 目录，
+  `os error 5`（`cannot open instance lock`），同一份 exe 在工作区盘上正常。数据根放
+  工作区同级，既绕开这个坑，又不进版本库（在仓库外面，连 ignore 规则都不用写）。
+- **为什么不放 `target/`**：`target/` 下只留 `debug` / `release` 两个 profile 目录，
   谁往里塞东西（探针、临时库、打包产物）就等于制造「`cargo clean` 也清不干净的杂物」。
   单测的临时库同理，落在 `target/<profile>/test-scratch/`（`core::test_scratch_dir()`）。
 - **端口**：`free_port()` 让内核分配，不再写死 4299/4300（曾经撞过一次）。
@@ -120,7 +125,10 @@ python probes/aria2_explorer.py --build       # 同上，先 cargo build
   去清回收站。
 - **v3（v4.9.53）**：`target/` 只留 `debug` / `release`——探针数据根从
   `target/probe/<时间戳>` 迁到 `.probe/<时间戳>`，单测临时库从 `target/test-scratch/`
-  迁到 `target/<profile>/test-scratch/`（`core::test_scratch_dir()`），文档同步。
+  迁到 `target/<profile>/test-scratch/`（`core::test_scratch_dir()`）；
+  **`.probe/` 再挪到 `asmoday/` 的同级**（仓库里连运行期目录都不留），并写死边界规则：
+  运行期产物只在工作区内、`asmoday/` 之外。playwright 的 node_modules 同样移到
+  `../.probe/node_modules`。
 - **v1（v4.9.48）**：从 `.asmoday-probe` 里四份「按版本号」的脚本收敛为
   `probes/run_login.py` 一套；数据根从「源码目录 + 每次 rmtree」改为
   `target/probe/<时间戳>`（v3 又迁出 `target/`）；截图改固定名；明确 L0~L3 分层与六条反模式。
