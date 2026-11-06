@@ -2,9 +2,9 @@
 /**
  * 登录 / 初始化一体页。整页独立布局，不套侧边栏。
  *
- * 单用户回归后没有用户名可言（v4.9.32）：
- * - 未初始化：这里就是初始化页，一个密码框直达——提交即建号并登录，
- *   不再有「控制台一次性密码 → 强制改密」两步；
+ * 单用户后没有用户名可言（v4.9.32）：
+ * - 待初始化（needs_setup）：这里就是初始化页——输入控制台首启打印的
+ *   一次性密码 + 新密码，一步建权并登录（v4.9.33）；
  * - 已初始化：普通登录页，只剩密码框（2FA 可选展开）。
  */
 import { onMounted, ref } from 'vue'
@@ -23,6 +23,7 @@ const router = useRouter()
 const route = useRoute()
 
 const mode = ref<'loading' | 'setup' | 'login'>('loading')
+const oneTimePassword = ref('')
 const password = ref('')
 const totp = ref('')
 const showTotp = ref(false)
@@ -32,18 +33,23 @@ const submitting = ref(false)
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (!password.value) {
+  if (mode.value === 'setup') {
+    if (!oneTimePassword.value) {
+      error.value = t('auth.setup.oneTimeRequired')
+      return
+    }
+    if (password.value.length < 8) {
+      error.value = t('auth.setup.tooShort')
+      return
+    }
+  } else if (!password.value) {
     error.value = t('auth.login.required')
-    return
-  }
-  if (mode.value === 'setup' && password.value.length < 8) {
-    error.value = t('auth.setup.tooShort')
     return
   }
   submitting.value = true
   try {
     if (mode.value === 'setup') {
-      await authApi.setup(password.value)
+      await authApi.setup(oneTimePassword.value, password.value)
     } else {
       await authApi.login(password.value, totp.value.trim())
     }
@@ -58,7 +64,7 @@ async function submit() {
 
 onMounted(async () => {
   await authApi.ensureAuth()
-  mode.value = authApi.initialized.value ? 'login' : 'setup'
+  mode.value = authApi.status.value.needs_setup ? 'setup' : 'login'
 })
 
 /** 语言切换：登录前也能改（首次运行可能整站是英文环境） */
@@ -111,6 +117,17 @@ function changeLocale(event: Event) {
         <p v-if="mode === 'setup'" class="text-[12px] leading-relaxed text-muted">
           {{ t('auth.setup.desc') }}
         </p>
+
+        <label v-if="mode === 'setup'" class="block">
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.setup.oneTime') }}</span>
+          <input
+            v-model="oneTimePassword"
+            type="text"
+            autocomplete="one-time-code"
+            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
+            :placeholder="t('auth.setup.oneTimePlaceholder')"
+          />
+        </label>
 
         <label class="block">
           <span class="mb-1 block text-[12px] text-muted">

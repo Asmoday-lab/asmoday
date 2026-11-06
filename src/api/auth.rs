@@ -643,6 +643,8 @@ pub struct LoginRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SetupRequest {
+    /// 控制台首启打印的一次性密码——所有权凭证，证明请求来自守在控制台前的人
+    pub one_time_password: String,
     pub password: String,
 }
 
@@ -680,6 +682,8 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut username: Option<String> = None;
     let mut totp_enabled = false;
     let mut must_change_password = false;
+    // 初始化页待完成：唯一账号还停在一次性密码上（前端据此在 /login 切出 setup 形态）
+    let mut needs_setup = false;
 
     if let Some(token) = cookie_token(&headers)
         && let Ok(true) = state.auth.session_active(&token)
@@ -688,6 +692,8 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         totp_enabled = user.totp_enabled;
         must_change_password = user.must_change_password;
         username = Some(user.username);
+    } else if initialized && let Ok(Some(user)) = state.auth.first_user() {
+        needs_setup = user.must_change_password;
     }
 
     Json(json!({
@@ -696,6 +702,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "username": username,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
+        "needs_setup": needs_setup,
         "version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()
@@ -842,12 +849,12 @@ pub async fn login(
     response
 }
 
-/// POST /api/auth/setup（公开，仅实例未初始化时可用；设计文档 3.1.1）
+/// POST /api/auth/setup（公开，仅管理员还停在一次性密码上时可用；设计文档 3.1.1）
 ///
-/// 单用户回归后，初始化就是「设一个密码」：网页首访直达初始化页，
-/// 提交即建号 + 登录，不再经过控制台一次性密码与强制改密两步。
-/// 先到先得——谁能先打开页面谁就是主人（与 FileBrowser 一致）；
-/// 第一个账号诞生后这个入口永久 409 关闭。
+/// 网页初始化页：输入控制台首启打印的一次性密码 + 新密码，一步完成建权并登录，
+/// 取代旧流程的「一次性密码登录 → 强制改密对话框」两步。一次性密码是所有权
+/// 凭证：没有它，先打开页面的路人就能抢注成主人。账号一旦换成正式密码
+/// （setup 完成或首登改密），此入口永久 409 关闭；找回走 --reset-password。
 pub async fn setup(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -863,19 +870,36 @@ pub async fn setup(
         );
     }
 
-    match state.auth.user_count() {
-        Ok(0) => {}
-        Ok(_) => {
-            return json_error_code(
-                StatusCode::CONFLICT,
-                "E_ALREADY_INITIALIZED",
-                "Instance is already initialized",
-            );
-        }
+    // 只有「账号存在且还没换过正式密码」才允许初始化
+    let Some(stub) = (match state.auth.first_user() {
+        Ok(found) => found,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }) else {
+        return json_error_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "E_INIT_REQUIRED",
+            "Instance is not initialized yet",
+        );
+    };
+    let Some((user, hash, _)) = (match state.auth.find_user(&stub.username) {
+        Ok(found) => found,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }) else {
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_USER_MISSING",
+            "User not found",
+        );
+    };
+    if !user.must_change_password {
+        return json_error_code(
+            StatusCode::CONFLICT,
+            "E_ALREADY_INITIALIZED",
+            "Instance is already initialized",
+        );
     }
 
-    // 初始化口子开着的时间窗极短，但也不该被人拿去刷 argon2：按 IP 限流
+    // 一次性密码就是防爆破的天然闸门，但 argon2 也不该被人刷：按 IP 限流
     let ip = client_ip(&state, &headers, Some(peer)).await;
     if let Err(remaining) = state.login_guard.check(&ip) {
         return json_error_code(
@@ -885,16 +909,21 @@ pub async fn setup(
         );
     }
 
-    // 强度校验在 create_user 里（≥8 位且不能全是数字），弱密码直接 400
-    let user = match state.auth.create_user("admin", body.password.trim()) {
-        Ok(user) => user,
-        Err(err) => {
-            state.login_guard.record_failure(&ip);
-            return json_error(StatusCode::BAD_REQUEST, err);
-        }
-    };
-    // 这里设的就是正式密码，不走 must_change_password 强改流程；
-    // create_user 默认置位是给一次性密码（--init / --reset）用的，这里清掉。
+    if !verify_password(&hash, body.one_time_password.trim()) {
+        state.login_guard.record_failure(&ip);
+        return json_error_code(
+            StatusCode::UNAUTHORIZED,
+            "E_SETUP_TOKEN_INVALID",
+            "One-time password is incorrect",
+        );
+    }
+
+    // 强度校验在 update_password 里（≥8 位且不能全是数字），弱密码直接 400
+    if let Err(err) = state.auth.update_password(user.id, body.password.trim()) {
+        state.login_guard.record_failure(&ip);
+        return json_error(StatusCode::BAD_REQUEST, err);
+    }
+    // 设的就是正式密码，不再走 must_change_password 强改流程
     if let Err(err) = state.auth.set_must_change_password(user.id, false) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
@@ -1295,9 +1324,12 @@ mod tests {
     }
 
     #[test]
-    fn setup_request_only_needs_password() {
-        let req: SetupRequest =
-            serde_json::from_str(r#"{"password":"secret-passphrase"}"#).unwrap();
+    fn setup_request_needs_one_time_password_and_new_password() {
+        let req: SetupRequest = serde_json::from_str(
+            r#"{"one_time_password":"Ab3dEf9h","password":"secret-passphrase"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.one_time_password, "Ab3dEf9h");
         assert_eq!(req.password, "secret-passphrase");
     }
 

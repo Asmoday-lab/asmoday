@@ -467,11 +467,24 @@ async fn run(cli: Cli) -> Result<(), String> {
         cwd,
     };
 
-    // 初始化改走网页（设计文档 3.1.1）：首启不建号、不打印一次性密码，
-    // 第一个访客在 /login 初始化页设一个密码即建号登录（POST /api/auth/setup，
-    // 仅未初始化时可用）。中间件对未初始化实例仍全程 503，不存在匿名暴露。
-    // 抢注问题与 FileBrowser 口径一致：先到先得，初始化完成即关闭入口；
-    // 锁死后的找回仍走 --reset-password / ASMODAY_RESET_PASSWORD。
+    // 首启自动引导（设计文档 3.1.1）：还没有管理员时生成 admin + 一次性随机密码，
+    // 打印到控制台。网页初始化页要收这个一次性密码 + 新密码（POST /api/auth/setup，
+    // v4.9.33）一步完成建权——一次性密码就是「守在控制台前的人」的所有权凭证，
+    // 没有它，先打开页面的路人就能抢注成主人。密码只走 println（不进 asmoday.log）
+    // ——日志文件会被轮转/采集，明文凭据不能落盘；与 --reset-password 口径一致。
+    if auth.user_count().unwrap_or(1) == 0 {
+        let password = core::auth::random_password();
+        let user = auth
+            .create_user("admin", &password)
+            .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
+        auth.set_must_change_password(user.id, true)?;
+        println!(
+            "[asmoday] no administrator yet; created user 'admin' with a one-time password: {password}"
+        );
+        println!(
+            "[asmoday] open the web UI and finish setup with this one-time password (it will ask for a new one)."
+        );
+    }
 
     state
         .thumbnails

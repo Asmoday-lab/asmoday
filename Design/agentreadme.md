@@ -319,22 +319,28 @@ stateDiagram-v2
 
 错误展示：**行内**（输入框下方红色小字），不用 toast。限流 429 → 底部提示条 `"请求过于频繁，请在 {seconds}s 后重试"` 倒计时。
 
-登录页同构：**未初始化时是初始化页，只有一个密码框**；已初始化时是登录页，同样只有密码框（TOTP 可选展开）。单用户模型（v4.9.28）下网页端不出现用户名——`/api/auth/login` 的 `username` 可省略，后端按唯一账号解析。
+登录页同构：**账号仍停在一次性密码上时是初始化页（一次性密码 + 新密码两个框）**；否则是登录页，只有密码框（TOTP 可选展开）。单用户模型（v4.9.28）下网页端不出现用户名——`/api/auth/login` 的 `username` 可省略，后端按唯一账号解析。
 
 #### API 契约
 
-（v4.9.32：初始化回到网页，`POST /api/auth/setup` 重生，但只收 `password`；无 `/api/auth/init`、无 `X-Setup-Token`。）
+（v4.9.33：`POST /api/auth/setup` 收「控制台一次性密码 + 新密码」；无 `/api/auth/init`、无 `X-Setup-Token`。）
 
 ```http
-POST /api/auth/setup        // 仅 user_count=0 时可用；浏览器需同源
-{ "password": "string" }
+POST /api/auth/setup        // 仅「唯一账号仍 must_change_password=1」时可用；浏览器需同源
+{ "one_time_password": "string", "password": "string" }
 
 200 { ok:true, data: { username, must_change_password: false } }
-// Set-Cookie: asmoday_session=... —— 建号即登录，不再走强制改密
+// Set-Cookie: asmoday_session=... —— 换密即登录，不再走强制改密对话框
 400 E_VALIDATION             // 弱密码（< 8 位或全数字）
-409 E_ALREADY_INITIALIZED    // 第一个账号已存在，该入口永久关闭
+401 E_SETUP_TOKEN_INVALID    // 控制台一次性密码不对（计入 IP 防爆破池）
+409 E_ALREADY_INITIALIZED    // 已换成正式密码，该入口永久关闭
 403 E_FORBIDDEN              // 跨站写请求
 429 E_TOO_MANY_REQUESTS
+```
+
+```http
+GET  /api/auth/status        // 公开；needs_setup=true 时前端切出初始化页
+{ initialized, authenticated, username, needs_setup, must_change_password, totp_enabled, version }
 ```
 
 ```http
@@ -372,18 +378,18 @@ POST /api/auth/password
 #### GWT 验收
 
 ```gwt
-GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 不建号、不打印任何密码，`/api/auth/status` 返回 initialized=false，所有 `/api/*` 503 E_INIT_REQUIRED（v4.9.32）
-GWT-AUTH-02 Given 未初始化实例  When 打开站点  Then 落在初始化页且只有 1 个密码框（无用户名）；提交 `POST /api/auth/setup { password }` 后直接进入主界面，must_change_password=0（v4.9.32）
-GWT-AUTH-03 Given 已有账号的实例  When 启动或访问 /login  Then 无初始化入口，登录页只有密码框；`POST /api/auth/setup` 永久 409 E_ALREADY_INITIALIZED（v4.9.32）
+GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 控制台打印一次性密码（stdout，不进日志文件），库里 admin 的 must_change_password=1，`/api/auth/status` 返回 needs_setup=true（v4.9.33）
+GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 初始化页有 2 个输入框（控制台一次性密码 / 新密码）且无用户名；一次性密码正确即换密+登录直达主界面，must_change_password=0（v4.9.33）
+GWT-AUTH-03 Given 待初始化实例  When 提交错误的一次性密码  Then 401 E_SETUP_TOKEN_INVALID 并计入 IP 防爆破池；换成正式密码后 `POST /api/auth/setup` 永久 409 E_ALREADY_INITIALIZED（v4.9.33）
 GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框
 GWT-AUTH-05 Given 登录页  When 密码错误  Then 行内错误「密码错误」，不泄露账号是否存在
 GWT-AUTH-06 Given 登录页  When 密码正确但 TOTP 开启  Then 弹出 6 位 TOTP 输入，输入错误回登录页
 GWT-AUTH-07 Given 已登录  When 密码重置成功（CLI --reset-password）  Then 前端下一个请求返回 401 E_UNAUTHORIZED → 跳登录
 GWT-AUTH-08 Given 会话已过期（30 天绝对上限）  When 用户点击任意页面  Then 401 跳登录，返回后回到原路径
-GWT-AUTH-09 Given 初始化完成  When 再次 POST /api/auth/setup（任意密码）  Then 409 E_ALREADY_INITIALIZED，不影响既有账号（v4.9.32）
-GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问日志  Then 无一次性密码明文（CLI 路径只打 stdout）、无初始化令牌
+GWT-AUTH-09 Given 已完成初始化  When 再次 POST /api/auth/setup（任意密码）  Then 409 E_ALREADY_INITIALIZED，不影响既有账号（v4.9.33）
+GWT-AUTH-10 Given 初始化完成  When 检查 data/logs/asmoday.log 与访问日志  Then 无一次性密码明文（只打 stdout）、无初始化令牌
 GWT-AUTH-11 Given 可信反代 + 客户端伪造 X-Forwarded-For 最左值  When 客户端连发登录失败  Then 防爆破池按「最右不可信地址」计数，伪造值换不动桶
-GWT-USER-01 Given 全新安装（无任何账号）  When 首次访问网页  Then 初始化页设密码即创建唯一账号 admin，无需用户名（v4.9.32）
+GWT-USER-01 Given 全新安装（无任何账号）  When 启动  Then 创建唯一账号 admin + 打印一次性密码；网页初始化页用该密码换正式密码，网页端全程无用户名（v4.9.33）
 GWT-USER-02 Given 已登录  When 访问 /api/users 或设置页  Then 端点 404（已随多用户模型删除），设置页无「用户管理」Tab（v4.9.28）
 GWT-USER-03 Given 存量库有多个账号（含 2 个 admin）  When 迁移 v20 跑完  Then 只留「启用中 id 最小的账号」（无启停列时取 id 最小），其余账号从 users 表物理删除，其 sessions / favorites / play_history / shares / access_tokens 一并删掉（含 user_id 为 NULL 的遗留令牌）；再次启动幂等（v4.9.30）
 GWT-USER-04 Given 库已完成 v20 收口  When 检查表结构  Then users 无 role / is_active / permissions / mount_scope，sessions / shares / access_tokens 无 user_id，favorites / play_history 主键为 (mount_id, file_path)；库里只有一行账号，登录即该账号（v4.9.30）

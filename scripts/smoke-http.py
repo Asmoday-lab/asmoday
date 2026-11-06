@@ -8,9 +8,9 @@
 用法：
     python scripts/smoke-http.py --base http://127.0.0.1:4971 \
         --user admin --password 'Smoke#2026test'
-    # 首次（还没有管理员）：打开网页在初始化页设一个密码（POST /api/auth/setup，
-    # v4.9.32 起不再打印控制台一次性密码），或以 `asmoday --init` 预建账号
-    # （打印一次性密码，首登后需改密），再把该密码作为 --password 传入。
+    # 首次（还没有正式密码）：启动时控制台打印了一次性密码，打开网页初始化页
+    # 用它换正式密码（POST /api/auth/setup，v4.9.33），或以 `asmoday --init`
+    # 预建账号；再把正式密码作为 --password 传入。
 
 覆盖：
     1. 登录
