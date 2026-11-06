@@ -111,10 +111,11 @@ thumb_preheat_per_scan = 200
 
 # aria2-compatible download engine. Any aria2 client (AriaNg, Aria2 Explorer,
 # motrix ...) can connect to http://<host>:<port>/jsonrpc with the RPC secret.
-# The secret is generated on first start and written to <data>/download_rpc_secret;
-# set rpc_secret explicitly to override it.
+# The secret lives in the database: view, copy or rotate it on the downloads page
+# (Settings -> RPC access). It is generated automatically, never hand-edited.
 # [download]
 # enable = true
+# Deprecated (v4.9.36): only imported once when the database has no secret yet.
 # rpc_secret = ""
 # Parallel connections per download (1-32).
 # segments = 8
@@ -281,8 +282,8 @@ impl MediaConfig {
 /// `[download]`：aria2 兼容下载引擎（设计文档 3.10，v4.9.26）。
 ///
 /// 任何 aria2 客户端（AriaNg / Aria2 Explorer / motrix…）连
-/// `http://<host>:<port>/jsonrpc` + RPC 密钥即用。密钥缺省时首次启动
-/// 自动生成并持久化到 `<data>/download_rpc_secret`，启动日志会打印。
+/// `http://<host>:<port>/jsonrpc` + RPC 密钥即用。密钥存在数据库
+/// （`app_settings`，v4.9.36）：自动生成，只在前端下载页可见，刷新也在那里。
 ///
 /// 落盘安全：RPC 的 `dir` / `out` 只允许落在 `roots` 白名单内（前缀校验，
 /// Windows 大小写不敏感），未配置时默认 `<data>/downloads`。
@@ -291,7 +292,9 @@ impl MediaConfig {
 pub struct DownloadConfig {
     /// 关掉后 `/jsonrpc` 不注册，引擎不启动
     pub enable: bool,
-    /// RPC 密钥（空 = 用 data 目录下持久化的自动生成密钥）
+    /// **已废弃（v4.9.36）**：只在数据库里还没有密钥时当作一次性种子导入，
+    /// 之后一律以数据库为准。保留字段只为兼容存量 `config.toml`
+    /// （`deny_unknown_fields` 会让删掉字段的旧配置直接解析失败）。
     pub rpc_secret: String,
     /// 每任务最大连接数（1-32，默认 8）
     pub segments: usize,

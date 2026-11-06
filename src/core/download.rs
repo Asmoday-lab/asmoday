@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -304,11 +304,15 @@ struct TaskMap {
     stopped: Vec<String>,
 }
 
+/// 实例设置里下载 RPC 密钥的键名（`app_settings.key`，v4.9.36）。
+pub const RPC_SECRET_SETTING: &str = "download_rpc_secret";
+
 /// 下载引擎。AppState 以 `Arc<DownloadManager>` 持有。
 pub struct DownloadManager {
     http: reqwest::Client,
-    /// RPC 密钥（`token:<secret>` 鉴权）
-    secret: String,
+    /// RPC 密钥（`token:<secret>` 鉴权）。可在运行中替换：前端「刷新密钥」写库
+    /// 之后直接换内存值，旧密钥下一个请求即失效，不需要重启（v4.9.36）。
+    secret: Arc<RwLock<String>>,
     /// 默认落盘根（roots 未配置时）
     default_root: PathBuf,
     /// 允许的落盘根白名单（空 = 只允许 default_root）
@@ -346,6 +350,18 @@ fn unknown_gid(gid: &str) -> RpcError {
     RpcError::new(2, format!("Cannot get download information: GID {gid}"))
 }
 
+/// 常量时间字节比较（`secret_matches` 用；长度不等直接驳回）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
 impl DownloadManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -362,7 +378,7 @@ impl DownloadManager {
         let max_concurrent_count = max_concurrent.clamp(1, 32);
         Self {
             http,
-            secret,
+            secret: Arc::new(RwLock::new(secret)),
             default_root,
             roots,
             segments: segments.clamp(1, 32),
@@ -391,8 +407,21 @@ impl DownloadManager {
     }
 
     /// RPC 密钥校验（`token:<secret>` 全串比较）
+    ///
+    /// 常量时间比较：密钥是长期有效的共享凭据，RPC 每秒能打几千次，
+    /// `==` 的逐字节提前返回理论上可被统计出前缀。长度不等直接驳回即可
+    /// —— 固定 20 位随机串，长度本身不是秘密。
     pub fn secret_matches(&self, token: &str) -> bool {
-        self.enabled && token == format!("token:{}", self.secret)
+        if !self.enabled {
+            return false;
+        }
+        let Some(given) = token.strip_prefix("token:") else {
+            return false;
+        };
+        let Ok(secret) = self.secret.read() else {
+            return false;
+        };
+        constant_time_eq(given.as_bytes(), secret.as_bytes())
     }
 
     /// 引擎是否启用（disabled 时协议层直接 404）
@@ -400,9 +429,21 @@ impl DownloadManager {
         self.enabled
     }
 
-    /// RPC 密钥（仅 `/api/downloads/engine` 用：管理页要把它显示给用户去接客户端）
-    pub fn secret(&self) -> &str {
-        &self.secret
+    /// RPC 密钥（`/api/downloads/engine` 回显 + 页面复制用）
+    pub fn secret(&self) -> String {
+        self.secret
+            .read()
+            .map(|secret| secret.clone())
+            .unwrap_or_default()
+    }
+
+    /// 运行中替换 RPC 密钥（前端「刷新密钥」；调用方负责先写库）。
+    ///
+    /// 旧密钥立即失效：`/jsonrpc` 下一次请求就是 401，不需要重启进程。
+    pub fn replace_secret(&self, next: String) {
+        if let Ok(mut guard) = self.secret.write() {
+            *guard = next;
+        }
     }
 
     /// 允许落盘的根白名单（`dir` 只能落在这些目录内）
@@ -413,11 +454,6 @@ impl DownloadManager {
     /// 全局并发上限（创建时快照，改配置需重启）
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent_count
-    }
-
-    /// RPC 密钥持久化路径
-    pub fn secret_path(data_dir: &Path) -> PathBuf {
-        data_dir.join("download_rpc_secret")
     }
 
     // -- 目录白名单 ---------------------------------------------------------
@@ -1928,6 +1964,44 @@ mod tests {
             .to_string();
         assert!(matches!(status.as_str(), "active" | "waiting"), "{status}");
         manager.remove(&gid).await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 刷新密钥（v4.9.36）：旧 `token:` 立即失效、新值生效，不需要重建管理器。
+    #[tokio::test]
+    async fn rotated_secret_invalidates_old_token() {
+        let base = std::env::temp_dir().join("asmoday-dl-secret");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = DownloadManager::new(
+            reqwest::Client::new(),
+            "secret1".into(),
+            vec![base.clone()],
+            2,
+            1,
+            true,
+            None,
+        );
+        assert!(manager.secret_matches("token:secret1"));
+        assert!(!manager.secret_matches("token:secret2"));
+        // aria2 语义：必须带 `token:` 前缀，裸密钥不算
+        assert!(!manager.secret_matches("secret1"));
+
+        manager.replace_secret("secret2".into());
+        assert!(!manager.secret_matches("token:secret1"));
+        assert!(manager.secret_matches("token:secret2"));
+        assert_eq!(manager.secret(), "secret2");
+
+        // 引擎关闭时任何 key 都不放行
+        let disabled = DownloadManager::new(
+            reqwest::Client::new(),
+            "secret1".into(),
+            vec![base.clone()],
+            2,
+            1,
+            false,
+            None,
+        );
+        assert!(!disabled.secret_matches("token:secret1"));
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 

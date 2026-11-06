@@ -98,9 +98,9 @@ pub async fn snapshot(State(state): State<AppState>, _admin: AdminUser) -> Respo
 
 /// GET /api/downloads/engine：引擎参数 + RPC 接入信息
 ///
-/// `rpc_secret` 只在这条管理端点上返回：页面要把它显示给用户去填 AriaNg。
-/// 密钥本身由 `<data>/download_rpc_secret`（0600）或 `[download].rpc_secret` 提供，
-/// 本接口不写、不轮换（轮换要重启，成本高于收益）。
+/// `rpc_secret` 只在这条管理端点返回：页面要把它显示给用户去填 AriaNg
+/// （可显隐、可复制）。密钥存放在 `app_settings`（v4.9.36），**唯一写入点**
+/// 是下面的 `rotate_secret` —— 前端刷新，没有手填入口。
 pub async fn engine(State(state): State<AppState>, _admin: AdminUser) -> Response {
     let manager = &state.downloads;
     let roots: Vec<String> = manager
@@ -119,9 +119,36 @@ pub async fn engine(State(state): State<AppState>, _admin: AdminUser) -> Respons
         // 以下三项是启动时快照，改配置必须重启（页面据此打「重启生效」标记）
         "restart_required": ["enable", "segments", "max_concurrent", "roots", "enable_bt",
                              "bt_listen_port_min", "bt_listen_port_max", "bt_disable_dht"],
-        "rpc_secret": if manager.enabled() { manager.secret() } else { "" },
+        "rpc_secret": if manager.enabled() {
+            manager.secret()
+        } else {
+            String::new()
+        },
     }))
     .into_response()
+}
+
+/// POST /api/downloads/secret：刷新 RPC 密钥（v4.9.36）
+///
+/// 立即生效、无需重启：先写 `app_settings`（重启后仍是新值），再换内存里的
+/// 当前值。旧 `token:<secret>` 下一次请求就是 401，已配置的 AriaNg 需要重填。
+/// 只影响 `/jsonrpc` 的外部客户端——页面的 `/api/downloads*` 走 Cookie 会话，
+/// 不依赖这个密钥。旧 `<data>/download_rpc_secret` 文件不再读取也不再写入。
+pub async fn rotate_secret(State(state): State<AppState>, _admin: AdminUser) -> Response {
+    if !state.downloads.enabled() {
+        return disabled();
+    }
+    let secret = crate::core::auth::random_password();
+    // 先落库：写失败就整个失败，避免「内存换了但重启回到旧值」这种半状态
+    if let Err(err) = state
+        .auth
+        .put_setting(crate::core::download::RPC_SECRET_SETTING, &secret)
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    state.downloads.replace_secret(secret.clone());
+    crate::log_info!("download RPC secret rotated (old token invalidated)");
+    Json(json!({ "status": "ok", "rpc_secret": secret })).into_response()
 }
 
 #[derive(Debug, Deserialize)]

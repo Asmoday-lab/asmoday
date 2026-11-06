@@ -62,6 +62,10 @@ const settings = ref<DownloadConfig | null>(null)
 const settingsBusy = ref(false)
 const settingsError = ref('')
 const secretShown = ref(false)
+/** 刷新密钥的两段式「上膛」：第一次点击只确认，3 秒内再点才真的换 */
+const rotateArmed = ref(false)
+const secretRotating = ref(false)
+let armTimer: number | undefined
 /** 保存时的整份配置：`POST /api/config` 收完整结构，不能只发 `[download]` */
 const fullConfig = ref<Record<string, unknown> | null>(null)
 const savedNeedsRestart = ref(false)
@@ -302,6 +306,39 @@ async function copyText(value: string, message: string) {
   }
 }
 
+/**
+ * 刷新 RPC 密钥（v4.9.36）。
+ *
+ * 两段式：第一次点击只是「上膛」（3 秒后自动复位），再点一次才换——密钥一换，
+ * 已配置的 AriaNg / Aria2 Explorer 立刻 401，误触的代价是逐个重填，值得一次确认。
+ * 新密钥直接就地写回 engine，不用重新拉接口；顺手展开明文，让用户复制。
+ */
+async function rotateSecret() {
+  if (secretRotating.value) return
+  if (!rotateArmed.value) {
+    rotateArmed.value = true
+    if (armTimer) window.clearTimeout(armTimer)
+    armTimer = window.setTimeout(() => {
+      rotateArmed.value = false
+    }, 3000)
+    return
+  }
+  if (armTimer) window.clearTimeout(armTimer)
+  rotateArmed.value = false
+  secretRotating.value = true
+  settingsError.value = ''
+  try {
+    const result = await downloadsApi.rotateSecret()
+    if (engine.value) engine.value.rpc_secret = result.rpc_secret
+    secretShown.value = true
+    showToast(t('downloads.rpc.rotated'))
+  } catch (err) {
+    settingsError.value = err instanceof Error ? err.message : t('downloads.actionFailed')
+  } finally {
+    secretRotating.value = false
+  }
+}
+
 let timer: number | undefined
 
 onMounted(async () => {
@@ -314,6 +351,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (timer) window.clearInterval(timer)
+  if (armTimer) window.clearTimeout(armTimer)
 })
 </script>
 
@@ -742,6 +780,25 @@ onUnmounted(() => {
                 >
                   <AppIcon name="copy" :size="13" />
                 </button>
+              </div>
+
+              <div class="mt-2 space-y-1">
+                <button
+                  class="rounded-md border border-line px-2 py-1 text-[11px] transition-colors hover:text-ink disabled:opacity-50"
+                  :class="rotateArmed ? 'fg-danger' : 'text-muted'"
+                  :disabled="secretRotating"
+                  data-testid="download-rotate-secret"
+                  @click="rotateSecret"
+                >
+                  {{
+                    secretRotating
+                      ? t('downloads.rpc.rotating')
+                      : rotateArmed
+                        ? t('downloads.rpc.rotateConfirm')
+                        : t('downloads.rpc.rotate')
+                  }}
+                </button>
+                <p class="text-[11px] leading-relaxed text-muted">{{ t('downloads.rpc.rotateHint') }}</p>
               </div>
             </div>
 

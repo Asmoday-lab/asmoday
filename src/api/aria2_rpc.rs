@@ -3,9 +3,9 @@
 //! `POST /jsonrpc`（JSON-RPC 2.0，支持批量数组）、`GET /jsonrpc?method=…&params=…`
 //! 与 `WS /jsonrpc`（双向：请求 + `aria2.on*` 通知推送）。
 //!
-//! 鉴权：每个请求的 `params` 第一项必须是 `token:<rpc_secret>`——密钥来自
-//! `[download].rpc_secret`，未配置时用 `<data>/download_rpc_secret` 里持久化的
-//! 自动生成值（main 启动时落盘并打印）。校验失败统一返回 aria2 语义的
+//! 鉴权：每个请求的 `params` 第一项必须是 `token:<rpc_secret>`——密钥存在数据库
+//! （`app_settings`，v4.9.36），前端下载页可查看与刷新；进程内是可变值，
+//! 刷新后旧密钥下一次请求即失效。校验失败统一返回 aria2 语义的
 //! `{"code":1,"message":"Unauthorized"}`。
 //!
 //! 兼容面刻意收窄并**诚实声明**：`getVersion.enabledFeatures` 不含

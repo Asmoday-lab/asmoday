@@ -331,36 +331,41 @@ async fn run(cli: Cli) -> Result<(), String> {
     let terminal = config.terminal.clone();
     let listen = (config.server.host.clone(), config.server.ssl.enabled);
 
-    // aria2 兼容下载引擎（设计文档 3.10）：RPC 密钥 = 配置显式值，
-    // 否则用 data 目录下持久化的自动生成值（首轮生成并打印一次）。
+    // aria2 兼容下载引擎（设计文档 3.10）：RPC 密钥由**数据库**持有
+    // （`settings.download_rpc_secret`，v4.9.36），前端「刷新密钥」写库 +
+    // 换内存，立即生效且重启后仍是新值。以前是 `<data>/download_rpc_secret`
+    // 文件——文件与内存两份真相，前端既改不了也删不干净，已废弃。
+    // `[download].rpc_secret` 只保留一次性种子语义：DB 里还没有值时才导入，
+    // 之后一律以数据库为准（配置值不再有任何效果，只 WARN 一次）。
     let download_config = config.download.clone();
-    let download_secret = if download_config.rpc_secret.trim().is_empty() {
-        let path = core::download::DownloadManager::secret_path(&data_dir);
-        let existing = std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        match existing {
-            Some(secret) => secret,
-            None => {
-                let secret = core::auth::random_password();
-                std::fs::write(&path, &secret)
+    let download_secret = {
+        const KEY: &str = core::download::RPC_SECRET_SETTING;
+        match auth
+            .setting(KEY)
+            .map_err(|e| format!("read download rpc secret failed: {e}"))?
+        {
+            Some(secret) if !secret.trim().is_empty() => secret,
+            _ => {
+                let seeded = download_config.rpc_secret.trim();
+                let secret = if seeded.is_empty() {
+                    core::auth::random_password()
+                } else {
+                    crate::log_warn!(
+                        "[download].rpc_secret is deprecated: importing the configured value into \
+                         the database once; rotate it from the downloads page from now on"
+                    );
+                    seeded.to_string()
+                };
+                auth.put_setting(KEY, &secret)
                     .map_err(|e| format!("persist download rpc secret failed: {e}"))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
-                println!(
-                    "[asmoday] download RPC enabled; generated secret (persisted to {}): {secret}",
-                    path.display()
-                );
                 secret
             }
         }
-    } else {
-        download_config.rpc_secret.trim().to_string()
     };
+    // 明文不进日志/控制台：密钥只在前端下载页可见（可显隐、可复制、可刷新）
+    crate::log_info!(
+        "download RPC secret loaded from database (view or rotate it in the downloads page)"
+    );
     let download_roots: Vec<PathBuf> = if download_config.roots.is_empty() {
         vec![data_dir.join("downloads")]
     } else {
@@ -736,6 +741,7 @@ fn protected_routes() -> Router<AppState> {
             get(api::downloads::snapshot).post(api::downloads::add),
         )
         .route("/api/downloads/engine", get(api::downloads::engine))
+        .route("/api/downloads/secret", post(api::downloads::rotate_secret))
         .route("/api/downloads/torrents", post(api::downloads::add_torrent))
         .route("/api/downloads/stopped", delete(api::downloads::purge))
         .route("/api/downloads/{gid}/pause", post(api::downloads::pause))

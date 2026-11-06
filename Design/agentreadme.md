@@ -403,6 +403,10 @@ GWT-DL-10 Given 下载中点暂停  Then 该任务只出现在 `waiting`（`stat
 GWT-DL-11 Given 已完成/已失败的任务  When 点移除  Then 任务从 `stopped` 列表彻底消失（走 removeDownloadResult，不留 `removed` 行）；`DELETE /api/downloads/stopped` 一次清空（v4.9.31）
 GWT-DL-12 Given 「引擎设置」  Then 回显 segments / max_concurrent / roots / BT 端口并标注「重启生效」；RPC 地址与密钥可复制（密钥默认掩码），保存后 `POST /api/config` 的 `[download]` 生效但引擎仍是旧快照，重启后 `GET /api/downloads/engine` 才反映新值（v4.9.31）
 GWT-DL-13 Given `[download].enable=false`  When 打开 `/downloads`  Then 显示「下载引擎未启用」提示且新建按钮禁用，`GET /api/downloads` 返回 `{enabled:false}`（v4.9.31）
+GWT-DL-14 Given RPC 密钥  When 检查存储  Then 位于数据库 `settings.download_rpc_secret`，`data/` 下不存在 `download_rpc_secret` 文件；启动日志与 `asmoday.log` 都不含明文，只有前端下载页能看（显隐 / 复制）（v4.9.36）
+GWT-DL-15 Given 引擎设置里的「刷新密钥」  When 第一次点击  Then 按钮文案变「确认刷新？」且 3 秒内不执行；再点一次才发起 `POST /api/downloads/secret`，返回新密钥、toast 提示、页面就地显示新值；`engine.rpc_secret` 随之改变（v4.9.36）
+GWT-DL-16 Given 刚刷新过密钥  When 旧 `token:<old>` 调 `/jsonrpc`  Then `{"code":1,"message":"Unauthorized"}`；新 token 正常返回；进程重启后 `engine` 仍回显新密钥（写库已生效，无需重启）（v4.9.36）
+GWT-DL-17 Given 存量 `config.toml` 里写了 `[download].rpc_secret`  When 数据库尚无密钥时启动  Then 用它作为初始值导入并 WARN；数据库已有值时该配置被忽略（不覆盖），前端刷新是唯一修改入口（v4.9.36）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

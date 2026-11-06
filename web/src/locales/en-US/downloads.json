@@ -84,6 +84,11 @@
     "show": "Show",
     "hide": "Hide",
     "copy": "Copy",
-    "copied": "Copied"
+    "copied": "Copied",
+    "rotate": "Rotate secret",
+    "rotateConfirm": "Rotate now?",
+    "rotating": "Rotating…",
+    "rotateHint": "The server generates this secret and keeps it in the database. Rotating invalidates the old one immediately — connected clients must be updated.",
+    "rotated": "Secret rotated; the old one no longer works"
   }
 }

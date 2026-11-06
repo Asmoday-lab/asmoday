@@ -81,6 +81,10 @@ export const downloadsApi = {
 
   engine: () => request<EngineInfo>('/api/downloads/engine'),
 
+  /** 刷新 RPC 密钥：写库 + 换内存，旧密钥下一次请求即 401（v4.9.36） */
+  rotateSecret: () =>
+    request<{ status: string; rpc_secret: string }>('/api/downloads/secret', { method: 'POST' }),
+
   addUri: (payload: { uri: string; dir?: string }) =>
     request<{ gid: string }>('/api/downloads', {
       method: 'POST',
