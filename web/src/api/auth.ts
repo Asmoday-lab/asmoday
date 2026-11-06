@@ -10,8 +10,6 @@ export interface AuthStatus {
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
-  /** 唯一账号还停在控制台一次性密码上：/login 应切出初始化形态（v4.9.33） */
-  needs_setup?: boolean
   version?: string
 }
 
@@ -84,13 +82,6 @@ export const authApi = {
    */
   async login(password: string, totp?: string) {
     await post('/api/auth/login', { password, totp: totp || undefined })
-  },
-  /**
-   * 初始化：输入控制台首启打印的一次性密码 + 新密码，一步建权并登录。
-   * 仅在唯一账号还停在一次性密码上时可用；完成后该入口永久关闭。
-   */
-  async setup(oneTimePassword: string, password: string) {
-    await post('/api/auth/setup', { one_time_password: oneTimePassword, password })
   },
   async logout() {
     await post('/api/auth/logout')

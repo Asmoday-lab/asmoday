@@ -642,13 +642,6 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SetupRequest {
-    /// 控制台首启打印的一次性密码——所有权凭证，证明请求来自守在控制台前的人
-    pub one_time_password: String,
-    pub password: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct PasswordRequest {
     /// 正式密码会话必填；一次性密码会话（must_change_password=1）可省——
     /// 登录时已验过一次性密码，不重复要「当前密码」（v4.9.33）
@@ -685,8 +678,6 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let mut username: Option<String> = None;
     let mut totp_enabled = false;
     let mut must_change_password = false;
-    // 初始化页待完成：唯一账号还停在一次性密码上（前端据此在 /login 切出 setup 形态）
-    let mut needs_setup = false;
 
     if let Some(token) = cookie_token(&headers)
         && let Ok(true) = state.auth.session_active(&token)
@@ -695,8 +686,6 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         totp_enabled = user.totp_enabled;
         must_change_password = user.must_change_password;
         username = Some(user.username);
-    } else if initialized && let Ok(Some(user)) = state.auth.first_user() {
-        needs_setup = user.must_change_password;
     }
 
     Json(json!({
@@ -705,7 +694,6 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "username": username,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
-        "needs_setup": needs_setup,
         "version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()
@@ -838,108 +826,6 @@ pub async fn login(
         "status": "ok",
         "username": user.username,
         "must_change_password": user.must_change_password,
-    }))
-    .into_response();
-    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
-    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
-        &token,
-        crate::core::auth::SESSION_TTL,
-        &path,
-        secure,
-    )) {
-        response.headers_mut().insert(header::SET_COOKIE, value);
-    }
-    response
-}
-
-/// POST /api/auth/setup（公开，仅管理员还停在一次性密码上时可用；设计文档 3.1.1）
-///
-/// 网页初始化页：输入控制台首启打印的一次性密码 + 新密码，一步完成建权并登录，
-/// 取代旧流程的「一次性密码登录 → 强制改密对话框」两步。一次性密码是所有权
-/// 凭证：没有它，先打开页面的路人就能抢注成主人。账号一旦换成正式密码
-/// （setup 完成或首登改密），此入口永久 409 关闭；找回走 --reset-password。
-pub async fn setup(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<SetupRequest>,
-) -> Response {
-    // 公开写操作：浏览器请求必须同源（与 logout 同一套 CSRF 判定）
-    if !origin_matches_host(&headers, &Method::POST) {
-        return json_error_code(
-            StatusCode::FORBIDDEN,
-            "E_FORBIDDEN",
-            "Cross-site request rejected",
-        );
-    }
-
-    // 只有「账号存在且还没换过正式密码」才允许初始化
-    let Some(stub) = (match state.auth.first_user() {
-        Ok(found) => found,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    }) else {
-        return json_error_code(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "E_INIT_REQUIRED",
-            "Instance is not initialized yet",
-        );
-    };
-    let Some((user, hash, _)) = (match state.auth.find_user(&stub.username) {
-        Ok(found) => found,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    }) else {
-        return json_error_code(
-            StatusCode::UNAUTHORIZED,
-            "AUTH_USER_MISSING",
-            "User not found",
-        );
-    };
-    if !user.must_change_password {
-        return json_error_code(
-            StatusCode::CONFLICT,
-            "E_ALREADY_INITIALIZED",
-            "Instance is already initialized",
-        );
-    }
-
-    // 一次性密码就是防爆破的天然闸门，但 argon2 也不该被人刷：按 IP 限流
-    let ip = client_ip(&state, &headers, Some(peer)).await;
-    if let Err(remaining) = state.login_guard.check(&ip) {
-        return json_error_code(
-            StatusCode::TOO_MANY_REQUESTS,
-            "AUTH_RATE_LIMITED",
-            format!("Too many attempts, retry in {remaining}s"),
-        );
-    }
-
-    if !verify_password(&hash, body.one_time_password.trim()) {
-        state.login_guard.record_failure(&ip);
-        return json_error_code(
-            StatusCode::UNAUTHORIZED,
-            "E_SETUP_TOKEN_INVALID",
-            "One-time password is incorrect",
-        );
-    }
-
-    // 强度校验在 update_password 里（≥8 位且不能全是数字），弱密码直接 400
-    if let Err(err) = state.auth.update_password(user.id, body.password.trim()) {
-        state.login_guard.record_failure(&ip);
-        return json_error(StatusCode::BAD_REQUEST, err);
-    }
-    // 设的就是正式密码，不再走 must_change_password 强改流程
-    if let Err(err) = state.auth.set_must_change_password(user.id, false) {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
-    }
-    let _ = state.auth.purge_expired();
-    let token = match state.auth.create_session() {
-        Ok(token) => token,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    };
-
-    let mut response = Json(json!({
-        "status": "ok",
-        "username": user.username,
-        "must_change_password": false,
     }))
     .into_response();
     let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
@@ -1309,7 +1195,7 @@ pub async fn totp_disable(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginRequest, SetupRequest, normalize_authority, origin_matches_host};
+    use super::{LoginRequest, PasswordRequest, normalize_authority, origin_matches_host};
     use axum::http::{HeaderMap, Method, header};
 
     #[test]
@@ -1330,13 +1216,15 @@ mod tests {
     }
 
     #[test]
-    fn setup_request_needs_one_time_password_and_new_password() {
-        let req: SetupRequest = serde_json::from_str(
-            r#"{"one_time_password":"Ab3dEf9h","password":"secret-passphrase"}"#,
-        )
-        .unwrap();
-        assert_eq!(req.one_time_password, "Ab3dEf9h");
-        assert_eq!(req.password, "secret-passphrase");
+    fn password_request_current_is_optional_for_otp_sessions() {
+        // v4.9.33：一次性密码登录后的改密不再重复要「当前密码」
+        let req: PasswordRequest = serde_json::from_str(r#"{"next":"secret-passphrase"}"#).unwrap();
+        assert_eq!(req.current, "");
+        assert_eq!(req.next, "secret-passphrase");
+
+        let full: PasswordRequest =
+            serde_json::from_str(r#"{"current":"old","next":"secret-passphrase"}"#).unwrap();
+        assert_eq!(full.current, "old");
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

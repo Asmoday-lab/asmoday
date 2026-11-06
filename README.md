@@ -56,7 +56,7 @@ tar -xzf asmoday-*.tar.gz && chmod +x asmoday
 asmoday.exe
 ```
 
-Open `http://127.0.0.1:4242`; the setup page asks for the **one-time password printed in the console** plus a new password (no username anywhere in the web UI), and you are in.
+Open `http://127.0.0.1:4242`, sign in with the **one-time password printed in the console** (no username anywhere in the web UI), then set your real password in the prompt that appears.
 
 The first start writes `config.toml` and `data/` into the current directory. With no mount configured, the working directory is used as a fallback root; to manage other disks, add a mount under Settings → Advanced or edit the config:
 

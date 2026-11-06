@@ -49,7 +49,7 @@ pub const FRESH: u64 = 600;
 /// 事务**只包住写**（readdir 在事务外，见 `walk_into_index`），所以这个数字决定的是
 /// 「写锁被持有多久」而不是「一次读盘有多久」：16 个目录的 `DELETE`+`INSERT` 是毫秒级，
 /// 其他写操作（登录、上传、缩略图缓存）排队等它一下就过去了。以前事务横跨 readdir，
-/// 首次建库能把 `auth/setup` 直接卡成 `database is locked`。
+/// 首次建库能把 `auth/login` 直接卡成 `database is locked`。
 pub const CHUNK: usize = 16;
 
 /// 排序维度（v4.9.0）。

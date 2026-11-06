@@ -468,10 +468,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
 
     // 首启自动引导（设计文档 3.1.1）：还没有管理员时生成 admin + 一次性随机密码，
-    // 打印到控制台。网页初始化页要收这个一次性密码 + 新密码（POST /api/auth/setup，
-    // v4.9.33）一步完成建权——一次性密码就是「守在控制台前的人」的所有权凭证，
-    // 没有它，先打开页面的路人就能抢注成主人。密码只走 println（不进 asmoday.log）
-    // ——日志文件会被轮转/采集，明文凭据不能落盘；与 --reset-password 口径一致。
+    // 打印到控制台。用户拿它在登录页登录（网页只有密码框，无用户名），会话
+    // must_change_password=1，登录后弹「设置新密码」对话框一步完成建权——
+    // 一次性密码就是「守在控制台前的人」的所有权凭证，没有它，先打开页面的
+    // 路人就能抢注成主人。密码只走 println（不进 asmoday.log）——日志文件会被
+    // 轮转/采集，明文凭据不能落盘；与 --reset-password 口径一致。
     if auth.user_count().unwrap_or(1) == 0 {
         let password = core::auth::random_password();
         let user = auth
@@ -481,9 +482,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         println!(
             "[asmoday] no administrator yet; created user 'admin' with a one-time password: {password}"
         );
-        println!(
-            "[asmoday] open the web UI and finish setup with this one-time password (it will ask for a new one)."
-        );
+        println!("[asmoday] sign in with this password, you will be asked to set a new one.");
     }
 
     state
@@ -696,7 +695,6 @@ fn public_routes() -> Router<AppState> {
         .route("/api/health", get(status))
         .route("/api/auth/status", get(api::auth::status))
         .route("/api/auth/login", post(api::auth::login))
-        .route("/api/auth/setup", post(api::auth::setup))
         .route("/api/auth/logout", post(api::auth::logout))
         // 公开分享（令牌/口令/有效期/防盗链由处理器自行校验）
         .route("/api/public/share/{token}", get(api::shares::info))

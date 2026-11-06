@@ -1,11 +1,10 @@
 <script setup lang="ts">
 /**
- * 登录 / 初始化一体页。整页独立布局，不套侧边栏。
+ * 登录页。整页独立布局，不套侧边栏。
  *
- * 单用户后没有用户名可言（v4.9.32）：
- * - 待初始化（needs_setup）：这里就是初始化页——输入控制台首启打印的
- *   一次性密码 + 新密码，一步建权并登录（v4.9.33）；
- * - 已初始化：普通登录页，只剩密码框（2FA 可选展开）。
+ * 单用户后没有用户名可言（v4.9.32）：只剩密码框（2FA 可选展开）。
+ * 首次部署用控制台打印的一次性密码登录，登录后 App.vue 会弹出
+ * 「设置新密码」对话框完成建权——本页不再承担初始化形态（v4.9.34）。
  */
 import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -22,8 +21,6 @@ const { t, locale } = useI18n()
 const router = useRouter()
 const route = useRoute()
 
-const mode = ref<'loading' | 'setup' | 'login'>('loading')
-const oneTimePassword = ref('')
 const password = ref('')
 const totp = ref('')
 const showTotp = ref(false)
@@ -33,26 +30,13 @@ const submitting = ref(false)
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (mode.value === 'setup') {
-    if (!oneTimePassword.value) {
-      error.value = t('auth.setup.oneTimeRequired')
-      return
-    }
-    if (password.value.length < 8) {
-      error.value = t('auth.setup.tooShort')
-      return
-    }
-  } else if (!password.value) {
+  if (!password.value) {
     error.value = t('auth.login.required')
     return
   }
   submitting.value = true
   try {
-    if (mode.value === 'setup') {
-      await authApi.setup(oneTimePassword.value, password.value)
-    } else {
-      await authApi.login(password.value, totp.value.trim())
-    }
+    await authApi.login(password.value, totp.value.trim())
     const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(target)
   } catch (err) {
@@ -62,9 +46,8 @@ async function submit() {
   }
 }
 
-onMounted(async () => {
-  await authApi.ensureAuth()
-  mode.value = authApi.status.value.needs_setup ? 'setup' : 'login'
+onMounted(() => {
+  void authApi.ensureAuth()
 })
 
 /** 语言切换：登录前也能改（首次运行可能整站是英文环境） */
@@ -108,48 +91,28 @@ function changeLocale(event: Event) {
           <AppIcon name="sparkle" :size="48" :stroke-width="1.75" />
         </span>
         <h1 class="text-xl font-semibold text-ink">Asmoday</h1>
-        <p class="mt-1 text-xs text-muted">
-          {{ mode === 'setup' ? t('auth.setup.tagline') : t('auth.login.tagline') }}
-        </p>
+        <p class="mt-1 text-xs text-muted">{{ t('auth.login.tagline') }}</p>
       </div>
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
-        <p v-if="mode === 'setup'" class="text-[12px] leading-relaxed text-muted">
-          {{ t('auth.setup.desc') }}
-        </p>
-
-        <label v-if="mode === 'setup'" class="block">
-          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.setup.oneTime') }}</span>
-          <input
-            v-model="oneTimePassword"
-            type="text"
-            autocomplete="one-time-code"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-            :placeholder="t('auth.setup.oneTimePlaceholder')"
-          />
-        </label>
-
         <label class="block">
-          <span class="mb-1 block text-[12px] text-muted">
-            {{ mode === 'setup' ? t('auth.setup.password') : t('auth.login.password') }}
-          </span>
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
           <PasswordInput
             v-model="password"
-            :autocomplete="mode === 'setup' ? 'new-password' : 'current-password'"
+            autocomplete="current-password"
             class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
             placeholder="••••••••"
           />
         </label>
 
         <button
-          v-if="mode === 'login'"
           type="button"
           class="text-[12px] text-muted transition-colors hover:text-ink"
           @click="showTotp = !showTotp"
         >
           {{ showTotp ? t('auth.login.totpHide') : t('auth.login.totpToggle') }}
         </button>
-        <label v-if="mode === 'login' && showTotp" class="block">
+        <label v-if="showTotp" class="block">
           <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.totpLabel') }}</span>
           <input
             v-model="totp"
@@ -172,17 +135,11 @@ function changeLocale(event: Event) {
           :disabled="submitting"
           class="w-full rounded-lg bg-accent py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
         >
-          {{
-            submitting
-              ? t('auth.login.submitting')
-              : mode === 'setup'
-                ? t('auth.setup.submit')
-                : t('auth.login.submit')
-          }}
+          {{ submitting ? t('auth.login.submitting') : t('auth.login.submit') }}
         </button>
 
         <p class="pt-1 text-center text-[12px] leading-relaxed text-muted">
-          {{ mode === 'setup' ? t('auth.setup.footer') : t('auth.login.footerLogin') }}
+          {{ t('auth.login.footerLogin') }}
         </p>
       </form>
     </div>
