@@ -411,12 +411,15 @@ GWT-DL-18 Given 「引擎设置 → 允许的保存目录」卡  Then 列出 `�
 GWT-DL-19 Given 保存目录里加 `dl2`  When 点「保存目录」  Then `POST /api/downloads/roots` 写 `settings.download_roots` 并热替换，列表立即出现、toast 提示「立即生效」，无需重启；`media/dl2` 目录被自动创建，`GET /api/downloads/engine` 的 `roots[].label` 立刻包含它（v4.9.37）
 GWT-DL-20 Given 保存目录填 `../escape` / 盘符 / UNC  When 保存  Then 400 并指出原因；未知 mount_id 或只读挂载点逐条跳过并回 `warnings`，全部失效时 400（v4.9.37）
 GWT-DL-21 Given 数据库里已有 `download_roots`  When 重启进程  Then `engine.roots` 与重启前一致；Given 库里没有值但 `config.toml` 的 `[download].roots` 有绝对路径  Then 能映射到挂载点的导入为子路径、映射不上的 WARN 丢弃，一个都没剩下时取第一个在线可写挂载点 + `downloads`（v4.9.37）
-GWT-DL-22 Given 点页头「引擎设置」  Then **以页内视图切换，不出现遮挡层**（DOM 里没有 `.fixed.inset-0` 弹窗），右侧按钮变「返回任务」；点它回到任务列表且分段数字、轮询照常（v4.9.38）
-GWT-DL-23 Given 在设置视图改了参数没保存  When 切回任务再进设置  Then 草稿仍在（只有首次进入才拉 `/api/config` 与挂载点清单，不会重置填了一半的值）；「保存目录」在无改动时禁用，加/删行后提示「目录有改动，记得保存」（v4.9.38）
+GWT-DL-22 Given 点页头「引擎设置」  Then **以页内视图切换，不出现遮挡层**（DOM 里没有 `.fixed.inset-0` 弹窗），右侧按钮变「返回下载列表」；点它回到任务列表、滚动回顶部且分段数字、轮询照常（v4.9.38 / v4.9.40）
+GWT-DL-23 Given 在设置视图改了参数没保存  When 点「返回下载列表」  Then 先弹确认而不是直接丢弃（见 GWT-DL-28）；「保存目录」在无改动时禁用，加/删行后提示「目录有改动，记得保存」（v4.9.40）
 GWT-DL-24 Given 「引擎设置 → BitTorrent Tracker」  Then 通栏一张卡：多行输入框（一行一个）、「填入常用列表」「清空」「保存 Tracker」三个按钮，标题旁标「对新任务生效」；BT 关闭时输入框与按钮禁用并提示先启用（v4.9.39）
 GWT-DL-25 Given 保存 Tracker  `udp://a.example:1337/announce` + `ftp://nope/x` + `udp://`  Then 只留合法项，`rejected` 逐条显示「已丢弃 …」；写 `settings.download_trackers` 并热替换，`POST` 后立刻 `GET /api/downloads/engine` 就返回新列表；重启进程仍是新值（v4.9.39）
 GWT-DL-26 Given 实例里有 Tracker 列表  When 添加一个不含 `tr=` 的 magnet 或 `.torrent`  Then 该任务的 announce 列表含这些地址（`.torrent` 走 `AddTorrentOptions::trackers`，magnet 走 URI 追加 `&tr=`，重复项不重复追加）；添加前已在跑的任务不受影响，`tellStatus.bittorrent.announceList` 仍是旧的（v4.9.39）
 GWT-DL-27 Given aria2 客户端  When `aria2.getGlobalOption`  Then 返回 `bt-tracker`（逗号分隔，与页面同一份）；`aria2.changeGlobalOption {"bt-tracker":"…"}` 返回 OK 且真的写库 + 换内存，随后 `getGlobalOption` 与页面都反映新值；不支持的键（如 `max-overall-download-limit`）也回 OK，但日志逐条 WARN（v4.9.39）
+GWT-DL-28 Given 引擎设置里改了参数 / 保存目录 / Tracker 任一项没保存  Then 页头出现「有未保存改动」徽标；点「返回下载列表」弹确认层并逐条列出会丢的东西（引擎参数 / 允许的保存目录 / BitTorrent Tracker 各自只在脏时列出）；「继续编辑」关掉确认、仍在设置视图且草稿不丢；「放弃改动并返回」才回任务列表，再进设置三块草稿都回到已保存值、徽标消失（v4.9.40）
+GWT-DL-29 Given 有未保存改动  When 点侧边栏或浏览器后退离开 `/downloads`  Then 同样弹确认；取消则 URL 仍在 `/downloads`，确认放弃才真正跳转且草稿回滚。放弃目录改动时 `GET /api/downloads/engine` 的 `roots` 条数不变（没有偷偷写库）（v4.9.40）
+GWT-DL-30 Given 设置页滚到最底部  Then 底部还有一颗「返回下载列表」，点击走同一套未保存确认；390 宽无横向溢出，底部按钮可见（v4.9.40）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

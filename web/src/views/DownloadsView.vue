@@ -15,6 +15,7 @@
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { onBeforeRouteLeave } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import {
   downloadsApi,
@@ -83,6 +84,11 @@ let armTimer: number | undefined
 /** 保存时的整份配置：`POST /api/config` 收完整结构，不能只发 `[download]` */
 const fullConfig = ref<Record<string, unknown> | null>(null)
 const savedNeedsRestart = ref(false)
+/**
+ * 参数快照（v4.9.40）：进设置视图与保存成功后各记一次 JSON 串，比对即知有没有未保存改动。
+ * 比逐字段 watch 省事，也不会漏掉新加的字段。
+ */
+const paramsBaseline = ref('')
 
 /** 三个开关的元数据：模板里 v-for 一次，省得写三段几乎一样的行 */
 const toggleFields: {
@@ -104,7 +110,6 @@ const mounts = ref<MountPoint[]>([])
 const rootDrafts = ref<RootDraft[]>([])
 const rootWarnings = ref<string[]>([])
 const rootsBusy = ref(false)
-const rootsDirty = ref(false)
 const newRootMount = ref('')
 const newRootRel = ref('downloads')
 
@@ -130,7 +135,73 @@ const COMMON_TRACKERS = [
   'udp://tracker.dler.org:6969/announce',
 ]
 
-useScrollLock(computed(() => addOpen.value))
+/** 悬挂中的「要不要放弃改动」询问：一次只开一个（先声明，下面的滚动锁要用） */
+const leaveOpen = ref(false)
+let leaveResolve: ((ok: boolean) => void) | null = null
+
+useScrollLock(computed(() => addOpen.value || leaveOpen.value))
+
+/**
+ * 未保存改动（v4.9.40）：三块草稿各自与「已保存态」比对。
+ *
+ * 设置视图里参数、保存目录、Tracker 是三个独立接口，任何一块改了都算未保存；
+ * 返回按钮与路由离开都靠这个判定，避免「点返回，填的东西悄悄没了」。
+ */
+const rootsDirty = computed(
+  () => rootPairs(rootDrafts.value) !== rootPairs(engine.value?.roots ?? []),
+)
+
+const trackersDirty = computed(
+  () => trackerLines(trackerText.value) !== trackerLines(engine.value?.trackers ?? []),
+)
+
+const paramsDirty = computed(
+  () =>
+    !!settings.value &&
+    paramsBaseline.value !== '' &&
+    JSON.stringify(settings.value) !== paramsBaseline.value,
+)
+
+/** 弹窗里逐条列出来的「丢了什么」 */
+const unsavedParts = computed(() => {
+  const parts: string[] = []
+  if (paramsDirty.value) parts.push('downloads.settings.unsavedParams')
+  if (rootsDirty.value) parts.push('downloads.settings.unsavedRoots')
+  if (trackersDirty.value) parts.push('downloads.settings.unsavedTrackers')
+  return parts
+})
+
+const unsaved = computed(() => unsavedParts.value.length > 0)
+
+function askLeave(): Promise<boolean> {
+  if (leaveOpen.value) return Promise.resolve(false)
+  leaveOpen.value = true
+  return new Promise<boolean>((resolve) => {
+    leaveResolve = resolve
+  })
+}
+
+/** `ok = true` 表示放弃草稿放行，`false` 表示留在设置视图继续编辑 */
+function settleLeave(ok: boolean) {
+  leaveOpen.value = false
+  const resolve = leaveResolve
+  leaveResolve = null
+  resolve?.(ok)
+}
+
+/** 目录草稿的比对键：挂载点 id + 子路径（顺序也算改动，用户可能是故意排的） */
+function rootPairs(list: { mount_id: string; rel: string }[]): string {
+  return list.map((root) => `${root.mount_id}\u0000${root.rel}`).join('\u0001')
+}
+
+/** Tracker 比对键：换行 / 逗号混写先归一，再比对（粘贴格式不同不算改动） */
+function trackerLines(value: string | string[]): string {
+  const lines = Array.isArray(value) ? value : value.split(/[\r\n,]+/)
+  return lines
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n')
+}
 
 const groups = computed(() => ({
   active: snapshot.value?.tasks?.active ?? [],
@@ -330,14 +401,14 @@ async function submitAdd() {
  * 进设置视图（v4.9.38：页内第二视图，不再是弹窗）。
  *
  * 只有第一次进入才拉配置与挂载点：来回切换时保留用户正在编辑的草稿，
- * 不会把填了一半的参数重置掉。
+ * 不会把填了一半的参数重置掉（要丢掉草稿，走返回时的确认弹窗）。
  */
 async function openSettings() {
   view.value = 'settings'
+  scrollToTop()
   if (settings.value) return
   settingsError.value = ''
   savedNeedsRestart.value = false
-  rootsDirty.value = false
   rootWarnings.value = []
   try {
     // 与设置页同一份配置：只改 `[download]`，其余原样回传
@@ -346,6 +417,7 @@ async function openSettings() {
     const config = (await res.json()) as Record<string, unknown>
     fullConfig.value = config
     settings.value = structuredClone(config.download as DownloadConfig)
+    paramsBaseline.value = JSON.stringify(settings.value)
     if (!engine.value) await loadEngine()
     // 保存目录只能选挂载点：拉实时清单（文件页每次进入都重拉，这里同理）
     mounts.value = (await filesApi.mounts()).mounts
@@ -360,22 +432,62 @@ async function openSettings() {
   }
 }
 
-function showTasks() {
+/**
+ * 回下载列表（v4.9.40）：有未保存改动先确认，确认放弃才回滚草稿并切视图。
+ *
+ * 「回滚」不只是切视图——留着脏草稿，下次进来还是旧输入，容易误以为已保存。
+ * 切完顺手滚到顶部，否则用户停在设置页滚动位置，看到的还是列表中段。
+ */
+async function showTasks() {
+  if (unsaved.value) {
+    const ok = await askLeave()
+    if (!ok) return
+    discardDrafts()
+  }
   view.value = 'tasks'
+  scrollToTop()
 }
+
+/** 丢掉三块草稿，回到「已保存态」 */
+function discardDrafts() {
+  // 基线是纯 JSON 串：不能对 `fullConfig.download` 做 structuredClone——那份是响应式代理，
+  // 浏览器会抛 DataCloneError（v4.9.40 实测踩到）
+  if (paramsBaseline.value) {
+    settings.value = JSON.parse(paramsBaseline.value) as DownloadConfig
+  }
+  rootDrafts.value = (engine.value?.roots ?? []).map((root) => ({
+    mount_id: root.mount_id,
+    rel: root.rel,
+  }))
+  trackerText.value = (engine.value?.trackers ?? []).join('\n')
+  rootWarnings.value = []
+  trackerWarnings.value = []
+  settingsError.value = ''
+}
+
+/** 本页的滚动容器是布局里的 `#app-scroll`，不是 body */
+function scrollToTop() {
+  document.getElementById('app-scroll')?.scrollTo({ top: 0 })
+}
+
+/** 侧边栏跳走同样要拦：草稿只在内存里，离开就没了 */
+onBeforeRouteLeave(async () => {
+  if (!unsaved.value) return true
+  const ok = await askLeave()
+  if (ok) discardDrafts()
+  return ok
+})
 
 function addRoot() {
   if (!newRootMount.value) return
   const rel = newRootRel.value.trim().replace(/^\/+/, '')
   if (rootDrafts.value.some((root) => root.mount_id === newRootMount.value && root.rel === rel)) return
   rootDrafts.value.push({ mount_id: newRootMount.value, rel })
-  rootsDirty.value = true
   newRootRel.value = 'downloads'
 }
 
 function removeRoot(index: number) {
   rootDrafts.value.splice(index, 1)
-  rootsDirty.value = true
 }
 
 /** 保存目录单独保存：写库 + 热替换，立即生效（v4.9.37） */
@@ -391,7 +503,6 @@ async function saveRoots() {
     const result = await downloadsApi.setRoots(rootDrafts.value.map((root) => ({ ...root })))
     rootDrafts.value = result.roots.map((root) => ({ mount_id: root.mount_id, rel: root.rel }))
     rootWarnings.value = result.warnings
-    rootsDirty.value = false
     await loadEngine()
     showToast(t('downloads.settings.rootsSaved'))
   } catch (err) {
@@ -446,6 +557,8 @@ async function saveSettings() {
     })
     if (!res.ok) throw new Error(await readApiError(res))
     fullConfig.value = next
+    // 保存成功即新的基线：否则「刚存的改动」还会被当成未保存
+    paramsBaseline.value = JSON.stringify(settings.value)
     savedNeedsRestart.value = true
     showToast(t('downloads.settings.saved'))
     await loadEngine()
@@ -519,9 +632,18 @@ onUnmounted(() => {
     <!-- 页头：任务 / 引擎设置共用一行，右侧按钮随视图换 -->
     <div class="flex flex-wrap items-start gap-3">
       <div class="min-w-0 flex-1">
-        <p class="text-sm font-semibold text-ink">
-          {{ t(view === 'tasks' ? 'downloads.heading' : 'downloads.settings.title') }}
-        </p>
+        <div class="flex flex-wrap items-center gap-2">
+          <p class="text-sm font-semibold text-ink">
+            {{ t(view === 'tasks' ? 'downloads.heading' : 'downloads.settings.title') }}
+          </p>
+          <span
+            v-if="view === 'settings' && unsaved"
+            class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] fg-warn"
+            data-testid="download-unsaved-badge"
+          >
+            {{ t('downloads.settings.unsaved') }}
+          </span>
+        </div>
         <p
           v-if="view === 'tasks'"
           class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-muted"
@@ -813,6 +935,51 @@ onUnmounted(() => {
       </div>
     </Teleport>
 
+    <!-- ================= 未保存改动确认（v4.9.40） ================= -->
+    <Teleport to="body">
+      <Transition name="fade">
+        <div
+          v-if="leaveOpen"
+          class="fixed inset-0 z-[86] grid place-items-center modal-overlay bg-black/50 p-4"
+          data-testid="download-unsaved-dialog"
+          @click.self="settleLeave(false)"
+        >
+          <div class="w-full max-w-sm modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
+            <p class="text-sm font-medium text-ink">{{ t('downloads.settings.unsavedTitle') }}</p>
+            <p class="mt-1.5 text-[12px] leading-relaxed text-muted">
+              {{ t('downloads.settings.unsavedBody') }}
+            </p>
+            <ul class="mt-2.5 space-y-1">
+              <li
+                v-for="part in unsavedParts"
+                :key="part"
+                class="flex items-center gap-1.5 text-[12px] text-ink"
+              >
+                <span class="h-1 w-1 shrink-0 rounded-full bg-accent" />
+                {{ t(part) }}
+              </li>
+            </ul>
+            <div class="mt-4 flex items-center justify-end gap-2">
+              <button
+                class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink"
+                data-testid="download-unsaved-stay"
+                @click="settleLeave(false)"
+              >
+                {{ t('downloads.settings.leaveStay') }}
+              </button>
+              <button
+                class="rounded-lg bg-red-500/90 px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+                data-testid="download-unsaved-discard"
+                @click="settleLeave(true)"
+              >
+                {{ t('downloads.settings.leaveDiscard') }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
     <!-- ================= 引擎设置（页内视图，v4.9.38） ================= -->
     <template v-if="view === 'settings'">
       <p v-if="settingsError && !settings" class="mt-5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger">
@@ -1016,6 +1183,7 @@ onUnmounted(() => {
               <select
                 v-model="newRootMount"
                 class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
+                data-testid="download-new-root-mount"
               >
                 <option value="" disabled>{{ t('downloads.settings.pickMount') }}</option>
                 <option
@@ -1031,11 +1199,13 @@ onUnmounted(() => {
                 v-model="newRootRel"
                 :placeholder="t('downloads.settings.subPath')"
                 class="w-28 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
+                data-testid="download-new-root-rel"
                 @keyup.enter="addRoot"
               />
               <button
                 class="rounded-lg border border-line px-2 py-1.5 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
                 :disabled="!newRootMount"
+                data-testid="download-add-root"
                 @click="addRoot"
               >
                 {{ t('downloads.settings.addRoot') }}
@@ -1128,6 +1298,27 @@ onUnmounted(() => {
         <p v-if="settingsError" class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs fg-danger lg:col-span-2">
           {{ settingsError }}
         </p>
+      </div>
+
+      <!-- 设置页比一屏长：滚到底也要有出口，不用再滚回去找页头（v4.9.40） -->
+      <div
+        v-if="settings"
+        class="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-4"
+      >
+        <span v-if="unsaved" class="text-[11px] leading-relaxed fg-warn">
+          {{ t('downloads.settings.unsavedHint') }}
+        </span>
+        <span v-else class="text-[11px] leading-relaxed text-muted">
+          {{ t('downloads.settings.backHint') }}
+        </span>
+        <button
+          class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-line px-3 text-xs text-muted transition-colors hover:border-accent/50 hover:text-ink"
+          data-testid="download-back-bottom"
+          @click="showTasks"
+        >
+          <AppIcon name="arrowLeft" :size="13" />
+          {{ t('downloads.settings.back') }}
+        </button>
       </div>
     </template>
 
