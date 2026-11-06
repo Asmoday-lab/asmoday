@@ -727,6 +727,32 @@ fn verify_one_time_code(state: &AppState, user_id: i64, secret: &str, code: &str
     }
 }
 
+/// 登录请求带的凭证组合（v4.9.48）。
+///
+/// 登录页在「密码 / 动态验证码」两种模式间切换，但始终只有一个输入框：
+/// 密码模式只传 `password`，动态码模式只传 `totp`。所以「只给 totp、password 为空」
+/// 是正常形态，不是漏传——把它判成空凭证会让人永远登不进去。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CredentialMode {
+    /// 两个字段都空：零凭证，直接拒
+    Empty,
+    /// 只给 `password`：按密码比；同格里可能填的是一次性码（宽容旧行为）
+    Password,
+    /// 只给 `totp`：动态码模式下的一次性码
+    OneTimeCode,
+    /// 两个都给：脚本 / 客户端显式要求严格双因子
+    TwoFactor,
+}
+
+fn credential_mode(password_empty: bool, code_empty: bool) -> CredentialMode {
+    match (password_empty, code_empty) {
+        (true, true) => CredentialMode::Empty,
+        (false, true) => CredentialMode::Password,
+        (true, false) => CredentialMode::OneTimeCode,
+        (false, false) => CredentialMode::TwoFactor,
+    }
+}
+
 /// 归一化后的码是不是 6 位 TOTP（恢复码是 10 位字母数字，两者不会撞车）。
 ///
 /// 抽出来是为了让这条分界有测试兜底：判错就会把 TOTP 码丢去查恢复码表，
@@ -801,14 +827,14 @@ pub async fn login(
         );
     };
 
-    // 单框凭证（v4.9.47）：登录页只有一个输入框，里面可能填的是密码，也可能是
-    // 6 位动态码 / 一次性恢复码——三者同等有效，由内容决定走哪条校验，不由页面
-    // 先问「你是哪种」。
-    // 带独立 `totp` 字段的调用方（脚本 / 第三方客户端）仍走**严格双因子**：
-    // 密码 + 动态码，缺一不可。
+    // 凭证组合（v4.9.48）：登录页一个框，可在「密码」与「动态验证码」两种模式间切换。
+    // - 密码模式：只传 password（若有人还是把 6 位码填进密码框，宽容地先当码试一次）
+    // - 动态码模式：只传 totp，password 为空
+    // - 两个都给：脚本 / 第三方客户端显式要求的**严格双因子**
     let code_field = body.totp.as_deref().map(str::trim).unwrap_or("");
     // 不 trim：密码里可能真带首尾空格，只有一次性码才需要归一化（它自己会剥符号）
     let credential = body.password.as_str();
+    let mode = credential_mode(credential.is_empty(), code_field.is_empty());
     let authentic = if user.totp_enabled {
         let Some(secret) = secret.as_deref() else {
             return json_error_code(
@@ -817,18 +843,26 @@ pub async fn login(
                 "TOTP secret missing",
             );
         };
-        if code_field.is_empty() {
-            // 单框：先按一次性码试（6 位数字 → TOTP，其余 → 恢复码），不中再按密码比
-            !credential.is_empty()
-                && (verify_one_time_code(&state, user.id, secret, credential)
-                    || verify_password(&hash, credential))
-        } else {
-            verify_password(&hash, &body.password)
-                && verify_one_time_code(&state, user.id, secret, code_field)
+        match mode {
+            CredentialMode::Empty => false,
+            // 动态码模式：只认一次性码（6 位数字 → TOTP，其余 → 恢复码）
+            CredentialMode::OneTimeCode => {
+                verify_one_time_code(&state, user.id, secret, code_field)
+            }
+            // 严格双因子：先比密码，密码错就别去碰恢复码（避免白耗一个）
+            CredentialMode::TwoFactor => {
+                verify_password(&hash, credential)
+                    && verify_one_time_code(&state, user.id, secret, code_field)
+            }
+            // 密码模式：先按一次性码试（有人会把码填进密码框），不中再比密码
+            CredentialMode::Password => {
+                verify_one_time_code(&state, user.id, secret, credential)
+                    || verify_password(&hash, credential)
+            }
         }
     } else {
-        // 没开 2FA：只有密码这一条路（顺带挡掉空凭证）
-        !credential.is_empty() && verify_password(&hash, credential)
+        // 没开 2FA：只有密码这一条路；只有 totp 字段的请求直接算失败
+        mode == CredentialMode::Password && verify_password(&hash, credential)
     };
 
     if !authentic {
@@ -1224,7 +1258,8 @@ pub async fn totp_disable(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoginRequest, PasswordRequest, looks_like_totp, normalize_authority, origin_matches_host,
+        CredentialMode, LoginRequest, PasswordRequest, credential_mode, looks_like_totp,
+        normalize_authority, origin_matches_host,
     };
     use axum::http::{HeaderMap, Method, header};
 
@@ -1248,6 +1283,19 @@ mod tests {
         let code_only: LoginRequest = serde_json::from_str(r#"{"totp":"123456"}"#).unwrap();
         assert_eq!(code_only.password, "");
         assert_eq!(code_only.totp.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn credentials_are_classified_by_which_field_is_filled() {
+        // 动态码模式（页面切成「使用动态验证码登录」）只传 totp，password 空——
+        // 这是正常形态，不能被当成空凭证拒掉
+        assert_eq!(credential_mode(true, false), CredentialMode::OneTimeCode);
+        // 密码模式
+        assert_eq!(credential_mode(false, true), CredentialMode::Password);
+        // 脚本显式要严格双因子
+        assert_eq!(credential_mode(false, false), CredentialMode::TwoFactor);
+        // 两个都空 = 零凭证
+        assert_eq!(credential_mode(true, true), CredentialMode::Empty);
     }
 
     #[test]

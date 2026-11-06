@@ -80,8 +80,11 @@ export const authApi = {
   /**
    * 登录。单用户后没有用户名输入框：username 由后端按唯一账号解析（留空即可）。
    *
-   * 登录页只有一个框（v4.9.47），`credential` 里可能是密码，也可能是 6 位动态码 /
-   * 一次性恢复码——后端按内容决定校验路径；带 `totp` 分开传的调用方是严格双因子。
+   * 两种调用形态（v4.9.48）：
+   * - 密码模式：`login(password)`，只带 password
+   * - 动态码模式：`login('', code)`，只带 totp（页面上是一枚 6 位码框）
+   *
+   * 两个都给（`login(password, code)`）= 严格双因子，脚本 / 第三方客户端用。
    */
   async login(credential: string, totp?: string) {
     await post('/api/auth/login', { password: credential, totp: totp || undefined })

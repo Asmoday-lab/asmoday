@@ -2,14 +2,15 @@
 /**
  * 登录页。整页独立布局，不套侧边栏。
  *
- * 单用户后没有用户名可言（v4.9.32）：整页只有一个输入框，**这个框同时接受
- * 密码、6 位动态码和一次性恢复码**（v4.9.47）——由填的内容决定走哪条校验，
- * 页面不先问「你是哪种」。开了 2FA 只是把标签与提示换掉，不会把框变成两个、
- * 也不会把密码这条路关掉；没开 2FA 时那颗「已开启 2FA」的开关也不再出现（v4.9.46）。
+ * 单用户后没有用户名（v4.9.32）：整页只有**一个输入框**，形态跟着登录方式走——
+ * 默认是密码框；账号开了 2FA 时框下方多一行「使用动态验证码登录」，点一下同一个
+ * 框变成 6 位动态码输入（居中、字距拉开、输满自动提交），再点一行就换回密码框
+ * （v4.9.48）。这是 GitHub / Vercel 这类站点的通行做法：方式可选，框始终一个。
+ *
  * 首次部署用控制台打印的一次性密码登录，登录后 App.vue 会弹出
  * 「设置新密码」对话框完成建权——本页不再承担初始化形态（v4.9.34）。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -24,25 +25,52 @@ const { t, locale } = useI18n()
 const router = useRouter()
 const route = useRoute()
 
-/** 单框凭证：密码 / 动态码 / 恢复码都填这里，原样提交，不在前端猜类型 */
-const credential = ref('')
+type LoginMode = 'password' | 'code'
+
+/** 同一个框的两种形态：默认密码，用户自己切到动态码 */
+const mode = ref<LoginMode>('password')
+const password = ref('')
+const code = ref('')
 const error = ref('')
 const submitting = ref(false)
+/** 已经自动提交过的 6 位码，避免失败后同一串反复打请求 */
+let lastAutoSubmitted = ''
 
-/** 只影响文案（标签、占位、提示）；框的个数与后端校验路径都由内容决定 */
+const passwordWrap = ref<HTMLElement | null>(null)
+const codeInput = ref<HTMLInputElement | null>(null)
+
+/** 账号开没开 2FA 只决定「要不要给切换入口」，框的个数永远是 1 */
 const totpEnabled = computed(() => authApi.status.value.totp_enabled)
+/** 没开 2FA 时恒为 false：即使 mode 被改过也不会露出动态码框 */
+const codeMode = computed(() => totpEnabled.value && mode.value === 'code')
+
+function toggleMode() {
+  if (!totpEnabled.value || submitting.value) return
+  mode.value = codeMode.value ? 'password' : 'code'
+  // 两种凭证互不相干，切换时清干净，免得把密码当动态码提交出去
+  password.value = ''
+  code.value = ''
+  error.value = ''
+  lastAutoSubmitted = ''
+  void nextTick(() => {
+    if (codeMode.value) codeInput.value?.focus()
+    else passwordWrap.value?.querySelector('input')?.focus()
+  })
+}
 
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (!credential.value) {
-    error.value = t(totpEnabled.value ? 'auth.login.credentialRequired' : 'auth.login.required')
+  const value = codeMode.value ? code.value.trim() : password.value
+  if (!value) {
+    error.value = t(codeMode.value ? 'auth.login.codeRequired' : 'auth.login.required')
     return
   }
   submitting.value = true
   try {
-    // 不 trim：密码可能真带首尾空格，动态码的归一化交给后端
-    await authApi.login(credential.value)
+    // 密码模式只传 password，动态码模式只传 totp —— 后端按「哪个字段有值」分派
+    if (codeMode.value) await authApi.login('', value)
+    else await authApi.login(value)
     const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(target)
   } catch (err) {
@@ -51,6 +79,15 @@ async function submit() {
     submitting.value = false
   }
 }
+
+/** 6 位数字输满就提交（动态码框的通行手感）；恢复码是 10 位字母数字，不会误触 */
+watch(code, (value) => {
+  if (!codeMode.value || submitting.value) return
+  const digits = value.replace(/\s+/g, '')
+  if (!/^\d{6}$/.test(digits) || digits === lastAutoSubmitted) return
+  lastAutoSubmitted = digits
+  void submit()
+})
 
 onMounted(() => {
   void authApi.ensureAuth()
@@ -101,22 +138,50 @@ function changeLocale(event: Event) {
       </div>
 
       <form class="glass-card space-y-3 rounded-2xl p-5" @submit.prevent="submit">
-        <label class="block">
-          <span class="mb-1 block text-[12px] text-muted">
-            {{ t(totpEnabled ? 'auth.login.credential' : 'auth.login.password') }}
-          </span>
-          <!-- 一个框，三种凭证：密码 / 6 位动态码 / 恢复码。输入默认遮住（可能是密码），
-               右侧眼睛可随时看明文——填动态码时不用再猜自己有没有打错 -->
-          <PasswordInput
-            v-model="credential"
-            autocomplete="current-password"
-            class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-            :placeholder="totpEnabled ? t('auth.login.credentialPlaceholder') : '••••••••'"
+        <!-- 密码形态 -->
+        <label v-if="!codeMode" class="block">
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.password') }}</span>
+          <div ref="passwordWrap">
+            <PasswordInput
+              v-model="password"
+              autocomplete="current-password"
+              class="w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm text-ink outline-none focus:border-accent"
+              placeholder="••••••••"
+            />
+          </div>
+        </label>
+        <!-- 动态码形态：同一个框，换成居中等宽数字样式 -->
+        <label v-else class="block">
+          <span class="mb-1 block text-[12px] text-muted">{{ t('auth.login.codeLabel') }}</span>
+          <input
+            ref="codeInput"
+            v-model="code"
+            type="text"
+            autocomplete="one-time-code"
+            autocapitalize="characters"
+            spellcheck="false"
+            class="w-full rounded-lg border border-line bg-elevated px-3 py-2.5 text-center text-lg font-medium tracking-[0.45em] text-ink outline-none placeholder:text-muted/40 focus:border-accent"
+            placeholder="000000"
+            @input="error = ''"
           />
-          <span v-if="totpEnabled" class="mt-1.5 block text-[11px] leading-relaxed text-muted">
-            {{ t('auth.login.totpHint') }}
+          <span
+            class="mt-1.5 block text-[11px] leading-relaxed whitespace-pre-line text-muted"
+          >
+            {{ t('auth.login.codeHint') }}
           </span>
         </label>
+
+        <!-- 方式切换：只有开了 2FA 才有第二条路，也才出现这一行 -->
+        <button
+          v-if="totpEnabled"
+          type="button"
+          class="mx-auto block text-[12px] text-muted underline-offset-4 transition-colors hover:text-ink hover:underline disabled:opacity-40"
+          :disabled="submitting"
+          data-testid="login-mode-toggle"
+          @click="toggleMode"
+        >
+          {{ t(codeMode ? 'auth.login.usePassword' : 'auth.login.useTotp') }}
+        </button>
 
         <p
           v-if="error"
@@ -128,6 +193,7 @@ function changeLocale(event: Event) {
         <button
           type="submit"
           :disabled="submitting"
+          data-testid="login-submit"
           class="w-full rounded-lg bg-accent py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
         >
           {{ submitting ? t('auth.login.submitting') : t('auth.login.submit') }}
