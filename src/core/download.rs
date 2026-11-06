@@ -304,8 +304,216 @@ struct TaskMap {
     stopped: Vec<String>,
 }
 
-/// 实例设置里下载 RPC 密钥的键名（`app_settings.key`，v4.9.36）。
+/// 实例设置里下载 RPC 密钥的键名（`settings.key`，v4.9.36）。
 pub const RPC_SECRET_SETTING: &str = "download_rpc_secret";
+
+/// 实例设置里「允许的保存目录」的键名（JSON 数组，v4.9.37）。
+pub const ROOTS_SETTING: &str = "download_roots";
+
+/// 落盘目录配置的持久化形态：挂载点稳定 id + 相对子路径。
+///
+/// 为什么存 id 而不是绝对路径：挂载点路径是可改的（换盘、改配置），`m0`
+/// 这类 id 在热重载后仍指向同一个位置；相对路径让「同一个配置」在换盘后继续
+/// 有效。绝对路径只存在于运行期（`DownloadRoot::path`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootSpec {
+    /// 挂载点 id（`m0` / `m1`…，见 `path_guard::MountPoint::id`）
+    pub mount_id: String,
+    /// 相对挂载点根的路径，空 = 挂载点根；分隔符统一为 `/`
+    #[serde(default)]
+    pub rel: String,
+}
+
+/// 运行期的落盘目录：配置 + 解析结果（供页面回显、RPC 白名单校验）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DownloadRoot {
+    pub mount_id: String,
+    /// 挂载点展示名（页面显示 `名字 / 子路径`，不显示绝对路径）
+    pub mount_name: String,
+    pub rel: String,
+    /// 解析出来的绝对路径（只用于落盘与 RPC `dir` 默认值）
+    pub path: PathBuf,
+    /// 挂载点当前是否在线（掉盘 / 网络共享断开时为 false，白名单不认它）
+    pub online: bool,
+}
+
+impl DownloadRoot {
+    /// 持久化形态（丢掉运行期解析出来的绝对路径）
+    pub fn spec(&self) -> RootSpec {
+        RootSpec {
+            mount_id: self.mount_id.clone(),
+            rel: self.rel.clone(),
+        }
+    }
+
+    /// 页面展示文本：`挂载点名 / 子路径`，根目录只显示名字
+    pub fn label(&self) -> String {
+        if self.rel.is_empty() {
+            self.mount_name.clone()
+        } else {
+            format!("{} / {}", self.mount_name, self.rel)
+        }
+    }
+}
+
+/// 规范化用户填的子路径：允许 `a/b`、`/a/b`（前导斜杠视作挂载点根），
+/// 拒绝盘符、`..`、`~` 与空段。返回统一用 `/` 的相对路径。
+pub fn normalize_rel(raw: &str) -> Result<String, String> {
+    let text = raw.trim().replace('\\', "/");
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    // 盘符（`C:`）与 UNC（`//server/share`）都是绝对路径，不属于「挂载点内」
+    if text.starts_with("//") || text.contains(':') {
+        return Err("子路径必须是相对路径，不能带盘符或网络前缀".into());
+    }
+    let mut parts = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return Err("子路径不能包含 `..`".into()),
+            "~" => return Err("子路径不能使用 `~`".into()),
+            other => parts.push(other),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// 把「挂载点 id + 子路径」解析成可落盘的目录。
+///
+/// 返回（解析成功的根，逐条问题说明）。找不到的挂载点、只读挂载点、非法子路径
+/// 都只跳过并给出原因 —— 一个坏条目不应当让整份配置失效，用户还能在页面上改。
+pub fn resolve_roots(
+    mounts: &crate::core::path_guard::MountSet,
+    specs: &[RootSpec],
+) -> (Vec<DownloadRoot>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut warnings = Vec::new();
+    for spec in specs {
+        let Some(entry) = mounts
+            .mounts
+            .iter()
+            .find(|mount| mount.info.id == spec.mount_id)
+        else {
+            warnings.push(format!("挂载点 {} 不存在（可能已被移除）", spec.mount_id));
+            continue;
+        };
+        if entry.info.readonly {
+            warnings.push(format!("挂载点 {} 是只读的", entry.info.name));
+            continue;
+        }
+        let rel = match normalize_rel(&spec.rel) {
+            Ok(rel) => rel,
+            Err(err) => {
+                warnings.push(format!("{}：{err}", entry.info.name));
+                continue;
+            }
+        };
+        let Some(root) = entry.root.as_ref() else {
+            // 掉线挂载点保留条目：用户能在设置里看到它，插回硬盘即恢复，
+            // 不必重新填一遍
+            roots.push(DownloadRoot {
+                mount_id: entry.info.id.clone(),
+                mount_name: entry.info.name.clone(),
+                rel,
+                path: PathBuf::from(&entry.info.path),
+                online: false,
+            });
+            continue;
+        };
+        let path = if rel.is_empty() {
+            root.clone()
+        } else {
+            root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
+        // 剥掉 Windows canonicalize 的 `\\?\` 前缀：这个路径会作为 RPC `dir`
+        // 回给客户端、也会在页面上当默认值，verbatim 形式对第三方客户端不友好
+        let path = PathBuf::from(crate::core::fs::normalize_display(&path));
+        roots.push(DownloadRoot {
+            mount_id: entry.info.id.clone(),
+            mount_name: entry.info.name.clone(),
+            rel,
+            path,
+            online: true,
+        });
+    }
+    (roots, warnings)
+}
+
+/// 没有配置时给一个可用默认：第一个在线、可写的挂载点下的 `downloads`。
+pub fn default_root_spec(mounts: &crate::core::path_guard::MountSet) -> Option<RootSpec> {
+    mounts
+        .mounts
+        .iter()
+        .find(|mount| mount.root.is_some() && !mount.info.readonly)
+        .map(|mount| RootSpec {
+            mount_id: mount.info.id.clone(),
+            rel: "downloads".to_string(),
+        })
+}
+
+/// `path` 相对 `base` 的剩余部分（纯文本比较，Windows 大小写不敏感）。
+///
+/// 只用于把旧配置里的绝对路径映射成挂载点子路径；真正的归属校验仍走
+/// `path_guard` 的 canonicalize 口径。
+fn rel_under(base: &str, path: &str) -> Option<String> {
+    let base = base.replace('\\', "/");
+    let base = base.trim_end_matches('/');
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    if path.eq_ignore_ascii_case(base) {
+        return Some(String::new());
+    }
+    if path.get(..base.len())?.eq_ignore_ascii_case(base)
+        && path.as_bytes().get(base.len()) == Some(&b'/')
+    {
+        return path.get(base.len() + 1..).map(str::to_string);
+    }
+    None
+}
+
+/// 旧配置 `[download].roots`（绝对路径）→ 挂载点子路径（一次性种子）。
+///
+/// 映射不上的条目直接丢弃并给原因：v4.9.37 起下载目录必须在挂载点内，
+/// 否则下完的文件在文件管理里根本看不见。
+pub fn seed_root_specs(
+    configured: &[String],
+    mounts: &crate::core::path_guard::MountSet,
+) -> (Vec<RootSpec>, Vec<String>) {
+    let mut specs = Vec::new();
+    let mut warnings = Vec::new();
+    for raw in configured {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Some(entry) = mounts.find_by_path_text(raw) else {
+            warnings.push(format!("{raw} 不属于任何挂载点，已忽略"));
+            continue;
+        };
+        let rel = match rel_under(&entry.info.path, raw) {
+            Some(rel) => match normalize_rel(&rel) {
+                Ok(rel) => rel,
+                Err(err) => {
+                    warnings.push(format!("{raw}：{err}"));
+                    continue;
+                }
+            },
+            None => {
+                warnings.push(format!("{raw} 无法转换为挂载点内路径，已忽略"));
+                continue;
+            }
+        };
+        specs.push(RootSpec {
+            mount_id: entry.info.id.clone(),
+            rel,
+        });
+    }
+    (specs, warnings)
+}
 
 /// 下载引擎。AppState 以 `Arc<DownloadManager>` 持有。
 pub struct DownloadManager {
@@ -313,10 +521,9 @@ pub struct DownloadManager {
     /// RPC 密钥（`token:<secret>` 鉴权）。可在运行中替换：前端「刷新密钥」写库
     /// 之后直接换内存值，旧密钥下一个请求即失效，不需要重启（v4.9.36）。
     secret: Arc<RwLock<String>>,
-    /// 默认落盘根（roots 未配置时）
-    default_root: PathBuf,
-    /// 允许的落盘根白名单（空 = 只允许 default_root）
-    roots: Vec<PathBuf>,
+    /// 允许落盘的根白名单（挂载点子路径，v4.9.37）。运行中可整体替换：
+    /// 页面保存目录后写库 + 换内存，下一个任务即生效，不需要重启。
+    roots: Arc<RwLock<Vec<DownloadRoot>>>,
     /// 每任务最大连接数
     pub segments: usize,
     /// `[download].enable=false` 时为 false：RPC handler 直接 404，无协议暴露面
@@ -367,20 +574,18 @@ impl DownloadManager {
     pub fn new(
         http: reqwest::Client,
         secret: String,
-        roots: Vec<PathBuf>,
+        roots: Vec<DownloadRoot>,
         segments: usize,
         max_concurrent: usize,
         enabled: bool,
         bt: Option<Arc<BtEngine>>,
     ) -> Self {
-        let default_root = roots.first().cloned().unwrap_or_default();
         let (events, _) = broadcast::channel(256);
         let max_concurrent_count = max_concurrent.clamp(1, 32);
         Self {
             http,
             secret: Arc::new(RwLock::new(secret)),
-            default_root,
-            roots,
+            roots: Arc::new(RwLock::new(roots)),
             segments: segments.clamp(1, 32),
             enabled,
             max_concurrent: Arc::new(Semaphore::new(max_concurrent_count)),
@@ -446,9 +651,29 @@ impl DownloadManager {
         }
     }
 
-    /// 允许落盘的根白名单（`dir` 只能落在这些目录内）
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
+    /// 允许落盘的根白名单（挂载点子路径）。返回快照，调用方不要长期持有。
+    pub fn roots(&self) -> Vec<DownloadRoot> {
+        self.roots
+            .read()
+            .map(|roots| roots.clone())
+            .unwrap_or_default()
+    }
+
+    /// 运行中替换落盘目录（页面保存后调用；调用方负责先写库）。
+    ///
+    /// 已存在的任务不受影响（它们已经记了自己的 `dir`），新任务按新白名单校验。
+    pub fn replace_roots(&self, next: Vec<DownloadRoot>) {
+        if let Ok(mut guard) = self.roots.write() {
+            *guard = next;
+        }
+    }
+
+    /// 默认落盘目录：白名单里第一个在线条目
+    fn default_root_path(&self) -> Option<PathBuf> {
+        self.roots()
+            .into_iter()
+            .find(|root| root.online)
+            .map(|root| root.path)
     }
 
     /// 全局并发上限（创建时快照，改配置需重启）
@@ -460,24 +685,30 @@ impl DownloadManager {
 
     /// 请求目录是否在白名单内；返回（尽量 canonical 的）路径。
     ///
-    /// Windows 大小写不敏感（与挂载点校验同口径）；网络路径 canonicalize
-    /// 可能失败（离线 SMB），失败时按字面量对比。
+    /// 白名单来源是「挂载点 + 子路径」（v4.9.37），已经过 `resolve_roots` 的
+    /// 只读 / 越界校验；这里只做前缀匹配。Windows 大小写不敏感（与挂载点校验
+    /// 同口径）；网络路径 canonicalize 可能失败（离线 SMB），失败时按字面量对比。
     fn resolve_dir(&self, requested: Option<&str>) -> Result<PathBuf, RpcError> {
+        // 掉线挂载点不参与校验：文件根本写不进去，早拒绝比写到一半失败好
+        let roots: Vec<DownloadRoot> = self
+            .roots()
+            .into_iter()
+            .filter(|root| root.online)
+            .collect();
+        if roots.is_empty() {
+            return Err(RpcError::new(
+                2,
+                "no download directory configured; pick a mount point in the downloads page",
+            ));
+        }
         let raw = match requested {
             Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
-            _ => self.default_root.clone(),
+            _ => roots[0].path.clone(),
         };
         let canon = std::fs::canonicalize(&raw).unwrap_or_else(|_| normalize(&raw));
-        let mut effective: &[PathBuf] = &self.roots;
-        if effective.is_empty() {
-            // 无配置：退回默认根（构造时保证非空；空 PathBuf 时一律拒绝）
-            effective = std::slice::from_ref(&self.default_root);
-        }
-        for root in effective {
-            if root.as_os_str().is_empty() {
-                continue;
-            }
-            let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| normalize(root));
+        for root in &roots {
+            let root_canon =
+                std::fs::canonicalize(&root.path).unwrap_or_else(|_| normalize(&root.path));
             if path_contains(&root_canon, &canon) {
                 return Ok(canon);
             }
@@ -1041,8 +1272,12 @@ impl DownloadManager {
 
     /// 全局选项回显（aria2.getGlobalOption）：只声明真实生效的键
     pub fn global_options(&self) -> serde_json::Value {
+        let dir = self
+            .default_root_path()
+            .map(|path| display_path(&path))
+            .unwrap_or_default();
         let mut options = json!({
-            "dir": self.default_root.to_string_lossy(),
+            "dir": dir,
             "max-concurrent-downloads": format!("{}", self.max_concurrent_count),
             "split": format!("{}", self.segments),
             "user-agent": "aria2/1.37.0",
@@ -1776,6 +2011,17 @@ fn task_json(state: &TaskState, keys: Option<&[String]>) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    /// 测试用落盘根（等价于「挂载点 m0 的根目录」）
+    fn test_root(path: &Path) -> DownloadRoot {
+        DownloadRoot {
+            mount_id: "m0".into(),
+            mount_name: "test".into(),
+            rel: String::new(),
+            path: path.to_path_buf(),
+            online: true,
+        }
+    }
+
     #[test]
     fn split_segments_even_and_remainder() {
         let segs = split_segments(100, 8);
@@ -1857,7 +2103,7 @@ mod tests {
         let manager = Arc::new(DownloadManager::new(
             reqwest::Client::new(),
             "secret1".into(),
-            vec![base.clone()],
+            vec![test_root(&base)],
             4,
             2,
             true,
@@ -1915,7 +2161,7 @@ mod tests {
         let manager = Arc::new(DownloadManager::new(
             reqwest::Client::new(),
             "secret1".into(),
-            vec![base.clone()],
+            vec![test_root(&base)],
             2,
             1,
             true,
@@ -1975,7 +2221,7 @@ mod tests {
         let manager = DownloadManager::new(
             reqwest::Client::new(),
             "secret1".into(),
-            vec![base.clone()],
+            vec![test_root(&base)],
             2,
             1,
             true,
@@ -1995,7 +2241,7 @@ mod tests {
         let disabled = DownloadManager::new(
             reqwest::Client::new(),
             "secret1".into(),
-            vec![base.clone()],
+            vec![test_root(&base)],
             2,
             1,
             false,
@@ -2012,7 +2258,7 @@ mod tests {
         let manager = DownloadManager::new(
             reqwest::Client::new(),
             "secret1".into(),
-            vec![base.clone()],
+            vec![test_root(&base)],
             4,
             2,
             true,
@@ -2031,6 +2277,109 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
+    /// 子路径规范化：只接受挂载点内的相对路径（v4.9.37）
+    #[test]
+    fn rel_rejects_absolute_and_parent() {
+        assert_eq!(normalize_rel("").unwrap(), "");
+        assert_eq!(normalize_rel(" /media//movies/ ").unwrap(), "media/movies");
+        assert_eq!(normalize_rel(r"media\movies").unwrap(), "media/movies");
+        assert_eq!(normalize_rel(".").unwrap(), "");
+        assert!(normalize_rel("../escape").is_err());
+        assert!(normalize_rel("a/../../b").is_err());
+        assert!(normalize_rel("C:/Windows").is_err());
+        assert!(normalize_rel("//server/share").is_err());
+        assert!(normalize_rel("~/home").is_err());
+    }
+
+    fn test_mount(
+        id: &str,
+        name: &str,
+        display: &str,
+        root: Option<&str>,
+        readonly: bool,
+    ) -> crate::core::path_guard::MountEntry {
+        crate::core::path_guard::MountEntry {
+            info: crate::core::path_guard::MountPoint {
+                id: id.into(),
+                name: name.into(),
+                path: display.into(),
+                readonly,
+                implicit: false,
+                online: root.is_some(),
+                follow_symlinks: true,
+            },
+            root: root.map(PathBuf::from),
+        }
+    }
+
+    /// 只读 / 未知 / 越界条目丢弃并给出原因；掉线条目保留但标 offline
+    #[test]
+    fn resolve_roots_filters_readonly_and_unknown() {
+        let set = crate::core::path_guard::MountSet {
+            mounts: vec![
+                test_mount("m0", "Movies", "/srv/movies", Some("/srv/movies"), false),
+                test_mount("m1", "Backup", "/mnt/backup", Some("/mnt/backup"), true),
+                test_mount("m2", "Offline", "/mnt/offline", None, false),
+            ],
+            implicit: false,
+        };
+        let specs = vec![
+            RootSpec {
+                mount_id: "m0".into(),
+                rel: "downloads".into(),
+            },
+            RootSpec {
+                mount_id: "m1".into(),
+                rel: String::new(),
+            },
+            RootSpec {
+                mount_id: "m9".into(),
+                rel: String::new(),
+            },
+            RootSpec {
+                mount_id: "m2".into(),
+                rel: "dl".into(),
+            },
+            RootSpec {
+                mount_id: "m0".into(),
+                rel: "../etc".into(),
+            },
+        ];
+        let (roots, warnings) = resolve_roots(&set, &specs);
+        assert_eq!(roots.len(), 2, "{warnings:?}");
+        assert!(roots[0].path.ends_with("downloads"));
+        assert!(roots[0].online);
+        assert_eq!(roots[0].label(), "Movies / downloads");
+        assert_eq!(roots[1].label(), "Offline / dl");
+        assert!(!roots[1].online);
+        // 只读、未知、越界各一条
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    /// 保存目录改完立即生效：旧根立刻不再放行，新根立刻可用（无需重启）
+    #[tokio::test]
+    async fn replacing_roots_takes_effect_immediately() {
+        let first = std::env::temp_dir().join("asmoday-dl-roots-first");
+        let second = std::env::temp_dir().join("asmoday-dl-roots-second");
+        tokio::fs::create_dir_all(&first).await.unwrap();
+        tokio::fs::create_dir_all(&second).await.unwrap();
+        let manager = DownloadManager::new(
+            reqwest::Client::new(),
+            "secret1".into(),
+            vec![test_root(&first)],
+            4,
+            2,
+            true,
+            None,
+        );
+        assert!(manager.resolve_dir(Some(second.to_str().unwrap())).is_err());
+        manager.replace_roots(vec![test_root(&second)]);
+        assert!(manager.resolve_dir(Some(second.to_str().unwrap())).is_ok());
+        assert!(manager.resolve_dir(Some(first.to_str().unwrap())).is_err());
+        let _ = tokio::fs::remove_dir_all(&first).await;
+        let _ = tokio::fs::remove_dir_all(&second).await;
+    }
+
     #[test]
     fn torrent_uri_detection() {
         assert!(is_torrent_uri("magnet:?xt=urn:btih:abc"));
@@ -2047,7 +2396,7 @@ mod tests {
         let manager = Arc::new(DownloadManager::new(
             reqwest::Client::new(),
             "secret1".into(),
-            vec![base.clone()],
+            vec![test_root(&base)],
             4,
             2,
             true,

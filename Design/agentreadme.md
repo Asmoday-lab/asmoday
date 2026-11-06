@@ -395,18 +395,22 @@ GWT-DL-02 Given 错误 RPC 密钥  When 调用任意方法  Then `{"code":1,"mes
 GWT-DL-03 Given AriaNg 的批量轮询  When `system.multicall` 内层 params **不含** token  Then 两个子调用都成功（鉴权只在 multicall 层做一次），结果形如 `[[...],[...]]`
 GWT-DL-04 Given 支持 Range 的源站  When `addUri` 后 `tellStatus`  Then `connections > 1`（按 segments 均分并发），`tellStatus` 的 totalLength/completedLength/downloadSpeed/connections/dir/files/errorCode/errorMessage 全部存在
 GWT-DL-05 Given 下载中 `pause`  Then 状态 paused、已下载字节保留、`.aria2` 控制文件生成、任务出现在 `tellWaiting`（paused 属 waiting 族）；`unpause` 后从断点续传且最终字节与源 sha256 一致
-GWT-DL-06 Given `dir` 落在 `[download].roots` 之外  When `addUri`  Then JSON-RPC fault（拒绝，不夹到根里）；`out` 含路径分隔符或 `..` 同样拒绝
+GWT-DL-06 Given `dir` 落在「允许的保存目录」之外  When `addUri`  Then JSON-RPC fault（拒绝，不夹到根里）；`out` 含路径分隔符或 `..` 同样拒绝（v4.9.37 起白名单 = 挂载点子路径）
 GWT-DL-07 Given `[download].enable=false`  When 任意客户端访问 `/jsonrpc`  Then 404（协议面完全不存在）
 GWT-DL-08 Given 已登录  When 打开侧边栏「下载」  Then URL 为 `/downloads`，页头显示下载/上传速度、进行中与队列计数、BT 监听端口；分栏为进行中 / 等待中 / 已完成（v4.9.31）
 GWT-DL-09 Given `/downloads`  When 新建下载填一行或多行链接  Then 每行各建一个任务并切到「进行中」；`GET /api/downloads` 的 `tasks.active[].name` 为落盘文件名、`kind=http`，进度字段随轮询增长（v4.9.31）
 GWT-DL-10 Given 下载中点暂停  Then 该任务只出现在 `waiting`（`status=paused`），**不再同时出现在 `stopped`**；点继续回到 active（v4.9.31 修正）
 GWT-DL-11 Given 已完成/已失败的任务  When 点移除  Then 任务从 `stopped` 列表彻底消失（走 removeDownloadResult，不留 `removed` 行）；`DELETE /api/downloads/stopped` 一次清空（v4.9.31）
-GWT-DL-12 Given 「引擎设置」  Then 回显 segments / max_concurrent / roots / BT 端口并标注「重启生效」；RPC 地址与密钥可复制（密钥默认掩码），保存后 `POST /api/config` 的 `[download]` 生效但引擎仍是旧快照，重启后 `GET /api/downloads/engine` 才反映新值（v4.9.31）
+GWT-DL-12 Given 「引擎设置」  Then 回显 segments / max_concurrent / BT 端口并标注「重启生效」；保存目录单独一块、显示 `挂载点名 / 子路径`（不显示绝对路径）并标「即时生效」；RPC 地址与密钥可复制（密钥默认掩码）。保存后 `POST /api/config` 的 `[download]` 生效但引擎仍是旧快照，重启后才反映新值；保存目录例外（v4.9.37 起热生效）
 GWT-DL-13 Given `[download].enable=false`  When 打开 `/downloads`  Then 显示「下载引擎未启用」提示且新建按钮禁用，`GET /api/downloads` 返回 `{enabled:false}`（v4.9.31）
 GWT-DL-14 Given RPC 密钥  When 检查存储  Then 位于数据库 `settings.download_rpc_secret`，`data/` 下不存在 `download_rpc_secret` 文件；启动日志与 `asmoday.log` 都不含明文，只有前端下载页能看（显隐 / 复制）（v4.9.36）
 GWT-DL-15 Given 引擎设置里的「刷新密钥」  When 第一次点击  Then 按钮文案变「确认刷新？」且 3 秒内不执行；再点一次才发起 `POST /api/downloads/secret`，返回新密钥、toast 提示、页面就地显示新值；`engine.rpc_secret` 随之改变（v4.9.36）
 GWT-DL-16 Given 刚刷新过密钥  When 旧 `token:<old>` 调 `/jsonrpc`  Then `{"code":1,"message":"Unauthorized"}`；新 token 正常返回；进程重启后 `engine` 仍回显新密钥（写库已生效，无需重启）（v4.9.36）
 GWT-DL-17 Given 存量 `config.toml` 里写了 `[download].rpc_secret`  When 数据库尚无密钥时启动  Then 用它作为初始值导入并 WARN；数据库已有值时该配置被忽略（不覆盖），前端刷新是唯一修改入口（v4.9.36）
+GWT-DL-18 Given 「引擎设置 → 允许的保存目录」  Then 列出 `挂载点名 / 子路径`（根目录只显示名字），页面任何位置都不出现服务器绝对路径；新增行只能从挂载点下拉选择 + 填子路径，只读挂载点不在选项里、掉线挂载点显示「（离线）」且禁用（v4.9.37）
+GWT-DL-19 Given 保存目录里加 `dl2`  When 点「保存目录」  Then `POST /api/downloads/roots` 写 `settings.download_roots` 并热替换，列表立即出现、toast 提示「立即生效」，无需重启；`media/dl2` 目录被自动创建，`GET /api/downloads/engine` 的 `roots[].label` 立刻包含它（v4.9.37）
+GWT-DL-20 Given 保存目录填 `../escape` / 盘符 / UNC  When 保存  Then 400 并指出原因；未知 mount_id 或只读挂载点逐条跳过并回 `warnings`，全部失效时 400（v4.9.37）
+GWT-DL-21 Given 数据库里已有 `download_roots`  When 重启进程  Then `engine.roots` 与重启前一致；Given 库里没有值但 `config.toml` 的 `[download].roots` 有绝对路径  Then 能映射到挂载点的导入为子路径、映射不上的 WARN 丢弃，一个都没剩下时取第一个在线可写挂载点 + `downloads`（v4.9.37）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 
@@ -416,7 +420,7 @@ GWT-BT-03 Given 本地做种端 + 直连 peer  When 完整下载  Then 落盘字
 GWT-BT-04 Given BT 任务下载中  When `pause` / `unpause`  Then 状态在 paused / active 间切换且已完成字节不回退；`remove` 后任务转 removed 但**已下载文件保留**（delete_files=false）
 GWT-BT-05 Given `[download].enable_bt=false`  When `addUri` 磁力链或 `addTorrent`  Then JSON-RPC fault 明确拒绝（不创建永远 waiting 的假任务），`enabledFeatures` 不含 BitTorrent
 GWT-BT-06 Given BT 会话启动失败（端口被占等）  When 进程启动  Then 只降级为 HTTP-only 并记 WARN，整个服务与 `/jsonrpc` 照常可用
-GWT-BT-07 Given 多文件种子  When 落盘  Then 文件在 `dir/<种子名>/…` 下（与 aria2 同构），且路径仍在 `[download].roots` 白名单内
+GWT-BT-07 Given 多文件种子  When 落盘  Then 文件在 `dir/<种子名>/…` 下（与 aria2 同构），且路径仍在「允许的保存目录」白名单内（v4.9.37）
 ```
 
 #### 依赖红线

@@ -57,6 +57,18 @@ export interface Snapshot {
   }
 }
 
+/** 允许的保存目录：挂载点 + 子路径（v4.9.37） */
+export interface EngineRoot {
+  mount_id: string
+  mount_name: string
+  rel: string
+  /** 页面显示用：`电影 / downloads`（根目录只有名字），不含绝对路径 */
+  label: string
+  /** 绝对路径：只用来填新建下载的 `dir`，不渲染 */
+  path: string
+  online: boolean
+}
+
 export interface EngineInfo {
   enabled: boolean
   bt: boolean
@@ -64,7 +76,7 @@ export interface EngineInfo {
   bt_port: number | null
   segments: number
   max_concurrent: number
-  roots: string[]
+  roots: EngineRoot[]
   rpc_path: string
   /** 仅管理端返回：给用户填 AriaNg */
   rpc_secret: string
@@ -84,6 +96,17 @@ export const downloadsApi = {
   /** 刷新 RPC 密钥：写库 + 换内存，旧密钥下一次请求即 401（v4.9.36） */
   rotateSecret: () =>
     request<{ status: string; rpc_secret: string }>('/api/downloads/secret', { method: 'POST' }),
+
+  /**
+   * 保存「允许的保存目录」：挂载点子路径，写库 + 热替换，立即生效（v4.9.37）。
+   * 返回解析后的完整条目（含掉线标记与逐条 warning）。
+   */
+  setRoots: (roots: { mount_id: string; rel: string }[]) =>
+    request<{ status: string; roots: EngineRoot[]; warnings: string[] }>('/api/downloads/roots', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roots }),
+    }),
 
   addUri: (payload: { uri: string; dir?: string }) =>
     request<{ gid: string }>('/api/downloads', {

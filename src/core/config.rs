@@ -121,8 +121,10 @@ thumb_preheat_per_scan = 200
 # segments = 8
 # Max concurrent active downloads.
 # max_concurrent = 5
-# Allowed target directories for RPC dir/out. Empty = <data>/downloads.
-# Paths must exist (or be creatable) and stay inside this list.
+# Allowed target directories for RPC dir/out. Deprecated since v4.9.37: the
+# downloads page owns this now (mount point + optional subfolder, applied
+# immediately, stored in the database). When the database has no value yet,
+# entries that map to a mount point are imported once as a seed.
 # roots = []
 # BitTorrent: magnet links, .torrent uploads, DHT + PEX + LSD. Set false to
 # advertise HTTP-only (addTorrent / magnet are rejected, clients hide BT UI).
@@ -283,10 +285,11 @@ impl MediaConfig {
 ///
 /// 任何 aria2 客户端（AriaNg / Aria2 Explorer / motrix…）连
 /// `http://<host>:<port>/jsonrpc` + RPC 密钥即用。密钥存在数据库
-/// （`app_settings`，v4.9.36）：自动生成，只在前端下载页可见，刷新也在那里。
+/// （`settings`，v4.9.36）：自动生成，只在前端下载页可见，刷新也在那里。
 ///
-/// 落盘安全：RPC 的 `dir` / `out` 只允许落在 `roots` 白名单内（前缀校验，
-/// Windows 大小写不敏感），未配置时默认 `<data>/downloads`。
+/// 落盘安全（v4.9.37）：RPC 的 `dir` / `out` 只允许落在「允许的保存目录」内——
+/// 那是「挂载点 id + 相对子路径」白名单，存在数据库（`settings.download_roots`）、
+/// 可在下载页热改、立即生效；本段的 `roots` 已废弃，只在库里还没有值时当一次性种子。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DownloadConfig {
@@ -300,7 +303,10 @@ pub struct DownloadConfig {
     pub segments: usize,
     /// 全局并发下载上限（默认 5，对齐 aria2 max-concurrent-downloads）
     pub max_concurrent: usize,
-    /// 允许落盘的目录白名单（空 = `<data>/downloads`）
+    /// **已废弃（v4.9.37）**：下载目录改存 `settings.download_roots`（挂载点子路径，
+    /// 前端可改、立即生效）。这里只在库里还没有值时当一次性种子：能映射到挂载点的
+    /// 绝对路径导入为子路径，映射不上的 WARN 丢弃。保留字段只为兼容存量
+    /// `config.toml`（`deny_unknown_fields` 会让删掉字段的旧配置解析失败）。
     pub roots: Vec<String>,
     /// 启用 BitTorrent（magnet / .torrent / DHT / PEX）。关掉后 RPC 不声明
     /// `BitTorrent` 能力，`addUri` 的 magnet 与 `addTorrent` 直接报错。

@@ -19,6 +19,7 @@ import {
   type GlobalStat,
   type Snapshot,
 } from '../api/downloads'
+import { filesApi, type MountPoint } from '../api/files'
 import { useScrollLock } from '../composables/useScrollLock'
 import { APP_BASE } from '../lib/base'
 import { readApiError } from '../lib/errors'
@@ -57,6 +58,12 @@ const addFile = ref<File | null>(null)
 const addBusy = ref(false)
 const addError = ref('')
 
+/** 保存目录的编辑态：只存「挂载点 id + 子路径」，绝对路径由后端解析（v4.9.37） */
+interface RootDraft {
+  mount_id: string
+  rel: string
+}
+
 const settingsOpen = ref(false)
 const settings = ref<DownloadConfig | null>(null)
 const settingsBusy = ref(false)
@@ -69,6 +76,15 @@ let armTimer: number | undefined
 /** 保存时的整份配置：`POST /api/config` 收完整结构，不能只发 `[download]` */
 const fullConfig = ref<Record<string, unknown> | null>(null)
 const savedNeedsRestart = ref(false)
+
+/** 挂载点清单（保存目录只能从这里选，v4.9.37） */
+const mounts = ref<MountPoint[]>([])
+const rootDrafts = ref<RootDraft[]>([])
+const rootWarnings = ref<string[]>([])
+const rootsBusy = ref(false)
+const rootsDirty = ref(false)
+const newRootMount = ref('')
+const newRootRel = ref('downloads')
 
 useScrollLock(computed(() => addOpen.value || settingsOpen.value))
 
@@ -98,6 +114,16 @@ const btEnabled = computed(() => !!snapshot.value?.bt)
 const rpcUrl = computed(
   () => `${window.location.origin}${APP_BASE}${engine.value?.rpc_path ?? '/jsonrpc'}`,
 )
+
+/** 可写入的挂载点（只读的不给选；掉线的显示但禁用） */
+const writableMounts = computed(() => mounts.value.filter((mount) => !mount.readonly))
+
+/** 编辑态标签：`挂载点名 / 子路径`，根目录只显示名字 */
+function rootLabel(draft: RootDraft): string {
+  const mount = mounts.value.find((item) => item.id === draft.mount_id)
+  const name = mount?.name ?? draft.mount_id
+  return draft.rel ? `${name} / ${draft.rel}` : name
+}
 
 function showToast(message: string) {
   toast.value = message
@@ -221,8 +247,8 @@ function openAdd() {
   addUri.value = ''
   addFile.value = null
   addError.value = ''
-  // 默认落到引擎的第一个白名单目录，用户不用每次重选
-  addDir.value = engine.value?.roots[0] ?? ''
+  // 默认落到第一个在线的保存目录，用户不用每次重选
+  addDir.value = engine.value?.roots.find((root) => root.online)?.path ?? ''
   addOpen.value = true
 }
 
@@ -260,6 +286,8 @@ async function openSettings() {
   settingsOpen.value = true
   settingsError.value = ''
   savedNeedsRestart.value = false
+  rootsDirty.value = false
+  rootWarnings.value = []
   try {
     // 与设置页同一份配置：只改 `[download]`，其余原样回传
     const res = await fetch('/api/config')
@@ -268,8 +296,52 @@ async function openSettings() {
     fullConfig.value = config
     settings.value = structuredClone(config.download as DownloadConfig)
     if (!engine.value) await loadEngine()
+    // 保存目录只能选挂载点：拉实时清单（文件页每次进入都重拉，这里同理）
+    mounts.value = (await filesApi.mounts()).mounts
+    rootDrafts.value = (engine.value?.roots ?? []).map((root) => ({
+      mount_id: root.mount_id,
+      rel: root.rel,
+    }))
+    newRootMount.value = writableMounts.value.find((mount) => mount.online)?.id ?? ''
   } catch (err) {
     settingsError.value = err instanceof Error ? err.message : t('downloads.loadFailed')
+  }
+}
+
+function addRoot() {
+  if (!newRootMount.value) return
+  const rel = newRootRel.value.trim().replace(/^\/+/, '')
+  if (rootDrafts.value.some((root) => root.mount_id === newRootMount.value && root.rel === rel)) return
+  rootDrafts.value.push({ mount_id: newRootMount.value, rel })
+  rootsDirty.value = true
+  newRootRel.value = 'downloads'
+}
+
+function removeRoot(index: number) {
+  rootDrafts.value.splice(index, 1)
+  rootsDirty.value = true
+}
+
+/** 保存目录单独保存：写库 + 热替换，立即生效（v4.9.37） */
+async function saveRoots() {
+  if (rootsBusy.value) return
+  if (!rootDrafts.value.length) {
+    settingsError.value = t('downloads.settings.rootsEmpty')
+    return
+  }
+  rootsBusy.value = true
+  settingsError.value = ''
+  try {
+    const result = await downloadsApi.setRoots(rootDrafts.value.map((root) => ({ ...root })))
+    rootDrafts.value = result.roots.map((root) => ({ mount_id: root.mount_id, rel: root.rel }))
+    rootWarnings.value = result.warnings
+    rootsDirty.value = false
+    await loadEngine()
+    showToast(t('downloads.settings.rootsSaved'))
+  } catch (err) {
+    settingsError.value = err instanceof Error ? err.message : t('downloads.actionFailed')
+  } finally {
+    rootsBusy.value = false
   }
 }
 
@@ -598,7 +670,14 @@ onUnmounted(() => {
               v-model="addDir"
               class="mt-1 w-full rounded-lg border border-line bg-elevated px-2 py-2 text-xs text-ink outline-none focus:border-accent"
             >
-              <option v-for="root in engine.roots" :key="root" :value="root">{{ root }}</option>
+              <option
+                v-for="root in engine.roots"
+                :key="root.mount_id + root.rel"
+                :value="root.path"
+                :disabled="!root.online"
+              >
+                {{ root.online ? root.label : `${root.label}（${t('downloads.settings.offline')}）` }}
+              </option>
             </select>
             <p v-else class="mt-1 rounded-lg border border-line bg-elevated px-2 py-2 text-xs text-muted">
               {{ t('downloads.dialog.defaultDir') }}
@@ -709,27 +788,87 @@ onUnmounted(() => {
                 </label>
               </div>
 
-              <div class="mt-4">
-                <p class="text-[12px] text-muted">{{ t('downloads.settings.roots') }}</p>
-                <div class="mt-1 space-y-1">
-                  <p
-                    v-for="root in engine?.roots ?? []"
-                    :key="root"
-                    class="truncate rounded-lg border border-line bg-elevated px-2 py-1.5 font-mono text-[11px] text-ink"
-                    :title="root"
-                  >
-                    {{ root }}
-                  </p>
-                  <p
-                    v-if="!(engine?.roots ?? []).length"
-                    class="rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-muted"
-                  >
-                    {{ t('downloads.dialog.defaultDir') }}
-                  </p>
+              <div class="mt-4 rounded-xl border border-line p-3">
+                <div class="flex items-center justify-between gap-2">
+                  <p class="text-[12px] font-medium text-ink">{{ t('downloads.settings.roots') }}</p>
+                  <span class="shrink-0 rounded bg-elevated px-1.5 py-0.5 text-[10px] text-muted">
+                    {{ t('downloads.settings.rootsLive') }}
+                  </span>
                 </div>
                 <p class="mt-1 text-[11px] leading-relaxed text-muted">
                   {{ t('downloads.settings.rootsHint') }}
                 </p>
+
+                <div class="mt-2 space-y-1">
+                  <div
+                    v-for="(root, index) in rootDrafts"
+                    :key="root.mount_id + root.rel"
+                    class="flex items-center gap-2 rounded-lg border border-line bg-elevated px-2 py-1.5"
+                  >
+                    <span class="min-w-0 flex-1 truncate text-[11px] text-ink">{{ rootLabel(root) }}</span>
+                    <button
+                      class="shrink-0 rounded p-0.5 text-muted transition-colors hover:text-ink"
+                      :title="t('downloads.settings.removeRoot')"
+                      @click="removeRoot(index)"
+                    >
+                      <AppIcon name="close" :size="12" />
+                    </button>
+                  </div>
+                  <p
+                    v-if="!rootDrafts.length"
+                    class="rounded-lg border border-dashed border-line px-2 py-1.5 text-[11px] text-muted"
+                  >
+                    {{ t('downloads.settings.rootsEmpty') }}
+                  </p>
+                </div>
+
+                <div class="mt-2 flex flex-wrap items-center gap-1.5">
+                  <select
+                    v-model="newRootMount"
+                    class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
+                  >
+                    <option value="" disabled>{{ t('downloads.settings.pickMount') }}</option>
+                    <option
+                      v-for="mount in writableMounts"
+                      :key="mount.id"
+                      :value="mount.id"
+                      :disabled="!mount.online"
+                    >
+                      {{
+                        mount.online
+                          ? mount.name
+                          : `${mount.name}（${t('downloads.settings.offline')}）`
+                      }}
+                    </option>
+                  </select>
+                  <input
+                    v-model="newRootRel"
+                    :placeholder="t('downloads.settings.subPath')"
+                    class="w-28 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
+                    @keyup.enter="addRoot"
+                  />
+                  <button
+                    class="rounded-lg border border-line px-2 py-1.5 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
+                    :disabled="!newRootMount"
+                    @click="addRoot"
+                  >
+                    {{ t('downloads.settings.addRoot') }}
+                  </button>
+                </div>
+
+                <p v-for="warning in rootWarnings" :key="warning" class="mt-1 text-[11px] fg-warn">
+                  {{ warning }}
+                </p>
+
+                <button
+                  class="mt-2 w-full rounded-lg border border-line px-2 py-1.5 text-[11px] transition-colors hover:text-ink disabled:opacity-50"
+                  :class="rootsDirty ? 'text-ink' : 'text-muted'"
+                  :disabled="rootsBusy"
+                  data-testid="download-save-roots"
+                  @click="saveRoots"
+                >
+                  {{ rootsBusy ? t('downloads.settings.saving') : t('downloads.settings.saveRoots') }}
+                </button>
               </div>
 
               <p

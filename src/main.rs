@@ -366,27 +366,69 @@ async fn run(cli: Cli) -> Result<(), String> {
     crate::log_info!(
         "download RPC secret loaded from database (view or rotate it in the downloads page)"
     );
-    let download_roots: Vec<PathBuf> = if download_config.roots.is_empty() {
-        vec![data_dir.join("downloads")]
-    } else {
-        download_config
-            .roots
-            .iter()
-            .map(|root| PathBuf::from(crate::core::fs::normalize_display(Path::new(root))))
-            .collect()
-    };
-    for root in &download_roots {
-        if !root.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(root);
+    // 下载落盘目录（v4.9.37）：数据库存「挂载点 id + 子路径」，启动时解析成
+    // 绝对路径给引擎。为什么不再用裸绝对路径：下载目录必须是文件管理里看得见的
+    // 目录，否则下完的文件在 asmoday 里找不到；挂载点已经是「可写 + 受管」的
+    // 权威清单，取它的子路径同时继承只读标记与掉线状态。
+    //
+    // 页面上改这个值**不需要重启**：`POST /api/downloads/roots` 写库 + 热换内存。
+    // `[download].roots` 只在库里还没有值时当一次性种子（能映射到挂载点的才导入）。
+    let mounts_at_start = core::path_guard::load(&config, &cwd);
+    let download_roots: Vec<core::download::DownloadRoot> = {
+        const KEY: &str = core::download::ROOTS_SETTING;
+        let stored = auth
+            .setting(KEY)
+            .map_err(|e| format!("read download roots failed: {e}"))?;
+        let specs: Vec<core::download::RootSpec> =
+            match stored.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(json) => serde_json::from_str(json)
+                    .map_err(|e| format!("stored {KEY} is not valid JSON: {e}"))?,
+                None => {
+                    let (mut seeded, warnings) =
+                        core::download::seed_root_specs(&download_config.roots, &mounts_at_start);
+                    for warning in &warnings {
+                        crate::log_warn!("[download].roots: {warning}");
+                    }
+                    if seeded.is_empty()
+                        && let Some(fallback) = core::download::default_root_spec(&mounts_at_start)
+                    {
+                        seeded.push(fallback);
+                    }
+                    let json = serde_json::to_string(&seeded)
+                        .map_err(|e| format!("encode download roots failed: {e}"))?;
+                    auth.put_setting(KEY, &json)
+                        .map_err(|e| format!("persist download roots failed: {e}"))?;
+                    seeded
+                }
+            };
+        let (roots, warnings) = core::download::resolve_roots(&mounts_at_start, &specs);
+        for warning in &warnings {
+            crate::log_warn!("download root skipped: {warning}");
         }
-    }
+        if roots.is_empty() {
+            crate::log_warn!(
+                "no usable download directory: configure one in the downloads page \
+                 (needs an online, writable mount point)"
+            );
+        }
+        for root in &roots {
+            if let Err(err) = std::fs::create_dir_all(&root.path) {
+                crate::log_warn!("create download root {} failed: {err}", root.path.display());
+            }
+        }
+        roots
+    };
 
     // BitTorrent 会话（v4.9.27）：DHT / 入站监听都在这里起。
     // 起不来只降级成 HTTP-only，不让整个服务跟着挂 —— BT 是附加能力。
     let bt_engine = if download_config.enable && download_config.enable_bt {
+        // BT 会话需要一个具体的下载目录（librqbit 的 session 默认路径），取
+        // 白名单里第一个在线条目；一个都没有时退回 `<data>/downloads` 只为让
+        // 会话能起来，实际 add 会被 `resolve_dir` 拒绝并提示去页面配目录。
         let default_root = download_roots
-            .first()
-            .cloned()
+            .iter()
+            .find(|root| root.online)
+            .map(|root| root.path.clone())
             .unwrap_or_else(|| data_dir.join("downloads"));
         match core::bt::BtEngine::start(
             default_root,
@@ -741,6 +783,7 @@ fn protected_routes() -> Router<AppState> {
             get(api::downloads::snapshot).post(api::downloads::add),
         )
         .route("/api/downloads/engine", get(api::downloads::engine))
+        .route("/api/downloads/roots", post(api::downloads::set_roots))
         .route("/api/downloads/secret", post(api::downloads::rotate_secret))
         .route("/api/downloads/torrents", post(api::downloads::add_torrent))
         .route("/api/downloads/stopped", delete(api::downloads::purge))

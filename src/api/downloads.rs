@@ -98,15 +98,26 @@ pub async fn snapshot(State(state): State<AppState>, _admin: AdminUser) -> Respo
 
 /// GET /api/downloads/engine：引擎参数 + RPC 接入信息
 ///
-/// `rpc_secret` 只在这条管理端点返回：页面要把它显示给用户去填 AriaNg
-/// （可显隐、可复制）。密钥存放在 `app_settings`（v4.9.36），**唯一写入点**
-/// 是下面的 `rotate_secret` —— 前端刷新，没有手填入口。
+/// `roots` 是「挂载点 + 子路径」的解析结果（v4.9.37）：`label` 给页面显示
+/// （`电影 / downloads`），`path` 只留给新建下载对话框当 `dir` 的默认值，
+/// 界面上不渲染完整绝对路径。`rpc_secret` 只在这条管理端点返回：页面要把它
+/// 显示给用户去填 AriaNg（可显隐、可复制）。密钥存放在 `settings`（v4.9.36），
+/// **唯一写入点**是下面的 `rotate_secret` —— 前端刷新，没有手填入口。
 pub async fn engine(State(state): State<AppState>, _admin: AdminUser) -> Response {
     let manager = &state.downloads;
-    let roots: Vec<String> = manager
+    let roots: Vec<Value> = manager
         .roots()
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|root| {
+            json!({
+                "mount_id": root.mount_id,
+                "mount_name": root.mount_name,
+                "rel": root.rel,
+                "label": root.label(),
+                "path": root.path.display().to_string(),
+                "online": root.online,
+            })
+        })
         .collect();
     Json(json!({
         "enabled": manager.enabled(),
@@ -116,8 +127,9 @@ pub async fn engine(State(state): State<AppState>, _admin: AdminUser) -> Respons
         "max_concurrent": manager.max_concurrent(),
         "roots": roots,
         "rpc_path": "/jsonrpc",
-        // 以下三项是启动时快照，改配置必须重启（页面据此打「重启生效」标记）
-        "restart_required": ["enable", "segments", "max_concurrent", "roots", "enable_bt",
+        // 以下各项是启动时快照，改配置必须重启（页面据此打「重启生效」标记）。
+        // `roots` 不在其中：它走 POST /api/downloads/roots 热替换（v4.9.37）。
+        "restart_required": ["enable", "segments", "max_concurrent", "enable_bt",
                              "bt_listen_port_min", "bt_listen_port_max", "bt_disable_dht"],
         "rpc_secret": if manager.enabled() {
             manager.secret()
@@ -128,9 +140,69 @@ pub async fn engine(State(state): State<AppState>, _admin: AdminUser) -> Respons
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RootsRequest {
+    pub roots: Vec<crate::core::download::RootSpec>,
+}
+
+/// POST /api/downloads/roots：改「允许的保存目录」（v4.9.37）
+///
+/// 只接受「挂载点 id + 相对子路径」：下载目录必须落在文件管理的挂载点内，
+/// 否则下完的文件在 asmoday 里看不见。写库 + 换内存，**立即生效**，不重启。
+/// 目录不存在时自动创建（`downloads` 这类子路径不必先手动建）。
+pub async fn set_roots(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Json(body): Json<RootsRequest>,
+) -> Response {
+    if !state.downloads.enabled() {
+        return disabled();
+    }
+    if body.roots.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "至少保留一个保存目录");
+    }
+    let mounts = super::files::mounts_for(&state).await;
+    let (roots, warnings) = crate::core::download::resolve_roots(&mounts, &body.roots);
+    if roots.is_empty() {
+        let detail = if warnings.is_empty() {
+            "没有可用的挂载点目录".to_string()
+        } else {
+            warnings.join("；")
+        };
+        return error(StatusCode::BAD_REQUEST, detail);
+    }
+    // 只给在线条目建目录：掉线挂载点保持原样，插回设备后自动可用
+    for root in roots.iter().filter(|root| root.online) {
+        if let Err(err) = tokio::fs::create_dir_all(&root.path).await {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("创建目录 {} 失败：{err}", root.path.display()),
+            );
+        }
+    }
+    let specs: Vec<_> = roots.iter().map(|root| root.spec()).collect();
+    let encoded = match serde_json::to_string(&specs) {
+        Ok(encoded) => encoded,
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    // 先落库再换内存：写失败就整体失败，避免「这次生效、重启回旧值」
+    if let Err(err) = state
+        .auth
+        .put_setting(crate::core::download::ROOTS_SETTING, &encoded)
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    state.downloads.replace_roots(roots.clone());
+    crate::log_info!(
+        "download roots updated ({} entries, effective immediately)",
+        roots.len()
+    );
+    Json(json!({ "status": "ok", "roots": roots, "warnings": warnings })).into_response()
+}
+
 /// POST /api/downloads/secret：刷新 RPC 密钥（v4.9.36）
 ///
-/// 立即生效、无需重启：先写 `app_settings`（重启后仍是新值），再换内存里的
+/// 立即生效、无需重启：先写 `settings`（重启后仍是新值），再换内存里的
 /// 当前值。旧 `token:<secret>` 下一次请求就是 401，已配置的 AriaNg 需要重填。
 /// 只影响 `/jsonrpc` 的外部客户端——页面的 `/api/downloads*` 走 Cookie 会话，
 /// 不依赖这个密钥。旧 `<data>/download_rpc_secret` 文件不再读取也不再写入。
