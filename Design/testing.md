@@ -145,6 +145,12 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v6（v4.9.56）**：`probes/aria2_explorer.py` 扩到 **15 条断言**，新增一次性签名链接
+  （只允许第一个 GET、之后 403）与 403 页面原文两组桩站；关键断言是
+  「整条任务只发 1 个 HTTP 请求」——旧版四发探测请求在这里必然失败。断言名
+  「HEAD 405 → GET+Range 探测」改为「首请求即下载」。改后端后照旧 `cargo build`
+  再跑探针；前端未动时不必重建 dist。
+
 - **v5（v4.9.55）**：新增 `probes/unsaved_guard.py` + `unsaved_guard.cjs`（浏览器回归，
   10 条断言），专测「下载页没改动却弹离开确认」：断言前提是探针实例的
   `/api/downloads/engine` 至少有一条保存目录（空数组复现不出这个 bug）。

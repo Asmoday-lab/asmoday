@@ -1728,6 +1728,77 @@ struct RemoteInfo {
 /// 重定向跳数上限（aria2 默认 5，浏览器 20，这里取中间偏宽的值）
 const MAX_REDIRECTS: usize = 10;
 
+/// 只在本次任务链里生效的 Cookie 容器。
+///
+/// 站点在 302 跳转页上种 Cookie、到 CDN 那一跳才校验，是防盗链的常见形态
+/// （短链 → 对象存储尤其多）。原版 aria2 有 CookieStorage 会照做，而 reqwest
+/// 的自动跟随只会删掉敏感头、不会吸收 `Set-Cookie`。这里按任务维度收一遍，
+/// 重定向的下一跳与后续分段请求都带上，不落盘、不跨任务共享。
+#[derive(Clone, Default)]
+struct TaskCookies(Vec<(String, String)>);
+
+impl TaskCookies {
+    fn absorb(&mut self, headers: &reqwest::header::HeaderMap) {
+        for raw in headers.get_all(reqwest::header::SET_COOKIE) {
+            let Ok(text) = raw.to_str() else { continue };
+            let Some(pair) = text.split(';').next() else {
+                continue;
+            };
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let (name, value) = (name.trim().to_owned(), value.trim().to_owned());
+            if name.is_empty() {
+                continue;
+            }
+            self.0.retain(|(existing, _)| existing != &name);
+            self.0.push((name, value));
+        }
+    }
+
+    /// 插件显式传来的 Cookie 优先，站点后种的只补齐缺的那几项。
+    fn apply(&self, headers: &mut reqwest::header::HeaderMap) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut cookie = headers
+            .get(reqwest::header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        for (name, value) in &self.0 {
+            let prefix = format!("{name}=");
+            if cookie
+                .split(';')
+                .any(|part| part.trim_start().starts_with(&prefix))
+            {
+                continue;
+            }
+            if !cookie.is_empty() {
+                cookie.push_str("; ");
+            }
+            cookie.push_str(&format!("{name}={value}"));
+        }
+        if let Ok(parsed) = reqwest::header::HeaderValue::from_str(&cookie) {
+            headers.insert(reqwest::header::COOKIE, parsed);
+        }
+    }
+}
+
+/// 日志只记「发了哪些头 / 各多长」，绝不打印 Cookie、Authorization 的值。
+fn header_summary(headers: &reqwest::header::HeaderMap) -> String {
+    let summary = headers
+        .iter()
+        .map(|(name, value)| format!("{}={}B", name.as_str(), value.len()))
+        .collect::<Vec<_>>()
+        .join(",");
+    if summary.is_empty() {
+        "(none; client defaults only)".to_string()
+    } else {
+        summary
+    }
+}
+
 /// 发一次请求并**自己**跟随 3xx，每一跳重新装上同一份请求头。
 ///
 /// 为什么不用 reqwest 的自动跟随：它在跨源跳转时按规范删掉 `Cookie` /
@@ -1743,14 +1814,17 @@ async fn send_following(
     uri: &str,
     headers: &reqwest::header::HeaderMap,
     range: Option<&str>,
+    cookies: &mut TaskCookies,
 ) -> Result<reqwest::Response, FailKind> {
     let mut url = reqwest::Url::parse(uri)
         .map_err(|err| FailKind::Failed(1, format!("bad url {uri}: {err}")))?;
     for _ in 0..=MAX_REDIRECTS {
+        let mut hop_headers = headers.clone();
+        cookies.apply(&mut hop_headers);
         let mut request = engine
             .http
             .request(method.clone(), url.clone())
-            .headers(headers.clone());
+            .headers(hop_headers.clone());
         if let Some(range) = range {
             request = request.header(reqwest::header::RANGE, range);
         }
@@ -1758,7 +1832,20 @@ async fn send_following(
             .send()
             .await
             .map_err(|err| FailKind::Failed(1, err.to_string()))?;
-        if !response.status().is_redirection() {
+        cookies.absorb(response.headers());
+        let status = response.status();
+        // 只有失败才打日志：403 到底出在哪一跳、当时带了哪些头，一眼可查
+        if !status.is_success() && !status.is_redirection() {
+            crate::log_warn!(
+                "download {} {} range={} -> {}; sent headers: {}",
+                method,
+                url,
+                range.unwrap_or("-"),
+                status,
+                header_summary(&hop_headers)
+            );
+        }
+        if !status.is_redirection() {
             return Ok(response);
         }
         let Some(location) = response
@@ -1792,19 +1879,15 @@ fn content_range_total(value: &str) -> Option<u64> {
     value.rsplit_once('/')?.1.trim().parse::<u64>().ok()
 }
 
-/// 从响应头读出探测结果
-fn remote_info_from(response: &reqwest::Response, ranged_probe: bool) -> RemoteInfo {
+/// 从响应头读出探测结果（首请求就是普通 GET，没有独立探针）
+fn remote_info_from(response: &reqwest::Response) -> RemoteInfo {
     let headers = response.headers();
     let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    let accept_ranges = if ranged_probe {
-        // GET + Range 探到 200，说明服务器压根不认 Range，只能单流
-        partial
-    } else {
-        headers
+    let accept_ranges = partial
+        || headers
             .get(reqwest::header::ACCEPT_RANGES)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("bytes"))
-    };
+            .is_some_and(|value| value.contains("bytes"));
     let total = if partial {
         headers
             .get(reqwest::header::CONTENT_RANGE)
@@ -1827,10 +1910,29 @@ fn remote_info_from(response: &reqwest::Response, ranged_probe: bool) -> RemoteI
     }
 }
 
-/// 目标站明确拒绝（401/403 等）：错误信息带上最常见的自救方向。
-/// 这条消息会原样进 tellStatus 的 errorMessage（插件 / WebUI 直接展示给用户），
-/// 对着一个裸 403 没法排查，得告诉人先去查插件到底转没转发 Cookie。
-fn http_reject(status: reqwest::StatusCode) -> FailKind {
+/// 读一小段响应体：403 的页面常常直接写着拒绝原因（"referer invalid"、
+/// "login required"、"token expired"），比我们对着猜有用得多。
+async fn reject_hint(response: &mut reqwest::Response) -> Option<String> {
+    // 站点可能回了 403 头却磨蹭着不发 body：给个短超时，别把任务挂在错误上报上
+    let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk())
+        .await
+        .ok()
+        .and_then(|result| result.ok().flatten())?;
+    let text = String::from_utf8_lossy(&chunk[..chunk.len().min(512)]);
+    let flat: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let flat = flat.chars().take(200).collect::<String>();
+    (!flat.is_empty()).then_some(flat)
+}
+
+/// 目标站明确拒绝（401/403 等）：错误信息带上最常见的自救方向 + 站点原文。
+/// 这条消息会原样进 tellStatus 的 errorMessage（插件 / WebUI 直接展示给用户）。
+fn http_reject(status: reqwest::StatusCode, hint: Option<&str>) -> FailKind {
     let code = status.as_u16() as u32;
     let msg = match code {
         401 | 403 => format!(
@@ -1838,54 +1940,37 @@ fn http_reject(status: reqwest::StatusCode) -> FailKind {
         ),
         _ => format!("HTTP {status}"),
     };
-    FailKind::Failed(code, msg)
+    let detail = hint
+        .map(|text| format!("; server said: {text}"))
+        .unwrap_or_default();
+    FailKind::Failed(code, format!("{msg}{detail}"))
 }
 
-/// 探测远端：HEAD → `GET + Range: bytes=0-0` → 普通 GET，三级退路。
+/// 起手式：**只发一次普通 GET，这个响应体直接拿去下载**（对齐原版 aria2）。
 ///
-/// 大量站点（对象存储、防盗链、部分 CDN）对 HEAD 直接回 405 / 403 / 501；
-/// 更糟的是一部分 WAF / 防盗链模块对**任何**带 Range 的请求都 403，
-/// 却放行普通 GET —— 原版 aria2 不做探测、直接普通 GET 开下，所以它能下我们
-/// 不能。因此 Range 探针失败不判死任务，退到普通 GET 探测（只读头就断开），
-/// 只有普通 GET 也被拒才算真失败（那 403 是真实拒绝，多半缺 Cookie / Referer）。
-///
-/// 普通 GET 探测成功时**强制单流**：这站点刚刚拒过 Range 请求，就算它头里
-/// 自称 `Accept-Ranges: bytes` 也不信，分段请求会再撞一次枪口。
-async fn probe_remote(
+/// v4.9.52/54 的独立探测链会先连发 HEAD、GET+Range、GET 三次，再另起一次下载
+/// 请求。一次性签名链接 / 按请求次数做风控的 WAF 恰好被这几次「白请求」耗掉：
+/// 探测全过、真正下载却 403，而 aria2 从头到尾只发一次所以能下。现在没有
+/// 独立探测阶段——这一个响应既给长度 / ETag / Range 能力，也直接是数据流。
+async fn open_remote(
     engine: &EngineHandle,
     uri: &str,
     headers: &reqwest::header::HeaderMap,
-) -> Result<RemoteInfo, FailKind> {
-    let head = send_following(engine, reqwest::Method::HEAD, uri, headers, None).await?;
-    if head.status().is_success() {
-        return Ok(remote_info_from(&head, false));
+    cookies: &mut TaskCookies,
+) -> Result<(reqwest::Response, RemoteInfo), FailKind> {
+    let mut response =
+        send_following(engine, reqwest::Method::GET, uri, headers, None, cookies).await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let hint = reject_hint(&mut response).await;
+        return Err(http_reject(status, hint.as_deref()));
     }
-    let status = head.status();
-    drop(head);
-    crate::log_warn!("HEAD {uri} returned {status}; retrying probe with GET + Range: bytes=0-0");
-    let ranged = send_following(
-        engine,
-        reqwest::Method::GET,
-        uri,
-        headers,
-        Some("bytes=0-0"),
-    )
-    .await?;
-    if ranged.status().is_success() {
-        return Ok(remote_info_from(&ranged, true));
-    }
-    let status = ranged.status();
-    drop(ranged);
-    crate::log_warn!("GET+Range {uri} returned {status}; falling back to plain GET probe");
-    let plain = send_following(engine, reqwest::Method::GET, uri, headers, None).await?;
-    if !plain.status().is_success() {
-        return Err(http_reject(plain.status()));
-    }
-    // 只要头，不要体：response 在这里 drop，连接随之中断
-    let mut info = remote_info_from(&plain, false);
-    info.accept_ranges = false;
-    Ok(info)
+    let info = remote_info_from(&response);
+    Ok((response, info))
 }
+
+/// 小于这个尺寸就别分段了：多连接握手比单流更贵，还多挨几次 WAF 检查。
+const MIN_SPLIT_BYTES: u64 = 1024 * 1024;
 
 async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskOutcome {
     let cancel = handle.current_token();
@@ -1901,10 +1986,11 @@ async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskO
         )
     };
 
-    // 1. 探测：长度 / 续传能力 / ETag
-    let probe = probe_remote(engine, &uri, &headers).await?;
+    // 1. 首请求：一次普通 GET，既是探测也是数据流（原版 aria2 的形态）。
+    //    绝不能在这里另发 HEAD / Range 探针——一次性签名链接会被白白耗掉。
+    let mut cookies = TaskCookies::default();
+    let (first, probe) = open_remote(engine, &uri, &headers, &mut cookies).await?;
     let total = probe.total;
-    let accept_ranges = probe.accept_ranges;
     let etag = probe.etag;
 
     {
@@ -1913,30 +1999,37 @@ async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskO
         state.etag = etag.clone();
     }
 
-    // 2. 分段方案：控制文件续传（总长 + ETag 都对得上且部分文件还在）→ 沿用；
-    //    否则按 Range 支持与否决定分段或单流。
+    // 2. 分段方案：只有站点明确说支持 Range、文件够大、且引擎开了多段才分段。
+    //    其余情况（绝大多数插件链接）直接消费首响应，全程只有一个请求。
+    let want_split =
+        probe.accept_ranges && total.is_some_and(|t| t >= MIN_SPLIT_BYTES) && engine.segments > 1;
     let target = handle.state.lock().await.target_path();
     let file_ready = tokio::fs::metadata(&target)
         .await
         .map(|meta| meta.is_file())
         .unwrap_or(false);
+    let mut initial = Some(first);
     let segments: Vec<SegmentState> = {
         let saved = if file_ready {
             load_control(&handle.state.lock().await.control_path()).await
         } else {
             None
         };
-        match (total, accept_ranges, saved) {
+        match (total, want_split, saved) {
             (Some(t), true, Some(saved))
                 if saved.total == t
                     && saved.etag == etag
                     && !saved.segments.is_empty()
                     && segments_fit(&saved.segments, t) =>
             {
+                initial = None; // 续传：另发带 Range 的请求
                 saved.segments
             }
-            (Some(t), true, _) => split_segments(t, engine.segments),
-            // 无长度或不支持 Range：单流（不发 Range 头），长度靠收尾校验
+            (Some(t), true, _) => {
+                initial = None; // 分段：另发带 Range 的请求
+                split_segments(t, engine.segments)
+            }
+            // 单流：不发 Range 头，首响应直接是数据流；长度靠收尾校验
             _ => vec![SegmentState {
                 start: 0,
                 end: u64::MAX,
@@ -1944,6 +2037,7 @@ async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskO
             }],
         }
     };
+    let segment_count = segments.len();
 
     {
         let mut state = handle.state.lock().await;
@@ -1956,14 +2050,17 @@ async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskO
         .send((handle.state.lock().await.gid.clone(), Event::Start))
         .ok();
 
-    // 3. 分段并发
-    let mut workers = Vec::with_capacity(segments.len());
-    for seg in segments {
+    // 3. 分段并发（首段可能直接复用首响应）
+    let mut workers = Vec::with_capacity(segment_count);
+    for (index, seg) in segments.into_iter().enumerate() {
+        let bootstrap = if index == 0 { initial.take() } else { None };
         workers.push(tokio::spawn(download_segment(
             engine.clone(),
             handle.clone(),
             cancel.clone(),
             seg,
+            bootstrap,
+            cookies.clone(),
         )));
     }
     let mut first_error: Option<FailKind> = None;
@@ -1986,7 +2083,47 @@ async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskO
         }
     }
     if let Some(kind) = first_error {
-        return Err(kind);
+        // 谎报 Accept-Ranges 的 WAF：分段请求被 403/405/501 打回 → 清掉半成品，
+        // 退回一个普通 GET 单流再试（对齐 aria2 的兜底形态）。
+        if segment_count > 1
+            && matches!(&kind, FailKind::Failed(code, _) if matches!(*code, 403 | 405 | 501))
+        {
+            crate::log_warn!(
+                "{uri}: server refused ranged requests; falling back to a single plain GET"
+            );
+            // 分段失败时各 worker 已经 cancel 过旧令牌，回退这一轮必须换新，
+            // 否则单流刚起跑就被自己取消，任务永远悬在 active。
+            handle.reset_token();
+            let cancel = handle.current_token();
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&target)
+                .await
+                .map_err(|err| FailKind::Failed(1, err.to_string()))?;
+            download_segment(
+                engine.clone(),
+                handle.clone(),
+                cancel.clone(),
+                SegmentState {
+                    start: 0,
+                    end: u64::MAX,
+                    done: 0,
+                },
+                None,
+                cookies.clone(),
+            )
+            .await?;
+            let mut state = handle.state.lock().await;
+            state.segments = vec![SegmentState {
+                start: 0,
+                end: u64::MAX,
+                done: state.total,
+            }];
+            state.connections = 1;
+        } else {
+            return Err(kind);
+        }
     }
 
     // 4. 收尾校验
@@ -2016,6 +2153,8 @@ async fn download_segment(
     handle: Arc<TaskHandle>,
     cancel: CancellationToken,
     mut seg: SegmentState,
+    mut initial: Option<reqwest::Response>,
+    mut cookies: TaskCookies,
 ) -> Result<(), FailKind> {
     let (uri, path) = {
         let state = handle.state.lock().await;
@@ -2025,10 +2164,12 @@ async fn download_segment(
         )
     };
 
+    // 从头开始的单流：先清空，免得上次失败留下的长文件在尾部残留旧字节。
+    let fresh_single = seg.end == u64::MAX && seg.start == 0 && seg.done == 0;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(false)
+        .truncate(fresh_single)
         .open(&path)
         .await
         .map_err(|err| FailKind::Failed(1, format!("open {}: {err}", path.display())))?;
@@ -2050,15 +2191,24 @@ async fn download_segment(
         };
         let range = ranged.then(|| format!("bytes={}-{}", seg.start + seg.done, seg.end));
 
-        match send_following(
-            &engine,
-            reqwest::Method::GET,
-            &uri,
-            &headers,
-            range.as_deref(),
-        )
-        .await
-        {
+        // 首段直接复用 open_remote 打开的响应：整条任务只发一次请求。
+        // 只有断流重试 / 真正的分段任务才会再发新请求。
+        let outcome = match initial.take() {
+            Some(response) => Ok(response),
+            None => {
+                send_following(
+                    &engine,
+                    reqwest::Method::GET,
+                    &uri,
+                    &headers,
+                    range.as_deref(),
+                    &mut cookies,
+                )
+                .await
+            }
+        };
+
+        match outcome {
             Ok(resp) if resp.status().is_success() => {
                 // 服务器无视 Range 返回 200：多段任务会被写花，直接失败
                 if ranged && seg.start + seg.done > 0 && resp.status() == reqwest::StatusCode::OK {
@@ -2114,14 +2264,23 @@ async fn download_segment(
                     ));
                 }
             }
-            Ok(resp) => {
+            Ok(mut resp) => {
                 // 416：续传场景下段已完整，视为成功
                 if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                     return Ok(());
                 }
+                let status = resp.status();
+                // 401/403/404/405/501 是确定性拒绝：重试四次只会多挨四次风控，
+                // 还会把一次性链接彻底耗死。立刻失败，并把站点原文带回去。
+                if (status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS)
+                    || status == reqwest::StatusCode::NOT_IMPLEMENTED
+                {
+                    let hint = reject_hint(&mut resp).await;
+                    return Err(http_reject(status, hint.as_deref()));
+                }
                 retries += 1;
                 if retries > 3 {
-                    return Err(http_reject(resp.status()));
+                    return Err(http_reject(status, None));
                 }
                 tokio::time::sleep(Duration::from_secs(retries as u64)).await;
             }
@@ -3262,6 +3421,293 @@ mod tests {
         assert!(
             message.contains("403") && message.contains("Cookie"),
             "error message lacks diagnostic hint: {message}"
+        );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 一次性签名链接：只允许一次请求，第二次起一律 403。
+    /// 旧版「HEAD → GET+Range → GET 探测 → GET 下载」会把额度耗光，
+    /// 原版 aria2 只发一次所以能下 —— 这正是「连接测试成功、下载却 403」的真身。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_shot_link_is_fetched_with_exactly_one_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BODY: &[u8] = b"one-shot-token-link";
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let content = spawn_stub(move |_method, _path, _headers| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if n > 0 {
+                return b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BODY.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(BODY);
+            response
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-oneshot-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            4,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{content}/file.bin?token=once")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("file.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                status = item["status"].as_str().unwrap_or_default().to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status, "complete", "task did not finish: {status}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a single download must not spend more than one HTTP request"
+        );
+        assert_eq!(tokio::fs::read(base.join("file.bin")).await.unwrap(), BODY);
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 短链在 302 上种 Cookie、CDN 那一跳才校验：原版 aria2 的 CookieStorage
+    /// 会带上，我们以前不会（reqwest 自动跟随只会删敏感头）。插件自带的
+    /// Cookie 与站点新种的必须同时存在，且不能互相覆盖。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_set_cookie_reaches_the_next_hop() {
+        const BODY: &[u8] = b"cookie-from-redirect";
+        let content = spawn_stub(|_method, _path, headers| {
+            let cookie = headers.get("cookie").map(String::as_str).unwrap_or("");
+            if !(cookie.contains("sid=abc") && cookie.contains("ticket=xyz")) {
+                return b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BODY.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(BODY);
+            response
+        });
+        let jump = spawn_stub(move |_method, _path, _headers| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{content}/file.bin\r\nSet-Cookie: ticket=xyz; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-cookie-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            2,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{jump}/download?id=7")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("file.bin".into()),
+                    headers: vec![("Cookie".into(), "sid=abc".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                status = item["status"].as_str().unwrap_or_default().to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status, "complete", "task did not finish: {status}");
+        assert_eq!(tokio::fs::read(base.join("file.bin")).await.unwrap(), BODY);
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 403 页面上写着的真实原因要进 errorMessage；确定性拒绝也不许重试四次
+    /// （多打几次只会更招风控，还把一次性链接彻底耗死）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hard_403_forwards_server_reason_without_retrying() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let content = spawn_stub(move |_method, _path, _headers| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let body = b"login required: cookie missing";
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(body);
+            response
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-reason-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            2,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{content}/file.bin")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("file.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut entry = None;
+        for _ in 0..100 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                entry = Some(item);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let entry = entry.expect("task never reached a terminal state");
+        assert_eq!(entry["status"], "error");
+        assert_eq!(entry["errorCode"], 403);
+        let message = entry["errorMessage"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("login required: cookie missing"),
+            "server-side reason lost: {message}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a deterministic 403 must fail fast instead of retrying"
+        );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 站点谎报 `Accept-Ranges: bytes`、却把所有带 Range 的请求都 403：
+    /// 分段方案必须能整体退回一个普通 GET 单流，而不是把任务判死。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lying_accept_ranges_falls_back_to_single_stream() {
+        let body = Arc::new(vec![b'z'; 1024 * 1024 + 7]);
+        let expected_len = body.len();
+        let shared = body.clone();
+        let content = spawn_stub(move |_method, _path, headers| {
+            if headers.contains_key("range") {
+                return b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                shared.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(&shared);
+            response
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-lierange-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            4,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{content}/big.bin")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("big.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut status = String::new();
+        for _ in 0..150 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                status = item["status"].as_str().unwrap_or_default().to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status, "complete", "task did not finish: {status}");
+        assert_eq!(
+            tokio::fs::read(base.join("big.bin")).await.unwrap().len(),
+            expected_len
         );
         let _ = tokio::fs::remove_dir_all(&base).await;
     }

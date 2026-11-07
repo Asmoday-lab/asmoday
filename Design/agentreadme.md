@@ -441,6 +441,7 @@ GWT-DL-32 Given Aria2 Explorer 形态的 addUri：`referer` 作为**独立选项
 GWT-DL-33 Given 目标站点 `HEAD` 返 405/403 并 302 跳到另一个源  When 下同一个文件  Then 任务仍 `complete` 且落盘字节一致；重定向每一跳都重发同一份头与 `Range`（reqwest 自动跟随会删 `Cookie`，实测会被桩站 403）；`pause="true"` 加完停在 `paused`，`changeOption` 补 `header` / `referer` 后 `unpause` 能下完；`split` 等价于 `max-connection-per-server`；`header` 里名字非法的行被丢弃且任务照跑（不得因 panic 静默消失）；`dir` 越界时错误消息列出允许的根（v4.9.52）
 GWT-DL-34 Given 目标站对 `HEAD` 与一切带 `Range` 的请求都回 403、只有普通 GET 放行（WAF / 防盗链的常见形态）  When 添加该链接  Then 探测退到普通 GET 后任务以**单流**照常 `complete`、落盘字节一致（原版 aria2 同样能下，因为它不探测）；若普通 GET 也 403，任务 `error` 且 `errorCode=403`，`errorMessage` 含 `Cookie`/`Referer` 自救提示而不是裸 403（v4.9.54）
 GWT-DL-35 Given 全新实例进 `/downloads` 且 `loadEngine()` 已拉回真实的「允许的保存目录」，用户**从未进过引擎设置**  When 点侧边栏离开下载页  Then 直接跳到目标路由，不弹「离开引擎设置？」、页头也无「有未保存改动」角标；进设置页后不做任何改动同样干净；真加一条保存目录再点返回才弹，且弹窗逐条列出「允许的保存目录」；选「放弃改动并返回」后回任务列表，再点侧边栏不被拦（v4.9.55）
+GWT-DL-36 Given 目标站的签名链接**只允许一次请求**（第二次起 403），或 302 跳转页种下 `Set-Cookie` 且 CDN 那一跳才校验  When 通过 Aria2 Explorer 添加该链接  Then 整条任务只发 **1 个** HTTP 请求且 `complete` 落盘一致；302 种下的 Cookie 与插件自带 Cookie 同时出现在下一跳；若首请求就 403，任务立即失败、`errorMessage` 同时含自救提示与站点 403 页面的原因原文，且不再重试（v4.9.56）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 
