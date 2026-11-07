@@ -1827,11 +1827,30 @@ fn remote_info_from(response: &reqwest::Response, ranged_probe: bool) -> RemoteI
     }
 }
 
-/// 探测远端：先 HEAD，被拒就退回 `GET + Range: bytes=0-0`。
+/// 目标站明确拒绝（401/403 等）：错误信息带上最常见的自救方向。
+/// 这条消息会原样进 tellStatus 的 errorMessage（插件 / WebUI 直接展示给用户），
+/// 对着一个裸 403 没法排查，得告诉人先去查插件到底转没转发 Cookie。
+fn http_reject(status: reqwest::StatusCode) -> FailKind {
+    let code = status.as_u16() as u32;
+    let msg = match code {
+        401 | 403 => format!(
+            "HTTP {status} (target site refused: the link may need Cookie/Referer that were not forwarded, or a WAF is blocking non-browser clients)"
+        ),
+        _ => format!("HTTP {status}"),
+    };
+    FailKind::Failed(code, msg)
+}
+
+/// 探测远端：HEAD → `GET + Range: bytes=0-0` → 普通 GET，三级退路。
 ///
-/// 大量站点（对象存储、防盗链、部分 CDN）对 HEAD 直接回 405 / 403 / 501，
-/// 原版 aria2 用的是 GET 探测，所以「HEAD 不通就当任务失败」会误杀能下的链接 ——
-/// 而浏览器插件抓来的链接恰好大量落在这些站点上。
+/// 大量站点（对象存储、防盗链、部分 CDN）对 HEAD 直接回 405 / 403 / 501；
+/// 更糟的是一部分 WAF / 防盗链模块对**任何**带 Range 的请求都 403，
+/// 却放行普通 GET —— 原版 aria2 不做探测、直接普通 GET 开下，所以它能下我们
+/// 不能。因此 Range 探针失败不判死任务，退到普通 GET 探测（只读头就断开），
+/// 只有普通 GET 也被拒才算真失败（那 403 是真实拒绝，多半缺 Cookie / Referer）。
+///
+/// 普通 GET 探测成功时**强制单流**：这站点刚刚拒过 Range 请求，就算它头里
+/// 自称 `Accept-Ranges: bytes` 也不信，分段请求会再撞一次枪口。
 async fn probe_remote(
     engine: &EngineHandle,
     uri: &str,
@@ -1844,7 +1863,7 @@ async fn probe_remote(
     let status = head.status();
     drop(head);
     crate::log_warn!("HEAD {uri} returned {status}; retrying probe with GET + Range: bytes=0-0");
-    let response = send_following(
+    let ranged = send_following(
         engine,
         reqwest::Method::GET,
         uri,
@@ -1852,14 +1871,20 @@ async fn probe_remote(
         Some("bytes=0-0"),
     )
     .await?;
-    if !response.status().is_success() {
-        return Err(FailKind::Failed(
-            response.status().as_u16() as u32,
-            format!("HTTP {}", response.status()),
-        ));
+    if ranged.status().is_success() {
+        return Ok(remote_info_from(&ranged, true));
+    }
+    let status = ranged.status();
+    drop(ranged);
+    crate::log_warn!("GET+Range {uri} returned {status}; falling back to plain GET probe");
+    let plain = send_following(engine, reqwest::Method::GET, uri, headers, None).await?;
+    if !plain.status().is_success() {
+        return Err(http_reject(plain.status()));
     }
     // 只要头，不要体：response 在这里 drop，连接随之中断
-    Ok(remote_info_from(&response, true))
+    let mut info = remote_info_from(&plain, false);
+    info.accept_ranges = false;
+    Ok(info)
 }
 
 async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskOutcome {
@@ -2096,10 +2121,7 @@ async fn download_segment(
                 }
                 retries += 1;
                 if retries > 3 {
-                    return Err(FailKind::Failed(
-                        resp.status().as_u16() as u32,
-                        format!("HTTP {}", resp.status()),
-                    ));
+                    return Err(http_reject(resp.status()));
                 }
                 tokio::time::sleep(Duration::from_secs(retries as u64)).await;
             }
@@ -2580,8 +2602,8 @@ mod tests {
             .unwrap();
         assert_eq!(gid.len(), 16);
 
-        // 等 error 落定（连接拒绝几乎立刻）
-        for _ in 0..50 {
+        // 等 error 落定（三级探测各要过一趟代理，本机环境单跳可到 2s）
+        for _ in 0..150 {
             if manager
                 .tell_stopped()
                 .await
@@ -3121,6 +3143,126 @@ mod tests {
         assert_eq!(status, "complete", "task did not finish: {status}");
         let written = tokio::fs::read(base.join("file.bin")).await.unwrap();
         assert_eq!(written, BODY);
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// WAF / 防盗链的另一种形态：HEAD 与**一切**带 Range 的请求都 403，
+    /// 只有普通 GET 放行 —— 原版 aria2 能下（它不探测、直接普通 GET）。
+    /// 三级退路的最后一级必须兜住：普通 GET 探测成功 → 强制单流，任务照常完成。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waf_rejecting_head_and_range_still_downloads_via_plain_get() {
+        const BODY: &[u8] = b"waf-allow-plain-get-only";
+        let content = spawn_stub(|method, _path, headers| {
+            if method == "HEAD" || headers.contains_key("range") {
+                return b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"w1\"\r\nConnection: close\r\n\r\n",
+                BODY.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(BODY);
+            response
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-waf-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            4,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{content}/file.bin")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("file.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                status = item["status"].as_str().unwrap_or_default().to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status, "complete", "task did not finish: {status}");
+        let written = tokio::fs::read(base.join("file.bin")).await.unwrap();
+        assert_eq!(written, BODY);
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 普通 GET 也被拒 = 真实拒绝（缺 Cookie / Referer 或风控）：任务失败，
+    /// 且 errorMessage 给出可自救的排查方向，而不是一个让人对着猜的裸 403。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hard_403_reports_hint_in_error_message() {
+        let content = spawn_stub(|_method, _path, _headers| {
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-hard403-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder().build().unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            2,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{content}/file.bin")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("file.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut entry = None;
+        for _ in 0..200 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                entry = Some(item);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let entry = entry.expect("task never reached a terminal state");
+        assert_eq!(entry["status"], "error");
+        assert_eq!(entry["errorCode"], 403);
+        let message = entry["errorMessage"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("403") && message.contains("Cookie"),
+            "error message lacks diagnostic hint: {message}"
+        );
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

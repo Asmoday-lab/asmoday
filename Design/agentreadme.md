@@ -439,6 +439,7 @@ GWT-DL-30 Given 设置页滚到最底部  Then 底部还有一颗「返回下载
 GWT-DL-31 Given 在引擎设置视图  When 按系统返回键 / 浏览器后退（不是点按钮）  Then **先回到下载任务列表**，URL 仍停在 `/downloads`，不出现「直接退回聚合主页」；有未保存改动时先弹确认，选「继续编辑」后视图与草稿都不变、再按一次仍能拦住；切到任务视图后再按返回才真的离开本页（v4.9.41）
 GWT-DL-32 Given Aria2 Explorer 形态的 addUri：`referer` 作为**独立选项**发、`header` 是 `"Name: value"` 数组  When 下载需要登录态的直链  Then 探测请求与**每一个分段请求**都带 `Referer` 与 `Cookie`（桩站缺任一头即 403）；`getOption` 回 `referer` 与 `header` 数组（含 `Cookie:` / `User-Agent:` 两行）；`header` 里显式写 `Referer:` 时以它为准；`header` 写成换行分隔的单串（AriaNg 设置里的形态）同样生效（v4.9.52）
 GWT-DL-33 Given 目标站点 `HEAD` 返 405/403 并 302 跳到另一个源  When 下同一个文件  Then 任务仍 `complete` 且落盘字节一致；重定向每一跳都重发同一份头与 `Range`（reqwest 自动跟随会删 `Cookie`，实测会被桩站 403）；`pause="true"` 加完停在 `paused`，`changeOption` 补 `header` / `referer` 后 `unpause` 能下完；`split` 等价于 `max-connection-per-server`；`header` 里名字非法的行被丢弃且任务照跑（不得因 panic 静默消失）；`dir` 越界时错误消息列出允许的根（v4.9.52）
+GWT-DL-34 Given 目标站对 `HEAD` 与一切带 `Range` 的请求都回 403、只有普通 GET 放行（WAF / 防盗链的常见形态）  When 添加该链接  Then 探测退到普通 GET 后任务以**单流**照常 `complete`、落盘字节一致（原版 aria2 同样能下，因为它不探测）；若普通 GET 也 403，任务 `error` 且 `errorCode=403`，`errorMessage` 含 `Cookie`/`Referer` 自救提示而不是裸 403（v4.9.54）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 
