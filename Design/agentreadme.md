@@ -408,7 +408,7 @@ GWT-DL-08 Given 单用户模型  When 任意 aria2 客户端用 `token:<secret>`
 
 GWT-DL-01 Given 任意 aria2 客户端  When `getVersion`  Then `enabledFeatures` 含 Asmoday / Multi-Connection / Resumable；BT 会话就绪时追加 BitTorrent（否则客户端自动隐藏磁力/种子入口）（v4.9.27 更新）
 GWT-DL-02 Given 错误 RPC 密钥  When 调用任意方法  Then `{"code":1,"message":"Unauthorized"}`；正确密钥（token:<secret>，首项）正常返回
-GWT-DL-03 Given AriaNg 的批量轮询  When `system.multicall` 内层 params **不含** token  Then 两个子调用都成功（鉴权只在 multicall 层做一次），结果形如 `[[...],[...]]`
+GWT-DL-03 Given 批量轮询  When `system.multicall` 的内层 params 带 token（AriaNg 的真实形态，外层是方法数组）或不带（手写客户端，外层带 token）、以及两层都带  Then 各形态的子调用都成功、结果形如 `[[...],[...]]`；任一子调用 token 缺失或伪造则整批 `Unauthorized`（v4.9.58 修订：旧条目误以为 AriaNg 内层不带 token，正是这条错误假设导致插件任务列表空白）
 GWT-DL-04 Given 支持 Range 的源站  When `addUri` 后 `tellStatus`  Then `connections > 1`（按 segments 均分并发），`tellStatus` 的 totalLength/completedLength/downloadSpeed/connections/dir/files/errorCode/errorMessage 全部存在
 GWT-DL-05 Given 下载中 `pause`  Then 状态 paused、已下载字节保留、`.aria2` 控制文件生成、任务出现在 `tellWaiting`（paused 属 waiting 族）；`unpause` 后从断点续传且最终字节与源 sha256 一致
 GWT-DL-06 Given `dir` 落在「允许的保存目录」之外  When `addUri`  Then JSON-RPC fault（拒绝，不夹到根里）；`out` 含路径分隔符或 `..` 同样拒绝（v4.9.37 起白名单 = 挂载点子路径）
@@ -443,6 +443,7 @@ GWT-DL-34 Given 目标站对 `HEAD` 与一切带 `Range` 的请求都回 403、�
 GWT-DL-35 Given 全新实例进 `/downloads` 且 `loadEngine()` 已拉回真实的「允许的保存目录」，用户**从未进过引擎设置**  When 点侧边栏离开下载页  Then 直接跳到目标路由，不弹「离开引擎设置？」、页头也无「有未保存改动」角标；进设置页后不做任何改动同样干净；真加一条保存目录再点返回才弹，且弹窗逐条列出「允许的保存目录」；选「放弃改动并返回」后回任务列表，再点侧边栏不被拦（v4.9.55）
 GWT-DL-36 Given 目标站的签名链接**只允许一次请求**（第二次起 403），或 302 跳转页种下 `Set-Cookie` 且 CDN 那一跳才校验  When 通过 Aria2 Explorer 添加该链接  Then 整条任务只发 **1 个** HTTP 请求且 `complete` 落盘一致；302 种下的 Cookie 与插件自带 Cookie 同时出现在下一跳；若首请求就 403，任务立即失败、`errorMessage` 同时含自救提示与站点 403 页面的原因原文，且不再重试（v4.9.56）
 GWT-DL-37 Given 目标站返回 Cloudflare `Just a moment...` 质询页（403 + `__cf_chl` / `challenge-platform`），或 `error code: 1010` 防火墙硬判决  When 任务失败  Then `errorMessage` 不含 `<!DOCTYPE`/`<html` 之类 boilerplate，而是分别给出「需要 cf_clearance + 完全一致的 User-Agent + 同一出口 IP（下载器无法自行过盾）」/「换头无解，需换出口 IP 或指纹」的结论；失败 WARN 里带 `proxy:` 字段供核对出口；普通站点 403 仍保留剥掉标签后的原文摘录（v4.9.57）
+GWT-DL-38 Given 插件（Aria2 Explorer 内置 AriaNg）已有一条已停止任务、左侧「已完成/已停止 (1)」有计数  When 打开任务列表  Then 右侧能列出该任务的 gid/status/errorCode/files（AriaNg 用 `system.multicall` 发 `tellActive` / `tellWaiting(0,1000)` / `tellStopped(-1,1000)`，token 只放在子调用的 params[0]）；外层单独带 token、内外两层都带 token 的旧写法照样工作；任一子调用伪造或缺少 token 时整批仍返回 `Unauthorized`（v4.9.58）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

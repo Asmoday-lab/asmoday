@@ -1363,22 +1363,14 @@ impl DownloadManager {
     pub async fn window(
         &self,
         list: WindowList,
-        offset: usize,
+        offset: i64,
         num: usize,
     ) -> Vec<serde_json::Value> {
-        let mut full = match list {
+        let full = match list {
             WindowList::Waiting => self.tell_waiting().await,
             WindowList::Stopped => self.tell_stopped().await,
         };
-        if offset >= full.len() {
-            return Vec::new();
-        }
-        full.drain(..offset);
-        if num == 0 {
-            return full; // aria2 语义：num=0 → 全部
-        }
-        full.truncate(num);
-        full
+        window_slice(full, list, offset, num)
     }
 
     async fn list_by(&self, pred: impl Fn(Status) -> bool) -> Vec<serde_json::Value> {
@@ -1535,6 +1527,46 @@ impl DownloadManager {
         }
         options
     }
+}
+
+/// aria2 的 offset / num 窗口语义（纯函数，便于断言）。
+///
+/// 正 offset：`[offset, offset + num)`，**正序**返回。
+/// 负 offset：`-1` 指队尾最后一个，`-2` 指倒数第二个，依此类推，并且
+/// **倒序**返回（aria2 手册的例子：A,B,C 时 `tellWaiting(-1, 2)` → `["C","B"]`）。
+/// AriaNg 拉「已完成 / 已停止」页用的正是 `-1, 1000` —— 只收无符号 offset 时
+/// 这个请求会直接报错，页面就空了（v4.9.58）。
+///
+/// `tellWaiting()` 的顺序就是队列顺序；`tellStopped()` 内部是**最新在前**，
+/// 而 aria2 的 offset 以「最早停止的」为 0，所以先反转成最早在前。
+fn window_slice(
+    mut full: Vec<serde_json::Value>,
+    list: WindowList,
+    offset: i64,
+    num: usize,
+) -> Vec<serde_json::Value> {
+    if matches!(list, WindowList::Stopped) {
+        full.reverse();
+    }
+    if offset < 0 {
+        let back = offset.unsigned_abs() as usize;
+        if back == 0 || back > full.len() {
+            return Vec::new();
+        }
+        let start = full.len() - back;
+        let take = if num == 0 { usize::MAX } else { num };
+        return full[..=start].iter().rev().take(take).cloned().collect();
+    }
+    let offset = offset as usize;
+    if offset >= full.len() {
+        return Vec::new();
+    }
+    full.drain(..offset);
+    if num == 0 {
+        return full;
+    }
+    full.truncate(num);
+    full
 }
 
 /// tellWaiting / tellStopped 的选择
@@ -2665,6 +2697,57 @@ mod tests {
             path: path.to_path_buf(),
             online: true,
         }
+    }
+
+    /// aria2 手册的 offset 例子：A,B,C 时 `tellWaiting(-1, 2)` → C,B；
+    /// 而 tellStopped 内部是「最新在前」，需先转成「最早停止的在前」再取窗口。
+    #[test]
+    fn window_slice_matches_aria2_offset_semantics() {
+        fn gids(items: &[serde_json::Value]) -> Vec<String> {
+            items
+                .iter()
+                .map(|item| item["gid"].as_str().unwrap_or("").to_string())
+                .collect()
+        }
+        let queue = |names: &[&str]| -> Vec<serde_json::Value> {
+            names
+                .iter()
+                .map(|name| serde_json::json!({ "gid": name }))
+                .collect()
+        };
+        let waiting = queue(&["A", "B", "C"]);
+        assert_eq!(
+            gids(&window_slice(waiting.clone(), WindowList::Waiting, 0, 1)),
+            vec!["A"]
+        );
+        assert_eq!(
+            gids(&window_slice(waiting.clone(), WindowList::Waiting, 1, 2)),
+            vec!["B", "C"]
+        );
+        assert_eq!(
+            gids(&window_slice(waiting.clone(), WindowList::Waiting, -1, 2)),
+            vec!["C", "B"]
+        );
+        assert_eq!(
+            gids(&window_slice(waiting.clone(), WindowList::Waiting, -2, 1)),
+            vec!["B"]
+        );
+
+        let stopped = queue(&["C", "B", "A"]); // 内部顺序：最新在前
+        assert_eq!(
+            gids(&window_slice(
+                stopped.clone(),
+                WindowList::Stopped,
+                -1,
+                1000
+            )),
+            vec!["C", "B", "A"]
+        );
+        assert_eq!(
+            gids(&window_slice(stopped.clone(), WindowList::Stopped, 0, 1)),
+            vec!["A"]
+        );
+        assert!(window_slice(stopped, WindowList::Stopped, -9, 1000).is_empty());
     }
 
     #[test]

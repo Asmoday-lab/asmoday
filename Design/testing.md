@@ -145,6 +145,12 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v8（v4.9.58）**：新增 `probes/ariang_list.py`（18 条断言），按 AriaNg 打包源码
+  的真实形态发 `system.multicall` —— **外层不带 token、每个子调用带 token、
+  `tellStopped` 的 offset 是 -1**。这是「左侧有数量、右侧列表空」的唯一复现方式，
+  手写 `tellStopped(0,1000)` 永远测不出来。断言同时锁住伪造 token / 缺 token
+  整批拒绝与旧式外层 token 兼容。改 `/jsonrpc` 分派后照旧 `cargo build` 再跑探针。
+
 - **v7（v4.9.57）**：拒绝响应分类改为可断言的行为——单测新增
   `reject_details_classify_cloudflare_and_plain_text` 与
   `cloudflare_challenge_page_reports_actionable_hint`，后者复刻真实 CF 403 页并

@@ -252,13 +252,36 @@ async fn dispatch_single(state: &AppState, request: Value) -> Value {
 
 /// 单方法调用 → JSON-RPC 响应
 async fn call(state: &AppState, method: &str, params: Vec<Value>, id: &Value) -> Value {
-    // 鉴权：params[0] 必须是 token:<secret>（aria2 语义）
-    match params.first().and_then(Value::as_str) {
-        Some(token) if state.downloads.secret_matches(token) => {}
-        _ => return rpc_fault_json(id.clone(), 1, "Unauthorized".to_string()),
+    // 鉴权：aria2 的 token 有两种摆放方式，都得认（v4.9.58）。
+    //   (1) 普通方法 / 手写 multicall：params[0] = "token:<secret>"；
+    //   (2) AriaNg（Aria2 Explorer 内置的就是它）的 system.multicall：外层
+    //       params[0] 是**方法数组**，token 放在每个子调用各自的 params[0]。
+    //       这时要求每个子调用都带有效 token，杜绝「无凭证批量调用」。
+    // 只认外层 token 会让整个任务列表查询返回 Unauthorized —— 而左侧计数
+    // 来自独立的 getGlobalStat（它带 token），于是表现为「有数量、没列表」。
+    let outer_token = params.first().and_then(Value::as_str);
+    let authorized = match outer_token {
+        Some(token) => state.downloads.secret_matches(token),
+        None if method == "system.multicall" => params
+            .first()
+            .and_then(Value::as_array)
+            .and_then(|calls| nested_tokens(calls))
+            .is_some_and(|tokens| {
+                tokens
+                    .iter()
+                    .all(|token| state.downloads.secret_matches(token))
+            }),
+        _ => false,
+    };
+    if !authorized {
+        return rpc_fault_json(id.clone(), 1, "Unauthorized".to_string());
     }
-
-    let args = &params[1..];
+    // 外层带 token 时剥掉它；AriaNg 形态外层是方法数组，整体留给 multicall 处理
+    let args: &[Value] = if outer_token.is_some() {
+        &params[1..]
+    } else {
+        &params[..]
+    };
     match run_method(state, method, args).await {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(err) => rpc_fault_json(id.clone(), err.code, err.message),
@@ -407,14 +430,16 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
             Ok(filter_keys(list, keys))
         }
         "aria2.tellWaiting" => {
-            let offset = arg_usize(args, 0)?;
+            let offset = arg_i64(args, 0)?;
             let num = arg_usize(args, 1)?;
             let keys = args_key_filter(args.get(2..).unwrap_or(&[]));
             let list = manager.window(WindowList::Waiting, offset, num).await;
             Ok(filter_keys(list, keys))
         }
         "aria2.tellStopped" => {
-            let offset = arg_usize(args, 0)?;
+            // AriaNg 默认就发 offset=-1（取最近 num 条、结果倒序）；
+            // 只收无符号整数会让整个「已完成 / 已停止」页永远空白。
+            let offset = arg_i64(args, 0)?;
             let num = arg_usize(args, 1)?;
             let keys = args_key_filter(args.get(2..).unwrap_or(&[]));
             let list = manager.window(WindowList::Stopped, offset, num).await;
@@ -604,13 +629,15 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let call_params = call_item
+                let mut call_params = call_item
                     .get("params")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                // aria2 语义：内层调用的 params **不含** token——鉴权在 multicall
-                // 层做一次即可，内层直接走 run_method（不重复鉴权）
+                // 内层 token 两种形态都要吃：手写客户端把它留在外层（内层干净），
+                // AriaNg 则把 token 塞进每个子调用的 params[0]（外层没有）。
+                // 不剥掉的话 tellStopped 会把 "token:xxx" 当成 offset 解析而失败。
+                strip_nested_token(&mut call_params);
                 let outcome = match Box::pin(run_method(state, &name, &call_params)).await {
                     Ok(result) => json!([result]),
                     Err(err) => json!({
@@ -639,6 +666,36 @@ fn unknown_gid(gid: &str) -> RpcError {
 // 参数解析小工具
 // ---------------------------------------------------------------------------
 
+/// AriaNg 形态的 multicall：token 在每个子调用的 params[0]。
+/// 只有「非空且每个子调用都有字符串首项」才算形态合法；token 本身是否有效
+/// 由调用方逐个交给 `secret_matches` 校验。
+fn nested_tokens(calls: &[Value]) -> Option<Vec<&str>> {
+    if calls.is_empty() {
+        return None;
+    }
+    calls
+        .iter()
+        .map(|item| {
+            item.get("params")
+                .and_then(Value::as_array)
+                .and_then(|nested| nested.first())
+                .and_then(Value::as_str)
+        })
+        .collect()
+}
+
+/// 子调用的首项若是 `token:...` 就剥掉——外层已鉴过权，剩给子方法的才是
+/// gid / offset。不是 token 的首项（例如 tellStatus 的 gid）必须原样保留。
+fn strip_nested_token(params: &mut Vec<Value>) {
+    if params
+        .first()
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with("token:"))
+    {
+        params.remove(0);
+    }
+}
+
 fn arg_str(args: &[Value], index: usize, name: &str) -> Result<String, RpcError> {
     args.get(index)
         .and_then(Value::as_str)
@@ -651,6 +708,14 @@ fn arg_usize(args: &[Value], index: usize) -> Result<usize, RpcError> {
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .ok_or_else(|| RpcError::new(2, "expected a non-negative integer"))
+}
+
+/// tellWaiting / tellStopped 的 offset 允许负数（aria2 语义：-1 指队尾）。
+/// 参数可能是 JSON 正整数或负整数，serde_json 的 `as_i64` 两种都能收。
+fn arg_i64(args: &[Value], index: usize) -> Result<i64, RpcError> {
+    args.get(index)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::new(2, "expected an integer offset"))
 }
 
 /// tellActive(secret, keys?) 的 keys 在第 1 位
@@ -821,5 +886,34 @@ mod tests {
         assert!(!is_bare_info_hash(
             "cab507494d02ebb1178b38f2e9d7be299c86b86"
         ));
+    }
+
+    /// AriaNg 的 multicall：token 在内层、offset 是 -1（v4.9.58）。
+    /// 这两点任一处理错，插件就只剩左侧计数、右侧列表全空。
+    #[test]
+    fn nested_multicall_tokens_and_negative_offset() {
+        let calls = vec![
+            json!({"methodName": "aria2.tellActive", "params": ["token:s1", ["gid"]]}),
+            json!({"methodName": "aria2.tellStopped", "params": ["token:s1", -1, 1000]}),
+        ];
+        assert_eq!(nested_tokens(&calls), Some(vec!["token:s1", "token:s1"]));
+        assert_eq!(nested_tokens(&[]), None);
+        // 缺 token 的子调用不能让整批「无凭证」放行
+        assert_eq!(
+            nested_tokens(&[json!({"methodName": "system.listMethods", "params": []})]),
+            None
+        );
+
+        let mut params = vec![json!("token:s1"), json!(-1), json!(1000)];
+        strip_nested_token(&mut params);
+        assert_eq!(params, vec![json!(-1), json!(1000)]);
+        // 普通 gid 不是 token，不能被误剥
+        let mut gid_first = vec![json!("2089b05ecca3d829")];
+        strip_nested_token(&mut gid_first);
+        assert_eq!(gid_first, vec![json!("2089b05ecca3d829")]);
+
+        assert_eq!(arg_i64(&[json!(-1), json!(1000)], 0).unwrap(), -1);
+        assert_eq!(arg_i64(&[json!(0), json!(1000)], 0).unwrap(), 0);
+        assert!(arg_i64(&[json!("token:s1")], 0).is_err());
     }
 }
