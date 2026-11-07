@@ -145,6 +145,12 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v9（v4.9.59）**：发版 CI 的 docker merge 失败（`-amd64 is a manifest list`）
+  暴露了一条只靠本地门禁测不出的链路：本机无 docker，多架构 manifest 合并只能在
+  tag 触发的真实 runner 上验证。查 CI 用匿名 REST
+  `GET /repos/Asmoday-lab/asmoday/actions/runs/{id}/jobs` 看失败 step，
+  修 workflow 后必须**重打 tag**（re-run 会用旧 commit 的 workflow 定义，改了不生效）。
+
 - **v8（v4.9.58）**：新增 `probes/ariang_list.py`（18 条断言），按 AriaNg 打包源码
   的真实形态发 `system.multicall` —— **外层不带 token、每个子调用带 token、
   `tellStopped` 的 offset 是 -1**。这是「左侧有数量、右侧列表空」的唯一复现方式，

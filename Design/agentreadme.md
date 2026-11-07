@@ -444,6 +444,7 @@ GWT-DL-35 Given 全新实例进 `/downloads` 且 `loadEngine()` 已拉回真实�
 GWT-DL-36 Given 目标站的签名链接**只允许一次请求**（第二次起 403），或 302 跳转页种下 `Set-Cookie` 且 CDN 那一跳才校验  When 通过 Aria2 Explorer 添加该链接  Then 整条任务只发 **1 个** HTTP 请求且 `complete` 落盘一致；302 种下的 Cookie 与插件自带 Cookie 同时出现在下一跳；若首请求就 403，任务立即失败、`errorMessage` 同时含自救提示与站点 403 页面的原因原文，且不再重试（v4.9.56）
 GWT-DL-37 Given 目标站返回 Cloudflare `Just a moment...` 质询页（403 + `__cf_chl` / `challenge-platform`），或 `error code: 1010` 防火墙硬判决  When 任务失败  Then `errorMessage` 不含 `<!DOCTYPE`/`<html` 之类 boilerplate，而是分别给出「需要 cf_clearance + 完全一致的 User-Agent + 同一出口 IP（下载器无法自行过盾）」/「换头无解，需换出口 IP 或指纹」的结论；失败 WARN 里带 `proxy:` 字段供核对出口；普通站点 403 仍保留剥掉标签后的原文摘录（v4.9.57）
 GWT-DL-38 Given 插件（Aria2 Explorer 内置 AriaNg）已有一条已停止任务、左侧「已完成/已停止 (1)」有计数  When 打开任务列表  Then 右侧能列出该任务的 gid/status/errorCode/files（AriaNg 用 `system.multicall` 发 `tellActive` / `tellWaiting(0,1000)` / `tellStopped(-1,1000)`，token 只放在子调用的 params[0]）；外层单独带 token、内外两层都带 token 的旧写法照样工作；任一子调用伪造或缺少 token 时整批仍返回 `Unauthorized`（v4.9.58）
+GWT-DL-39 Given 在最终提交重打 `v0.1.0-alpha.1`  When release 与 docker 两条 tag 工作流跑完  Then Release 挂着 win-msvc / linux-musl x2 三件产物，GHCR 存在 `:v0.1.0-alpha.1` 多架构 manifest（含 amd64 与 arm64）；单架构 tag 因关闭 provenance 是单一 manifest，merge 用 imagetools create 不再报 `is a manifest list`；预发布 tag 不覆盖 `:latest`（v4.9.59）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 
