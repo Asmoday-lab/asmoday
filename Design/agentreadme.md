@@ -442,6 +442,7 @@ GWT-DL-33 Given 目标站点 `HEAD` 返 405/403 并 302 跳到另一个源  When
 GWT-DL-34 Given 目标站对 `HEAD` 与一切带 `Range` 的请求都回 403、只有普通 GET 放行（WAF / 防盗链的常见形态）  When 添加该链接  Then 探测退到普通 GET 后任务以**单流**照常 `complete`、落盘字节一致（原版 aria2 同样能下，因为它不探测）；若普通 GET 也 403，任务 `error` 且 `errorCode=403`，`errorMessage` 含 `Cookie`/`Referer` 自救提示而不是裸 403（v4.9.54）
 GWT-DL-35 Given 全新实例进 `/downloads` 且 `loadEngine()` 已拉回真实的「允许的保存目录」，用户**从未进过引擎设置**  When 点侧边栏离开下载页  Then 直接跳到目标路由，不弹「离开引擎设置？」、页头也无「有未保存改动」角标；进设置页后不做任何改动同样干净；真加一条保存目录再点返回才弹，且弹窗逐条列出「允许的保存目录」；选「放弃改动并返回」后回任务列表，再点侧边栏不被拦（v4.9.55）
 GWT-DL-36 Given 目标站的签名链接**只允许一次请求**（第二次起 403），或 302 跳转页种下 `Set-Cookie` 且 CDN 那一跳才校验  When 通过 Aria2 Explorer 添加该链接  Then 整条任务只发 **1 个** HTTP 请求且 `complete` 落盘一致；302 种下的 Cookie 与插件自带 Cookie 同时出现在下一跳；若首请求就 403，任务立即失败、`errorMessage` 同时含自救提示与站点 403 页面的原因原文，且不再重试（v4.9.56）
+GWT-DL-37 Given 目标站返回 Cloudflare `Just a moment...` 质询页（403 + `__cf_chl` / `challenge-platform`），或 `error code: 1010` 防火墙硬判决  When 任务失败  Then `errorMessage` 不含 `<!DOCTYPE`/`<html` 之类 boilerplate，而是分别给出「需要 cf_clearance + 完全一致的 User-Agent + 同一出口 IP（下载器无法自行过盾）」/「换头无解，需换出口 IP 或指纹」的结论；失败 WARN 里带 `proxy:` 字段供核对出口；普通站点 403 仍保留剥掉标签后的原文摘录（v4.9.57）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

@@ -145,6 +145,12 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v7（v4.9.57）**：拒绝响应分类改为可断言的行为——单测新增
+  `reject_details_classify_cloudflare_and_plain_text` 与
+  `cloudflare_challenge_page_reports_actionable_hint`，后者复刻真实 CF 403 页并
+  断言 errorMessage 里**没有** `<!DOCTYPE` / `<html`。排查真实站点 403 时，
+  先看 errorMessage 的分类结论，再看控制台 WARN 的 `proxy:` 字段核对出口 IP。
+
 - **v6（v4.9.56）**：`probes/aria2_explorer.py` 扩到 **15 条断言**，新增一次性签名链接
   （只允许第一个 GET、之后 403）与 403 页面原文两组桩站；关键断言是
   「整条任务只发 1 个 HTTP 请求」——旧版四发探测请求在这里必然失败。断言名

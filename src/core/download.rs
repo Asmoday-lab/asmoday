@@ -1785,6 +1785,30 @@ impl TaskCookies {
     }
 }
 
+/// 失败日志里标出进程看到的代理：cf_clearance 绑定出口 IP，浏览器与下载器
+/// 走不同出口时 Cookie 必然失效。只打印 host:port，绝不打印代理账号密码。
+fn proxy_summary() -> String {
+    let mut parts = Vec::new();
+    for (label, keys) in [
+        ("http", ["http_proxy", "HTTP_PROXY"]),
+        ("https", ["https_proxy", "HTTPS_PROXY"]),
+        ("all", ["all_proxy", "ALL_PROXY"]),
+    ] {
+        if let Some(value) = keys.iter().find_map(|key| std::env::var(key).ok()) {
+            let host = value.rsplit('@').next().unwrap_or(&value);
+            parts.push(format!(
+                "{label}={}",
+                host.chars().take(64).collect::<String>()
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
 /// 日志只记「发了哪些头 / 各多长」，绝不打印 Cookie、Authorization 的值。
 fn header_summary(headers: &reqwest::header::HeaderMap) -> String {
     let summary = headers
@@ -1837,12 +1861,13 @@ async fn send_following(
         // 只有失败才打日志：403 到底出在哪一跳、当时带了哪些头，一眼可查
         if !status.is_success() && !status.is_redirection() {
             crate::log_warn!(
-                "download {} {} range={} -> {}; sent headers: {}",
+                "download {} {} range={} -> {}; sent headers: {}; proxy: {}",
                 method,
                 url,
                 range.unwrap_or("-"),
                 status,
-                header_summary(&hop_headers)
+                header_summary(&hop_headers),
+                proxy_summary()
             );
         }
         if !status.is_redirection() {
@@ -1910,40 +1935,112 @@ fn remote_info_from(response: &reqwest::Response) -> RemoteInfo {
     }
 }
 
-/// 读一小段响应体：403 的页面常常直接写着拒绝原因（"referer invalid"、
-/// "login required"、"token expired"），比我们对着猜有用得多。
-async fn reject_hint(response: &mut reqwest::Response) -> Option<String> {
-    // 站点可能回了 403 头却磨蹭着不发 body：给个短超时，别把任务挂在错误上报上
-    let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk())
-        .await
-        .ok()
-        .and_then(|result| result.ok().flatten())?;
-    let text = String::from_utf8_lossy(&chunk[..chunk.len().min(512)]);
-    let flat: String = text
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let flat = flat.chars().take(200).collect::<String>();
-    (!flat.is_empty()).then_some(flat)
+/// 拒绝响应归成「能自救 / 不能自救」两类，别把一整页 HTML 甩给用户。
+struct RejectDetail {
+    /// 命中已知反爬形态时，用诊断结论替换 401/403 那句泛泛的猜测
+    reason: Option<String>,
+    /// 其它站点：剥掉标签后的原文摘录
+    excerpt: Option<String>,
 }
 
-/// 目标站明确拒绝（401/403 等）：错误信息带上最常见的自救方向 + 站点原文。
-/// 这条消息会原样进 tellStatus 的 errorMessage（插件 / WebUI 直接展示给用户）。
-fn http_reject(status: reqwest::StatusCode, hint: Option<&str>) -> FailKind {
-    let code = status.as_u16() as u32;
-    let msg = match code {
-        401 | 403 => format!(
-            "HTTP {status} (target site refused: the link may need Cookie/Referer that were not forwarded, or a WAF is blocking non-browser clients)"
-        ),
-        _ => format!("HTTP {status}"),
+fn plain_excerpt(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in raw.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+/// Cloudflare 的 `Just a moment...` 是**质询页**而不是权限拒绝：它要求客户端
+/// 跑 JS / Turnstile 换 `cf_clearance`，而 clearance 绑定 IP + UA + TLS 指纹，
+/// 换一个下载器就失效。这时候「补 Cookie/Referer」的建议是错的，得说清楚。
+fn classify_reject(raw: &str) -> RejectDetail {
+    let lower = raw.to_ascii_lowercase();
+    let challenge = lower.contains("just a moment")
+        || lower.contains("cf-chl")
+        || lower.contains("challenge-platform")
+        || lower.contains("cf-turnstile")
+        || lower.contains("checking your browser")
+        || lower.contains("cf-browser-verification")
+        || lower.contains("enable javascript and cookies to continue");
+    if challenge {
+        return RejectDetail {
+            reason: Some(
+                "Cloudflare browser challenge: this site requires a JavaScript / Turnstile check that no download client (aria2 included) can pass by itself. Open the link in your browser first, then pass the cf_clearance Cookie together with the EXACT same User-Agent through the SAME exit IP (proxy); cf_clearance is bound to IP + UA + TLS fingerprint and expires quickly".to_string(),
+            ),
+            excerpt: None,
+        };
+    }
+    // 只有四位错误码、没有挑战脚本 = 防火墙硬判决，换头没用
+    let cf_code = ["1020", "1010", "1015", "1006", "1007", "1008", "1009"]
+        .into_iter()
+        .find(|code| {
+            let short = format!("error {code}");
+            let long = format!("error code: {code}");
+            lower.contains(short.as_str()) || lower.contains(long.as_str())
+        });
+    if let Some(code) = cf_code {
+        return RejectDetail {
+            reason: Some(format!(
+                "Cloudflare firewall verdict {code}: IP / browser-signature / rate-limit rejection, not a missing header. Retrying or adding cookies will not help; the exit IP or client fingerprint must change"
+            )),
+            excerpt: None,
+        };
+    }
+    let excerpt = plain_excerpt(raw);
+    RejectDetail {
+        reason: None,
+        excerpt: (!excerpt.is_empty()).then_some(excerpt),
+    }
+}
+
+/// 读一小段响应体并分类。站点可能只回了 403 头却磨蹭着不发 body，给短超时。
+async fn reject_detail(response: &mut reqwest::Response) -> Option<RejectDetail> {
+    let mut text = String::new();
+    let read = async {
+        while text.len() < 8192 {
+            match response.chunk().await.ok().flatten() {
+                Some(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                None => break,
+            }
+        }
     };
-    let detail = hint
+    let _ = tokio::time::timeout(Duration::from_secs(2), read).await;
+    (!text.is_empty()).then(|| classify_reject(&text))
+}
+
+/// 目标站明确拒绝：错误信息带上可执行的诊断结论 + 站点原文摘录。
+/// 这条消息会原样进 tellStatus 的 errorMessage（插件 / WebUI 直接展示给用户）。
+fn http_reject(status: reqwest::StatusCode, detail: Option<&RejectDetail>) -> FailKind {
+    let code = status.as_u16() as u32;
+    let fallback = "the link may need Cookie/Referer that were not forwarded, or a WAF is blocking non-browser clients";
+    let msg = if let Some(reason) = detail.and_then(|item| item.reason.as_deref()) {
+        format!("HTTP {status} ({reason})")
+    } else {
+        match code {
+            401 | 403 => format!("HTTP {status} (target site refused: {fallback})"),
+            _ => format!("HTTP {status}"),
+        }
+    };
+    let excerpt = detail
+        .and_then(|item| item.excerpt.as_deref())
         .map(|text| format!("; server said: {text}"))
         .unwrap_or_default();
-    FailKind::Failed(code, format!("{msg}{detail}"))
+    FailKind::Failed(code, format!("{msg}{excerpt}"))
 }
 
 /// 起手式：**只发一次普通 GET，这个响应体直接拿去下载**（对齐原版 aria2）。
@@ -1962,8 +2059,8 @@ async fn open_remote(
         send_following(engine, reqwest::Method::GET, uri, headers, None, cookies).await?;
     if !response.status().is_success() {
         let status = response.status();
-        let hint = reject_hint(&mut response).await;
-        return Err(http_reject(status, hint.as_deref()));
+        let detail = reject_detail(&mut response).await;
+        return Err(http_reject(status, detail.as_ref()));
     }
     let info = remote_info_from(&response);
     Ok((response, info))
@@ -2275,8 +2372,8 @@ async fn download_segment(
                 if (status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS)
                     || status == reqwest::StatusCode::NOT_IMPLEMENTED
                 {
-                    let hint = reject_hint(&mut resp).await;
-                    return Err(http_reject(status, hint.as_deref()));
+                    let detail = reject_detail(&mut resp).await;
+                    return Err(http_reject(status, detail.as_ref()));
                 }
                 retries += 1;
                 if retries > 3 {
@@ -3709,6 +3806,108 @@ mod tests {
             tokio::fs::read(base.join("big.bin")).await.unwrap().len(),
             expected_len
         );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 反爬拒绝要分类：Cloudflare 质询页给可执行结论，防火墙硬判决别让人白补
+    /// Cookie，普通站点则保留剥掉标签后的原文。
+    #[test]
+    fn reject_details_classify_cloudflare_and_plain_text() {
+        let cf = classify_reject(
+            r#"<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head>
+<body><script src="/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js"></script></body></html>"#,
+        );
+        let reason = cf.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("Cloudflare browser challenge"), "{reason}");
+        assert!(reason.contains("cf_clearance"), "{reason}");
+        assert!(
+            cf.excerpt.is_none(),
+            "challenge HTML must not be dumped into errorMessage"
+        );
+
+        let block = classify_reject("<html><body>error code: 1010</body></html>");
+        assert!(
+            block.reason.as_deref().unwrap_or_default().contains("1010"),
+            "{:?}",
+            block.reason
+        );
+        assert!(block.excerpt.is_none());
+
+        let plain = classify_reject("<html><body>login required: cookie missing</body></html>");
+        assert!(plain.reason.is_none());
+        assert_eq!(
+            plain.excerpt.as_deref(),
+            Some("login required: cookie missing")
+        );
+    }
+
+    /// 端到端复刻用户实际收到的那张 Cloudflare 403 页：错误信息里不能再出现
+    /// `<!DOCTYPE html>` 这类 boilerplate，而要告诉人 cf_clearance / UA / IP 三件事。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloudflare_challenge_page_reports_actionable_hint() {
+        let content = spawn_stub(|_method, _path, _headers| {
+            let body = b"<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body><script src=\"/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js\"></script></body></html>";
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut response = head.into_bytes();
+            response.extend_from_slice(body);
+            response
+        });
+
+        let base = crate::core::test_scratch_dir().join(format!("dl-cf-{}", new_gid()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let manager = Arc::new(DownloadManager::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            "secret1".into(),
+            vec![test_root(&base)],
+            2,
+            2,
+            true,
+            None,
+        ));
+        let gid = manager
+            .add_uri(
+                vec![format!("http://127.0.0.1:{content}/protected.bin")],
+                UriOptions {
+                    dir: Some(base.to_str().unwrap().into()),
+                    out: Some("protected.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut entry = None;
+        for _ in 0..100 {
+            let found = manager
+                .tell_stopped()
+                .await
+                .into_iter()
+                .find(|item| item["gid"] == gid.as_str());
+            if let Some(item) = found {
+                entry = Some(item);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let entry = entry.expect("task never reached a terminal state");
+        assert_eq!(entry["status"], "error");
+        assert_eq!(entry["errorCode"], 403);
+        let message = entry["errorMessage"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("Cloudflare browser challenge"),
+            "{message}"
+        );
+        assert!(message.contains("cf_clearance"), "{message}");
+        assert!(message.contains("User-Agent"), "{message}");
+        assert!(!message.contains("<!DOCTYPE"), "{message}");
+        assert!(!message.contains("<html"), "{message}");
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }
