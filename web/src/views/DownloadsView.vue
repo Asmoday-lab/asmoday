@@ -74,6 +74,19 @@ interface RootDraft {
   rel: string
 }
 
+/**
+ * 草稿基线（v4.9.55）：进设置视图时和草稿**同时**快照，保存成功后各自推进。
+ *
+ * 之前两块草稿是直接跟 `engine.value` 的 live 状态比：草稿只有第一次进设置视图
+ * 才填，而页面一挂载 `loadEngine()` 就把保存目录拉回来了 —— 用户压根没进过设置页，
+ * `rootDrafts` 还是空数组，于是「允许的保存目录」凭空变脏，点侧边栏离开就弹
+ * 「离开引擎设置？」。同理，保存参数后重新拉 engine 也可能让 live 值与草稿漂移。
+ * `draftsReady` 同时挡住首次加载那段空窗（加载失败时也不许弹）。
+ */
+const rootsBaseline = ref<RootDraft[]>([])
+const trackersBaseline = ref<string[]>([])
+const draftsReady = ref(false)
+
 const settings = ref<DownloadConfig | null>(null)
 const settingsBusy = ref(false)
 const settingsError = ref('')
@@ -149,15 +162,18 @@ useScrollLock(computed(() => addOpen.value || leaveOpen.value))
  * 返回按钮与路由离开都靠这个判定，避免「点返回，填的东西悄悄没了」。
  */
 const rootsDirty = computed(
-  () => rootPairs(rootDrafts.value) !== rootPairs(engine.value?.roots ?? []),
+  () => draftsReady.value && rootPairs(rootDrafts.value) !== rootPairs(rootsBaseline.value),
 )
 
 const trackersDirty = computed(
-  () => trackerLines(trackerText.value) !== trackerLines(engine.value?.trackers ?? []),
+  () =>
+    draftsReady.value &&
+    trackerLines(trackerText.value) !== trackerLines(trackersBaseline.value),
 )
 
 const paramsDirty = computed(
   () =>
+    draftsReady.value &&
     !!settings.value &&
     paramsBaseline.value !== '' &&
     JSON.stringify(settings.value) !== paramsBaseline.value,
@@ -172,7 +188,8 @@ const unsavedParts = computed(() => {
   return parts
 })
 
-const unsaved = computed(() => unsavedParts.value.length > 0)
+/** 只有设置视图里的草稿才需要保护：任务列表视图不该被「离开引擎设置？」拦住 */
+const unsaved = computed(() => view.value === 'settings' && unsavedParts.value.length > 0)
 
 function askLeave(): Promise<boolean> {
   if (leaveOpen.value) return Promise.resolve(false)
@@ -407,7 +424,8 @@ async function submitAdd() {
 async function openSettings() {
   view.value = 'settings'
   scrollToTop()
-  if (settings.value) return
+  // 只有「三块草稿都已就位」才算来过：上次加载到一半失败，下次进来要重试
+  if (draftsReady.value) return
   settingsError.value = ''
   savedNeedsRestart.value = false
   rootWarnings.value = []
@@ -422,12 +440,18 @@ async function openSettings() {
     if (!engine.value) await loadEngine()
     // 保存目录只能选挂载点：拉实时清单（文件页每次进入都重拉，这里同理）
     mounts.value = (await filesApi.mounts()).mounts
-    rootDrafts.value = (engine.value?.roots ?? []).map((root) => ({
+    const savedRoots: RootDraft[] = (engine.value?.roots ?? []).map((root) => ({
       mount_id: root.mount_id,
       rel: root.rel,
     }))
+    const savedTrackers = [...(engine.value?.trackers ?? [])]
+    rootDrafts.value = savedRoots.map((root) => ({ ...root }))
+    rootsBaseline.value = savedRoots
+    trackerText.value = savedTrackers.join('\n')
+    trackersBaseline.value = savedTrackers
     newRootMount.value = writableMounts.value.find((mount) => mount.online)?.id ?? ''
-    trackerText.value = (engine.value?.trackers ?? []).join('\n')
+    // 最后才放行脏检测：上面的窗口里草稿还是空的，不能让离开确认先弹出来
+    draftsReady.value = true
   } catch (err) {
     settingsError.value = err instanceof Error ? err.message : t('downloads.loadFailed')
   }
@@ -456,11 +480,9 @@ function discardDrafts() {
   if (paramsBaseline.value) {
     settings.value = JSON.parse(paramsBaseline.value) as DownloadConfig
   }
-  rootDrafts.value = (engine.value?.roots ?? []).map((root) => ({
-    mount_id: root.mount_id,
-    rel: root.rel,
-  }))
-  trackerText.value = (engine.value?.trackers ?? []).join('\n')
+  // 回滚到基线快照，不碰 live engine —— 它可能在草稿编辑期间被别的操作刷新过
+  rootDrafts.value = rootsBaseline.value.map((root) => ({ ...root }))
+  trackerText.value = trackersBaseline.value.join('\n')
   rootWarnings.value = []
   trackerWarnings.value = []
   settingsError.value = ''
@@ -516,7 +538,9 @@ async function saveRoots() {
   settingsError.value = ''
   try {
     const result = await downloadsApi.setRoots(rootDrafts.value.map((root) => ({ ...root })))
-    rootDrafts.value = result.roots.map((root) => ({ mount_id: root.mount_id, rel: root.rel }))
+    const saved = result.roots.map((root) => ({ mount_id: root.mount_id, rel: root.rel }))
+    rootDrafts.value = saved.map((root) => ({ ...root }))
+    rootsBaseline.value = saved
     rootWarnings.value = result.warnings
     await loadEngine()
     showToast(t('downloads.settings.rootsSaved'))
@@ -544,6 +568,7 @@ async function saveTrackers() {
       trackerText.value.split('\n').map((line) => line.trim()).filter(Boolean),
     )
     trackerText.value = result.trackers.join('\n')
+    trackersBaseline.value = [...result.trackers]
     trackerWarnings.value = result.rejected
     if (engine.value) engine.value.trackers = result.trackers
     showToast(t('downloads.trackers.saved'))

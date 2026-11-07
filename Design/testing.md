@@ -145,6 +145,12 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v5（v4.9.55）**：新增 `probes/unsaved_guard.py` + `unsaved_guard.cjs`（浏览器回归，
+  10 条断言），专测「下载页没改动却弹离开确认」：断言前提是探针实例的
+  `/api/downloads/engine` 至少有一条保存目录（空数组复现不出这个 bug）。
+  改前端后照旧先 `npm run build` 再 `cargo build`——dist 内嵌，只改 Vue 不重编 exe
+  探针跑的还是旧页面。
+
 - **v4（v4.9.53）**：新增 §3.5「容器与监听」——Docker 不在 L0~L3 自动链里，本机无 docker 时
   用二进制验 `-H auto` 双栈与「端口被占不降级」；有 docker 时补一遍镜像与 healthcheck。
   判据写死为日志里的 `cannot listen on [::]:… falling back to 0.0.0.0`。
