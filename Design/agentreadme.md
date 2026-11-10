@@ -445,6 +445,8 @@ GWT-DL-36 Given 目标站的签名链接**只允许一次请求**（第二次起
 GWT-DL-37 Given 目标站返回 Cloudflare `Just a moment...` 质询页（403 + `__cf_chl` / `challenge-platform`），或 `error code: 1010` 防火墙硬判决  When 任务失败  Then `errorMessage` 不含 `<!DOCTYPE`/`<html` 之类 boilerplate，而是分别给出「需要 cf_clearance + 完全一致的 User-Agent + 同一出口 IP（下载器无法自行过盾）」/「换头无解，需换出口 IP 或指纹」的结论；失败 WARN 里带 `proxy:` 字段供核对出口；普通站点 403 仍保留剥掉标签后的原文摘录（v4.9.57）
 GWT-DL-38 Given 插件（Aria2 Explorer 内置 AriaNg）已有一条已停止任务、左侧「已完成/已停止 (1)」有计数  When 打开任务列表  Then 右侧能列出该任务的 gid/status/errorCode/files（AriaNg 用 `system.multicall` 发 `tellActive` / `tellWaiting(0,1000)` / `tellStopped(-1,1000)`，token 只放在子调用的 params[0]）；外层单独带 token、内外两层都带 token 的旧写法照样工作；任一子调用伪造或缺少 token 时整批仍返回 `Unauthorized`（v4.9.58）
 GWT-DL-39 Given 在最终提交重打 `v0.1.0-alpha.1`  When release 与 docker 两条 tag 工作流跑完  Then Release 挂着 win-msvc / linux-musl x2 三件产物，GHCR 存在 `:v0.1.0-alpha.1` 多架构 manifest（含 amd64 与 arm64）；单架构 tag 因关闭 provenance 是单一 manifest，merge 用 imagetools create 不再报 `is a manifest list`；预发布 tag 不覆盖 `:latest`（v4.9.59）
+GWT-DL-40 Given 下载引擎设置页与新建下载弹窗都要选目录  When 用户点「选择目录」/「浏览子目录」  Then 打开的是内联面板而非浮层（不新增 useBackClose 哨兵），只列子目录、面包屑可逐级回跳、可新建文件夹且建完自动进入；选中即回填，全程无需手输路径；设置页回填 `mount_id + rel`，新建下载回填绝对路径且「保存到」下拉仍显示所属保存目录、路径文本显示 `保存目录 / 子路径`；浏览不能越出挂载点或当前允许的保存目录（v4.9.60）
+GWT-DL-41 Given 下载引擎设置页已改了任一引擎参数  When 点「保存引擎参数」  Then 不出现 `Failed to execute 'structuredClone' ... #<Object> could not be cloned`，`POST /api/config` 返回 200 且请求体只改了那一个字段、`system` 段原样回传；保存后 GET 读到新值、未保存角标消失；无改动再保存一次仍成功。`fullConfig` / `settings` 都是 ref，深拷贝一律走 JSON 往返，禁止对 `.value`（响应式代理）调用 `structuredClone`（v4.9.61）
 
 #### BitTorrent（GWT-BT，v4.9.27）
 

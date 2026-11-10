@@ -17,14 +17,17 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
+import DirectoryPicker from '../components/DirectoryPicker.vue'
 import {
   downloadsApi,
   type DownloadTask,
   type EngineInfo,
+  type EngineRoot,
   type GlobalStat,
   type Snapshot,
 } from '../api/downloads'
 import { filesApi, type MountPoint } from '../api/files'
+import type { DirChoice, DirRoot } from '../lib/dir-picker'
 import { useBackClose } from '../composables/useBackClose'
 import { useScrollLock } from '../composables/useScrollLock'
 import { APP_BASE } from '../lib/base'
@@ -125,7 +128,8 @@ const rootDrafts = ref<RootDraft[]>([])
 const rootWarnings = ref<string[]>([])
 const rootsBusy = ref(false)
 const newRootMount = ref('')
-const newRootRel = ref('downloads')
+const rootPickerOpen = ref(false)
+const addDirPickerOpen = ref(false)
 
 /** Tracker 编辑态：一行一个，保存时交给后端归一化（v4.9.39） */
 const trackerText = ref('')
@@ -250,6 +254,56 @@ const rpcUrl = computed(
 
 /** 可写入的挂载点（只读的不给选；掉线的显示但禁用） */
 const writableMounts = computed(() => mounts.value.filter((mount) => !mount.readonly))
+
+/** 设置页目录选择器的起点：可写挂载点全列出来，下拉切换即换一棵树 */
+const pickerRoots = computed<DirRoot[]>(() =>
+  writableMounts.value.map((mount) => ({ id: mount.id, name: mount.name, path: mount.path })),
+)
+
+/**
+ * 新建下载的目录浏览器只在「当前允许的保存目录」内挑子目录。
+ * 后端 resolve_dir 按白名单前缀校验，放用户浏览到白名单外只会换来一次失败；
+ * addDir 本身可能已是某个 root 的子目录，用最长前缀反推归属。
+ */
+const addDirRoot = computed<EngineRoot | null>(() => {
+  const roots = engine.value?.roots ?? []
+  const dir = addDir.value.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  let best: EngineRoot | null = null
+  let bestLength = -1
+  for (const root of roots) {
+    const prefix = root.path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    if ((dir === prefix || dir.startsWith(prefix + '/')) && prefix.length > bestLength) {
+      best = root
+      bestLength = prefix.length
+    }
+  }
+  return best ?? roots.find((root) => root.online) ?? roots[0] ?? null
+})
+
+const addDirRoots = computed<DirRoot[]>(() =>
+  addDirRoot.value
+    ? [
+        {
+          id: addDirRoot.value.mount_id,
+          name: addDirRoot.value.label,
+          path: addDirRoot.value.path,
+        },
+      ]
+    : [],
+)
+
+/** 显示「保存目录名 / 子路径」而不是一长串被截断的绝对路径；title 里仍是完整路径 */
+const addDirDisplay = computed(() => {
+  const root = addDirRoot.value
+  if (!root) return addDir.value
+  const base = root.path.replace(/\\/g, '/').replace(/\/+$/, '')
+  const cur = addDir.value.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (cur.toLowerCase() === base.toLowerCase()) return root.label
+  if (cur.toLowerCase().startsWith(base.toLowerCase() + '/')) {
+    return `${root.label} / ${cur.slice(base.length).replace(/^\/+/, '')}`
+  }
+  return addDir.value
+})
 
 /** 编辑态标签：`挂载点名 / 子路径`，根目录只显示名字 */
 function rootLabel(draft: RootDraft): string {
@@ -382,6 +436,7 @@ function openAdd() {
   addError.value = ''
   // 默认落到第一个在线的保存目录，用户不用每次重选
   addDir.value = engine.value?.roots.find((root) => root.online)?.path ?? ''
+  addDirPickerOpen.value = false
   addOpen.value = true
 }
 
@@ -435,7 +490,10 @@ async function openSettings() {
     if (!res.ok) throw new Error(await readApiError(res))
     const config = (await res.json()) as Record<string, unknown>
     fullConfig.value = config
-    settings.value = structuredClone(config.download as DownloadConfig)
+    // 配置是纯 JSON：统一用 JSON 往返做深拷贝，不用 structuredClone。
+    // ref/reactive 的 .value 是代理，克隆它会抛 DataCloneError（见 saveSettings）。
+    const download = (config.download ?? {}) as DownloadConfig
+    settings.value = JSON.parse(JSON.stringify(download)) as DownloadConfig
     paramsBaseline.value = JSON.stringify(settings.value)
     if (!engine.value) await loadEngine()
     // 保存目录只能选挂载点：拉实时清单（文件页每次进入都重拉，这里同理）
@@ -515,12 +573,39 @@ onBeforeRouteLeave(async () => {
   return ok
 })
 
-function addRoot() {
+function openRootPicker() {
+  if (!newRootMount.value) {
+    newRootMount.value = writableMounts.value.find((mount) => mount.online)?.id ?? ''
+  }
   if (!newRootMount.value) return
-  const rel = newRootRel.value.trim().replace(/^\/+/, '')
-  if (rootDrafts.value.some((root) => root.mount_id === newRootMount.value && root.rel === rel)) return
-  rootDrafts.value.push({ mount_id: newRootMount.value, rel })
-  newRootRel.value = 'downloads'
+  rootPickerOpen.value = true
+}
+
+/** 选中即入库：不再需要「手填子路径 → 点添加」两步 */
+function onRootPicked(choice: DirChoice) {
+  addRoot({ mount_id: choice.mountId, rel: choice.rel })
+  newRootMount.value = choice.mountId
+  rootPickerOpen.value = false
+}
+
+function onAddDirPicked(choice: DirChoice) {
+  addDir.value = choice.path
+  addDirPickerOpen.value = false
+}
+
+/** 下拉切回某个保存目录时，丢掉之前浏览选中的子目录 */
+function setAddDirRoot(event: Event) {
+  addDir.value = (event.target as HTMLSelectElement).value
+  addDirPickerOpen.value = false
+}
+
+function addRoot(draft: RootDraft) {
+  if (!draft.mount_id) return
+  const exists = rootDrafts.value.some(
+    (root) => root.mount_id === draft.mount_id && root.rel === draft.rel,
+  )
+  if (exists) return
+  rootDrafts.value.push({ mount_id: draft.mount_id, rel: draft.rel })
 }
 
 function removeRoot(index: number) {
@@ -588,8 +673,13 @@ async function saveSettings() {
   settingsBusy.value = true
   settingsError.value = ''
   try {
-    const next = structuredClone(fullConfig.value)
-    next.download = { ...(next.download as DownloadConfig), ...settings.value }
+    // fullConfig / settings 都是 ref，.value 是响应式代理；对代理调用
+    // structuredClone 会抛 "Failed to execute 'structuredClone' ... #<Object>
+    // could not be cloned"（v4.9.61 实测：点「保存引擎参数」必现）。
+    // /api/config 来回都是纯 JSON，用 JSON 往返深拷贝，语义等价且不会混入代理。
+    const next = JSON.parse(JSON.stringify(fullConfig.value)) as Record<string, unknown>
+    const patch = JSON.parse(JSON.stringify(settings.value)) as DownloadConfig
+    next.download = { ...(next.download as DownloadConfig), ...patch }
     const res = await fetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -881,7 +971,7 @@ onUnmounted(() => {
         data-testid="download-dialog"
         @click.self="addOpen = false"
       >
-        <div class="w-full max-w-md modal-card rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <div class="modal-card max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl border border-line bg-panel p-5 shadow-xl">
           <p class="text-sm font-medium text-ink">{{ t('downloads.dialog.title') }}</p>
 
           <div class="mt-3 flex items-center rounded-lg border border-line p-0.5 text-xs">
@@ -932,12 +1022,14 @@ onUnmounted(() => {
             </label>
           </template>
 
-          <label class="mt-3 block text-[12px] text-muted">
-            {{ t('downloads.dialog.dir') }}
+          <div class="mt-3 text-[12px] text-muted">
+            <span>{{ t('downloads.dialog.dir') }}</span>
+            <!-- 只绑定「所属保存目录」：用户浏览挑的子目录不是 option，v-model 会让框变空白 -->
             <select
               v-if="engine?.roots.length"
-              v-model="addDir"
+              :value="addDirRoot?.path ?? ''"
               class="mt-1 w-full rounded-lg border border-line bg-elevated px-2 py-2 text-xs text-ink outline-none focus:border-accent"
+              @change="setAddDirRoot"
             >
               <option
                 v-for="root in engine.roots"
@@ -951,7 +1043,35 @@ onUnmounted(() => {
             <p v-else class="mt-1 rounded-lg border border-line bg-elevated px-2 py-2 text-xs text-muted">
               {{ t('downloads.dialog.defaultDir') }}
             </p>
-          </label>
+
+            <div v-if="engine?.roots.length" class="mt-1.5 flex items-center gap-2">
+              <button
+                type="button"
+                class="shrink-0 rounded border border-line px-2 py-1 text-[11px] text-muted transition-colors hover:text-ink"
+                data-testid="download-browse-dir"
+                @click="addDirPickerOpen = !addDirPickerOpen"
+              >
+                {{ addDirPickerOpen ? t('downloads.picker.hide') : t('downloads.picker.browse') }}
+              </button>
+              <span
+                v-if="addDir"
+                class="min-w-0 flex-1 truncate text-[11px] text-muted"
+                :title="addDir"
+                data-testid="download-dir-path"
+              >
+                {{ addDirDisplay }}
+              </span>
+            </div>
+            <DirectoryPicker
+              v-if="addDirPickerOpen && addDirRoots.length"
+              :roots="addDirRoots"
+              :initial-id="addDirRoots[0].id"
+              :start-path="addDir"
+              :base-path="addDirRoots[0].path"
+              @select="onAddDirPicked"
+              @cancel="addDirPickerOpen = false"
+            />
+          </div>
 
           <p v-if="addError" class="mt-3 text-xs fg-danger">{{ addError }}</p>
 
@@ -1219,38 +1339,25 @@ onUnmounted(() => {
               </p>
             </div>
 
-            <div class="mt-2 flex flex-wrap items-center gap-1.5">
-              <select
-                v-model="newRootMount"
-                class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
-                data-testid="download-new-root-mount"
-              >
-                <option value="" disabled>{{ t('downloads.settings.pickMount') }}</option>
-                <option
-                  v-for="mount in writableMounts"
-                  :key="mount.id"
-                  :value="mount.id"
-                  :disabled="!mount.online"
-                >
-                  {{ mount.online ? mount.name : `${mount.name}（${t('downloads.settings.offline')}）` }}
-                </option>
-              </select>
-              <input
-                v-model="newRootRel"
-                :placeholder="t('downloads.settings.subPath')"
-                class="w-28 rounded-lg border border-line bg-elevated px-2 py-1.5 text-[11px] text-ink outline-none focus:border-accent"
-                data-testid="download-new-root-rel"
-                @keyup.enter="addRoot"
-              />
+            <div class="mt-2">
               <button
-                class="rounded-lg border border-line px-2 py-1.5 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
-                :disabled="!newRootMount"
-                data-testid="download-add-root"
-                @click="addRoot"
+                type="button"
+                class="rounded-lg border border-line px-2.5 py-1.5 text-[11px] text-muted transition-colors hover:text-ink disabled:opacity-50"
+                :disabled="!writableMounts.length"
+                data-testid="download-pick-root"
+                @click="openRootPicker"
               >
-                {{ t('downloads.settings.addRoot') }}
+                + {{ t('downloads.picker.pick') }}
               </button>
+              <p class="mt-1 text-[11px] text-muted">{{ t('downloads.picker.hint') }}</p>
             </div>
+            <DirectoryPicker
+              v-if="rootPickerOpen"
+              :roots="pickerRoots"
+              :initial-id="newRootMount"
+              @select="onRootPicked"
+              @cancel="rootPickerOpen = false"
+            />
 
             <p v-for="warning in rootWarnings" :key="warning" class="mt-1 text-[11px] fg-warn">
               {{ warning }}

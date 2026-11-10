@@ -60,6 +60,22 @@
     "uriRequired": "请先填写下载链接",
     "submit": "开始下载"
   },
+  "picker": {
+    "pick": "选择目录",
+    "hint": "从挂载点里点选目录，也能直接新建文件夹，不用手填路径。",
+    "browse": "浏览子目录",
+    "hide": "收起浏览",
+    "cancel": "取消",
+    "confirm": "选择此目录",
+    "newFolder": "新建文件夹",
+    "folderName": "文件夹名称",
+    "create": "创建",
+    "empty": "这里没有子目录",
+    "root": "根目录",
+    "outside": "不能选到允许的保存目录之外",
+    "invalidName": "名称不能包含 / 或 \\",
+    "failed": "操作失败"
+  },
   "settings": {
     "title": "引擎设置",
     "enable": "启用下载引擎",

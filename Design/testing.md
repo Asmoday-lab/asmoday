@@ -145,6 +145,30 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v11（v4.9.61）**：新增 `probes/config_save.py` + `config_save.cjs`（14 条浏览器断言），
+  补上此前所有探针都没覆盖的「真的点保存」路径：进设置页 → 改 `segments` → 点
+  `download-settings-save` → 抓 POST 请求体与响应 → 断言 200、只改一个字段、
+  `system.mounts` 原样回传、GET 读到新值、未保存角标消失、无 `structuredClone` 错误条，
+  再无改动保存一次仍 200。用 `[[system.mounts]]` 临时配置，POST 回写不碰仓库配置。
+  **探针缺口教训**：`unsaved_guard` 的 C 段只「改草稿 → 放弃」，所以 v4.9.40 漏修的
+  `saveSettings()` 一直没被发现；验证「保存」类 bug 必须真的发一次请求。
+  **实测纠正**：v10 写的「不重建 exe 浏览器跑旧页面」只在 release 成立；debug 下
+  rust-embed 运行时读盘，本次 `cargo build` 因用户手动启动的裸实例（PID 23800，
+  CommandLine 无参数）占用 exe 报 os error 5，三套探针仍全部跑在新 dist 上；实例退出后
+  补跑 `cargo build` 成功（23.22s），用新 exe 复验 `config_save` 仍 14/14。
+  遇 `failed to remove file ... asmoday.exe` 先用 `Get-CimInstance Win32_Process`
+  看命令行再决定是否 taskkill：带 `-d/-p/-H` 的是探针遗留可清，无参数的可能是用户在用的服务，
+  不要盲杀；debug 验证也不必为它强行重建。
+
+- **v10（v4.9.60）**：新增 `probes/dir_picker.py` + `dir_picker.cjs`（13 条浏览器断言）：
+  设置页无手输路径输入框、面包屑逐级进入预置子目录、新建文件夹后自动进入并回填草稿、
+  新建下载弹窗内选择器受保存目录白名单约束、选中路径回填且所属下拉不空白、无 JS 报错。
+  挂载点用 `[[system.mounts]]` 指向 `.probe/<时间戳>/mnt`，新建文件夹不碰真实数据。
+  `unsaved_guard.cjs` 的 C 段不再依赖已删除的 `download-new-root-rel`，改填引擎参数。
+  改前端后门禁顺序固定：`vue-tsc -b` → `vite build` → `cargo build`（dist 内嵌，不重建 exe
+  浏览器跑的还是旧页面）。**[v11 更正]** 括号里的判断只对 release / 发版成立：rust-embed 8
+  未启用 `debug-embed`，debug 构建运行时从磁盘读 `dist/`，实测不重建 exe 浏览器也是新页面。
+
 - **v9（v4.9.59）**：发版 CI 的 docker merge 失败（`-amd64 is a manifest list`）
   暴露了一条只靠本地门禁测不出的链路：本机无 docker，多架构 manifest 合并只能在
   tag 触发的真实 runner 上验证。查 CI 用匿名 REST

@@ -60,6 +60,22 @@
     "uriRequired": "Enter at least one link",
     "submit": "Start download"
   },
+  "picker": {
+    "pick": "Choose directory",
+    "hint": "Browse a mount point and pick a folder, or create one — no path typing needed.",
+    "browse": "Browse subfolders",
+    "hide": "Hide browser",
+    "cancel": "Cancel",
+    "confirm": "Use this directory",
+    "newFolder": "New folder",
+    "folderName": "Folder name",
+    "create": "Create",
+    "empty": "No subfolders here",
+    "root": "Root",
+    "outside": "Cannot browse outside the allowed save directory",
+    "invalidName": "Name cannot contain / or \\",
+    "failed": "Operation failed"
+  },
   "settings": {
     "title": "Engine settings",
     "enable": "Enable download engine",
