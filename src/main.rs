@@ -115,38 +115,34 @@ impl AppState {
 #[command(
     name = "asmoday",
     version,
-    about = "Asmoday — 个人媒体与设备控制中枢（单二进制）"
+    about = "Asmoday - personal media and device hub (single binary)"
 )]
 struct Cli {
-    /// 指定配置文件路径
+    /// Path to the config file
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// 指定运行数据目录（SQLite / 缓存）
+    /// Directory for runtime data (SQLite / cache)
     #[arg(short = 'd', long)]
     data_dir: Option<PathBuf>,
-    /// 强制覆盖监听端口
+    /// Override the listening port
     #[arg(short, long)]
     port: Option<u16>,
-    /// 强制覆盖监听地址（0.0.0.0 / 127.0.0.1 / :: / auto）
+    /// Override the listening address (0.0.0.0 / 127.0.0.1 / :: / auto)
     #[arg(short = 'H', long)]
     host: Option<String>,
-    /// 生成默认配置与数据目录，并输出一次性管理员密码
+    /// Write the default config file and exit (no server, no database)
     #[arg(long)]
     init: bool,
-    /// 重置管理员密码，输出一次性新密码
+    /// Reset the admin password and print a new one-time password
     #[arg(long = "reset-password")]
     reset_password: bool,
-    /// 清除 TOTP 配置并关闭 2FA（需要当前密码）
+    /// Clear TOTP settings and disable 2FA (current password required)
     #[arg(long = "reset-2fa")]
     reset_2fa: bool,
-    /// 只校验配置文件语法与危险配置，不启动服务
+    /// Validate config syntax and safety issues, then exit without starting the server
     #[arg(long = "check-config")]
     check_config: bool,
-    /// 启动后用系统默认浏览器打开入口地址（经典控制台里点不动链接时用；
-    /// 也可用环境变量 ASMODAY_OPEN=1）
-    #[arg(long)]
-    open: bool,
-    /// 把数据库热备份到指定文件后退出（不启动服务；服务在跑时也能执行）
+    /// Hot-backup the database to PATH and exit (works while the service is running)
     #[arg(long, value_name = "PATH")]
     backup: Option<PathBuf>,
 }
@@ -218,19 +214,6 @@ async fn run(cli: Cli) -> Result<(), String> {
         config.server.port = port;
     }
 
-    // `--open` / `ASMODAY_OPEN=1`：起完服务直接用默认浏览器打开入口（v4.9.45）。
-    // 双击 exe 的用户拿不到可点的链接（经典 conhost 不实现 OSC 8），这条是唯一
-    // 可靠的出路；做成开关而不是默认行为，免得 NAS / 服务器上凭空拉起一个浏览器。
-    let manual_open = cli.open
-        || std::env::var("ASMODAY_OPEN")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-
     // `--check-config`：只校验语法与危险配置，不碰数据库、不监听端口（设计文档 5）
     if cli.check_config {
         config.validate()?;
@@ -248,6 +231,20 @@ async fn run(cli: Cli) -> Result<(), String> {
             ));
         }
         println!("[asmoday] config OK: {}", config_path.display());
+        return Ok(());
+    }
+
+    // `--init`：只写默认配置，尽早退出（v4.9.63）。
+    // 以前它会建库、建 admin、打一次性密码横幅和 Open 地址，但服务根本没监听：
+    // 地址是死的，那串密码在下次正常启动时还会被「待改密补发」直接顶掉作废。
+    // 首启引导本来就在正常启动路径里，凭证挪到那时发，地址与密码才都是真的。
+    if cli.init {
+        if !created {
+            println!("[asmoday] config already exists: {}", config_path.display());
+        }
+        println!(
+            "[asmoday] config ready; start asmoday without --init to create the data dir and print the one-time admin password"
+        );
         return Ok(());
     }
 
@@ -272,7 +269,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     config.apply_safety();
 
     // ---- 单实例锁 ----
-    // 必须在打开数据库之前：`--init` / `--reset-password` 也会写库，同样不能并发。
+    // 必须在打开数据库之前：`--reset-password` 也要写库，同样不能并发。
     // 内存 per-path 锁与 `.asmoday-part` 启动清理都隐含「只有一个进程」的假设。
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
@@ -334,14 +331,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 
     // 控制台入口地址：一次性密码横幅与启动日志共用同一份（v4.9.42）。
-    // 放在 CLI 分支之前——`--init` 也要把它印在密码下面。
+    // 只有真正起服务的路径才用得上；`--reset-password` 不起服务，横幅里不带地址。
     let urls = access_urls(&config.server);
 
-    if cli.init {
-        return bootstrap_admin(&auth, &data_dir, &urls).await;
-    }
     if cli.reset_password {
-        return reset_admin_password(&auth, &urls).await;
+        return reset_admin_password(&auth).await;
     }
     if cli.reset_2fa {
         return reset_two_factor(&auth).await;
@@ -588,7 +582,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| format!("auto-bootstrap admin failed: {e}"))?;
         auth.set_must_change_password(user.id, true)?;
         crate::log_info!("no administrator yet; created user 'admin'");
-        print_one_time_password(&password, Some(&urls), None, manual_open);
+        print_one_time_password(&password, Some(&urls), None);
     } else if let Some(password) = auth.reissue_pending_password()? {
         // 账号建好了、但还没人用一次性密码登录过（must_change_password 仍是 1）。
         // 上一次打的那串只在控制台出现过一次；用户没记下来就把进程关掉的话，重启后
@@ -604,7 +598,6 @@ async fn run(cli: Cli) -> Result<(), String> {
             Some(
                 "issued again because no password has been set yet; an earlier one is now invalid.",
             ),
-            manual_open,
         );
     }
 
@@ -707,27 +700,9 @@ async fn run(cli: Cli) -> Result<(), String> {
     if let Some(network) = &urls.network {
         crate::log_info!("network: {}", crate::core::logging::link(network));
     }
-    // 替用户拉浏览器**只在显式要求时**发生（v4.9.49）：`--open` / `ASMODAY_OPEN=1`。
-    //
-    // v4.9.45 曾经让它「首启 + 经典 conhost」也自动触发，结果是双击 exe 首启时
-    // 从本进程链下去拉起浏览器 —— 本进程若带提权 token（右键以管理员身份运行、
-    // 或从提权终端里启动），浏览器会跟着提权，于是撞上「已有一个提权 Edge 实例」，
-    // Edge 弹「现有实例正在以提升的权限运行，是否用普通权限重启」（2026-11-06 反馈）。
-    // 隐式副作用换不来那点便利：地址已经打在横幅和日志里，用户自己点/复制即可。
-    let open_browser = manual_open;
-    if open_browser {
-        let target = urls.primary().to_string();
-        // 稍等一下让 axum::serve 真正开始 accept，否则浏览器可能拿到 connection refused
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            match launch_browser(&target) {
-                Ok(()) => crate::log_info!("opened the default browser: {target}"),
-                Err(err) => {
-                    crate::log_warn!("could not open a browser ({err}); open {target} manually")
-                }
-            }
-        });
-    }
+    // 不再替用户拉起浏览器（v4.9.64）：`--open` / `ASMODAY_OPEN=1` 已移除。
+    // 地址本来就在横幅与启动日志里，现代终端可点、经典 conhost 可复制；
+    // 由服务端进程拉浏览器还会在提权 / 无图形会话下引出混权弹窗与无效 WARN。
     crate::log_info!(
         "frontend build: {}",
         option_env!("ASMODAY_BUILD_ID").unwrap_or("dev")
@@ -811,13 +786,6 @@ struct AccessUrls {
     network: Option<String>,
 }
 
-impl AccessUrls {
-    /// `--open` 拉浏览器用哪个：本机地址永远可用（localhost 在宿主上必然可解析）
-    fn primary(&self) -> &str {
-        &self.local
-    }
-}
-
 /// 通配地址不能直接给人点：浏览器打开 `http://0.0.0.0:4242` 会被拒（v4.9.42），
 /// 所以本机那条换成 `localhost`；绑具体网卡地址时原样用它。`base_url` 已经是
 /// 完整 URL 时直接用它（反代场景，本机/局域网都是同一个域名）。
@@ -889,6 +857,9 @@ fn lan_ip() -> Option<std::net::IpAddr> {
 
 /// 双击 exe 打开的**经典 conhost** 不实现 OSC 8：文本就是一堆字符，点不动。
 ///
+/// v4.9.64 起唯一用途是在密码横幅里补一句「复制地址」；不再有任何自动或显式
+/// 拉起浏览器的旁路，地址只能由用户自己点（支持的终端）或复制（conhost）。
+///
 /// 判断依据是「Windows 且没有 Windows Terminal / VS Code 这类宿主留下的环境变量」——
 /// conhost 不设 `WT_SESSION` 也不设 `TERM_PROGRAM`。只在真控制台里提示，重定向
 /// 到文件时不打（那里本来就没有「点」这回事）。
@@ -900,51 +871,6 @@ fn legacy_console() -> bool {
         return false;
     }
     std::io::IsTerminal::is_terminal(&std::io::stdout())
-}
-
-/// 用系统默认浏览器打开 URL（仅 `--open` / `ASMODAY_OPEN=1`，v4.9.45）。
-///
-/// 经典 conhost 里任何程序都做不出可点的链接，所以留了这条显式出路。
-///
-/// Windows 上**先交给 shell**（`explorer.exe <url>`）而不是 `cmd /C start`（v4.9.49）：
-/// explorer 是登录用户的普通权限进程，URL 经它转给默认浏览器时，浏览器也就落在普通
-/// 权限上。由 `cmd start` 直接拉，浏览器会继承本进程的 token——本进程一旦是提权运行
-/// 的（右键「以管理员身份运行」、从提权终端里启动），就会出现「已有一个提权实例」的
-/// 混权冲突：Edge 弹「现有实例正在以提升的权限运行，是否用普通权限重启」，Chrome 则
-/// 干脆以管理员身份跑（等于把浏览器暴露给本机任意代码）。
-#[cfg(windows)]
-fn launch_browser(url: &str) -> std::io::Result<()> {
-    if std::process::Command::new("explorer.exe")
-        .arg(url)
-        .spawn()
-        .is_ok()
-    {
-        return Ok(());
-    }
-    use std::os::windows::process::CommandExt;
-    // 退回 cmd 内建 `start`：它把**第一个带引号的参数**当窗口标题，所以要补一个 ""
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-}
-
-#[cfg(target_os = "macos")]
-fn launch_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn launch_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
 }
 
 /// 一次性密码必须「一眼看见」：框起来、单独成行、附上能直接点的入口地址。
@@ -961,15 +887,8 @@ fn launch_browser(url: &str) -> std::io::Result<()> {
 /// 入口地址按「本机 / 局域网」两行给（v4.9.45）：绑 `0.0.0.0` 时只打 localhost，
 /// 手机 / 平板那头根本不知道该填什么。
 ///
-/// `skip_hint`：不用再补「这个控制台点不动链接」的提示。两种情况下为 true——
-/// 已经决定替用户拉起浏览器（`--open`），或者根本不起服务（`--init` /
-/// `--reset-password`，那时 URL 也不通，提示 `--open` 只会误导）。
-fn print_one_time_password(
-    password: &str,
-    urls: Option<&AccessUrls>,
-    note: Option<&str>,
-    skip_hint: bool,
-) {
+/// `--reset-password` 不起服务，传 `urls = None`，横幅里根本不出现地址（v4.9.63）。
+fn print_one_time_password(password: &str, urls: Option<&AccessUrls>, note: Option<&str>) {
     let color = crate::core::logging::color_enabled();
     let (title, value, dim, reset) = if color {
         ("\x1b[1;36m", "\x1b[1;7;33m", "\x1b[90m", "\x1b[0m")
@@ -998,11 +917,11 @@ fn print_one_time_password(
         if let Some(network) = &urls.network {
             println!("  LAN:  {}", crate::core::logging::link(network));
         }
-        // 经典 conhost 里链接点不动，干脆明说一句出路（v4.9.45）：地址就在上面，
-        // 抄走即可；不想抄下次带 `--open`。只在真控制台提示，重定向到文件时没意义
-        if legacy_console() && !skip_hint {
+        // 经典 conhost 里链接点不动，明说一句让用户复制地址（v4.9.64）。
+        // 只在真控制台提示，重定向到文件时没意义。
+        if legacy_console() {
             println!(
-                "{dim}        (this classic console cannot open links; copy the address above, or start with --open){reset}"
+                "{dim}        (this classic console cannot open links; copy the address above){reset}"
             );
         }
     }
@@ -1655,61 +1574,15 @@ fn spawn_media_janitor(state: AppState) {
     });
 }
 
-/// `--init`：确保有管理员账号，并打印一次性密码
-async fn bootstrap_admin(
-    auth: &AuthStore,
-    data_dir: &Path,
-    urls: &AccessUrls,
-) -> Result<(), String> {
-    crate::log_info!("data directory: {}", data_dir.display());
-    match auth.user_count() {
-        Ok(0) => {}
-        Ok(_) => {
-            // 账号已存在。正式密码绝不覆盖；但如果它还停在「待改密」状态，说明上次
-            // 打印的一次性密码没人用过——此时补发一个，正是 `--init` 想达成的效果
-            // （v4.9.44：以前这里只说「不覆盖」，用户手里没密码就只能干瞪眼）。
-            if let Some(password) = auth.reissue_pending_password()? {
-                crate::log_info!(
-                    "administrator exists without a set password; re-issued a one-time password"
-                );
-                print_one_time_password(
-                    &password,
-                    Some(urls),
-                    Some(
-                        "re-issued because no password has been set yet; an earlier one is invalid.",
-                    ),
-                    true,
-                );
-            } else {
-                crate::log_info!(
-                    "administrator already exists; --init does not overwrite the password \
-                     (use --reset-password for a new one-time password)"
-                );
-            }
-            return Ok(());
-        }
-        Err(err) => return Err(err),
-    }
-
-    let password = core::auth::random_password();
-    let user = auth.create_user("admin", &password)?;
-    auth.set_must_change_password(user.id, true)?;
-    crate::log_info!("administrator created: {}", user.username);
-    // 一次性密码只打控制台（stdout），绝不走 log_*!——那会落进
-    // data/logs/asmoday.log 并随轮转留存（2026-11-04 审查）
-    print_one_time_password(&password, Some(urls), None, true);
-    Ok(())
-}
-
 /// `--reset-password`：重置管理员密码。
 ///
 /// 密码来源二选一：
 /// 1. 环境变量 `ASMODAY_RESET_PASSWORD`——**只在带 `--reset-password` 启动时生效**，
 ///    且同一个值只能用一次（指纹存库，重复出现拒绝并记 WARN，设计文档 3.1.2）；
 /// 2. 未提供环境变量时随机生成一次性密码并打印。
-async fn reset_admin_password(auth: &AuthStore, urls: &AccessUrls) -> Result<(), String> {
+async fn reset_admin_password(auth: &AuthStore) -> Result<(), String> {
     let Some(user) = auth.first_user()? else {
-        return Err("no user yet; run with --init first".to_string());
+        return Err("no user yet; start the server once to create the administrator".to_string());
     };
     auth.invalidate_sessions()?;
 
@@ -1740,8 +1613,8 @@ async fn reset_admin_password(auth: &AuthStore, urls: &AccessUrls) -> Result<(),
             auth.update_password(user.id, &password)?;
             auth.set_must_change_password(user.id, true)?;
             crate::log_info!("password reset for {}", user.username);
-            // 同 bootstrap_admin：只打 stdout，不落日志文件
-            print_one_time_password(&password, Some(urls), Some("password was reset."), true);
+            // 同首启引导：只打 stdout，不落日志文件；不起服务，横幅里不带地址
+            print_one_time_password(&password, None, Some("password was reset."));
         }
     }
     Ok(())
@@ -1750,7 +1623,7 @@ async fn reset_admin_password(auth: &AuthStore, urls: &AccessUrls) -> Result<(),
 /// `--reset-2fa`：清除 TOTP 配置（需要当前密码，防止可用性死锁）
 async fn reset_two_factor(auth: &AuthStore) -> Result<(), String> {
     let Some(user) = auth.first_user()? else {
-        return Err("no user yet; run with --init first".to_string());
+        return Err("no user yet; start the server once to create the administrator".to_string());
     };
     println!("[asmoday] reset 2FA for user '{}'", user.username);
     let Some((_, hash, _)) = auth.find_user(&user.username)? else {
@@ -1919,7 +1792,6 @@ mod tests {
         assert_eq!(server.host, "127.0.0.1");
         let urls = access_urls(&server);
         assert_eq!(urls.local, "http://localhost:4242");
-        assert_eq!(urls.primary(), "http://localhost:4242");
         // 只监听回环时，报任何局域网地址都是假的
         assert!(urls.network.is_none());
 

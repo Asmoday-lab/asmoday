@@ -370,7 +370,7 @@ POST /api/auth/password
 GWT-AUTH-01 Given 全新数据目录首次启动  When 进程起来  Then 控制台打印一次性密码（stdout，不进日志文件），库里 admin 的 must_change_password=1（v4.9.34）
 GWT-AUTH-02 Given 待初始化实例  When 打开站点  Then 登录页只有 1 个输入框且无用户名（无初始化页；未开 2FA 时是密码框、也没有切换入口）；一次性密码登录成功后弹「设置新密码」对话框（v4.9.34 / v4.9.48）
 GWT-AUTH-03 Given 待初始化实例  When 登录页输入错误密码  Then 401 并计入 IP 防爆破池；换成正式密码后旧一次性密码登录 401（v4.9.34）
-GWT-AUTH-04 Given 用 `--init` / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框（只有新密码 + 确认，无需再填一次性密码，v4.9.33）
+GWT-AUTH-04 Given 用首启引导 / `--reset-password` 发放的一次性密码登录成功（must_change_password=1）  When 访问业务 API  Then 403 E_PASSWORD_CHANGE_REQUIRED，前端弹强制改密对话框（只有新密码 + 确认，无需再填一次性密码，v4.9.33）
 GWT-AUTH-18 Given 首启打印了一次性密码但没人登录（must_change_password=1），进程被关掉  When 再次启动  Then 控制台**重新打印一个一次性密码**并在横幅里注明「上一个已作废」；旧密码登录 401、新密码登录 200；库里仍只有一行账号、`must_change_password=1`、既有会话不被清掉（v4.9.44）
 GWT-AUTH-05 Given 登录页  When 密码 / 动态码错误  Then 行内统一提示「密码或动态验证码不正确」，不区分是哪一种、不泄露账号是否存在（v4.9.48）
 GWT-AUTH-06 Given 账号已开 2FA  When 打开登录页  Then 默认是**密码框**，框下方有一行「使用动态验证码登录」；点它同一个框变成动态码样式（明文、居中、字距拉开、占位 000000、`autocomplete=one-time-code`），标签变「动态验证码」并提示恢复码这条出路，入口变「使用密码登录」；再点回密码框且切换会清空已填内容。动态码模式下填 6 位码（输满自动提交）或恢复码都能进站，填密码进不去；密码模式下密码能进站（v4.9.48）
@@ -387,10 +387,11 @@ GWT-AUTH-14 Given 端口已被占用  When 再启动一个实例  Then 控制台
 GWT-AUTH-15 Given 在 Windows Terminal / iTerm2 / VS Code 终端里首次启动  When 看密码横幅的 `Open:` / `LAN:` 行与启动日志的 `local:` / `network:` 行  Then URL 是 OSC 8 超链接（Ctrl/⌘+点击直接打开浏览器），显示文本仍是纯 URL；`data/logs/asmoday.log` 与 JSON 通道里**没有** `\x1b]8;;` 残留（v4.9.43）
 GWT-AUTH-16 Given 输出被重定向（`> out.log`、管道、CI 采集）  When 启动  Then 横幅与日志都不含任何转义码；文件日志为纯 UTF-8 正文（v4.9.43）
 GWT-AUTH-17 Given 启动完成  When 看 `data/logs/asmoday.log` 的 DEBUG 行  Then 有 `console: tty=<bool> vt=<bool> color=<bool> hyperlink=<bool> (TERM=… TERM_PROGRAM=…)`，可据此判断「没链接」是被主动关掉还是终端不支持（v4.9.43）
-GWT-AUTH-19 Given Windows 双击 exe（经典 conhost，无 `WT_SESSION` / `TERM_PROGRAM`）且数据库里还没有正式密码  When 启动  Then 横幅照样打印（含 `Open:` / `LAN:`）并多一行 `(this classic console cannot open links; copy the address above, or start with --open)`，但**不会**自己拉起浏览器——日志里没有 `opened the default browser`，也不会有浏览器窗口 / UAC 或 Edge 的「提权实例」弹窗（v4.9.49）
-GWT-AUTH-20 Given 任意实例  When 带 `--open`（或 `ASMODAY_OPEN=1`）启动  Then 监听成功后延迟 400ms 用默认浏览器打开 `local` 地址，日志有 `opened the default browser: …`；Windows 走 `explorer.exe <url>` 交回登录用户 shell（浏览器为普通权限，不随本进程提权），`explorer` 不可用时才退到 shell 的 `start` 内建；**不带该参数时任何情况下都不开**（v4.9.49）
-GWT-AUTH-21 Given Linux 服务器 / 无图形会话  When 不带 `--open` 启动  Then 不尝试拉起浏览器；带 `--open` 且 `xdg-open` 不存在时只 WARN（`could not open a browser …; open … manually`），服务照常起（v4.9.45 / v4.9.49）
-GWT-AUTH-22 Given 任意实例（未登录）  When GET /api/auth/status  Then 回设备级 `totp_enabled`（只说明本机账号开没开 2FA，不含密钥）：没开时登录页没有任何「动态验证码 / 恢复码」字样、也没有切换入口；开了才出现切换入口，**框始终只有 1 个**（v4.9.46 / v4.9.48）
+GWT-AUTH-19 Given Windows 双击 exe（经典 conhost，无 `WT_SESSION` / `TERM_PROGRAM`）且数据库里还没有正式密码  When 启动  Then 横幅照常打印（含 `Open:` / `LAN:`）并多一行 `(this classic console cannot open links; copy the address above)`；**任何情况下都不拉起浏览器**——无 `opened the default browser` / `could not open a browser` 日志，无浏览器窗口、UAC 或 Edge「提权实例」弹窗，提示里不含任何命令行开关（v4.9.49 / v4.9.64）
+GWT-AUTH-20 Given 任意实例  When 传 `--open` 启动  Then clap 报 `unexpected argument '--open'` 并以非零码退出，不建库、不监听，`-h` 也不再列出该选项  When 只设 `ASMODAY_OPEN=1` 正常启动  Then 环境变量被忽略，服务照常可访问、日志无任何浏览器相关行（v4.9.64）
+GWT-AUTH-21 Given 任意终端（含无图形会话的 Linux / Termux / Docker）  When 启动  Then 地址仍以 OSC 8 超链接打在支持的终端里、非 TTY 回落纯文本 URL，服务端不尝试 `xdg-open` / `explorer` 之类的外部程序，也不产生任何浏览器 WARN（v4.9.64）
+GWT-AUTH-22 Given 全新目录  When 执行 `asmoday --init`  Then 只写默认 `config.toml` 并退出，stdout 无一次性密码、无 `Open:` 地址、无 `starting` / `database ready` 日志；数据目录、DB、实例锁都不创建；随后不带 `--init` 正常启动才由首启引导建 admin、打印 OTP 横幅与可访问的 `Open:` 地址；配置已存在时重跑 `--init` 只提示 `config already exists`，不改配置、不碰库（v4.9.63）
+GWT-AUTH-28 Given 任意实例（未登录）  When GET /api/auth/status  Then 回设备级 `totp_enabled`（只说明本机账号开没开 2FA，不含密钥）：没开时登录页没有任何「动态验证码 / 恢复码」字样、也没有切换入口；开了才出现切换入口，**框始终只有 1 个**（v4.9.46 / v4.9.48）
 GWT-AUTH-23 Given 2FA 账号  When POST /api/auth/login  Then `{password}` 与 `{totp}` 各自 200（前者密码模式，后者动态码 / 恢复码模式）；`{password,totp}` 是严格双因子（缺一或码错 401）；两字段都空 401 AUTH_INVALID；用过的恢复码 401；未开 2FA 的账号 `{totp}` 一律 401（v4.9.48）
 GWT-AUTH-24 Given 已设正式密码的账号  When 登录 / 改密 / 关 2FA / WebDAV 时把密码写成「首尾带空格或全角空格」  Then 一律按 trim 后的值校验并通过（`{password: "  Secret#2026 "}` → 200）；纯空白 → 401 `AUTH_INVALID`；改密时 `next` 的首尾空白不进入哈希（事后用不带空格的密码能登）；登录页密码框失焦 / 按回车时首尾空白自动消失（v4.9.50）
 GWT-AUTH-25 Given 任意账号（或创建分享）  When 把密码 / 口令设成含空格、中文、全角符号、超过 128 位或纯数字  Then 写入侧 400 + 稳定 code：`PASSWORD_SPACE` / `PASSWORD_CHARSET` / `PASSWORD_TOO_LONG` / `PASSWORD_ALL_DIGITS`（过短为 `PASSWORD_TOO_SHORT`）；被拒的改密不影响原密码、也不清会话；网页密码框与分享口令框在输入、粘贴、输入法落定时把非可见 ASCII 直接滤掉（`ab cSecret#2026密码！` → `abcSecret#2026`）（v4.9.51）

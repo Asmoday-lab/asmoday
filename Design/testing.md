@@ -145,6 +145,35 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v14（v4.9.64）**：新增 `probes/open_removed.py`（纯 CLI 探针，不起浏览器）：
+  A `-h` 不含 `--open` / `ASMODAY_OPEN` 且字符全 ASCII；B 传 `--open` 启动 →
+  clap `unexpected argument` 非零退出、不建库不监听；C 只设 `ASMODAY_OPEN=1`
+  正常启动 → 服务可访问、日志无 `opened the default browser` /
+  `could not open a browser`、横幅 `Open:` 地址与端口仍正确（OSC 8 链路未受影响）。
+  门禁：`cargo fmt --check` → `clippy -D warnings` → `cargo test` → `cargo build`
+  → `init_flow.py` 回归。
+  **防回归**：别再把「由服务端进程拉起浏览器」以任何形式加回来（flag / 环境变量 /
+  首启 + conhost 隐式触发）——v4.9.45 / v4.9.49 的提权混权弹窗是实机教训；
+  经典 conhost 的出路只有「复制地址」这一条纯提示。
+
+- **v13（v4.9.63）**：新增 `probes/init_flow.py`（纯 CLI 端到端探针，不起浏览器）：
+  A 全新目录跑 `--init` → stdout 只有 `default config created` + `config ready; ...`，
+  **没有** `One-time password` / `Open:` / `starting` / `database ready`；
+  且数据目录、`asmoday.db`、`data/logs` 都不存在。B 紧接着不带 `--init` 正常启动
+  → 首启引导才打印 OTP 横幅与 `Open:`，地址端口可连。C 再跑一次 `--init`
+  → 只提示 `config already exists`，不改配置、不碰库。
+  `--init` 与 `--reset-password` 都不起服务，横幅一律不带地址。
+  **防回归**：别再把首启引导塞回 `--init` —— 那边发的密码在下次正常启动时会被
+  `reissue_pending_password()` 直接顶掉作废，且 `Open:` 地址根本没服务监听。
+
+- **v12（v4.9.62）**：CLI 帮助文案纯文本改动，无新增浏览器探针。验收口径：
+  `cargo fmt --check` → `cargo build` → `./target/debug/asmoday.exe -h` 全量读一遍
+  （检查语言一致、选项对齐、描述不超长折行）→ `-V` 输出 `asmoday 0.1.0`
+  → 管道 `python -c` 断言 help 里没有 `ord(c) > 127` 的字符。
+  **防回归**：clap derive 直接拿 `Cli` 字段的 `///` 当 help 文本，别再把中文写回
+  `src/main.rs:114-152`；控制台输出全英文是 v4.9.42 定下的编码约定，不是风格偏好。
+  Windows 下 `Usage: asmoday.exe [OPTIONS]` 属 clap 读 `argv[0]` 的正常行为，非缺陷。
+
 - **v11（v4.9.61）**：新增 `probes/config_save.py` + `config_save.cjs`（14 条浏览器断言），
   补上此前所有探针都没覆盖的「真的点保存」路径：进设置页 → 改 `segments` → 点
   `download-settings-save` → 抓 POST 请求体与响应 → 断言 200、只改一个字段、

@@ -118,7 +118,7 @@ pub struct User {
     pub id: i64,
     pub username: String,
     pub totp_enabled: bool,
-    /// 一次性密码（--init / --reset-password）登录后必须改密
+    /// 一次性密码（首启引导 / --reset-password）登录后必须改密
     pub must_change_password: bool,
 }
 
@@ -856,7 +856,7 @@ impl AuthStore {
         }
     }
 
-    /// 创建唯一账号（首启自动引导 / `--init` / `--reset-password` 共用）。
+    /// 创建唯一账号（首启自动引导 / `--reset-password` 共用）。
     ///
     /// 单用户模型下没有角色可挑：建出来的就是设备主人。初始密码经由控制台传递，
     /// 登录后强制换掉（`must_change_password = 1`）。
@@ -1101,7 +1101,7 @@ impl AuthStore {
         Ok(())
     }
 
-    /// 标记「登录后必须改密」（--init / --reset-password 发放一次性密码时置位）
+    /// 标记「登录后必须改密」（首启引导 / --reset-password 发放一次性密码时置位）
     pub fn set_must_change_password(&self, user_id: i64, required: bool) -> Result<(), String> {
         let conn = self.connect()?;
         conn.execute(

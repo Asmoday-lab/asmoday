@@ -30,7 +30,7 @@ pub const SESSION_COOKIE: &str = "asmoday_session";
 pub struct AuthUser {
     pub id: i64,
     pub username: String,
-    /// 是否还是一次性密码（`--init` / `--reset-password` / 管理员代设）会话：改密前只放行改密自身
+    /// 是否还是一次性密码（首启引导 / `--reset-password` / 管理员代设）会话：改密前只放行改密自身
     pub must_change_password: bool,
 }
 
@@ -603,7 +603,7 @@ pub async fn require_auth(
         None
     };
 
-    // 一次性密码（`--init` / `--reset-password` / 管理员代设）会话必须先改密。
+    // 一次性密码（首启引导 / `--reset-password` / 管理员代设）会话必须先改密。
     // 前端有遮罩，但遮罩只是 UI——直接 curl 带着 Cookie 照样能开终端、
     // 能读全盘。这里只放行改密/改名自身与状态查询，其余一律 403。
     if user.must_change_password && !is_password_change_path(request.uri().path()) {
@@ -963,7 +963,7 @@ pub async fn change_password(
         );
     };
 
-    // 一次性密码会话（--init / --reset 发放后首次登录）：登录那一刻已经用
+    // 一次性密码会话（首启引导 / --reset-password 发放后首次登录）：登录那一刻已经用
     // 一次性密码验过身份，改密时不再重复要「当前密码」——那等于把同一个
     // 密码连输两遍（v4.9.33）。正式密码会话仍必须带 current。
     if !user.must_change_password && !verify_password_lenient(&hash, &body.current) {
