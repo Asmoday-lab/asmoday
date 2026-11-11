@@ -13,6 +13,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import { onBeforeRouteLeave } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import AppIcon from '../components/AppIcon.vue'
+import IconPicker from '../components/IconPicker.vue'
 import PasswordInput from '../components/PasswordInput.vue'
 import type { IconName } from '../components/icons'
 import { authApi } from '../api/auth'
@@ -54,6 +55,48 @@ interface Service {
   rewrite_html: boolean
   insecure_skip_verify: boolean
   inject_headers: Record<string, string>
+}
+
+interface HeaderRow {
+  uid: number
+  name: string
+  value: string
+}
+
+/**
+ * 服务行的**前端态**：稳定 key、注入头编辑行、落盘时的 id 基线。
+ *
+ * 刻意不塞进 `draft.services` —— `unsavedConfig` 是拿整份 draft 与服务端快照做
+ * `JSON.stringify` 比较的，多一个前端字段就会永久显示「未保存」；而且 POST 回写时
+ * 后端 `#[serde(deny_unknown_fields)]` 会直接拒收。这里按数组下标与 services 严格对齐，
+ * add/remove 同步维护，保存时才把 headers 折叠回 `inject_headers`。
+ */
+interface ServiceRowState {
+  uid: number
+  /** 空串 = 本次新建、还没有落过盘的 id（不显示断链警告） */
+  savedId: string
+  headers: HeaderRow[]
+}
+
+const serviceRows = ref<ServiceRowState[]>([])
+let nextRowUid = 1
+
+function rowsFromHeaders(headers: Record<string, string> | undefined): HeaderRow[] {
+  return Object.entries(headers ?? {}).map(([name, value]) => ({
+    uid: nextRowUid++,
+    name,
+    value,
+  }))
+}
+
+/** 折叠回后端的 BTreeMap：空头名丢弃，重名后写的覆盖先写的 */
+function foldHeaders(rows: HeaderRow[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const row of rows) {
+    const name = row.name.trim()
+    if (name) out[name] = row.value
+  }
+  return out
 }
 
 interface MediaSettings {
@@ -484,6 +527,12 @@ async function loadConfig() {
     }
     config.value = data
     draft.value = structuredClone(data)
+    // 每次重新拉取都要重建行状态：保存成功后 baseline（savedId）才跟着前移
+    serviceRows.value = (draft.value?.services ?? []).map((service) => ({
+      uid: nextRowUid++,
+      savedId: service.id,
+      headers: rowsFromHeaders(service.inject_headers),
+    }))
   } catch (err) {
     error.value = err instanceof Error ? err.message : t('settings.advanced.loadFailed')
   } finally {
@@ -516,9 +565,34 @@ function onRawChange(value: string) {
   rawDirty.value = true
 }
 
+/** 与后端 `config.rs::validate()` 同口径：ASCII 字母数字、`-`、`_`，大小写敏感去重 */
+const SERVICE_ID_PATTERN = /^[A-Za-z0-9_-]+$/
+const serviceIssues = computed(() => {
+  const services = draft.value?.services ?? []
+  const seen = new Map<string, number>()
+  return services.map((service, index) => {
+    const id = service.id.trim()
+    if (!id) return t('settings.advanced.emptyId', { index: index + 1 })
+    if (!SERVICE_ID_PATTERN.test(id)) return t('settings.advanced.invalidId', { id })
+    const first = seen.get(id)
+    if (first !== undefined) return t('settings.advanced.duplicateId', { id, first: first + 1 })
+    seen.set(id, index)
+    if (!/^https?:\/\//.test(service.target_url.trim())) {
+      return t('settings.advanced.invalidTarget', { id })
+    }
+    return ''
+  })
+})
+
 /** 保存整份配置（表单模式）。媒体面板的复位也走这里，保证只改 `[media]`。 */
 async function saveForm(successMessage?: string) {
   if (!draft.value) return
+  // 后端也会拒，但等一次往返再报错太晚，用户根本不知道是哪一行写错了
+  const issue = serviceIssues.value.find(Boolean)
+  if (issue) {
+    error.value = issue
+    return
+  }
   saving.value = true
   error.value = ''
   try {
@@ -527,6 +601,17 @@ async function saveForm(successMessage?: string) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...draft.value,
+        // 注入头按行折叠回 BTreeMap；`icon` 空串省略，别写出 `icon = ""`
+        services: (draft.value.services ?? []).map((service, index) => {
+          const { icon, ...rest } = service
+          return {
+            ...rest,
+            id: service.id.trim(),
+            target_url: service.target_url.trim(),
+            ...(icon?.trim() ? { icon: icon.trim() } : {}),
+            inject_headers: foldHeaders(serviceRows.value[index]?.headers ?? []),
+          }
+        }),
         system: {
           ...draft.value.system,
           // 空 name 不落盘：后端 Option<String> 收到 "" 会写出 `name = ""`
@@ -588,29 +673,69 @@ function removeMount(index: number) {
   draft.value?.system.mounts.splice(index, 1)
 }
 
+/** 新建用可读且可预测的 id：service-1 / service-2 …，跳过已占用的序号 */
+function nextServiceId(): string {
+  const used = new Set((draft.value?.services ?? []).map((service) => service.id.trim()))
+  let n = 1
+  while (used.has(`service-${n}`)) n++
+  return `service-${n}`
+}
+
 function addService() {
   draft.value?.services.push({
-    id: `service-${Date.now().toString(36)}`,
+    id: nextServiceId(),
     name: t('settings.advanced.newService'),
     icon: 'grid',
     type: 'external',
     target_url: '',
+    // 历史字段：路由天然剥离前缀，后端运行时并不读取；但 deny_unknown_fields
+    // 不允许删，存量 config.toml 里的值必须原样回传，否则旧配置会拒绝启动
     strip_prefix: true,
     rewrite_html: false,
     insecure_skip_verify: false,
     inject_headers: {},
   })
+  serviceRows.value.push({ uid: nextRowUid++, savedId: '', headers: [] })
 }
 
 function removeService(index: number) {
   draft.value?.services.splice(index, 1)
+  serviceRows.value.splice(index, 1)
 }
 
-const injectKey = (service: Service) => Object.keys(service.inject_headers)[0] ?? ''
-const injectValue = (service: Service) => Object.values(service.inject_headers)[0] ?? ''
+function addHeaderRow(serviceIndex: number) {
+  const row = serviceRows.value[serviceIndex]
+  if (!row) return
+  row.headers.push({ uid: nextRowUid++, name: '', value: '' })
+}
 
-function setInject(service: Service, key: string, value: string) {
-  service.inject_headers = key.trim() ? { [key.trim()]: value } : {}
+function removeHeaderRow(serviceIndex: number, uid: number) {
+  const row = serviceRows.value[serviceIndex]
+  if (!row) return
+  row.headers = row.headers.filter((item) => item.uid !== uid)
+}
+
+/** 反代地址常驻可见：id 是 URL 的一段，不该藏在输入框里只露半截 */
+function proxyPath(service: Service): string {
+  return `${APP_BASE}/proxy/${service.id.trim() || '<id>'}/`
+}
+
+async function copyProxyUrl(service: Service) {
+  const url = `${window.location.origin}${proxyPath(service)}`
+  try {
+    await navigator.clipboard.writeText(url)
+    showToast(t('settings.advanced.urlCopied'))
+  } catch {
+    // 非安全上下文里 clipboard 不可用：至少把地址显示出来给用户自行复制
+    showToast(url)
+  }
+}
+
+/** 与落盘基线不同 → 旧地址会失效，保存前就在行内讲清楚 */
+function idChanged(index: number): boolean {
+  const row = serviceRows.value[index]
+  const service = draft.value?.services[index]
+  return Boolean(row?.savedId && service && row.savedId !== service.id.trim())
 }
 
 async function changePassword() {
@@ -826,6 +951,7 @@ onBeforeUnmount(() => {
           <button
             v-for="item in tabs"
             :key="item.key"
+            :data-testid="`settings-tab-${item.key}`"
             class="flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors md:w-full"
             :class="
               tab === item.key
@@ -1496,6 +1622,7 @@ onBeforeUnmount(() => {
           v-if="configMode === 'form'"
           class="ml-auto flex items-center gap-1.5 h-10 rounded-md bg-accent px-4 text-xs text-white disabled:opacity-50"
           :disabled="saving"
+          data-testid="settings-save"
           @click="saveForm()"
         >
           <AppIcon name="save" :size="13" />
@@ -1609,7 +1736,11 @@ onBeforeUnmount(() => {
             <p class="text-sm font-semibold text-ink">
               {{ t('settings.advanced.services') }}
             </p>
-            <button class="text-[12px] text-accent hover:underline" @click="addService">
+            <button
+              class="text-[12px] text-accent hover:underline"
+              data-testid="service-add"
+              @click="addService"
+            >
               + {{ t('settings.advanced.add') }}
             </button>
           </div>
@@ -1618,34 +1749,76 @@ onBeforeUnmount(() => {
           </p>
           <div
             v-for="(service, index) in draft.services"
-            :key="index"
+            :key="serviceRows[index]?.uid ?? index"
             class="mb-3 space-y-2 rounded-lg border border-line/60 p-3"
+            data-testid="service-row"
           >
             <div class="flex gap-2">
               <input
                 v-model="service.id"
                 :placeholder="t('settings.advanced.serviceId')"
-                class="w-28 rounded-lg border border-line bg-elevated px-2 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
+                :aria-label="t('settings.advanced.serviceId')"
+                :class="serviceIssues[index] ? 'border-red-500/70' : 'border-line'"
+                class="w-32 rounded-lg border bg-elevated px-2 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
+                data-testid="service-id"
               />
               <input
                 v-model="service.name"
                 :placeholder="t('settings.advanced.serviceName')"
                 class="w-32 rounded-lg border border-line bg-elevated px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+                data-testid="service-name"
               />
               <input
                 v-model="service.target_url"
                 placeholder="http://192.168.1.50:3000"
                 class="min-w-0 flex-1 rounded-lg border border-line bg-elevated px-2 py-1.5 font-mono text-xs text-ink outline-none focus:border-accent"
+                data-testid="service-target"
               />
-              <button class="text-muted hover-danger" @click="removeService(index)">
+              <button
+                type="button"
+                class="text-muted hover-danger"
+                :title="t('settings.advanced.remove')"
+                data-testid="service-remove"
+                @click="removeService(index)"
+              >
                 <AppIcon name="close" :size="14" />
               </button>
             </div>
+
+            <!-- id 是永久 URL：常驻预览 + 复制，改动时行内讲清断链后果 -->
+            <div class="flex flex-wrap items-center gap-2 text-[11px]">
+              <span class="text-muted">{{ t('settings.advanced.proxyUrl') }}</span>
+              <code
+                class="rounded bg-elevated px-1.5 py-0.5 font-mono text-ink"
+                data-testid="service-proxy-path"
+              >{{ proxyPath(service) }}</code>
+              <button
+                type="button"
+                class="text-accent hover:underline"
+                data-testid="service-copy-url"
+                @click="copyProxyUrl(service)"
+              >
+                {{ t('settings.advanced.copyUrl') }}
+              </button>
+              <span v-if="idChanged(index)" class="fg-warn" data-testid="service-id-changed">
+                {{ t('settings.advanced.idChanged', { old: serviceRows[index]?.savedId, id: service.id.trim() }) }}
+              </span>
+              <span v-if="serviceIssues[index]" class="fg-danger" data-testid="service-issue">
+                {{ serviceIssues[index] }}
+              </span>
+            </div>
+
             <div class="flex flex-wrap items-center gap-3 text-[12px] text-muted">
-              <label class="flex items-center gap-1">
-                <input v-model="service.strip_prefix" type="checkbox" />
-                {{ t('settings.advanced.stripPrefix') }}
-              </label>
+              <!-- 图标：可视化宫格选择（v4.9.70），不再是英文标识符下拉 -->
+              <div class="flex items-center gap-1">
+                <span>{{ t('settings.advanced.serviceIcon') }}</span>
+                <IconPicker
+                  :model-value="service.icon ?? ''"
+                  :default-label="t('settings.advanced.iconDefault')"
+                  :aria-label="t('settings.advanced.serviceIcon')"
+                  @update:model-value="service.icon = $event"
+                />
+              </div>
               <label class="flex items-center gap-1">
                 <input v-model="service.rewrite_html" type="checkbox" />
                 {{ t('settings.advanced.rewriteHtml') }}
@@ -1654,19 +1827,54 @@ onBeforeUnmount(() => {
                 <input v-model="service.insecure_skip_verify" type="checkbox" />
                 {{ t('settings.advanced.insecure') }}
               </label>
-              <span class="mx-1 opacity-50">|</span>
-              <input
-                :value="injectKey(service)"
-                :placeholder="t('settings.advanced.injectKey')"
-                class="w-36 rounded border border-line bg-elevated px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
-                @input="setInject(service, ($event.target as HTMLInputElement).value, injectValue(service))"
-              />
-              <input
-                :value="injectValue(service)"
-                :placeholder="t('settings.advanced.injectValue')"
-                class="w-32 rounded border border-line bg-elevated px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
-                @input="setInject(service, injectKey(service), ($event.target as HTMLInputElement).value)"
-              />
+              <!-- strip_prefix 是死开关：后端路由天然剥离，运行时从不读取；
+                   字段保留在 draft 里仅为兼容存量 config.toml，不再给 UI -->
+            </div>
+
+            <!-- 注入头：可增删的键值行（原来只露出第一对，改一次就静默丢掉其余的） -->
+            <div class="space-y-1.5 border-t border-line/50 pt-2" data-testid="service-headers">
+              <div class="flex items-center gap-2 text-[11px] text-muted">
+                <span>{{ t('settings.advanced.headers') }}</span>
+                <button
+                  type="button"
+                  class="text-accent hover:underline"
+                  data-testid="service-add-header"
+                  @click="addHeaderRow(index)"
+                >
+                  + {{ t('settings.advanced.addHeader') }}
+                </button>
+              </div>
+              <p v-if="!serviceRows[index]?.headers.length" class="text-[11px] text-muted">
+                {{ t('settings.advanced.noHeaders') }}
+              </p>
+              <div
+                v-for="row in serviceRows[index]?.headers ?? []"
+                :key="row.uid"
+                class="flex gap-2"
+                data-testid="service-header-row"
+              >
+                <input
+                  v-model="row.name"
+                  :placeholder="t('settings.advanced.headerName')"
+                  class="w-48 rounded border border-line bg-elevated px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
+                  data-testid="service-header-name"
+                />
+                <input
+                  v-model="row.value"
+                  :placeholder="t('settings.advanced.headerValue')"
+                  class="min-w-0 flex-1 rounded border border-line bg-elevated px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
+                  data-testid="service-header-value"
+                />
+                <button
+                  type="button"
+                  class="text-muted hover-danger"
+                  :title="t('settings.advanced.removeHeader')"
+                  data-testid="service-remove-header"
+                  @click="removeHeaderRow(index, row.uid)"
+                >
+                  <AppIcon name="close" :size="12" />
+                </button>
+              </div>
             </div>
           </div>
         </div>

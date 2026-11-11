@@ -2,13 +2,13 @@
 /**
  * 媒体画廊：照片（文件夹 / 时间线）+ 影视库 + 音乐库。
  *
- * 视频播放器由 defineAsyncComponent 按需加载（可在「原生播放器」降级开关切换）；
+ * v4.9.67：照片 / 影视 / 文件管理统一走全局 MediaLightbox——一套翻页、一套关闭、
+ * 一套工具栏。影视库不再自建 `playing` 全屏遮罩（那正是「两个库交互不一致」的根因）。
  * 照片网格用虚拟列表渲染；音乐走全局悬浮播放条（跨页面不中断）。
  */
 import { useEventListener } from '@vueuse/core'
 import {
   computed,
-  defineAsyncComponent,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -42,20 +42,18 @@ import { filesApi, type MountPoint } from '../api/files'
 import { sharesApi } from '../api/shares'
 import { formatDurationLong } from '../lib/format'
 import { triggerDownload } from '../lib/download'
-import { useScrollLock } from '../composables/useScrollLock'
 import { useBackClose } from '../composables/useBackClose'
 import { useLongPress } from '../composables/useLongPress'
 import { useDeferredLoading } from '../composables/useDeferredLoading'
 import { useYearRail } from '../composables/useYearRail'
 import { player } from '../stores/player'
-import { openLightbox } from '../stores/lightbox'
+import { openLightbox, lightboxState } from '../stores/lightbox'
 import { openShare } from '../stores/share'
 import { thumbHashToDataUrl } from '../lib/thumbhash'
 import { justifiedRows } from '../lib/justified'
 import { useFlip } from '../lib/flip'
 import { readCache, writeCache } from '../lib/view-cache'
 
-const MediaPlayer = defineAsyncComponent(() => import('../components/MediaPlayer.vue'))
 const { t, locale } = useI18n()
 
 type MediaTab = 'photos' | 'cinema' | 'music'
@@ -127,8 +125,6 @@ function appendItems(list: MediaItem[]) {
   if (fresh.length) items.value = [...items.value, ...fresh]
 }
 
-const playing = ref<MediaItem | null>(null)
-
 /** 轻提示：坏文件只提示一次，不弹阻断性弹窗（设计文档 3.4.7 第 1 条） */
 const toast = ref('')
 let toastTimer: number | null = null
@@ -146,50 +142,11 @@ onBeforeUnmount(() => {
   observer = null
 })
 
-// 影视库播放器是整屏遮罩，锁住底层滚动（设计文档 8.4）；灯箱自己管自己的锁
-useScrollLock(computed(() => Boolean(playing.value)))
-
-// ---------------- 收藏 / 播放历史 / 播放器降级开关 ----------------
+// ---------------- 收藏 / 播放历史 ----------------
 const favorites = ref(new Set<string>())
 const progressMap = ref(new Map<string, number>())
+/** 顶栏常驻筛选 chip：不再塞进「更多」下拉（v4.9.68） */
 const onlyFavorites = ref(false)
-const nativePlayer = ref(localStorage.getItem('asmoday.cinema.native') === '1')
-/** 原生播放器无法解码时的可读提示（mkv / avi 等常见容器） */
-const nativeError = ref('')
-const NATIVE_UNSUPPORTED = ['mkv', 'avi', 'wmv', 'flv', 'rmvb', 'rm', 'ts', 'm2ts', 'vob']
-
-function seekNative(event: Event) {
-  const element = event.target as HTMLVideoElement
-  const start = resumeAt(playing.value?.path ?? '')
-  if (start > 10 && Math.abs(element.currentTime - start) > 1) {
-    try {
-      element.currentTime = start
-    } catch {
-      /* 元数据未就绪，忽略 */
-    }
-  }
-}
-
-function onNativeError() {
-  const ext = (playing.value?.ext ?? '').toLowerCase()
-  nativeError.value = NATIVE_UNSUPPORTED.includes(ext)
-    ? t('gallery.video.unsupportedExt', { ext })
-    : t('gallery.video.loadFailed')
-  // 坏文件只 Toast + 就地提示，绝不让整页崩掉（设计文档 3.4.7 第 1 条）
-  showToast(nativeError.value)
-}
-
-/** 坏文件的兜底出口：浏览器解不了就交给下载（设计文档 3.4.7 第 1 条） */
-function downloadPlaying() {
-  const item = playing.value
-  if (!item) return
-  triggerDownload(rawUrl(item.path, { download: true }))
-}
-
-// 换片时清掉上一条错误提示
-watch(playing, () => {
-  nativeError.value = ''
-})
 
 function isFavorite(path: string) {
   return favorites.value.has(path)
@@ -210,32 +167,10 @@ async function toggleFavorite(item: MediaItem) {
   }
 }
 
-function setNativePlayer(value: boolean) {
-  nativePlayer.value = value
-  localStorage.setItem('asmoday.cinema.native', value ? '1' : '0')
-}
-
-let lastReport = 0
+/** 灯箱 store 的 progress 回调：续播位置写库 + 更新本地角标 */
 function savePosition(path: string, seconds: number) {
   void libraryApi.saveProgress(path, seconds).catch(() => {})
   progressMap.value.set(path, seconds)
-}
-
-function reportProgress(seconds: number) {
-  const video = playing.value
-  if (!video) return
-  // 小于 5 秒的位置没有续播价值，忽略（防止卸载/误报的 0 覆盖已有进度）
-  if (seconds < 5) return
-  const now = Date.now()
-  if (now - lastReport < 5000) return
-  lastReport = now
-  savePosition(video.path, seconds)
-}
-
-/** 播放结束：进度清零，下次从头看 */
-function onPlayEnded(path: string) {
-  lastReport = Date.now()
-  savePosition(path, 0)
 }
 
 function resumeAt(path: string): number {
@@ -256,15 +191,26 @@ const streamKind = computed<'media' | 'video' | 'audio'>(() =>
 /** `items` 目前装的是哪条流；与 `streamKind` 不一致说明还没换过来 */
 const loadedKind = ref<'media' | 'video' | 'audio' | null>(null)
 
+/**
+ * 收藏筛选统一落点（v4.9.68）：所有「条目列表」视图都走这里。
+ * 以前只有影视/音乐流会筛，相册详情、影视文件夹详情和时间线勾了筛选却没反应。
+ * 目录墙（相册卡片 / 影视文件夹卡片）是目录维度，不参与文件级筛选，顶栏 chip 会禁用。
+ */
+function favoriteVisible(item: MediaItem) {
+  return !onlyFavorites.value || isFavorite(item.path)
+}
+
 /** 照片分区只含图片与视频（音频归音乐库，否则时间线里会出现点不开的黑块） */
 const photoItems = computed(() =>
-  items.value.filter((item) => item.kind === 'image' || item.kind === 'video'),
+  items.value.filter(
+    (item) => (item.kind === 'image' || item.kind === 'video') && favoriteVisible(item),
+  ),
 )
 const videos = computed(() =>
-  items.value.filter((item) => item.kind === 'video' && (!onlyFavorites.value || isFavorite(item.path))),
+  items.value.filter((item) => item.kind === 'video' && favoriteVisible(item)),
 )
 const audios = computed(() =>
-  items.value.filter((item) => item.kind === 'audio' && (!onlyFavorites.value || isFavorite(item.path))),
+  items.value.filter((item) => item.kind === 'audio' && favoriteVisible(item)),
 )
 
 /**
@@ -281,10 +227,20 @@ const progress = computed(() => {
 
 /** 文件夹墙看的是卡片，不是媒体流，这枚进度标签没有意义 */
 const showProgress = computed(() => {
+  // 筛选态下分子是「已加载里的收藏数」、分母仍是全库总数，摆出来只会误导
+  if (onlyFavorites.value) return false
   if (tab.value === 'photos' && photoView.value === 'albums') return false
   // 影视库：文件夹卡片与分子分母对不上；「全部影片」媒体流才显示
   if (tab.value === 'cinema') return cinemaView.value === 'videos'
   return progress.value.loaded < progress.value.total
+})
+
+/** 筛选后列表为空不能再说「媒体库是空的」，否则用户会以为文件丢了 */
+const emptyLabel = computed(() => {
+  if (onlyFavorites.value) return t('gallery.toolbar.noFavorites')
+  if (tab.value === 'photos') return t('gallery.photos.empty')
+  if (tab.value === 'cinema') return t('gallery.cinema.empty')
+  return t('gallery.music.empty')
 })
 
 /** 内嵌封面加载失败的曲目（坏标签很常见），记住后不再重复请求 */
@@ -622,15 +578,6 @@ function setFolderSort(next: SortValue) {
   })
 }
 
-/** 顶部「更多」菜单（v4.6.23）：收藏筛选 / 原生播放器 / 重新扫描 / 分页进度都收进来 */
-const moreOpen = ref(false)
-const moreWrap = ref<HTMLElement | null>(null)
-function onMoreOutside(event: PointerEvent) {
-  if (!moreOpen.value) return
-  const node = moreWrap.value
-  if (node && event.target instanceof Node && node.contains(event.target)) return
-  moreOpen.value = false
-}
 const photoView = ref<PhotoView>(
   localStorage.getItem(PHOTO_VIEW_KEY) === 'albums' ? 'albums' : 'timeline',
 )
@@ -646,6 +593,8 @@ const albumsTotal = ref(0)
 /** 已经点进去的那本相册；非空时相册视图展示册内图片 */
 const activeAlbum = ref<Album | null>(null)
 const albumItems = ref<MediaItem[]>([])
+/** 相册详情里真正渲染的那批：收藏筛选只作用于展示，不影响分页游标与去重 */
+const visibleAlbumItems = computed(() => albumItems.value.filter(favoriteVisible))
 const albumLoading = ref(false)
 const albumError = ref('')
 const albumSkeleton = useDeferredLoading(albumLoading)
@@ -910,6 +859,11 @@ async function openAlbum(album: Album) {
   await loadAlbumItems(album)
 }
 
+/** 相册详情只要图片与视频：后端 `kind=media` 会连音频一起返回（v4.9.67） */
+function albumMedia(list: MediaItem[]): MediaItem[] {
+  return list.filter((item) => item.kind === 'image' || item.kind === 'video')
+}
+
 /**
  * 拉册内第一屏（重试按钮也走这里，避免失败只能退出再进）。
  *
@@ -928,13 +882,14 @@ async function loadAlbumItems(album: Album, options: { silent?: boolean } = {}) 
   const sort = gridSort.value
   try {
     // 只列册内第一层（depth=0 = 不进子目录，与后端统计 count 的口径一致，
-    // v2.8 相册视图同款；递归会把子目录的图也算进来，条数就对不上了）
-    const result = await browseMedia(album.path, 'image', 0, {
+    // v2.8 相册视图同款；递归会把子目录的图也算进来，条数就对不上了）。
+    // v4.9.67：改拉 image+video 混流，翻页序列里才有同目录视频；音频不属于相册。
+    const result = await browseMedia(album.path, 'media', 0, {
       limit: PAGE_SIZE,
       sort,
     })
     if (sort !== gridSort.value) return
-    albumItems.value = result.items
+    albumItems.value = albumMedia(result.items)
     albumCursor.value = result.next_cursor ?? null
     albumHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
@@ -951,7 +906,7 @@ async function loadMoreAlbumItems() {
   const sort = gridSort.value
   loadingMore.value = true
   try {
-    const result = await browseMedia(album.path, 'image', 0, {
+    const result = await browseMedia(album.path, 'media', 0, {
       limit: PAGE_SIZE,
       cursor,
       sort,
@@ -961,7 +916,10 @@ async function loadMoreAlbumItems() {
       return
     }
     const seen = new Set(albumItems.value.map((item) => item.path))
-    albumItems.value = [...albumItems.value, ...result.items.filter((item) => !seen.has(item.path))]
+    albumItems.value = [
+      ...albumItems.value,
+      ...albumMedia(result.items).filter((item) => !seen.has(item.path)),
+    ]
     albumCursor.value = result.next_cursor ?? null
     albumHasMore.value = result.has_more && Boolean(result.next_cursor)
   } catch (err) {
@@ -996,6 +954,8 @@ const cinemaAlbumsHasMore = ref(false)
 const cinemaAlbumsTotal = ref(0)
 const activeCinemaAlbum = ref<Album | null>(null)
 const cinemaItems = ref<MediaItem[]>([])
+/** 影视文件夹详情里真正渲染的那批：与时间线同口径支持收藏筛选 */
+const visibleCinemaItems = computed(() => cinemaItems.value.filter(favoriteVisible))
 const cinemaLoading = ref(false)
 const cinemaSkeleton = useDeferredLoading(cinemaLoading)
 const cinemaCursor = ref<string | null>(null)
@@ -1156,13 +1116,13 @@ function cinemaAlbumHash(album: Album): string | null {
 // 而不是把整个媒体库都退掉（此前按返回直接离开页面，返回过后还要重新载入列表）
 useBackClose(computed(() => Boolean(activeAlbum.value)), closeAlbum)
 useBackClose(computed(() => Boolean(activeCinemaAlbum.value)), closeCinemaAlbum)
-useBackClose(computed(() => Boolean(playing.value)), () => {
-  playing.value = null
-})
+// 灯箱自己挂 useBackClose：一层浮层一条历史哨兵，这里不能再压一层（v4.9.67）
 
 /** 当前正在浏览的照片列表：相册详情与时间线各自独立 */
 function currentPhotoList(): MediaItem[] {
-  return photoView.value === 'albums' && activeAlbum.value ? albumItems.value : photoItems.value
+  return photoView.value === 'albums' && activeAlbum.value
+    ? visibleAlbumItems.value
+    : photoItems.value
 }
 
 function albumColor(album: Album): string {
@@ -1247,10 +1207,32 @@ function openViewer(list: MediaItem[], index: number) {
       subtitle: item.subtitle ?? null,
       size: item.size,
       modified: item.modified,
+      // 统一查看器后，影视库的续播起点也得带进灯箱（v4.9.67）
+      startAt: item.kind === 'video' ? resumeAt(item.path) : 0,
     })),
     index,
     { onProgress: savePosition },
   )
+}
+
+/**
+ * 影视库点卡片：与照片库共用同一个灯箱，翻页序列就是当前视图里那批视频。
+ * 以前这里直接把 `playing` 置成一条，等于另开了一套只有播放控制的查看器。
+ */
+function currentCinemaList(): MediaItem[] {
+  return cinemaView.value === 'videos' ? videos.value : visibleCinemaItems.value
+}
+
+function openCinemaItem(video: MediaItem) {
+  const list = currentCinemaList()
+  const index = list.findIndex((item) => item.path === video.path)
+  openViewer(index >= 0 ? list : [video], index >= 0 ? index : 0)
+}
+
+/** 长按弹出菜单后紧跟的那次 click 不该顺手开灯箱（与照片格同一口径） */
+function onCinemaPlay(video: MediaItem) {
+  if (press.takeFired()) return
+  openCinemaItem(video)
 }
 
 // ---------------- 媒体库右键菜单（设计文档 3.2.5 / 8.4.13） ----------------
@@ -1420,7 +1402,7 @@ async function onMediaMenuSelect(id: string) {
         const index = list.findIndex((entry) => entry.path === item.path)
         openViewer(list, index > 0 ? index : 0)
       } else if (current.context === 'cinema') {
-        playing.value = item
+        openCinemaItem(item)
       } else {
         const index = audios.value.findIndex((entry) => entry.path === item.path)
         player.play(audios.value, index > 0 ? index : 0)
@@ -1622,10 +1604,8 @@ function onKey(event: KeyboardEvent) {
   // 输入框里不抢键
   if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return
 
-  if (playing.value) {
-    if (event.key === 'Escape') playing.value = null
-    return
-  }
+  // 全局灯箱打开时按键归它：页面层一律不碰，避免 Esc 同时关灯箱又退出相册/影视文件夹
+  if (lightboxState.open) return
   // 菜单与变更弹窗自己收 Esc：这一下只该关最上面那层，不能顺手把相册也退了
   if (event.key === 'Escape' && (mediaMenu.value || folderMenu.value || ops.value?.isOpen)) return
   // 相册详情里按 Esc 退回相册列表（对齐 v2.9）；灯箱会先消费掉 Esc 并 preventDefault，
@@ -2038,22 +2018,9 @@ onMounted(() => {
 // 切换视图会换掉 sentinel 元素（v-if 分支互斥），这里跟着重新 observe
 watch(sentinel, (el) => observeSentinel(el), { flush: 'post' })
 
-// 「更多」菜单：按下即收（捕获阶段，免得被内部按钮的 click 抢走）+ Esc
-onMounted(() => {
-  window.addEventListener('pointerdown', onMoreOutside, true)
-})
-function onMoreEsc(event: KeyboardEvent) {
-  if (event.key === 'Escape') moreOpen.value = false
-}
-onMounted(() => {
-  window.addEventListener('keydown', onMoreEsc)
-})
-onBeforeUnmount(() => {
-  window.removeEventListener('pointerdown', onMoreOutside, true)
-  window.removeEventListener('keydown', onMoreEsc)
-})
-
 // 快捷键：挂载/卸载由 useEventListener 成对处理
+// v4.9.68：顶栏「更多」下拉已删，Esc 只剩「相册/影视文件夹 → 页面」一层归退，
+// 灯箱仍由自己消费 Esc，不会再出现一次按键连退两层。
 useEventListener(window, 'keydown', onKey)
 </script>
 
@@ -2150,6 +2117,32 @@ useEventListener(window, 'keydown', onKey)
         @update:model-value="setGridSort"
       />
 
+      <!-- 收藏筛选（v4.9.68）：常驻顶栏、带激活态，不再藏在「更多」下拉里。
+           目录墙看的是目录卡片，不是媒体条目，此时禁用并说明原因，避免「打了勾没反应」。 -->
+      <button
+        type="button"
+        class="flex h-7 shrink-0 items-center gap-1.5 rounded-md border px-2 text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+        :class="
+          onlyFavorites
+            ? 'border-accent/40 bg-accent-soft text-accent'
+            : 'border-line text-muted hover:bg-elevated hover:text-ink'
+        "
+        :aria-pressed="onlyFavorites"
+        :disabled="folderSortVisible"
+        :title="
+          folderSortVisible
+            ? t('gallery.toolbar.favoritesWallHint')
+            : t('gallery.toolbar.onlyFavoritesHint')
+        "
+        data-testid="gallery-favorites"
+        @click="onlyFavorites = !onlyFavorites"
+      >
+        <AppIcon name="heart" :size="13" :class="onlyFavorites ? 'fill-current' : ''" />
+        {{ t('gallery.toolbar.onlyFavorites') }}
+        <!-- 激活态自带清除出口：筛选后空列表时不用回头找开关 -->
+        <AppIcon v-if="onlyFavorites" name="close" :size="11" class="opacity-70" />
+      </button>
+
       <div class="ml-auto flex items-center gap-2 text-[12px] text-muted">
         <!-- 改完挂载点能看见「系统在干活」，而不是一排没来的空骨架 -->
         <span
@@ -2160,7 +2153,11 @@ useEventListener(window, 'keydown', onKey)
           <span class="size-3 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
           {{ t('gallery.toolbar.indexingMounts') }}
         </span>
-        <span v-else-if="showProgress" class="hidden text-[11px] md:inline">
+        <span
+          v-else-if="showProgress"
+          class="hidden text-[11px] md:inline"
+          data-testid="gallery-progress"
+        >
           {{ t('gallery.toolbar.loadedOf', { loaded: progress.loaded, total: progress.total }) }}
         </span>
         <!-- 重新扫描（v4.9.2）：以前塞在「更多」里，改完挂载点根本找不到入口 -->
@@ -2173,42 +2170,6 @@ useEventListener(window, 'keydown', onKey)
         >
           <AppIcon name="refresh" :size="15" :class="refreshing || indexingMounts ? 'animate-spin' : ''" />
         </button>
-        <!-- 次要开关收进「更多」：顶栏只留视图、排序这些每次都会用的东西 -->
-        <div ref="moreWrap" class="relative">
-          <button
-            class="grid size-7 place-items-center rounded-md transition-colors hover:bg-elevated hover:text-ink"
-            :class="moreOpen ? 'bg-elevated text-ink' : ''"
-            :title="t('gallery.toolbar.more')"
-            :aria-expanded="moreOpen"
-            data-testid="gallery-more"
-            @click="moreOpen = !moreOpen"
-          >
-            <AppIcon name="more" :size="16" />
-          </button>
-          <div
-            v-if="moreOpen"
-            class="absolute top-full right-0 z-30 mt-1 w-52 rounded-lg border border-line bg-panel p-1 text-xs shadow-lg"
-          >
-            <button
-              v-if="tab === 'cinema' || tab === 'music'"
-              class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
-              @click="onlyFavorites = !onlyFavorites"
-            >
-              <AppIcon name="heart" :size="13" />
-              <span class="flex-1">{{ t('gallery.toolbar.onlyFavorites') }}</span>
-              <AppIcon v-if="onlyFavorites" name="check" :size="13" class="text-accent" />
-            </button>
-            <button
-              v-if="tab === 'cinema'"
-              class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-elevated hover:text-ink"
-              @click="setNativePlayer(!nativePlayer)"
-            >
-              <AppIcon name="play" :size="13" />
-              <span class="flex-1">{{ t('gallery.cinema.native') }}</span>
-              <AppIcon v-if="nativePlayer" name="check" :size="13" class="text-accent" />
-            </button>
-          </div>
-        </div>
       </div>
     </header>
 
@@ -2301,9 +2262,9 @@ useEventListener(window, 'keydown', onKey)
           </div>
           <button
             class="shrink-0 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-elevated hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-            :disabled="albumLoading || albumItems.length === 0"
+            :disabled="albumLoading || visibleAlbumItems.length === 0"
             data-testid="album-slideshow"
-            @click="openViewer(albumItems, 0)"
+            @click="openViewer(visibleAlbumItems, 0)"
           >
             {{ t('gallery.photos.slideshow') }}
           </button>
@@ -2337,10 +2298,10 @@ useEventListener(window, 'keydown', onKey)
             <div v-else class="h-24" />
           </div>
           <div
-            v-else-if="albumItems.length === 0"
+            v-else-if="visibleAlbumItems.length === 0"
             class="grid h-full place-items-center text-center"
           >
-            <p class="text-sm text-muted">{{ t('gallery.photos.empty') }}</p>
+            <p class="text-sm text-muted">{{ emptyLabel }}</p>
           </div>
           <div
             v-else
@@ -2349,11 +2310,11 @@ useEventListener(window, 'keydown', onKey)
             data-testid="album-photos"
           >
             <PhotoTile
-              v-for="(item, index) in albumItems"
+              v-for="(item, index) in visibleAlbumItems"
               :key="item.path"
               :data-flip-key="item.path"
               :item="item"
-              @click="openPhotoTile(albumItems, index)"
+              @click="openPhotoTile(visibleAlbumItems, index)"
               @contextmenu.prevent="openMediaMenu($event, item, 'photos')"
               @touchstart.passive="press.start($event, { item, context: 'photos' })"
               @touchmove.passive="press.move"
@@ -2367,7 +2328,7 @@ useEventListener(window, 'keydown', onKey)
             {{ t('gallery.toolbar.loadingMore') }}
           </div>
           <div v-if="albumHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
-          <p v-else-if="albumItems.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
+          <p v-else-if="visibleAlbumItems.length > 0 && !loadingMore" class="py-4 text-center text-[11px] text-muted">
             {{ t('gallery.toolbar.allLoaded') }}
           </p>
         </div>
@@ -2512,7 +2473,7 @@ useEventListener(window, 'keydown', onKey)
               <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
                 <AppIcon name="gallery" :size="22" />
               </span>
-              <p class="text-sm text-ink">{{ t('gallery.photos.empty') }}</p>
+              <p class="text-sm text-ink">{{ emptyLabel }}</p>
               <p class="mt-1 text-xs text-muted">{{ t('gallery.photos.emptyHint') }}</p>
             </div>
           </div>
@@ -2634,8 +2595,8 @@ useEventListener(window, 'keydown', onKey)
             </template>
             <div v-else class="h-24" />
           </div>
-          <div v-else-if="cinemaItems.length === 0" class="grid h-full place-items-center text-center">
-            <p class="text-sm text-muted">{{ t('gallery.cinema.empty') }}</p>
+          <div v-else-if="visibleCinemaItems.length === 0" class="grid h-full place-items-center text-center">
+            <p class="text-sm text-muted">{{ emptyLabel }}</p>
           </div>
           <div
             v-else
@@ -2644,15 +2605,19 @@ useEventListener(window, 'keydown', onKey)
             data-testid="cinema-videos"
           >
             <VideoCard
-              v-for="video in cinemaItems"
+              v-for="video in visibleCinemaItems"
               :key="video.path"
               :data-flip-key="video.path"
               :video="video"
               :favorite="isFavorite(video.path)"
               :resume-at="resumeAt(video.path)"
-              @play="playing = video"
+              @play="onCinemaPlay(video)"
               @menu="openMediaMenu($event, video, 'cinema')"
               @favorite="toggleFavorite(video)"
+              @touchstart.passive="press.start($event, { item: video, context: 'cinema' })"
+              @touchmove.passive="press.move"
+              @touchend="press.cancel"
+              @touchcancel="press.cancel"
             />
           </div>
           <div v-if="loadingMore" class="flex items-center justify-center gap-2 py-4 text-xs text-muted">
@@ -2661,7 +2626,7 @@ useEventListener(window, 'keydown', onKey)
           </div>
           <div v-if="cinemaHasMore" ref="sentinel" class="h-px w-full" aria-hidden="true" />
           <p
-            v-else-if="cinemaItems.length > 0 && !loadingMore"
+            v-else-if="visibleCinemaItems.length > 0 && !loadingMore"
             class="py-4 text-center text-[11px] text-muted"
           >
             {{ t('gallery.toolbar.allLoaded') }}
@@ -2809,7 +2774,7 @@ useEventListener(window, 'keydown', onKey)
               <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
                 <AppIcon name="video" :size="22" />
               </span>
-              <p class="text-sm text-ink">{{ t('gallery.cinema.empty') }}</p>
+              <p class="text-sm text-ink">{{ emptyLabel }}</p>
             </div>
           </div>
 
@@ -2843,9 +2808,13 @@ useEventListener(window, 'keydown', onKey)
                       :video="cell.item"
                       :favorite="isFavorite(cell.item.path)"
                       :resume-at="resumeAt(cell.item.path)"
-                      @play="playing = cell.item"
+                      @play="onCinemaPlay(cell.item)"
                       @menu="openMediaMenu($event, cell.item, 'cinema')"
                       @favorite="toggleFavorite(cell.item)"
+                      @touchstart.passive="press.start($event, { item: cell.item, context: 'cinema' })"
+                      @touchmove.passive="press.move"
+                      @touchend="press.cancel"
+                      @touchcancel="press.cancel"
                     />
                   </div>
                 </div>
@@ -2952,7 +2921,7 @@ useEventListener(window, 'keydown', onKey)
             <span class="mb-3 inline-grid size-12 place-items-center rounded-full bg-elevated text-muted">
               <AppIcon name="audio" :size="22" />
             </span>
-            <p class="text-sm text-ink">{{ t('gallery.music.empty') }}</p>
+            <p class="text-sm text-ink">{{ emptyLabel }}</p>
             <p class="mt-1 text-xs text-muted">{{ t('gallery.music.emptyHint') }}</p>
           </div>
         </div>
@@ -3144,50 +3113,8 @@ useEventListener(window, 'keydown', onKey)
       </p>
     </div>
 
-    <!-- 播放器（影视库） -->
-    <div
-      v-if="playing"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/95 p-4 md:p-10"
-      @click.self="playing = null"
-    >
-      <div class="w-full max-w-5xl">
-        <p class="mb-2 truncate text-center text-sm text-white/80">{{ playing.name }}</p>
-        <template v-if="nativePlayer">
-          <!-- 降级开关：浏览器原生 <video>（设计文档 3.4 播放器选择） -->
-          <video
-            :key="playing.path"
-            :src="rawUrl(playing.path)"
-            controls
-            autoplay
-            playsinline
-            class="max-h-[78vh] w-full rounded-xl bg-black"
-            @loadedmetadata="seekNative"
-            @error="onNativeError"
-            @timeupdate="reportProgress(($event.target as HTMLVideoElement).currentTime)"
-            @ended="onPlayEnded(playing.path)"
-          />
-          <p v-if="nativeError" class="mt-2 text-center text-xs fg-warn">
-            {{ nativeError }}
-            <button
-              class="ml-2 rounded border border-amber-300/40 px-2 py-0.5 text-[12px] fg-warn transition-colors hover:bg-amber-300/10"
-              @click="downloadPlaying"
-            >
-              {{ t('gallery.video.tryDownload') }}
-            </button>
-          </p>
-        </template>
-        <MediaPlayer
-          v-else
-          :key="playing.path"
-          :src="rawUrl(playing.path)"
-          :subtitle="playing.subtitle"
-          :start-at="resumeAt(playing.path)"
-          @progress="reportProgress"
-          @close="playing = null"
-          @ended="onPlayEnded(playing.path)"
-        />
-      </div>
-    </div>
+    <!-- 全屏查看统一由 App.vue 的全局 MediaLightbox 承担（v4.9.67）；
+         这里不再自建播放器遮罩，避免两个库两套翻页 / 关闭 / 工具栏。 -->
 
     <!-- 全局右键菜单（设计文档 8.4.13：媒体库与文件管理共用同一组件） -->
     <ContextMenu

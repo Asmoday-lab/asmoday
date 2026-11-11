@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,9 @@ pub struct UriOptions {
     pub headers: Vec<(String, String)>,
     /// `max-connection-per-server` / `split` 的覆盖值（最终仍按全局上限收敛）
     pub segments: Option<usize>,
+    /// aria2 的文件名策略开关（`allow-overwrite` / `auto-file-renaming`），
+    /// 以字符串原样带进 `TaskOptions::extra`：`getOption` 能回显，引擎再按 bool 解析。
+    pub extra: Vec<(String, String)>,
 }
 
 /// `header` 选项解析：**字符串数组**（aria2 RPC 原生形态，Aria2 Explorer 就发这个）
@@ -194,6 +198,9 @@ pub struct TaskState {
     pub error_code: u32,
     pub error_message: String,
     pub options: TaskOptions,
+    /// 目标文件名是否已定稿：`Content-Disposition` 取名与同名自动改名只在首次开跑时
+    /// 做一次。暂停恢复会重跑 `download_task`，不做这个门闩就会每恢复一次多加一个 `.N`。
+    pub name_resolved: bool,
     /// 速度采样：上次快照（时刻 + 字节），查询时算增量
     speed_sample: (Instant, u64),
     pub speed: u64,
@@ -346,6 +353,10 @@ impl TaskState {
 pub struct TaskHandle {
     pub state: Mutex<TaskState>,
     cancel: std::sync::Mutex<CancellationToken>,
+    /// 「删除任务并连带删文件」：worker 收尾时不要再落 `.aria2` 控制文件。
+    /// cancel_current() 会让 HTTP worker 走 Cancelled 分支写控制文件供续传，
+    /// 若此时文件已删掉，控制文件就成了删不掉的残骸（v4.9.66）。
+    purge_files: AtomicBool,
 }
 
 impl TaskHandle {
@@ -357,6 +368,12 @@ impl TaskHandle {
     }
     fn reset_token(&self) {
         *self.cancel.lock().unwrap() = CancellationToken::new();
+    }
+    fn mark_purge_files(&self) {
+        self.purge_files.store(true, Ordering::Relaxed);
+    }
+    fn purging_files(&self) -> bool {
+        self.purge_files.load(Ordering::Relaxed)
     }
 }
 
@@ -704,6 +721,16 @@ pub fn seed_root_specs(
     (specs, warnings)
 }
 
+/// `remove_task` 的结果：任务一定被移除，文件删除是尽力而为，失败不回滚任务。
+#[derive(Debug, Default)]
+pub struct RemoveOutcome {
+    pub gid: String,
+    /// 真正删掉的文件数（HTTP 任务的 `.aria2` 控制文件也算一个）
+    pub deleted_files: usize,
+    /// 删不掉 / 不敢删的路径，交给前端提示
+    pub failed_files: Vec<String>,
+}
+
 /// 下载引擎。AppState 以 `Arc<DownloadManager>` 持有。
 pub struct DownloadManager {
     http: reqwest::Client,
@@ -956,6 +983,7 @@ impl DownloadManager {
             referer,
             headers,
             segments: segments_override,
+            extra,
         } = options;
         let uri = uris
             .first()
@@ -971,6 +999,9 @@ impl DownloadManager {
         }
         let dir = self.resolve_dir(dir.as_deref())?;
 
+        // `out` 是用户显式指定的名字：aria2 里它优先于 URL 与 Content-Disposition，
+        // 且只有它被写进 `getOption` 的回显。自动推导的名字只放 out_name。
+        let out_given = out.is_some();
         let filename = match out {
             Some(name) if is_safe_filename(&name) => name,
             Some(name) => {
@@ -979,13 +1010,43 @@ impl DownloadManager {
             None => filename_from_url(&uri),
         };
 
+        // aria2 `RequestGroupMan::isSameFileBeingDownloaded`：已有任务占着同一个
+        // 目标路径时，新建任务立刻换名。光靠落盘前检查不够——两个任务同时排队
+        // 时文件都还没建，谁都看不见谁。`try_lock` 拿不到就跳过（那些任务正忙，
+        // 落盘前的磁盘检查会兜住）。
+        let filename = {
+            let map = self.tasks.lock().await;
+            let taken = |candidate: &str| {
+                let target = dir.join(candidate);
+                map.tasks.values().any(|other| {
+                    other.state.try_lock().is_ok_and(|state| {
+                        // 与 aria2 `isSameFileBeingDownloaded` 一致：只看还没定局的
+                        // 任务。complete / error / removed 仍留在 map 里供 tellStopped
+                        // 查询，把它们算进来会让每次重复下载都凭空多一个 .N。
+                        matches!(
+                            state.status,
+                            Status::Active | Status::Waiting | Status::Paused
+                        ) && state.target_path() == target
+                    })
+                })
+            };
+            if taken(&filename) {
+                (1..10000)
+                    .map(|index| renamed_candidate(&filename, index))
+                    .find(|candidate| !taken(candidate))
+                    .unwrap_or_else(|| filename.clone())
+            } else {
+                filename
+            }
+        };
+
         let options = TaskOptions {
             dir,
-            out: Some(filename.clone()),
+            out: out_given.then(|| filename.clone()),
             user_agent,
             referer,
             headers,
-            extra: Vec::new(),
+            extra,
         };
         let segments = segments_override
             .unwrap_or(self.segments)
@@ -1006,6 +1067,7 @@ impl DownloadManager {
                 error_code: 0,
                 error_message: String::new(),
                 options,
+                name_resolved: false,
                 speed_sample: (Instant::now(), 0),
                 speed: 0,
                 etag: None,
@@ -1021,6 +1083,7 @@ impl DownloadManager {
                 bittorrent: None,
             }),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
+            purge_files: AtomicBool::new(false),
         });
 
         {
@@ -1106,6 +1169,8 @@ impl DownloadManager {
                 error_code: 0,
                 error_message: String::new(),
                 options,
+                // BT 落盘名由种子元数据决定，不参与 HTTP 的 CD / 同名改名
+                name_resolved: true,
                 speed_sample: (Instant::now(), 0),
                 speed: 0,
                 etag: None,
@@ -1121,6 +1186,7 @@ impl DownloadManager {
                 bittorrent: None,
             }),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
+            purge_files: AtomicBool::new(false),
         });
 
         {
@@ -1315,6 +1381,109 @@ impl DownloadManager {
         Ok(gid.to_string())
     }
 
+    /// 页面「移除任务」：运行中停掉（沿用 `remove` 的 stopped 记录语义），
+    /// 已停止的直接清记录；`delete_files` 时连带删除已下载文件，对齐
+    /// Aria2 Explorer 的「删除任务并删除文件」（v4.9.66）。
+    ///
+    /// 删除范围只认引擎自己记下的输出路径，并且这些路径必须**仍在当前允许的
+    /// 保存目录白名单内**。用户后来把根目录移出白名单、某个文件被换成指向库外
+    /// 的软链接，都宁可留着不删 —— 一次误删用户资料的代价远高于留个残留文件。
+    pub async fn remove_task(
+        &self,
+        gid: &str,
+        delete_files: bool,
+    ) -> Result<RemoveOutcome, RpcError> {
+        let status = self
+            .status_with_keys(gid, Some(&["status".to_string()]))
+            .await
+            .and_then(|task| {
+                task.get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+
+        // 文件清单必须在移除前取：remove_result 之后 handle 已从表里消失
+        let files = if delete_files {
+            self.output_files(gid).await
+        } else {
+            Vec::new()
+        };
+        if let Some(handle) = self.get(gid).await
+            && delete_files
+        {
+            // cancel_current() 会让 HTTP worker 走 Cancelled 分支写 .aria2，
+            // 先立标记，避免删完文件又被收尾逻辑重建一个孤零零的控制文件
+            handle.mark_purge_files();
+        }
+
+        let removed = match status.as_deref() {
+            Some("complete") | Some("error") | Some("removed") => self.remove_result(gid).await?,
+            _ => self.remove(gid).await?,
+        };
+        let (deleted_files, failed_files) = self.delete_output_files(&files).await;
+        Ok(RemoveOutcome {
+            gid: removed,
+            deleted_files,
+            failed_files,
+        })
+    }
+
+    /// 任务写出来的文件：HTTP = 目标文件 + `.aria2` 控制文件；BT = 种子文件清单。
+    async fn output_files(&self, gid: &str) -> Vec<PathBuf> {
+        let Some(handle) = self.get(gid).await else {
+            return Vec::new();
+        };
+        let state = handle.state.lock().await;
+        match state.kind {
+            TaskKind::Torrent if !state.bt_files.is_empty() => state
+                .bt_files
+                .iter()
+                .map(|file| state.dir.join(&file.relative))
+                .collect(),
+            TaskKind::Torrent => vec![state.target_path()],
+            TaskKind::Http => vec![state.target_path(), state.control_path()],
+        }
+    }
+
+    /// 只删「当前白名单内的普通文件」：父目录 canonical 后仍须在某个在线根下，
+    /// 且目标本身不能是软链接 / 目录（不跟随、不递归）。
+    async fn delete_output_files(&self, files: &[PathBuf]) -> (usize, Vec<String>) {
+        if files.is_empty() {
+            return (0, Vec::new());
+        }
+        let roots: Vec<PathBuf> = self
+            .roots()
+            .into_iter()
+            .filter(|root| root.online)
+            .map(|root| std::fs::canonicalize(&root.path).unwrap_or_else(|_| normalize(&root.path)))
+            .collect();
+        let mut deleted = 0;
+        let mut failed = Vec::new();
+        for file in files {
+            // 不存在 / 已经删过 = 正常；软链接、目录一律不碰
+            let Ok(meta) = tokio::fs::symlink_metadata(file).await else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some((parent, name)) = file.parent().zip(file.file_name()) else {
+                continue;
+            };
+            let parent_canon = std::fs::canonicalize(parent).unwrap_or_else(|_| normalize(parent));
+            if !roots.iter().any(|root| path_contains(root, &parent_canon)) {
+                failed.push(display_path(file));
+                continue;
+            }
+            let target = parent_canon.join(name);
+            match tokio::fs::remove_file(&target).await {
+                Ok(()) => deleted += 1,
+                Err(_) => failed.push(display_path(&target)),
+            }
+        }
+        (deleted, failed)
+    }
+
     async fn mark_stopped(&self, gid: &str) {
         let mut map = self.tasks.lock().await;
         map.stopped.retain(|g| g != gid);
@@ -1477,6 +1646,8 @@ impl DownloadManager {
             && state.status != Status::Active
         {
             state.out_name = out.to_string();
+            // 标成「用户给的名字」后，首响应的 Content-Disposition 不再覆盖它
+            state.options.out = Some(out.to_string());
         }
         if let Some(ua) = options.get("user-agent").and_then(Value::as_str) {
             state.options.user_agent = Some(ua.to_string());
@@ -1496,9 +1667,17 @@ impl DownloadManager {
                 ) {
                     continue;
                 }
-                if let Some(text) = value.as_str() {
+                // aria2 的选项值既可能是字符串也可能是 JSON bool/number；文件名策略
+                // 开关按字符串读，统一存文本，getOption 也能原样回显
+                let text = match value {
+                    Value::String(text) => Some(text.clone()),
+                    Value::Bool(flag) => Some(flag.to_string()),
+                    Value::Number(number) => Some(number.to_string()),
+                    _ => None,
+                };
+                if let Some(text) = text {
                     state.options.extra.retain(|(existing, _)| existing != key);
-                    state.options.extra.push((key.clone(), text.to_string()));
+                    state.options.extra.push((key.clone(), text));
                 }
             }
         }
@@ -1622,6 +1801,10 @@ async fn run_task(engine: EngineHandle, manager: Arc<DownloadManager>, handle: A
             }
         }
         Err(FailKind::Cancelled) => {
+            // 「删除任务并连带删文件」：不要重建控制文件，否则删完又残留一个 .aria2
+            if handle.purging_files() {
+                return;
+            }
             // 暂停：状态已被 pause() 置好；落控制文件供下次续传
             let state = handle.state.lock().await;
             let control = serde_json::json!({
@@ -2101,6 +2284,109 @@ async fn open_remote(
 /// 小于这个尺寸就别分段了：多连接握手比单流更贵，还多挨几次 WAF 检查。
 const MIN_SPLIT_BYTES: u64 = 1024 * 1024;
 
+/// 首响应到手、还没落盘之前定稿文件名（对齐 aria2 的顺序）：
+/// 1. 没有显式 `out` 时，用 `Content-Disposition` 的名字（不合法则整段忽略）；
+/// 2. `allow-overwrite=false`（默认）且目标已存在、又没有可续传控制文件时，
+///    按 `name.1.ext` … `name.9999.ext` 自动改名，绝不覆盖已有文件。
+///
+/// `name_resolved` 门闩：暂停恢复会重跑 `download_task`，没有它每恢复一次就会
+/// 再加一个 `.N`，并把控制文件留在旧名字上。
+async fn resolve_target_name(
+    handle: &Arc<TaskHandle>,
+    response: &reqwest::Response,
+    total: Option<u64>,
+    etag: &Option<String>,
+) -> Result<(), FailKind> {
+    if handle.state.lock().await.name_resolved {
+        return Ok(());
+    }
+
+    // 1. Content-Disposition：aria2 的 `-o` 优先，所以只有自动命名时才接管
+    if let Some(raw) = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .map(|value| value.as_bytes())
+    {
+        // HeaderValue::to_str() 只认 ASCII；`filename="…"` 里的非 ASCII 字节
+        // 要按 aria2 `content-disposition-default-utf8` 的口径解释（默认 ISO-8859-1）
+        let default_utf8 = {
+            let state = handle.state.lock().await;
+            option_flag(
+                &state.options.extra,
+                "content-disposition-default-utf8",
+                false,
+            )
+        };
+        if let Some(name) = filename_from_disposition(&decode_disposition_bytes(raw, default_utf8))
+        {
+            let mut state = handle.state.lock().await;
+            if state.options.out.is_none() && state.out_name != name {
+                state.out_name = name;
+            }
+        }
+    }
+
+    // 2. 同名冲突（aria2 `shouldCancelDownloadForSafety` / `tryAutoFileRenaming`）
+    let (dir, name, allow_overwrite, auto_renaming) = {
+        let state = handle.state.lock().await;
+        (
+            state.dir.clone(),
+            state.out_name.clone(),
+            option_flag(&state.options.extra, "allow-overwrite", false),
+            option_flag(&state.options.extra, "auto-file-renaming", true),
+        )
+    };
+    if !allow_overwrite {
+        let target = dir.join(&name);
+        let exists = tokio::fs::metadata(&target)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if exists {
+            // 控制文件与本次的 total / ETag 对得上 = 本任务的续传，不改名
+            let control = dir.join(format!("{name}.aria2"));
+            let resumable = load_control(&control)
+                .await
+                .is_some_and(|saved| saved.total == total.unwrap_or(0) && saved.etag == *etag);
+            if !resumable {
+                if !auto_renaming {
+                    return Err(FailKind::Failed(
+                        13, // aria2 FILE_ALREADY_EXISTS
+                        format!("file already exists: {}", target.display()),
+                    ));
+                }
+                let mut picked = None;
+                for index in 1..10000 {
+                    let candidate = renamed_candidate(&name, index);
+                    let busy = tokio::fs::metadata(dir.join(&candidate))
+                        .await
+                        .map(|meta| meta.is_file())
+                        .unwrap_or(false);
+                    // aria2：候选已存在但有 .aria2 控制文件，视为未完成任务可复用
+                    let has_control = tokio::fs::metadata(dir.join(format!("{candidate}.aria2")))
+                        .await
+                        .is_ok();
+                    if !busy || has_control {
+                        picked = Some(candidate);
+                        break;
+                    }
+                }
+                let Some(candidate) = picked else {
+                    return Err(FailKind::Failed(
+                        14, // aria2 FILE_RENAMING_FAILED
+                        format!("file renaming failed: {}", target.display()),
+                    ));
+                };
+                crate::log_info!("download target renamed: {name} -> {candidate}");
+                handle.state.lock().await.out_name = candidate;
+            }
+        }
+    }
+
+    handle.state.lock().await.name_resolved = true;
+    Ok(())
+}
+
 async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskOutcome {
     let cancel = handle.current_token();
     let (uri, headers) = {
@@ -2127,6 +2413,10 @@ async fn download_task(engine: &EngineHandle, handle: &Arc<TaskHandle>) -> TaskO
         state.total = total.unwrap_or(0);
         state.etag = etag.clone();
     }
+
+    // aria2 文件名策略：CD 取名 + 同名自动改名，只在首次开跑时定稿一次。
+    // 必须排在 target_path() 之前，也必须在首响应消费之前（headers 还在这里）。
+    resolve_target_name(handle, &first, total, &etag).await?;
 
     // 2. 分段方案：只有站点明确说支持 Range、文件够大、且引擎开了多段才分段。
     //    其余情况（绝大多数插件链接）直接消费首响应，全程只有一个请求。
@@ -2513,37 +2803,109 @@ fn is_torrent_uri(uri: &str) -> bool {
         || (uri.len() == 40 && uri.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-/// URL → 文件名（去 query/fragment，简单 percent-decode）
+/// aria2 `createSafePath` / `fixTaintedBasename`：把路径成分与控制字符转成 `%XX`。
+///
+/// 关键在 percent-decode **之后**再净化：`%2F` / `%5C` / `%2E%2E` 解出来是 `/`、
+/// `\`、`..`，直接 `dir.join(name)` 就能把文件写到保存目录之外。转成字面 `%2F`
+/// 后永远只是一个 basename（与 aria2 的表现一致）。
+fn safe_basename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        let code = ch as u32;
+        // aria2 escapePath 逐字节处理控制字符；Windows 上另有这些非法字符
+        let tainted = matches!(ch, '/' | '\\' | '"' | '*' | ':' | '<' | '>' | '?' | '|')
+            || code < 0x20
+            || code == 0x7f;
+        if tainted {
+            let buf = ch.to_string();
+            for byte in buf.as_bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        return "index.html".to_string();
+    }
+    out
+}
+
+/// URL → 文件名（去 query/fragment，percent-decode，再净化成 basename）。
+/// 空路径回退 `index.html`，对齐 aria2 的 `Request::DEFAULT_FILE`。
 fn filename_from_url(uri: &str) -> String {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
     let name = path.rsplit('/').next().unwrap_or("");
-    let decoded = percent_decode(name);
-    if decoded.is_empty() || decoded == "/" {
-        "index.html".to_string()
-    } else {
-        decoded
-    }
+    safe_basename(&percent_decode(name))
 }
 
-#[allow(dead_code)]
+/// `Content-Disposition` → 文件名（aria2 `HttpResponse::determineFilename`）。
+///
+/// RFC 6266 的扩展形式 `filename*=UTF-8''…` 优先于 `filename=`。名字里带路径
+/// 成分、`..` 或控制字符时**整段忽略**（aria2 `getContentDispositionFilename` 的
+/// `detectDirTraversal` + `find_first_of("/\\")`），退回 URL 推导名。
 fn filename_from_disposition(value: &str) -> Option<String> {
-    // attachment; filename="x.zip" / filename*=UTF-8''x.zip
-    for part in value.split(';') {
-        let part = part.trim();
-        if let Some(rest) = part.strip_prefix("filename*=") {
-            let after = rest.split("''").nth(1).unwrap_or(rest);
-            let name = percent_decode(after.trim_matches('"'));
-            if !name.is_empty() {
-                return Some(name);
-            }
-        } else if let Some(rest) = part.strip_prefix("filename=") {
-            let name = rest.trim_matches('"');
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
+    let parts: Vec<&str> = value.split(';').map(str::trim).collect();
+    for part in parts.iter().filter(|part| part.starts_with("filename*=")) {
+        let rest = &part["filename*=".len()..];
+        let after = rest.split("''").nth(1).unwrap_or(rest);
+        if let Some(name) = safe_disposition_name(&percent_decode(after.trim_matches('"'))) {
+            return Some(name);
+        }
+    }
+    for part in parts.iter().filter(|part| part.starts_with("filename=")) {
+        let rest = &part["filename=".len()..];
+        if let Some(name) = safe_disposition_name(rest.trim_matches('"')) {
+            return Some(name);
         }
     }
     None
+}
+
+/// aria2 `iso8859p1ToUtf8` 的口径：默认把 `filename=` 的裸字节当 ISO-8859-1；
+/// 开了 `content-disposition-default-utf8` 才按 UTF-8 解（`filename*` 不受影响）。
+fn decode_disposition_bytes(raw: &[u8], default_utf8: bool) -> String {
+    if default_utf8 || raw.is_ascii() {
+        String::from_utf8_lossy(raw).into_owned()
+    } else {
+        raw.iter().map(|byte| char::from(*byte)).collect()
+    }
+}
+
+fn safe_disposition_name(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.contains('/')
+        || raw.contains('\\')
+        || raw.contains("..")
+        || raw.chars().any(|ch| (ch as u32) < 0x20 || ch == '\u{7f}')
+    {
+        return None;
+    }
+    Some(safe_basename(raw))
+}
+
+/// aria2 `tryAutoFileRenaming`：在扩展名前插 `.N`（`file.zip` → `file.1.zip`）。
+/// 隐藏文件 `.foo` 不切扩展名（aria2 的 `idx != 0` 规则）。
+fn renamed_candidate(name: &str, index: usize) -> String {
+    let dot = name.rfind('.');
+    let slash = name.rfind(['/', '\\']);
+    match dot {
+        Some(dot) if dot > 0 && slash.is_none_or(|s| s + 1 < dot) => {
+            format!("{}.{}{}", &name[..dot], index, &name[dot..])
+        }
+        _ => format!("{name}.{index}"),
+    }
+}
+
+/// `TaskOptions::extra` 里的 aria2 布尔选项（默认按 aria2 的出厂值）。
+fn option_flag(extra: &[(String, String)], key: &str, default: bool) -> bool {
+    match extra.iter().find(|(name, _)| name == key) {
+        Some((_, value)) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        ),
+        None => default,
+    }
 }
 
 fn percent_decode(input: &str) -> String {
@@ -2866,6 +3228,14 @@ mod tests {
         assert_eq!(filename_from_url("http://x/a/b/big.zip?t=1"), "big.zip");
         assert_eq!(filename_from_url("http://x/"), "index.html");
         assert_eq!(
+            filename_from_url("http://x/a/b/%E6%8A%A5%E5%91%8A.pdf"),
+            "报告.pdf"
+        );
+        // percent-decode 之后才净化：/ 与 .. 都不能变成路径成分（aria2 fixTaintedBasename）
+        assert_eq!(filename_from_url("http://x/a%2Fb%2Fevil"), "a%2Fb%2Fevil");
+        assert_eq!(filename_from_url("http://x/%2E%2E%2Fescape"), "..%2Fescape");
+        assert_eq!(filename_from_url("http://x/.."), "index.html");
+        assert_eq!(
             filename_from_disposition("attachment; filename=\"report.pdf\""),
             Some("report.pdf".to_string())
         );
@@ -2873,11 +3243,66 @@ mod tests {
             filename_from_disposition("attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf"),
             Some("报告.pdf".to_string())
         );
+        // RFC 6266：扩展形式优先于 filename=
+        assert_eq!(
+            filename_from_disposition("attachment; filename=\"old.bin\"; filename*=UTF-8''new.bin"),
+            Some("new.bin".to_string())
+        );
+        // CD 名带路径成分 / 穿越片段 → 整段忽略，退回 URL 名
+        assert_eq!(
+            filename_from_disposition("attachment; filename=\"../escape\""),
+            None
+        );
+        assert_eq!(
+            filename_from_disposition("attachment; filename=\"a\\b\""),
+            None
+        );
         assert!(is_safe_filename("ok.bin"));
         assert!(!is_safe_filename("../escape"));
         assert!(!is_safe_filename("a/b"));
         assert!(!is_safe_filename("a\\b"));
         assert!(!is_safe_filename("..hidden.."));
+    }
+
+    #[test]
+    fn aria2_auto_renaming_shapes() {
+        assert_eq!(renamed_candidate("file.zip", 1), "file.1.zip");
+        assert_eq!(renamed_candidate("archive.tar.gz", 3), "archive.tar.3.gz");
+        assert_eq!(renamed_candidate("noext", 9), "noext.9");
+        // 隐藏文件没有扩展名，数字只能追加在末尾（aria2 的 idx != 0 规则）
+        assert_eq!(renamed_candidate(".hidden", 2), ".hidden.2");
+    }
+
+    #[test]
+    fn aria2_option_flags_default_and_override() {
+        let empty: Vec<(String, String)> = Vec::new();
+        assert!(!option_flag(&empty, "allow-overwrite", false));
+        assert!(option_flag(&empty, "auto-file-renaming", true));
+        let flags = vec![
+            ("allow-overwrite".into(), "true".into()),
+            ("auto-file-renaming".into(), "false".into()),
+        ];
+        assert!(option_flag(&flags, "allow-overwrite", false));
+        assert!(!option_flag(&flags, "auto-file-renaming", true));
+    }
+
+    #[test]
+    fn disposition_charset_follows_aria2_flag() {
+        // filename* 自带 UTF-8，不受 charset 开关影响
+        let both = b"attachment; filename=\"caf\xe9.pdf\"; filename*=UTF-8''new.bin";
+        assert_eq!(
+            filename_from_disposition(&decode_disposition_bytes(both, false)),
+            Some("new.bin".to_string())
+        );
+        let latin = b"attachment; filename=\"caf\xe9.pdf\"";
+        assert_eq!(
+            filename_from_disposition(&decode_disposition_bytes(latin, false)),
+            Some("caf\u{e9}.pdf".to_string())
+        );
+        assert_eq!(
+            filename_from_disposition(&decode_disposition_bytes(latin, true)),
+            Some("caf\u{fffd}.pdf".to_string())
+        );
     }
 
     #[test]
@@ -3093,6 +3518,64 @@ mod tests {
         let resolved = manager.resolve_dir(None).unwrap();
         assert!(path_contains(&base, &resolved));
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 「删除任务并连带删文件」只清白名单内的普通文件（v4.9.66）：
+    /// 目标文件 + `.aria2` 控制文件删掉；白名单外、目录、软链接一律不碰。
+    #[tokio::test]
+    async fn delete_output_files_stays_inside_roots() {
+        let tag = new_gid();
+        let base = std::env::temp_dir().join(format!("asmoday-dl-purge-{tag}"));
+        let outside = std::env::temp_dir().join(format!("asmoday-dl-purge-out-{tag}"));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        let target = base.join("movie.mkv");
+        let control = base.join("movie.mkv.aria2");
+        let foreign = outside.join("keep.mkv");
+        let folder = base.join("a-folder");
+        tokio::fs::write(&target, b"data").await.unwrap();
+        tokio::fs::write(&control, b"{}").await.unwrap();
+        tokio::fs::write(&foreign, b"data").await.unwrap();
+        tokio::fs::create_dir_all(&folder).await.unwrap();
+
+        let manager = DownloadManager::new(
+            reqwest::Client::new(),
+            "secret".into(),
+            vec![test_root(&base)],
+            2,
+            1,
+            true,
+            None,
+        );
+        let (deleted, failed) = manager
+            .delete_output_files(&[
+                target.clone(),
+                control.clone(),
+                foreign.clone(),
+                folder.clone(),
+            ])
+            .await;
+
+        assert_eq!(deleted, 2, "目标文件与控制文件应该被删掉");
+        assert!(!target.exists());
+        assert!(!control.exists());
+        assert!(foreign.exists(), "白名单外的文件绝不能删");
+        assert!(folder.exists(), "目录绝不能删");
+        assert_eq!(failed.len(), 1, "白名单外的文件要报给前端");
+
+        #[cfg(unix)]
+        {
+            let link = base.join("link.mkv");
+            tokio::fs::symlink(&foreign, &link).await.unwrap();
+            let (deleted, _) = manager.delete_output_files(&[link.clone()]).await;
+            assert_eq!(deleted, 0, "软链接不跟随、不删除");
+            assert!(foreign.exists());
+            let _ = tokio::fs::remove_file(&link).await;
+        }
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let _ = tokio::fs::remove_dir_all(&outside).await;
     }
 
     /// 子路径规范化：只接受挂载点内的相对路径（v4.9.37）

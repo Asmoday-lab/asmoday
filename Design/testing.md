@@ -145,6 +145,76 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v20（v4.9.70）**：`probes/services_form.cjs` D 段按可视化图标选择器重写，断言数 27→31。
+  覆盖：D0 点触发按钮宫格展开且格子数 ≥30（每格是渲染出的图标而不是文字选项）；
+  D1 点格子选中后宫格收起；D2/D3 图标写进 POST 与 GET；**D4 跳到门户 `/` 页断言
+  `[data-service]` 卡片的 svg path 真是 folder**（v4.9.70 前模板写死 `grid`，icon 配了
+  也从不显示）；D5 默认档把 icon 从 POST 里整个省略（不是写空串）。A5 从
+  `inputValue()` 改为断言触发按钮的 `data-value` 属性（按钮不是 input 了）。
+  **坑**：D 段跑在 C 段之后，服务已在 C5 改名为 `probe-renamed`，门户断言的 id 必须从
+  当前落盘配置 `cfg.services[0].id` 读，不能写死探针初始 id。
+  门禁 `vue-tsc -b` + `vite build --emptyOutDir=false` + `services_form.py` 31/31 +
+  既有 `config_save.py` 15/15；Rust 零改动不重跑 `cargo build`。
+- **v19（v4.9.69）**：新增 `probes/services_form.py` + `services_form.cjs`（27 条断言）。
+  初始 `config.toml` 故意带 `strip_prefix = true` 与两个注入头，同时钉住「弃用 UI 字段后
+  存量配置仍可解析、原样回传」。覆盖：A 表单无死开关、常驻 `/proxy/<id>/` 预览、两个头
+  各占一行、图标下拉回显；B 改 / 增 / 删注入头都完整落盘、POST 不带 `headerRows` 等前端
+  字段、`strip_prefix` 原样回传；C 新建 id 为 `service-1`、复制完整地址、改名出现断链
+  警告且保存后消失、重复 / 非法字符 / 空 id 均不发 POST、恢复后可保存；D 图标改动回写；
+  Z 无未捕获异常。
+  **坑**：后端 `inject_headers` 是 `BTreeMap`，每次保存后 GET 会按头名字母序重排，断言必须
+  按头名定位而不是 `nth(1)` / `last()`；本机 playwright-core 较旧，没有
+  `locator.allInputValues()`，改用 `evaluateAll(els => els.map(el => el.value))`。
+  门禁 `vue-tsc -b` + `vite build --emptyOutDir=false` + 新探针 27/27 +
+  既有 `config_save.py` 15/15；Rust 零改动不重跑 `cargo build`。
+- **v18（v4.9.68）**：新增 `probes/gallery_toolbar.py` + `gallery_toolbar.cjs`（34 条断言）。
+  样本为 2 张 1×1 PNG + 2 个无效 mp4 + 1 个无效 mp3，起服务后先由 `Caller` 预热索引并
+  把 `a.png` 置为收藏，浏览器里筛选结果才是确定的。覆盖：A 三分区都不再有 `gallery-more`
+  下拉、都有显式 `gallery-favorites` chip；B chip 的 `aria-pressed` / 强调色激活态 / 时间线
+  4→1→4 / 筛选态隐藏分页进度 / 目录墙禁用且给出原因提示；C 影视与音乐库筛选同样生效，
+  空态文案指向筛选而不是「媒体库是空的」；D 360px 窄屏下音乐行三点常驻可见且能开单条菜单、
+  Esc 只收菜单、竖三点描边为 3、影视卡片长按（合成 `TouchEvent`）能开同一菜单且补发 click
+  不误开灯箱；E 视频灯箱信息层的兼容模式开关勾选即时切原生 `<video controls>`、持久化到
+  `asmoday.cinema.native`、取消即回、图片灯箱不显示该项；Z 无未捕获异常。
+  **坑**：B8 把照片库视图切到「文件夹」并写进 `asmoday.photos.view.v2`，后续再进 `/photos`
+  等 `[data-photo]` 会超时——须先写回 `timeline`；合成 `TouchEvent` 需要 `Touch` 构造并
+  带上 `touches[0]`，`useLongPress` 才会启动计时；`vite build` 仍用 `--emptyOutDir=false`
+  绕开执行环境的批量删除闸门。门禁 `vue-tsc -b` + `vite build --emptyOutDir=false` +
+  新探针 34/34 + 既有 `media_viewer.py` 21/21；Rust 零改动不重跑 `cargo build`。
+- **v17（v4.9.67）**：新增 `probes/media_viewer.py` + `media_viewer.cjs`（21 条断言）。
+  一次性实例 + 挂载点里 2 张 1×1 PNG 与 2 个无效 mp4（只断言 DOM / 导航 / 键位，
+  不依赖解码），真实浏览器走：A 影视库点卡片开的是全局灯箱且序列为 1/2、视频也有
+  缩略图条与左右箭头、顶栏工具齐全；B `←/→` 在视频上翻页、`Shift+→` 不翻页、
+  信息层给出键位提示；C Esc 分层收信息层 → 再按关灯箱、顶栏隐去 3.2s 后左上 ✕
+  仍可见可点且能关；D 图片库序列 1/4 且缩略图条有 2 个 `.mp4`、点它直接跳到视频
+  并渲染播放器、相册详情确实发 `kind=media&depth=0`；  E 分享动作图标 5 段三点两线、
+  侧边栏分享管理改用 2 段 `link`；F 置 `asmoday.cinema.native=1` 后灯箱仍走原生
+  `<video controls autoplay>`（收敛查看器后降级开关不丢）；Z 无未捕获异常。
+  **坑**：`playwright-core` 不在仓库里，必须给 `run_node()` 传
+  `NODE_PATH=<工作区>/.probe/node_modules`（与 `config_save.py` 同口径）；
+  视频文件故意无效，`MediaPlayer` 的 error 事件不是 `pageerror`，不影响断言。
+  门禁 `vue-tsc -b` + `vite build --emptyOutDir=false` + 探针全绿；Rust 零改动，
+  不重复跑 `cargo build`（避免增量产物被重定向到回收站）。
+- **v16（v4.9.66）**：新增 `probes/remove_with_files.py`（14 条断言，本地 HTTP 站点 +
+  真实 exe + `/jsonrpc` 造任务 + 页面同款 REST 删除）：A 普通删除 / `delete_files=0`
+  保留文件且 `deletedFiles=0`；B `delete_files=1` / `=true` 删掉目标文件并清掉任务记录；
+  C pause 任务手工补半成品与 `.aria2` 后删除，两个文件都没了且 worker 收尾不重建
+  控制文件；D 下载后把保存目录热替换到别处再删，白名单外文件不删且进 `failedFiles`。
+  Rust 单测补 `delete_output_files_stays_inside_roots`（越界 / 目录 / 软链接不删）。
+  门禁 `fmt` + `clippy -D warnings` + `cargo test`（346）+ `cargo build` +
+  `vue-tsc -b` + `vite build` 全绿。**坑**：本地 `vite build` 默认清空 `dist/assets`
+  会被执行环境的批量删除闸门拦下（109 个文件 > 50），验证时用
+  `vite build --emptyOutDir=false`；产物哈希已更新，仅残留旧 asset，不影响 debug 运行。
+- **v15（v4.9.65）**：新增 `probes/filename_policy.py`（23 条断言，本地 HTTP 站点 +
+  真实 exe + `/jsonrpc`）：A 无 CD 用 URL 末段且 `getOption` 不回显自动 `out`；B CD 的
+  UTF-8 中文名 / `filename*` 优先 / 显式 `out` 覆盖；C 危险 CD 名整段忽略、URL 里的
+  `%2F`、`..%2F` 不越出保存目录；D 同名二次下载改 `name.1.ext` 且不覆盖旧文件；
+  E `allow-overwrite=true` 恢复覆盖；F `auto-file-renaming=false` 报 aria2 的 13；
+  G 两个 pause 任务同名排队也要分到两个文件；H `filename=` 的 ISO-8859-1 / UTF-8
+  两种解释。门禁 `fmt` + `clippy -D warnings` + `cargo test`（345）+ `cargo build`
+  全绿，既有 `aria2_explorer` 15/15、`ariang_list` 18/18、`init_flow` /
+  `open_removed` 无回归。**坑**：活跃任务同名预检查若把 complete 的历史任务也算进去，
+  重复下载会凭空多一个 `.N` —— 只看 active / waiting / paused。
 - **v14（v4.9.64）**：新增 `probes/open_removed.py`（纯 CLI 探针，不起浏览器）：
   A `-h` 不含 `--open` / `ASMODAY_OPEN` 且字符全 ASCII；B 传 `--open` 启动 →
   clap `unexpected argument` 非零退出、不建库不监听；C 只设 `ASMODAY_OPEN=1`

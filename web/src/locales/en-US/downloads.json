@@ -12,11 +12,13 @@
     "counts": "Active {active} · Queued {queue}"
   },
   "tabs": {
+    "all": "All tasks",
     "active": "Active",
     "queue": "Queued",
     "done": "Completed"
   },
   "empty": {
+    "all": "No download tasks yet",
     "active": "No active downloads",
     "queue": "The queue is empty",
     "done": "No completed records yet"
@@ -40,8 +42,18 @@
     "paused": "Paused",
     "resumed": "Resumed",
     "removed": "Task removed",
+    "removedWithFiles": "Task removed, {count} files deleted",
     "purged": "Cleared {count} records",
     "pathCopied": "Save path copied"
+  },
+  "remove": {
+    "title": "Remove this task?",
+    "withFiles": "Also delete downloaded files",
+    "withFilesHint": "Includes the partial file and the .aria2 resume record. Active downloads are stopped first.",
+    "warning": "Files are permanently deleted from disk. Only files written by this task inside an allowed download directory are removed.",
+    "confirm": "Remove task",
+    "busy": "Working…",
+    "partial": "{count} file(s) could not be deleted (possibly outside the allowed directories). The task was removed."
   },
   "disabled": {
     "title": "Download engine is disabled",

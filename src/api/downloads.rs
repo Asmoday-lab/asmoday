@@ -13,7 +13,7 @@
 //! 「重启生效」提示（见 `engine` 的 `restart_required`）。
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -387,31 +387,33 @@ pub async fn unpause(
     }
 }
 
-/// DELETE /api/downloads/{gid}：运行中=停掉并移除；已停止=从列表清掉
+/// DELETE /api/downloads/{gid}?delete_files=1
+///
+/// 先按状态停任务/清记录（口径见 `DownloadManager::remove_task`），
+/// `delete_files=1` 时再删任务写出来的文件；只删仍在保存目录白名单内的普通文件。
+#[derive(Debug, Default, Deserialize)]
+pub struct RemoveQuery {
+    #[serde(default, deserialize_with = "crate::api::boolish")]
+    pub delete_files: Option<bool>,
+}
+
 pub async fn remove(
     State(state): State<AppState>,
     _admin: AdminUser,
     Path(gid): Path<String>,
+    Query(query): Query<RemoveQuery>,
 ) -> Response {
-    // 先看状态再决定调用哪个：`remove` 会把任务标成 Removed 并留在 stopped 列表里，
-    // 对已完成的任务用它就是「列表里还留着一条」——用户点删除却是这个结果会困惑。
-    let done = state
+    match state
         .downloads
-        .status_with_keys(&gid, Some(&["status".to_string()]))
+        .remove_task(&gid, query.delete_files.unwrap_or(false))
         .await
-        .and_then(|task| {
-            task.get("status")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    let result = match done.as_deref() {
-        Some("complete") | Some("error") | Some("removed") => {
-            state.downloads.remove_result(&gid).await
-        }
-        _ => state.downloads.remove(&gid).await,
-    };
-    match result {
-        Ok(gid) => Json(json!({ "gid": gid })).into_response(),
+    {
+        Ok(outcome) => Json(json!({
+            "gid": outcome.gid,
+            "deletedFiles": outcome.deleted_files,
+            "failedFiles": outcome.failed_files,
+        }))
+        .into_response(),
         Err(err) => rpc_error(err),
     }
 }

@@ -9,6 +9,7 @@ import { useI18n } from 'vue-i18n'
 import { RouterLink } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import type { IconName } from '../components/icons'
+import { isIconName } from '../components/icons'
 import { authApi } from '../api/auth'
 
 interface Entry {
@@ -58,6 +59,11 @@ const services = ref<ServiceCard[]>([])
 /** 卡片打开地址：走内置反代，保留 inject_headers / 混合内容规避能力 */
 function serviceHref(service: ServiceCard): string {
   return `/proxy/${service.id}/`
+}
+
+/** 卡片图标：合法名字用配置值，空值/未知值（源码模式手写）退回 grid，不让 AppIcon 拿到非法名 */
+function serviceIcon(service: ServiceCard): IconName {
+  return service.icon && isIconName(service.icon) ? service.icon : 'grid'
 }
 
 onMounted(async () => {
@@ -146,7 +152,8 @@ onMounted(async () => {
             <span
               class="grid size-10 shrink-0 place-items-center rounded-xl bg-elevated text-muted group-hover:text-accent"
             >
-              <AppIcon name="grid" :size="18" />
+              <!-- v4.9.70 前这里写死 grid，设置页配的图标从不生效（半死功能） -->
+              <AppIcon :name="serviceIcon(service)" :size="18" />
             </span>
             <span class="min-w-0 flex-1">
               <span class="block truncate text-sm font-medium text-ink">{{ service.name }}</span>

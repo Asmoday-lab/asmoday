@@ -1,17 +1,19 @@
 <script setup lang="ts">
 /**
- * 全局媒体灯箱（设计文档 3.2 / 8.4.9 / v4.4.6）。
+ * 全局媒体灯箱（设计文档 3.2 / 8.4.9 / v4.4.6，v4.9.67 统一导航层）。
  *
  * 交互骨架对齐 Telegram，工程细节参考 FileBrowser `Preview.vue`：
  * - **媒体是主角**：舞台铺满视口，顶栏与缩略图条是浮在画面上的临时层，
  *   闲置 2.6s 自动隐去（FileBrowser 是 1.5s 隐藏导航），鼠标一动、按任意键就回来；
- * - **顶栏**：左 × → 文件名 → 计数 chip → 下载 / 新窗 / 分享 / 信息（右键菜单保留，触屏也有入口了）；
- * - **底栏**：只在图片且多于一张时出现，跟随顶栏显隐；当前项加白环并轻微放大；
- *   视频不给底栏——Video.js 的控制条就在视口底部，两条会叠在一起；
- * - **图片**：滚轮以光标为锚点缩放、放大后拖动平移、双击 1↔2、双指捏合、
+ * - **顶栏**：文件名 → 计数 chip → 下载 / 新窗 / 分享 / 信息；左上角 ✕ **常驻**，
+ *   不随 chrome 隐去（v4.9.67：以前视频只有这个入口，顶栏一隐就无处可退）；
+ * - **导航层与媒体类型解耦**：左右箭头、缩略图条、计数、键盘 ←/→ 对图片与视频
+ *   一视同仁；视频时缩略图条上移到播放器控制条之上，用布局避让而不是整条砍掉；
+ * - **图片专属**：滚轮以光标为锚点缩放、放大后拖动平移、双击 1↔2、双指捏合、
  *   未放大时左右滑切图 / 下滑关闭（`useImageZoom`）；
- * - **视频**：铺满（`fill`），不再套 `max-w-4xl` 的盒子；播放器自带的 ✕ 关掉，
- *   避免和顶栏重复；`←/→` 在视频上做 ±5s 快进，不切条目（FileBrowser 特意做了这个放行）。
+ * - **视频专属**：铺满（`fill`）、播放器自带 ✕ 关掉；快进退改由 `J` / `L` 或
+ *   `Shift+←/→` 承担，`←/→` 统一翻页；触屏不接管播放器手势，翻页靠箭头与缩略图条；
+ * - **关闭**：Esc / 左上 ✕ / 点画面黑边（图片与视频同一套几何判定）/ 图片下滑。
  */
 import { useEventListener } from '@vueuse/core'
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, watch } from 'vue'
@@ -111,6 +113,8 @@ function toggleChrome() {
 }
 
 // ---------------- 图片缩放 / 滑动 ----------------
+// 缩放、拖动、左右滑、下滑关闭只属于图片；视频不把 pointer 交给 useImageZoom，
+// 否则拖播放器进度条会被判成「左右滑」而误翻页。视频的轻点走下面同一套 handleTap。
 const zoom = useImageZoom({
   container: () => stageEl.value,
   media: () => (imgEl.value?.offsetWidth ? imgEl.value : layerEl.value),
@@ -118,30 +122,7 @@ const zoom = useImageZoom({
   canDismiss: () => item.value?.kind === 'image',
   onSwipe: (delta) => stepLightbox(delta),
   onDismiss: () => closeLightbox(),
-  onTap: () => {
-    // 按下点落在自己的控件（左右箭头、缩放角标）上时什么都不做：
-    // 这些按钮在 stage 里，pointerup 会先走到这里——早先把「点黑边关闭」
-    // 误判进来，灯箱当场关掉，按钮的 click 永远等不到（上下页失效的真凶）
-    const down = downTarget as HTMLElement | null
-    if (down?.closest('button, a, [data-lightbox-control]')) return
-    // 信息层也算一层：点画面先把它收掉，别让面板和工具栏抢同一次点击
-    if (infoOpen.value) {
-      infoOpen.value = false
-      return
-    }
-    if (zoom.zoomed.value) {
-      toggleChrome()
-      return
-    }
-    if (item.value?.kind === 'image' && down && !hitsPicture()) {
-      // 未放大时点在画面外的黑边 / 舞台空白上 → 关闭（v4.6.16 修复：
-      // 原图 <img> 元素盒子是 size-full 铺满舞台的，object-contain 的黑边
-      // 也在元素里，早先 `downTarget !== imgEl` 的判定永远判不中黑边）
-      closeLightbox()
-      return
-    }
-    toggleChrome()
-  },
+  onTap: () => handleTap(downTarget),
 })
 const { style: zoomStyle } = zoom
 
@@ -149,21 +130,36 @@ const { style: zoomStyle } = zoom
 let downTarget: EventTarget | null = null
 /** 按下时的指针位置（黑边判定用，pointerup 才结算） */
 let downPoint: { x: number; y: number } | null = null
+/** 按下那一刻工具栏是否可见：轻点在「已隐」状态下只负责把它叫回来 */
+let downChromeVisible = true
 
 /**
- * 按下点是否落在图片的**实际渲染矩形**内（object-contain letterbox 几何）。
- * 元素信息不全（原图还没解码出尺寸）时按「在画面内」处理，宁可切工具栏不误关。
+ * 播放器兼容模式（v4.9.68）：开关搬进灯箱信息层，跟着查看器走。
+ * 以前只有影视库顶栏「更多」里能改，且要下次打开灯箱才生效；从文件管理或照片库
+ * 打开的视频根本找不到入口。localStorage 沿用旧 key，老用户不用重新选。
  */
-function hitsPicture(): boolean {
+const NATIVE_KEY = 'asmoday.cinema.native'
+const forceNative = ref(localStorage.getItem(NATIVE_KEY) === '1')
+function setForceNative(value: boolean) {
+  forceNative.value = value
+  localStorage.setItem(NATIVE_KEY, value ? '1' : '0')
+}
+
+/**
+ * 按下点是否落在媒体的**实际渲染矩形**内（object-contain letterbox 几何）。
+ * 图片用解码后的 natural，视频用播放器上报的 videoMeta；元数据没就绪时按
+ * 「在画面内」处理，宁可切工具栏也不误关。v4.9.67 起两种媒体走同一套判定。
+ */
+function hitsMedia(): boolean {
   const stage = stageEl.value
   const down = downPoint
   if (!stage || !down) return true
-  // 信息层 / 缩略图阶段还没有 natural，退回「元素内即画面内」的保守行为
-  if (!natural.value) return true
+  const dims = item.value?.kind === 'video' ? videoMeta.value : natural.value
+  if (!dims) return true
   const rect = stage.getBoundingClientRect()
-  const scale = Math.min(rect.width / natural.value.width, rect.height / natural.value.height)
-  const width = natural.value.width * scale
-  const height = natural.value.height * scale
+  const scale = Math.min(rect.width / dims.width, rect.height / dims.height)
+  const width = dims.width * scale
+  const height = dims.height * scale
   const offsetX = rect.left + (rect.width - width) / 2
   const offsetY = rect.top + (rect.height - height) / 2
   return (
@@ -171,11 +167,47 @@ function hitsPicture(): boolean {
   )
 }
 
+/** 轻点画面：图片与视频共用，保证「点黑边关闭 / 点画面切工具栏」口径一致 */
+function handleTap(target: EventTarget | null) {
+  // 按下点落在自己的控件（左右箭头、缩放角标）上时什么都不做：
+  // 这些按钮在 stage 里，pointerup 会先走到这里——早先把「点黑边关闭」
+  // 误判进来，灯箱当场关掉，按钮的 click 永远等不到（上下页失效的真凶）
+  const down = target as HTMLElement | null
+  if (down?.closest('button, a, [data-lightbox-control]')) return
+  // 信息层也算一层：点画面先把它收掉，别让面板和工具栏抢同一次点击
+  if (infoOpen.value) {
+    infoOpen.value = false
+    return
+  }
+  if (zoom.zoomed.value) {
+    toggleChrome()
+    return
+  }
+  const kind = item.value?.kind
+  if ((kind === 'image' || kind === 'video') && downPoint && !hitsMedia()) {
+    // 点在 object-contain 留下的黑边 / 舞台空白上 → 关闭。
+    // <img> / <video> 的盒子都是 size-full 铺满舞台的，黑边也在元素里，
+    // 所以必须按内容矩形算，不能靠 `target !== imgEl`（v4.6.16）。
+    closeLightbox()
+    return
+  }
+  // 工具栏已经自动隐去时，轻点只把它叫回来；否则才是「显示 ↔ 隐藏」的切换。
+  // 没有这个分支，pointerdown 的 noteActivity 会先亮起、onTap 又立刻按掉，
+  // 视频播放中点一下画面等于什么都没发生（v4.9.67）。
+  if (!downChromeVisible) {
+    chrome.value = true
+    hideAfterIdle()
+    return
+  }
+  toggleChrome()
+}
+
 function onStagePointerDown(event: PointerEvent) {
-  if (item.value?.kind !== 'image') return
+  downChromeVisible = chrome.value
+  noteActivity()
   downTarget = event.target
   downPoint = { x: event.clientX, y: event.clientY }
-  noteActivity()
+  if (item.value?.kind !== 'image') return
   zoom.onPointerDown(event)
 }
 
@@ -185,8 +217,19 @@ function onStagePointerMove(event: PointerEvent) {
 }
 
 function onStagePointerUp(event: PointerEvent) {
-  if (item.value?.kind !== 'image') return
-  zoom.onPointerUp(event)
+  if (item.value?.kind === 'image') {
+    zoom.onPointerUp(event)
+    return
+  }
+  // 视频 / 音频：不接管拖动，只把「轻点」按同一套规则结算
+  if (!downPoint) return
+  const travel = Math.hypot(event.clientX - downPoint.x, event.clientY - downPoint.y)
+  if (travel > 8) {
+    downPoint = null
+    return
+  }
+  handleTap(downTarget)
+  downPoint = null
 }
 
 function onStageWheel(event: WheelEvent) {
@@ -319,14 +362,20 @@ function onKey(event: KeyboardEvent) {
     return
   }
   const isVideo = item.value?.kind === 'video'
-  if (event.key === 'ArrowLeft') {
-    if (isVideo) playerRef.value?.seekBy(-5)
-    else stepLightbox(-1)
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    const back = event.key === 'ArrowLeft'
+    // v4.9.67：←/→ 对图片与视频都是「上/下一项」，屏幕上的左右箭头也是这个语义。
+    // 播放器的快进退让给 Shift+←/→ 与 J / L（播放器惯例），不再和导航抢键。
+    if (isVideo && event.shiftKey) playerRef.value?.seekBy(back ? -5 : 5)
+    else stepLightbox(back ? -1 : 1)
     return
   }
-  if (event.key === 'ArrowRight') {
-    if (isVideo) playerRef.value?.seekBy(5)
-    else stepLightbox(1)
+  if (isVideo && (event.key === 'j' || event.key === 'J')) {
+    playerRef.value?.seekBy(-10)
+    return
+  }
+  if (isVideo && (event.key === 'l' || event.key === 'L')) {
+    playerRef.value?.seekBy(10)
     return
   }
   if (isVideo && (event.key === ' ' || event.key === 'k')) {
@@ -490,10 +539,10 @@ onBeforeUnmount(() => {
         class="absolute inset-0 flex items-center justify-center overflow-hidden"
         :style="item.kind === 'image' ? { touchAction: 'none' } : undefined"
         @wheel="onStageWheel"
-        @pointerdown="onStagePointerDown"
-        @pointermove="onStagePointerMove"
-        @pointerup="onStagePointerUp"
-        @pointercancel="onStagePointerUp"
+        @pointerdown.capture="onStagePointerDown"
+        @pointermove.capture="onStagePointerMove"
+        @pointerup.capture="onStagePointerUp"
+        @pointercancel.capture="onStagePointerUp"
         @dblclick="onStageDblClick"
       >
         <!-- 图片：缩略图打底 → 原图淡入，整层跟着缩放/平移/滑动 -->
@@ -540,14 +589,18 @@ onBeforeUnmount(() => {
           </div>
         </template>
 
-        <!-- 视频：铺满视口，控制条与字幕交给 Video.js，顶栏只留我们自己的工具 -->
-        <div v-else-if="item.kind === 'video'" :key="item.path" class="size-full" @click="noteActivity">
+        <!-- 视频：铺满视口，控制条与字幕交给 Video.js，顶栏只留我们自己的工具。
+             不再挂 @click="noteActivity"：轻点由 stage 的 handleTap 统一结算，
+             否则 click 会把刚被 toggle 掉的工具栏又亮回来。 -->
+        <div v-else-if="item.kind === 'video'" :key="item.path" class="size-full">
           <MediaPlayer
             ref="playerRef"
             :src="rawUrl(item.path)"
             :poster="thumbUrl(item.path, THUMB_WIDTH.tile, item.modified)"
             :subtitle="item.subtitle ?? null"
+            :start-at="item.startAt ?? 0"
             :autoplay="true"
+            :force-native="forceNative"
             fill
             :show-close="false"
             @meta="videoMeta = $event"
@@ -557,7 +610,7 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- 音频 -->
-        <div v-else :key="item.path" class="w-full max-w-xl px-4">
+        <div v-else :key="item.path" class="w-full max-w-xl px-4" data-lightbox-control>
           <div class="mb-4 flex flex-col items-center gap-3">
             <img
               :src="coverUrl(item.path)"
@@ -578,11 +631,13 @@ onBeforeUnmount(() => {
           />
         </div>
 
-        <!-- 翻页：贴视口左右边缘，与媒体实际宽度无关；触屏靠左右滑，不占地方 -->
+        <!-- 翻页：贴视口左右边缘，与媒体实际宽度无关。
+             v4.9.67 起对图片与视频都常驻（隐藏时降到 45% 而不是 pointer-events-none），
+             小屏也显示——触屏上视频不接管播放器手势，这两个按钮就是它的翻页入口。 -->
         <button
           v-if="total > 1"
-          class="absolute left-2 top-1/2 z-20 hidden size-10 -translate-y-1/2 place-items-center rounded-full bg-black/40 text-white backdrop-blur transition-all hover:bg-black/70 sm:grid"
-          :class="chrome ? 'opacity-100' : 'pointer-events-none opacity-0'"
+          class="absolute left-2 top-1/2 z-40 grid size-9 -translate-y-1/2 place-items-center rounded-full bg-black/40 text-white backdrop-blur transition-opacity hover:bg-black/70 sm:size-10"
+          :class="chrome ? 'opacity-100' : 'opacity-45'"
           :title="t('gallery.viewer.prev')"
           data-testid="lightbox-prev"
           @click.stop="stepLightbox(-1)"
@@ -591,8 +646,8 @@ onBeforeUnmount(() => {
         </button>
         <button
           v-if="total > 1"
-          class="absolute right-2 top-1/2 z-20 hidden size-10 -translate-y-1/2 place-items-center rounded-full bg-black/40 text-white backdrop-blur transition-all hover:bg-black/70 sm:grid"
-          :class="chrome ? 'opacity-100' : 'pointer-events-none opacity-0'"
+          class="absolute right-2 top-1/2 z-40 grid size-9 -translate-y-1/2 place-items-center rounded-full bg-black/40 text-white backdrop-blur transition-opacity hover:bg-black/70 sm:size-10"
+          :class="chrome ? 'opacity-100' : 'opacity-45'"
           :title="t('gallery.viewer.next')"
           data-testid="lightbox-next"
           @click.stop="stepLightbox(1)"
@@ -617,24 +672,29 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <!-- 顶栏：Telegram 顺序（× 在最左）与我们全屏编辑器保持一致 -->
+      <!-- 常驻退出：顶栏会随 chrome 隐去，但「怎么退出」不能跟着消失（v4.9.67）。
+           独立放在 header 之外：父级一旦 opacity-0 + pointer-events-none，
+           子元素再怎么设都点不动；隐藏时只降透明度，仍可点。 -->
+      <button
+        type="button"
+        class="absolute left-1 top-[10px] z-40 grid size-9 place-items-center rounded-full bg-black/35 text-white/85 backdrop-blur transition-opacity hover:bg-black/70 hover:text-white sm:left-2"
+        :class="chrome ? 'opacity-100' : 'opacity-45'"
+        style="margin-top: env(safe-area-inset-top, 0px)"
+        :title="t('gallery.viewer.close')"
+        data-testid="lightbox-close"
+        @click="closeLightbox()"
+      >
+        <AppIcon name="close" :size="18" />
+      </button>
+
+      <!-- 顶栏：文件名 → 计数 → 下载 / 新窗 / 分享 / 信息；左侧给常驻 × 留位 -->
       <header
-        class="absolute inset-x-0 top-0 z-30 flex h-14 items-center gap-1.5 bg-gradient-to-b from-black/80 via-black/45 to-transparent pr-2 pl-1 transition-opacity duration-300 sm:gap-2 sm:pl-2"
+        class="absolute inset-x-0 top-0 z-30 flex h-14 items-center gap-1.5 bg-gradient-to-b from-black/80 via-black/45 to-transparent pr-2 pl-11 transition-opacity duration-300 sm:gap-2 sm:pl-12"
         :class="chrome ? 'opacity-100' : 'pointer-events-none opacity-0'"
         style="padding-top: env(safe-area-inset-top, 0px)"
         @pointerenter="holding = true"
         @pointerleave="releaseHold"
       >
-        <button
-          type="button"
-          class="grid size-9 shrink-0 place-items-center rounded-full text-white/85 transition-colors hover:bg-white/15 hover:text-white"
-          :title="t('gallery.viewer.close')"
-          data-testid="lightbox-close"
-          @click="closeLightbox()"
-        >
-          <AppIcon name="close" :size="18" />
-        </button>
-
         <p class="min-w-0 flex-1 truncate text-[13px] text-white/85" :title="item.name">
           {{ item.name }}
         </p>
@@ -703,15 +763,47 @@ onBeforeUnmount(() => {
             </div>
           </dl>
           <p v-else class="text-white/40">{{ t('gallery.viewer.infoPending') }}</p>
+          <!-- 键位提示：←/→ 改回翻页后，快进退得有可发现的去处 -->
+          <p
+            v-if="item.kind === 'video'"
+            class="mt-2 border-t border-white/10 pt-2 text-white/40"
+            data-testid="lightbox-video-keys"
+          >
+            {{ t('gallery.viewer.videoKeys') }}
+          </p>
+          <!-- 播放器兼容模式属于播放器自己的设置：放在查看器里，任何入口都能改 -->
+          <label
+            v-if="item.kind === 'video'"
+            class="mt-2 flex cursor-pointer items-start gap-2 border-t border-white/10 pt-2"
+            data-testid="lightbox-compat-row"
+          >
+            <input
+              type="checkbox"
+              class="mt-0.5 size-3.5 shrink-0 accent-sky-400"
+              :checked="forceNative"
+              :aria-label="t('gallery.viewer.compatMode')"
+              data-testid="lightbox-compat-mode"
+              @change="setForceNative(!forceNative)"
+            />
+            <span class="min-w-0">
+              <span class="block text-white/80">{{ t('gallery.viewer.compatMode') }}</span>
+              <span class="mt-0.5 block text-white/40">{{ t('gallery.viewer.compatModeHint') }}</span>
+            </span>
+          </label>
         </div>
       </Transition>
 
-      <!-- 缩略图条：跟随顶栏显隐；只有图片且多于一张才出现 -->
+      <!-- 缩略图条：跟随顶栏显隐；多条目就出现，图片与视频一视同仁（v4.9.67）。
+           视频的播放控制条在视口底部，所以整条上移到它上方——用布局避让，
+           而不是把导航整条砍掉让用户以为「视频没有上下页」。 -->
       <div
-        v-if="total > 1 && item.kind === 'image'"
+        v-if="total > 1"
         ref="stripEl"
-        class="lightbox-strip absolute inset-x-0 bottom-0 z-30 flex h-[70px] items-center gap-1.5 overflow-x-auto overflow-y-hidden bg-gradient-to-t from-black/85 via-black/50 to-transparent px-3 pt-3 pb-3 transition-all duration-300"
-        :class="chrome ? 'translate-y-0 opacity-100' : 'pointer-events-none translate-y-full opacity-0'"
+        class="lightbox-strip absolute inset-x-0 z-30 flex items-center gap-1.5 overflow-x-auto overflow-y-hidden bg-gradient-to-t from-black/85 via-black/50 to-transparent px-3 pt-3 pb-3 transition-all duration-300"
+        :class="[
+          chrome ? 'translate-y-0 opacity-100' : 'pointer-events-none translate-y-full opacity-0',
+          item.kind === 'video' ? 'bottom-[76px] h-[64px]' : 'bottom-0 h-[70px]',
+        ]"
         style="padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px))"
         data-testid="lightbox-strip"
         @pointerenter="holding = true"
@@ -724,12 +816,13 @@ onBeforeUnmount(() => {
             :key="entry.path"
             :ref="(el) => setThumbRef(index, el as Element | null)"
             type="button"
-            class="relative size-11 shrink-0 overflow-hidden rounded-md transition-all duration-200"
-            :class="
+            class="relative shrink-0 overflow-hidden rounded-md transition-all duration-200"
+            :class="[
               index === lightboxState.index
                 ? 'scale-105 ring-2 ring-white/85'
-                : 'opacity-55 ring-1 ring-white/10 hover:opacity-90'
-            "
+                : 'opacity-55 ring-1 ring-white/10 hover:opacity-90',
+              item.kind === 'video' ? 'size-9' : 'size-11',
+            ]"
             :title="entry.name"
             @click="jumpLightbox(index)"
           >

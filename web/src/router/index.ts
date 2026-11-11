@@ -121,7 +121,7 @@ const routes: RouteRecordRaw[] = [
     path: '/shares',
     name: 'shares',
     component: () => import('../views/SharesView.vue'),
-    meta: { title: 'common.nav.shares', icon: 'share', subtitle: 'common.subtitle.shares' },
+    meta: { title: 'common.nav.shares', icon: 'link', subtitle: 'common.subtitle.shares' },
   },
   {
     path: '/settings',

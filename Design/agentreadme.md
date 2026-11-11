@@ -447,6 +447,8 @@ GWT-DL-37 Given 目标站返回 Cloudflare `Just a moment...` 质询页（403 + 
 GWT-DL-38 Given 插件（Aria2 Explorer 内置 AriaNg）已有一条已停止任务、左侧「已完成/已停止 (1)」有计数  When 打开任务列表  Then 右侧能列出该任务的 gid/status/errorCode/files（AriaNg 用 `system.multicall` 发 `tellActive` / `tellWaiting(0,1000)` / `tellStopped(-1,1000)`，token 只放在子调用的 params[0]）；外层单独带 token、内外两层都带 token 的旧写法照样工作；任一子调用伪造或缺少 token 时整批仍返回 `Unauthorized`（v4.9.58）
 GWT-DL-39 Given 在最终提交重打 `v0.1.0-alpha.1`  When release 与 docker 两条 tag 工作流跑完  Then Release 挂着 win-msvc / linux-musl x2 三件产物，GHCR 存在 `:v0.1.0-alpha.1` 多架构 manifest（含 amd64 与 arm64）；单架构 tag 因关闭 provenance 是单一 manifest，merge 用 imagetools create 不再报 `is a manifest list`；预发布 tag 不覆盖 `:latest`（v4.9.59）
 GWT-DL-40 Given 下载引擎设置页与新建下载弹窗都要选目录  When 用户点「选择目录」/「浏览子目录」  Then 打开的是内联面板而非浮层（不新增 useBackClose 哨兵），只列子目录、面包屑可逐级回跳、可新建文件夹且建完自动进入；选中即回填，全程无需手输路径；设置页回填 `mount_id + rel`，新建下载回填绝对路径且「保存到」下拉仍显示所属保存目录、路径文本显示 `保存目录 / 子路径`；浏览不能越出挂载点或当前允许的保存目录（v4.9.60）
+GWT-DL-42 Given 下载任务首响应已到、还没落盘  When 没有显式 out  Then 按显式 out > Content-Disposition（filename* 优先、filename= 次之）> URL 末段定名，URL 名在 percent-decode 后净化（/、\、控制字符 → %XX），CD 名含路径成分或 .. 整段忽略；目标已存在且无匹配控制文件时按 name.1.ext…name.9999.ext 改名（有 .aria2 的候选可复用），绝不覆盖已有文件；allow-overwrite=true 才覆盖、auto-file-renaming=false 报 code 13、用尽报 14；暂停恢复不重复改名；三个开关经 getOption 回显（v4.9.65，对齐 aria2 1.37）
+GWT-DL-43 Given 下载引擎任务列表里有进行中 / 等待中 / 已完成三种任务  When 打开页面  Then 默认停在新页签「全部任务」，一页按 active → waiting → stopped 顺序列出全部任务且计数为三者之和；切到「进行中」「等待中」「已完成」仍各自只显示该族，「清空记录」只在「已完成」出现。点任一任务的删除按钮先弹确认框（不再直接删），复选框「同时删除已下载的文件」默认不勾、勾上显示不可逆警告；不勾只移除任务、磁盘文件保留；勾上则 `DELETE /api/downloads/{gid}?delete_files=1` 后目标文件（及未完成的 `.aria2` 控制文件 / BT 文件清单）一起消失，提示删掉的数量。被移出当前「允许的保存目录」白名单的文件、软链接、目录一律不删，任务仍正常移除并把路径列进 `failedFiles` 提示；HTTP worker 收尾不会重建 `.aria2`；RPC 侧 `aria2.remove` 仍保留文件（v4.9.66）
 GWT-DL-41 Given 下载引擎设置页已改了任一引擎参数  When 点「保存引擎参数」  Then 不出现 `Failed to execute 'structuredClone' ... #<Object> could not be cloned`，`POST /api/config` 返回 200 且请求体只改了那一个字段、`system` 段原样回传；保存后 GET 读到新值、未保存角标消失；无改动再保存一次仍成功。`fullConfig` / `settings` 都是 ref，深拷贝一律走 JSON 往返，禁止对 `.value`（响应式代理）调用 `structuredClone`（v4.9.61）
 
 #### BitTorrent（GWT-BT，v4.9.27）
@@ -1341,13 +1343,13 @@ GET /api/media/photos/timeline?mount_id=&cursor=
 GWT-PHOTO-01 Given 挂载点含 3 个一级目录  When 进入相册  Then 只显示含图片的目录卡片，无图目录剔除
 GWT-PHOTO-02 Given 目录内图片  When 进入相册  Then count 只数第一层
 GWT-PHOTO-03 Given 时间线  When 滚动  Then 年月标题吸顶，穿透所有子目录
-GWT-PHOTO-04 Given 灯箱打开  When 点击左右箭头  Then 在同目录同类型数组内切换
-GWT-PHOTO-05 Given 灯箱  When 键盘 ← →  Then 同上
-GWT-PHOTO-06 Given 灯箱  When 关闭  Then 遮罩消失，页面滚动恢复
-GWT-PHOTO-07 Given 灯箱打开  When 闲置 2.6 秒  Then 顶栏与缩略图条隐去，鼠标一动立即回来
+GWT-PHOTO-04 Given 灯箱打开（图片或视频）  When 点击左右箭头  Then 在入口传入的媒体序列内切换（图片与视频可混排），左右箭头常驻且小屏可见（v4.9.67）
+GWT-PHOTO-05 Given 灯箱（图片或视频）  When 键盘 ← →  Then 一律翻上/下一项；Shift+←/→（±5s）与 J / L（±10s）才是视频快进退（v4.9.67）
+GWT-PHOTO-06 Given 灯箱  When 关闭  Then 遮罩消失，页面滚动恢复；Esc、左上常驻 ✕、点黑边三种路径对图片与视频都可用
+GWT-PHOTO-07 Given 灯箱打开  When 闲置 2.6 秒  Then 顶栏与缩略图条隐去，鼠标一动立即回来；但左上 ✕ 与左右箭头只降到 45% 透明度、仍可点（v4.9.67）
 GWT-PHOTO-08 Given 灯箱图片  When 滚轮放大到 200%  Then 光标下那一点不动；拖动可平移；双击回到 100%
-GWT-PHOTO-09 Given 手机灯箱  When 左滑  Then 下一张；When 下滑  Then 关闭灯箱（位移跟手，未到阈值回弹）
-GWT-PHOTO-10 Given 灯箱视频  When 按 →  Then 快进 5 秒且不切条目；视频铺满视口且只有顶栏一个关闭按钮
+GWT-PHOTO-09 Given 手机灯箱图片  When 左滑  Then 下一张；When 下滑  Then 关闭灯箱（位移跟手，未到阈值回弹）。视频不接管播放器手势，翻页靠箭头与缩略图条
+GWT-PHOTO-10 Given 灯箱视频  When 按 →  Then 切下一项（不再是快进）；Then 视频铺满视口、缩略图条上移到播放控制条之上仍可见、只有左上常驻一个 ✕（v4.9.67）
 GWT-PHOTO-11 Given 灯箱打开  When 点击左右箭头或缩放胶囊  Then 正常生效且灯箱不关（onTap 按 closest('button, a') 豁免 stage 内控件）
 GWT-PHOTO-12 Given 图片模式  When 看底部  Then 缩放胶囊常驻显示百分比，未放大淡显、放大变亮，点击复位
 GWT-PHOTO-13 Given 快速连按翻页  When 旧图 load 晚到  Then 不污染新图 ready，无空白闪帧；打底图与原图均已预载
@@ -1357,6 +1359,7 @@ GWT-PHOTO-16 Given 灯箱  When 长按 +/−  Then 只放大一档；When 长按
 GWT-PHOTO-17 Given 深链进 /cinema 再点侧边栏「图片库」  Then 相册清单必须出现（切分区要补拉，不能停在「没有找到含图片的文件夹」）
 GWT-PHOTO-18 Given 相册清单接口 500 / 断网  Then 显示错误 + 「重新扫描」，不得显示成空相册；点重试后恢复
 GWT-PHOTO-19 Given 索引里有图（counts.image>0）但相册清单为空  Then 文案是「相册清单没有加载出来」并给重扫入口
+GWT-PHOTO-20 Given 图片库 / 影视库 / 文件管理任意入口  When 点开图片或视频  Then 打开的是同一个全局 MediaLightbox（影视库不再有私有全屏播放器），翻页 / 关闭 / 工具栏口径一致；Given 相册详情或时间线  When 翻页  Then 序列含同目录视频（`browse?kind=media&depth=0`，过滤 audio），缩略图条能直接跳到 .mp4；Given 顶栏  Then 分享动作是三点两线图标，侧边栏「分享管理」是 link 图标，两者不再共用（v4.9.67）
 GWT-PHOTO-20 Given 慢网 >180ms  Then 骨架形状与真实卡片一致（4:3 + 两行字 / 方格 / 16:9），内容到达时无跳版，且刷新时不清空旧数据
 GWT-PHOTO-21 Given prefers-reduced-motion  Then 骨架不动画（只留静态底块）
 GWT-THUMB-01 Given 缩略图 URL 带 v=<mtime>  When 服务端指纹与 mtime 一致  Then 回 immutable 长缓存；不带 v 则 private, no-cache + ETag，条件请求回 304
@@ -1621,7 +1624,11 @@ GWT-CFG-08 Given 恢复默认分区块  When 点击  Then 只重置该区块，�
 #### 范围
 - 配置驱动，外部服务默认新标签页打开，禁止 iframe。
 - 反代模式链接 `/proxy/{service_id}`，Rust `hyper` 代理。
-- 剥离路径前缀、重写内部绝对链接、忽略 SSL 证书（高级选项）。
+- 重写内部绝对链接、忽略 SSL 证书（高级选项）；`strip_prefix` 只作存量配置兼容字段保留，
+  路由天然剥离 `/proxy/<id>`，运行时不读取、表单不暴露。
+- `[[services]].id` 是永久反代 URL：新建用 `service-N`，表单常驻 `/proxy/<id>/` 预览与复制，
+  改名行内提示断链，保存前校验空值 / 字符集 / 查重 / 目标协议。
+- `inject_headers` 按可增删行编辑，保存时折叠回 `BTreeMap`，不得只保留第一对。
 - 转发前摘除 `asmoday_session` Cookie；上游同名 `Set-Cookie` 丢弃。
 
 #### GWT 验收
@@ -1633,6 +1640,14 @@ GWT-PROXY-03 Given 请求 /proxy/{id}  When 转发  Then Cookie 中 asmoday_sess
 GWT-PROXY-04 Given 上游 Set-Cookie  When 响应  Then 同名 Cookie 被丢弃
 GWT-PROXY-05 Given inject_headers 配置  When 转发  Then 注入头生效
 GWT-PROXY-06 Given 上游返回绝对链接  When rewrite_internal_links=true  Then 改写为 /proxy/{id}/...
+GWT-PROXY-07 Given 源码模式写了 3 个 inject_headers  When 表单里改其中一行并保存  Then 3 个头全部保留
+GWT-PROXY-08 Given 外部服务表单  When 打开  Then 不出现「剥离路径前缀」，但常驻 /proxy/<id>/ 预览与复制
+GWT-PROXY-09 Given 新建外部服务  When 点「+ 添加」  Then id 是可读的 service-N 而非时间戳随机串
+GWT-PROXY-10 Given 已落盘服务的 id 被改掉  When 未保存  Then 行内提示旧地址将失效；保存后提示消失
+GWT-PROXY-11 Given id 为空 / 含空格 / 与另一条重复  When 点保存  Then 不发 POST /api/config 且行内给出原因
+GWT-PROXY-12 Given 图标选择器  When 点触发按钮  Then 弹出可视化图标宫格（非文字下拉），点外 / Esc / 滚动收起
+GWT-PROXY-13 Given 源码模式写了图标集之外的 icon 值  When 打开表单  Then 按钮显示原文且值不丢，选中宫格格子才覆盖
+GWT-PROXY-14 Given 服务配置了合法 icon（如 folder）  When 打开门户 /  Then 卡片渲染该图标；空 / 未知值退回 grid（v4.9.70 前写死 grid，从不生效）
 ```
 
 #### 依赖红线
@@ -1774,10 +1789,10 @@ GWT-UP-10 Given 上传临时文件命名  When 进程被强杀后重启  Then �
 GWT-NAV-01 Given /files/m0/a/b  When 浏览器返回键  Then 回 /files/m0/a（上一个目录），再退回挂载点根、再退出门户；history.length 随目录导航增长
 GWT-NAV-02 Given 挂载点改指到新路径  When 重新进入 /files  Then 旧位置目录的上一帧被丢弃（快照键带挂载点路径 + 挂载点清单变更即清帧），不出现「旧索引 + 只有转圈」的窗口
 GWT-FADE-01 Given 门户 → 文件管理路由切换  Then 过渡为同帧交叉淡入（#app-scroll 内短暂同时挂两个页面），不再有 out-in 的整页空白帧
-GWT-LBX-01 Given 灯箱显示一张 contain 后有黑边的图  When 鼠标点在黑边（避开箭头/胶囊控件）  Then 灯箱关闭；点在画面内只切 chrome；Esc 始终可关
+GWT-LBX-01 Given 灯箱显示 contain 后有黑边的图片或视频  When 鼠标点在黑边（避开箭头/胶囊控件）  Then 灯箱关闭；点在画面内只切 chrome；Esc 始终可关（v4.9.67 起 `hitsMedia()` 用 natural / videoMeta 对两种媒体算同一套几何）
 GWT-GAL-01 Given 图片库  When 打开  Then 默认落在时间线：按天分段（`YYYY年M月D日 周X`），每段内为等高行，同一行格子等高且行宽贴齐容器（非末行偏差 ≤2px），图片按真实宽高比占宽不裁成方格，末行不拉伸；Given 工具栏切换  Then 可切到文件夹墙（路径升序、同父目录相邻），两边都能进册与 Esc 退回
 GWT-GAL-05 Given 图片库「按文件夹」  Then 卡片是封面铺满 + 名称 + 「时间范围 · N 项」（如 2020/4 – 2022/5 · 1030 项），没有文件夹图标/数量角标/模糊底纹，行内卡片等高；同名目录靠 title 悬停看完整路径
-GWT-GAL-06 Given 图片库「按文件夹」  When 点排序下拉切「按修改日期」  Then 列表按册内最新图时间重排，游标作废从第一页重取；Given 顶栏  Then 只有视图切换、分组、排序与「更多」，重新扫描/收藏筛选/原生播放器/分页进度都在「更多」里
+GWT-GAL-06 Given 图片库「按文件夹」  When 点排序下拉切「按修改日期」  Then 列表按册内最新图时间重排，游标作废从第一页重取；Given 顶栏（v4.9.68）  Then 只有视图切换、分组、排序、常驻「只看收藏」筛选 chip、分页进度与重新扫描，不再有「更多」下拉，播放器兼容模式在灯箱信息层
 GWT-GAL-07 Given 库里有 10698 张图  When 打开图片库  Then 首屏只取 120 条（时间线/相册同口径），触底续接；Given 文件管理打开 1030 条的目录  Then 单页 200 条 + has_more，可直接续到底
 GWT-GAL-08 Given 两万条媒体的库（v4.7.0）  When 连续翻页/切分区/进文件夹墙  Then 只有第一页走一次目录树，其余请求走 SQLite 索引（`scanned=0`，同页再取 <1s）；When 点「重新扫描」（`refresh=1`）  Then 立刻穿透窗口重扫
 GWT-GAL-11 Given 索引里已有 A 挂载点的目录行（v4.8.1）  When 配置改成 B（A 从配置里消失）且后台跑到下一轮  Then A 的 `media_dirs` / `media_assets` / `media_roots` 全部清掉，接口只返回 B；Given 用户改完挂载点回到图片库  Then 相册墙不再贴上一帧的旧库目录（切视图即刷新，快照挂载点指纹不符就作废）；Given 所有挂载点暂时离线  When 后台轮询跑到  Then 不清索引（等网络恢复）
@@ -1785,6 +1800,11 @@ GWT-GAL-09 Given 库里有 17800 图 / 4002 视频 / 96 音频  When 打开图�
 GWT-GAL-02 Given 时间线  When 切「按文件夹」  Then 分组头为目录名且年份刻度隐藏；When 滚动  Then 右侧年份刻度跟随高亮，点年份跳到该年第一天，窄屏（<md）不显示刻度。Given 影视库  Then 默认落「全部影片」按天分段 + 等高行（16:9），与照片库同一套布局，触底续接走同一条分页流
 GWT-GAL-03 Given 照片时间线/相册网格（冷缓存）  When 首屏渲染  Then 缩略图请求按 DOM 行序发出（并发 6），前排先出图，不会「东一块西一块」随机亮；滚到密集日期  Then 下一批请求仍按行序；When 服务端解码队列打满  Then 回 503 + Retry-After，前端退避重试，最终可见格子全部出图（不留永久灰块）
 GWT-GAL-04 Given 时间线只有一年照片  When 打开  Then 右侧刻度尺仍然显示该年（不再要求 >1 年）；Given 年份跨 2026..2024 且中间某年没有照片  Then 该年也占一格，点击不跳转
+GWT-GAL-12 Given 三个媒体分区任一  When 打开顶栏  Then 不存在「更多」下拉（`gallery-more`），照片库也不会出现只有 padding 的空白气泡；三分区都有常驻的「只看收藏」chip 且 `aria-pressed` 初始为 false
+GWT-GAL-13 Given 时间线 / 相册详情 / 全部影片 / 影视文件夹详情 / 音乐列表  When 打开「只看收藏」  Then 只显示已收藏条目，chip 进强调色激活态并带 × 清除出口，分页进度「已加载 / 共 N」隐藏，空态文案是「已加载的项目里没有收藏」而不是「媒体库是空的」；When 再次点击 chip  Then 完整列表恢复
+GWT-GAL-14 Given 文件夹墙 / 相册墙（目录维度）  When 看「只看收藏」chip  Then 禁用且 title 说明「切到时间线或全部影片后可筛选」，不允许出现勾了却毫无反应的状态；When 从列表视图带着筛选切到目录墙  Then 顶栏仍能看到筛选处于激活态（不隐藏、不静默失效）
+GWT-GAL-15 Given 窄屏（<sm）音乐库  When 看曲目行  Then 三点按钮常驻可见、带 aria-label、点击能开单条菜单且 Esc 只收菜单；Given 窄屏影视库  When 长按视频卡片  Then 打开同一个 ContextMenu 且紧随的 click 不会误开灯箱；Given 任意竖三点  Then 描边加粗到 3（不作为页面级设置图标使用）
+GWT-GAL-16 Given 视频灯箱  When 点「信息」  Then 信息层有「兼容模式（原生播放器）」开关，勾选即时切到原生 `<video controls>` 并写入 `asmoday.cinema.native`，取消即回；Given 图片灯箱  When 打开同一信息层  Then 不显示该开关；Given 从文件管理/照片库打开的视频  Then 同样能改这个开关
 ```
 
 #### GWT 验收（挂载点配置与设置页，v4.6.17）

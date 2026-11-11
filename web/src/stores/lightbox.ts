@@ -3,6 +3,7 @@
  *
  * 单例原则：整个应用只有 App.vue 里的一个 `MediaLightbox` 实例（Teleport 到 body），
  * 文件管理、相册、影视库共用它，严禁在列表循环里各写一套 `<img>` / `<video>` 弹窗。
+ * v4.9.67 起影视库的私有全屏播放器已删除，三个入口真正收到同一个实例上。
  *
  * 状态本体在 Pinia store 里（`useLightboxStore`），文件末尾再导出几个具名符号，
  * 让组件层保持「`lightboxState.open` / `openLightbox(...)`」这种简洁写法。
@@ -23,6 +24,8 @@ export interface LightboxItem {
   size?: number
   /** 修改时间（unix 秒），同上 */
   modified?: number | null
+  /** 视频续播起点（秒）：影视库收敛到灯箱后由调用方带上（v4.9.67） */
+  startAt?: number
 }
 
 export interface OpenOptions {

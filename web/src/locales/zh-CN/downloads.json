@@ -12,11 +12,13 @@
     "counts": "进行中 {active} · 队列 {queue}"
   },
   "tabs": {
+    "all": "全部任务",
     "active": "进行中",
     "queue": "等待中",
     "done": "已完成"
   },
   "empty": {
+    "all": "还没有下载任务",
     "active": "暂无进行中的下载",
     "queue": "队列是空的",
     "done": "还没有已完成的记录"
@@ -40,8 +42,18 @@
     "paused": "已暂停",
     "resumed": "已继续",
     "removed": "任务已移除",
+    "removedWithFiles": "任务已移除，删除了 {count} 个文件",
     "purged": "已清空 {count} 条记录",
     "pathCopied": "保存路径已复制"
+  },
+  "remove": {
+    "title": "移除这个任务？",
+    "withFiles": "同时删除已下载的文件",
+    "withFilesHint": "包含未完成的文件与 .aria2 续传记录；进行中的任务会先停止。",
+    "warning": "文件会从磁盘永久删除，无法恢复。只删除本任务写入、且仍在允许保存目录内的文件。",
+    "confirm": "移除任务",
+    "busy": "处理中…",
+    "partial": "{count} 个文件未能删除（可能已移出允许的保存目录），任务已移除。"
   },
   "disabled": {
     "title": "下载引擎未启用",

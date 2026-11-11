@@ -19,6 +19,12 @@ const props = withDefaults(
 const paths = computed(() => ICONS[props.name] ?? [])
 /** 音量类图标：第一段（喇叭体）实心，其余段（声波/叉）描边 */
 const headSolid = computed(() => HEAD_SOLID.has(props.name))
+/**
+ * 竖排三点用极短线段 + round linecap 画成圆点：默认 1.6 描边在 14~16px 尺寸下
+ * 只有约 1px，几乎看不见。这类图标单独加粗，不改变调用方。
+ */
+const DOT_ICONS = new Set<IconName>(['more'])
+const strokeWidth = computed(() => (DOT_ICONS.has(props.name) ? 3 : props.strokeWidth))
 /** 某一段是否走实心：整体 filled，或该图标的首段实心 */
 const isFilled = (index: number) => props.filled || (headSolid.value && index === 0)
 </script>
@@ -30,7 +36,7 @@ const isFilled = (index: number) => props.filled || (headSolid.value && index ==
     viewBox="0 0 24 24"
     :fill="props.filled ? 'currentColor' : 'none'"
     :stroke="props.filled ? 'none' : 'currentColor'"
-    :stroke-width="props.filled ? 0 : props.strokeWidth"
+    :stroke-width="props.filled ? 0 : strokeWidth"
     stroke-linecap="round"
     stroke-linejoin="round"
     aria-hidden="true"

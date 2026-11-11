@@ -37,6 +37,14 @@ export interface DownloadTask {
   bittorrent?: { info?: { name?: string } }
 }
 
+export interface RemoveResult {
+  gid: string
+  /** 实际删掉的文件数（含 `.aria2` 控制文件）；没勾选时为 0 */
+  deletedFiles?: number
+  /** 删不掉 / 不敢删的路径，交给页面提示 */
+  failedFiles?: string[]
+}
+
 export interface GlobalStat {
   downloadSpeed: number
   uploadSpeed: number
@@ -147,8 +155,15 @@ export const downloadsApi = {
       method: 'POST',
     }),
 
-  remove: (gid: string) =>
-    request<{ gid: string }>(`/api/downloads/${encodeURIComponent(gid)}`, { method: 'DELETE' }),
+  /**
+   * 移除任务；`deleteFiles` 为真时连带删掉任务写出来的文件（v4.9.66）。
+   * 后端只删仍在保存目录白名单内的普通文件，删不掉的会列在 `failedFiles`。
+   */
+  remove: (gid: string, deleteFiles = false) =>
+    request<RemoveResult>(
+      `/api/downloads/${encodeURIComponent(gid)}${deleteFiles ? '?delete_files=1' : ''}`,
+      { method: 'DELETE' },
+    ),
 
   purge: () => request<{ removed: number }>('/api/downloads/stopped', { method: 'DELETE' }),
 }

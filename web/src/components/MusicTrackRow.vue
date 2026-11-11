@@ -114,11 +114,14 @@ const duration = computed(() => formatDuration(props.item.duration_ms))
       <AppIcon name="heart" :size="14" :filled="favorite" />
     </button>
 
-    <!-- 更多：右键也能开，这里给触屏和「不知道有右键」的人留一个入口 -->
+    <!-- 更多：右键也能开。窄屏没有 hover，按钮必须常驻可见（v4.9.68）——
+         以前 `hidden sm:grid` + group-hover 恰好把最需要它的触屏用户挡在门外。 -->
     <button
       type="button"
-      class="hidden size-7 shrink-0 place-items-center rounded text-muted opacity-0 transition-opacity hover:bg-panel hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 sm:grid"
+      class="grid size-7 shrink-0 place-items-center rounded text-muted opacity-70 transition-colors hover:bg-panel hover:text-ink focus-visible:bg-panel focus-visible:text-ink sm:opacity-40 sm:group-hover:opacity-100"
       :title="t('gallery.toolbar.more')"
+      :aria-label="t('gallery.toolbar.more')"
+      data-testid="track-more"
       @click.stop="emit('menu', $event)"
     >
       <AppIcon name="more" :size="14" />

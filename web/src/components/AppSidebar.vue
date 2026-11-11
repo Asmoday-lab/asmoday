@@ -53,7 +53,7 @@ const groups = computed<NavGroup[]>(() => [
   {
     title: 'common.group.system',
     items: [
-      { to: '/shares', label: 'common.nav.shares', icon: 'share' },
+      { to: '/shares', label: 'common.nav.shares', icon: 'link' },
       { to: '/settings', label: 'common.nav.settings', icon: 'gear' },
     ],
   },

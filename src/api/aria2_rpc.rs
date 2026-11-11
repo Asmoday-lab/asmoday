@@ -326,6 +326,8 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
                 .or_else(|| option_str(&options, "split"))
                 .and_then(|v| v.parse::<usize>().ok());
             let headers = option_header_list(&options);
+            // aria2 的文件名策略开关（默认 allow-overwrite=false / auto-file-renaming=true）
+            let flags = option_flags(&options);
             let pause = option_bool(&options, "pause");
             // magnet 走 BT 分支时把 select-file 一起带过去（0 基）
             let only_files = option_select_files(&options);
@@ -353,6 +355,7 @@ async fn run_method(state: &AppState, method: &str, args: &[Value]) -> Result<Va
                         referer,
                         headers,
                         segments,
+                        extra: flags,
                     },
                 )
                 .await?;
@@ -814,6 +817,28 @@ fn option_header_list(options: &Value) -> Vec<(String, String)> {
 }
 
 /// 布尔型选项：aria2 的 RPC 客户端两种写法都有（`true` 与 `"true"`）
+/// aria2 的文件名策略开关：`allow-overwrite` / `auto-file-renaming`。
+/// 字符串、JSON 布尔、数字三种写法都收，统一存成文本，引擎按 bool 解析，
+/// `getOption` 也能原样回显（aria2 的 getOption 会回显这两个键）。
+fn option_flags(options: &Value) -> Vec<(String, String)> {
+    [
+        "allow-overwrite",
+        "auto-file-renaming",
+        "content-disposition-default-utf8",
+    ]
+    .iter()
+    .filter_map(|key| {
+        let text = match options.get(*key)? {
+            Value::String(text) => text.clone(),
+            Value::Bool(flag) => flag.to_string(),
+            Value::Number(number) => number.to_string(),
+            _ => return None,
+        };
+        Some(((*key).to_string(), text))
+    })
+    .collect()
+}
+
 fn option_bool(options: &Value, key: &str) -> bool {
     match options.get(key) {
         Some(Value::Bool(flag)) => *flag,

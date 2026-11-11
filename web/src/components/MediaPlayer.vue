@@ -36,6 +36,8 @@ const props = defineProps<{
   fill?: boolean
   /** 是否显示组件自带的关闭按钮（灯箱自己有工具栏，重复一个 ✕ 会让人犯迷糊） */
   showClose?: boolean
+  /** 强制浏览器原生 <video>：灯箱信息层的「兼容模式」，切换即时生效 */
+  forceNative?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -48,8 +50,22 @@ const emit = defineEmits<{
 
 
 const { t } = useI18n()
-const nativeFallback = ref(false)
+/** 原生兜底：要么用户强制，要么自定义元素没升级；两者共用同一套 <video> 逻辑 */
+const nativeFallback = ref(props.forceNative === true)
 const errorMsg = ref('')
+
+/** 自定义元素没升级（极旧浏览器 / 模块加载被拦）时，皮肤不会渲染任何控件 */
+function skinUnavailable() {
+  return !('customElements' in window) || !customElements.get('video-neutral-skin')
+}
+
+/** 灯箱信息层的兼容模式随时可切；切换会重建 <video>，播放位置重新载入 */
+watch(
+  () => props.forceNative,
+  (value) => {
+    nativeFallback.value = value === true || skinUnavailable()
+  },
+)
 /** 容器比例，随视频元数据更新，避免竖屏视频被强行拉成 16:9 */
 const ratio = ref(16 / 9)
 /** 播放器最大高度占总视口的百分比（下方还要留说明文字） */
@@ -152,16 +168,14 @@ function onError() {
 
 onMounted(() => {
   // 自定义元素没升级（极旧浏览器 / 模块加载被拦）时，皮肤不会渲染任何控件
-  if (!('customElements' in window) || !customElements.get('video-neutral-skin')) {
-    nativeFallback.value = true
-  }
+  if (skinUnavailable()) nativeFallback.value = true
   // 音量要在播放前就位：`<video>` 虽是自定义元素的 light DOM 子节点，
   // 但升级完成前也能直接查到，先挂一次，避免自动播放的第一声是 100%
   const element = root.value?.querySelector('video')
   if (element) attachVolume(element)
 })
 
-/** 键盘 ←/→ 在视频上做快进，而不是切到上下一条（对齐 FileBrowser 的口径） */
+/** 快进退：v4.9.67 起由 J / L 或 Shift+←/→ 触发，←/→ 统一留给「上/下一项」 */
 function seekBy(seconds: number) {
   const element = mediaEl.value
   if (!element || !Number.isFinite(element.duration)) return
@@ -203,6 +217,7 @@ onBeforeUnmount(() => {
         v-if="nativeFallback"
         :src="src"
         :poster="poster"
+        :autoplay="autoplay ?? true"
         controls
         playsinline
         class="size-full object-contain"

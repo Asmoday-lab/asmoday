@@ -46,8 +46,9 @@ interface DownloadConfig {
   bt_disable_dht: boolean
 }
 
-type Tab = 'active' | 'queue' | 'done'
-const TABS: Tab[] = ['active', 'queue', 'done']
+/** 「全部任务」把三个状态族拼在一页，省得在 tab 之间来回找（v4.9.66） */
+type Tab = 'all' | 'active' | 'queue' | 'done'
+const TABS: Tab[] = ['all', 'active', 'queue', 'done']
 
 /** 页内视图：任务 / 引擎设置（v4.9.38；设置不再走弹窗） */
 type View = 'tasks' | 'settings'
@@ -60,8 +61,14 @@ const engine = ref<EngineInfo | null>(null)
 const loading = ref(true)
 const error = ref('')
 const toast = ref('')
-const tab = ref<Tab>('active')
+const tab = ref<Tab>('all')
 const busyGid = ref('')
+
+/** 删除确认（v4.9.66）：点垃圾桶先问一次，可选「连带删除已下载文件」 */
+const removeTarget = ref<DownloadTask | null>(null)
+const removeDeleteFiles = ref(false)
+const removeBusy = ref(false)
+const removeOpen = computed(() => removeTarget.value !== null)
 
 const addOpen = ref(false)
 const addMode = ref<'uri' | 'torrent'>('uri')
@@ -157,7 +164,7 @@ const COMMON_TRACKERS = [
 const leaveOpen = ref(false)
 let leaveResolve: ((ok: boolean) => void) | null = null
 
-useScrollLock(computed(() => addOpen.value || leaveOpen.value))
+useScrollLock(computed(() => addOpen.value || leaveOpen.value || removeOpen.value))
 
 /**
  * 未保存改动（v4.9.40）：三块草稿各自与「已保存态」比对。
@@ -225,11 +232,17 @@ function trackerLines(value: string | string[]): string {
     .join('\n')
 }
 
-const groups = computed(() => ({
-  active: snapshot.value?.tasks?.active ?? [],
-  queue: snapshot.value?.tasks?.waiting ?? [],
-  done: snapshot.value?.tasks?.stopped ?? [],
-}))
+const groups = computed(() => {
+  const active = snapshot.value?.tasks?.active ?? []
+  const queue = snapshot.value?.tasks?.waiting ?? []
+  const done = snapshot.value?.tasks?.stopped ?? []
+  return {
+    all: [...active, ...queue, ...done],
+    active,
+    queue,
+    done,
+  }
+})
 
 const rows = computed(() => groups.value[tab.value])
 
@@ -397,15 +410,41 @@ async function togglePause(task: DownloadTask) {
   }
 }
 
-async function removeTask(task: DownloadTask) {
+/** 点垃圾桶只开确认框：勾了「连带删文件」就不能一键把磁盘上的东西删掉 */
+function askRemove(task: DownloadTask) {
+  if (removeBusy.value) return
+  removeTarget.value = task
+  removeDeleteFiles.value = false
+}
+
+function closeRemove() {
+  if (!removeBusy.value) removeTarget.value = null
+}
+
+async function confirmRemove() {
+  const task = removeTarget.value
+  if (!task || removeBusy.value) return
+  const withFiles = removeDeleteFiles.value
+  removeBusy.value = true
   busyGid.value = task.gid
   try {
-    await downloadsApi.remove(task.gid)
+    const result = await downloadsApi.remove(task.gid, withFiles)
+    // 先关浮层再刷新：失败时保留弹窗，用户可以看清错误或取消
+    removeTarget.value = null
     await refresh()
-    showToast(t('downloads.toast.removed'))
+    if (!withFiles) {
+      showToast(t('downloads.toast.removed'))
+    } else {
+      showToast(t('downloads.toast.removedWithFiles', { count: result.deletedFiles ?? 0 }))
+      const failed = result.failedFiles ?? []
+      if (failed.length) {
+        await conflict(t('downloads.remove.partial', { count: failed.length }))
+      }
+    }
   } catch (err) {
     await conflict(err instanceof Error ? err.message : t('downloads.actionFailed'))
   } finally {
+    removeBusy.value = false
     busyGid.value = ''
   }
 }
@@ -942,7 +981,7 @@ onUnmounted(() => {
                 class="rounded-md p-1.5 text-muted transition-colors hover:bg-elevated hover-danger disabled:opacity-40"
                 :disabled="busyGid === task.gid"
                 :title="t('downloads.actions.remove')"
-                @click="removeTask(task)"
+                @click="askRemove(task)"
               >
                 <AppIcon name="trash" :size="14" />
               </button>
@@ -1089,6 +1128,64 @@ onUnmounted(() => {
               @click="submitAdd"
             >
               {{ addBusy ? t('downloads.adding') : t('downloads.dialog.submit') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- ================= 删除任务确认（v4.9.66） ================= -->
+    <Teleport to="body">
+      <div
+        v-if="removeOpen"
+        class="fixed inset-0 z-[87] grid place-items-center modal-overlay bg-black/50 p-4"
+        data-testid="download-remove-dialog"
+        @click.self="closeRemove"
+      >
+        <div class="modal-card w-full max-w-sm rounded-2xl border border-line bg-panel p-5 shadow-xl">
+          <p class="text-sm font-medium text-ink">{{ t('downloads.remove.title') }}</p>
+          <p class="mt-1.5 break-all text-[12px] leading-relaxed text-muted">
+            {{ removeTarget ? taskName(removeTarget) : '' }}
+          </p>
+
+          <label
+            class="mt-4 flex cursor-pointer items-start gap-2.5 rounded-lg border border-line bg-elevated px-3 py-2.5"
+          >
+            <input
+              v-model="removeDeleteFiles"
+              type="checkbox"
+              class="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
+              data-testid="download-remove-files"
+            />
+            <span class="text-[12px] leading-relaxed text-ink">
+              {{ t('downloads.remove.withFiles') }}
+              <span class="mt-1 block text-[11px] leading-relaxed text-muted">
+                {{ t('downloads.remove.withFilesHint') }}
+              </span>
+            </span>
+          </label>
+          <p
+            v-if="removeDeleteFiles"
+            class="mt-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] leading-relaxed fg-danger"
+          >
+            {{ t('downloads.remove.warning') }}
+          </p>
+
+          <div class="mt-4 flex justify-end gap-2">
+            <button
+              class="rounded-lg border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:text-ink disabled:opacity-40"
+              :disabled="removeBusy"
+              @click="closeRemove"
+            >
+              {{ t('common.action.cancel') }}
+            </button>
+            <button
+              class="rounded-lg bg-red-500/90 px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+              :disabled="removeBusy"
+              data-testid="download-remove-confirm"
+              @click="confirmRemove"
+            >
+              {{ removeBusy ? t('downloads.remove.busy') : t('downloads.remove.confirm') }}
             </button>
           </div>
         </div>

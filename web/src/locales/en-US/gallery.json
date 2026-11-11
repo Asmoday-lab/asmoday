@@ -23,10 +23,7 @@
     "backToFolders": "Folders",
     "folderEmpty": "No folders with videos yet",
     "folderEmptyHint": "Put films into a mount (root included) and they show up here",
-    "resume": "Resume {time}",
-    "native": "Native player",
-    "nativeOn": "Current: native browser player (click to switch back to Video.js)",
-    "nativeOff": "Current: Video.js (click to force the native player)"
+    "resume": "Resume {time}"
   },
   "music": {
     "title": "Local music",
@@ -55,6 +52,9 @@
   "toolbar": {
     "favorites": "Favorites",
     "onlyFavorites": "Favorites only",
+    "onlyFavoritesHint": "Show favorites only; click again to clear",
+    "favoritesWallHint": "Folder view lists directories; switch to a list view to filter favorites",
+    "noFavorites": "No favorites among the loaded items",
     "rescan": "Rescan",
     "indexed": "Media indexed from mounts",
     "loadFailed": "Failed to load the media index",
@@ -109,8 +109,11 @@
     "tryDownload": "Try downloading"
   },
   "viewer": {
-    "prev": "Previous",
-    "next": "Next",
+    "prev": "Previous (←)",
+    "next": "Next (→)",
+    "videoKeys": "Video: ←/→ to switch, J / L or Shift+←/→ to seek, Space to pause",
+    "compatMode": "Compatibility mode (native player)",
+    "compatModeHint": "Enable if playback fails; switching reloads the video",
     "close": "Close",
     "openOriginal": "Open original in new tab",
     "broken": "This image can't be displayed",
