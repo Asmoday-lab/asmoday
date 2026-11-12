@@ -3,7 +3,8 @@
 #   docker compose up -d --build      # 首次构建约十几分钟（musl 上重编依赖树）
 #   docker compose logs -f asmoday    # 首启的一次性密码只在这里出现一次
 #
-# 已经有构建好的镜像时，把 build 换成 image 即可（如 ghcr.io/<owner>/asmoday:latest）。
+# 已经有构建好的镜像时，把 build 换成 image 即可（如 ghcr.io/<owner>/asmoday:<版本 tag>；
+# 只推 tag，没有 latest）。
 
 services:
   asmoday:
