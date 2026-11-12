@@ -256,8 +256,6 @@ cargo run                                   # 默认 http://127.0.0.1:4242
 cd web && pnpm run build && cd .. && cargo build --release
 ```
 
-测试与调试流程（门禁分层、探针套件、数据与产物规矩）见 `doc/testing.md`——该目录只在本机维护，有意不入版本库。
-
 提交前请通过门禁：
 
 ```bash

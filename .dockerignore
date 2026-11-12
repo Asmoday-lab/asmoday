@@ -7,7 +7,7 @@ dist/
 .git/
 .github/
 
-# 本机调试脚手架与设计笔记（不入库，见 .gitignore）
+# 本机调试脚手架与本机笔记（不入库，见 .gitignore）
 probes/
 scripts/
 .probe/

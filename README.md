@@ -256,9 +256,6 @@ cargo run                                   # http://127.0.0.1:4242
 cd web && pnpm run build && cd .. && cargo build --release
 ```
 
-Test flow (gate levels, probe suite, data/artifact rules) lives in `doc/testing.md`,
-which is kept locally and is deliberately not part of the repository.
-
 Before submitting, run the same gates CI uses:
 
 ```bash
