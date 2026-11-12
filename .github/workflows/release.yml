@@ -68,7 +68,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # windows-latest 的池子会被占满：排队 15 分钟后由 GitHub 直接取消
+          # （runner 始终为空、一个 step 都没跑，不是编译失败），整个 release job
+          # 因此被 needs 跳过、连 Release 都建不出来。2022 镜像同为 VS2022 + MSVC，
+          # 产物 target 不变，换个池子更稳。
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
