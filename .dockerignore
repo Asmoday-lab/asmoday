@@ -7,10 +7,11 @@ dist/
 .git/
 .github/
 
-# 本机调试脚手架（不入库，见 Design/testing.md）
+# 本机调试脚手架与设计笔记（不入库，见 .gitignore）
 probes/
 scripts/
 .probe/
+Design/
 
 # 运行期数据与用户配置：绝不进镜像
 config.toml

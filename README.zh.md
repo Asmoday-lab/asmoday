@@ -256,7 +256,7 @@ cargo run                                   # 默认 http://127.0.0.1:4242
 cd web && pnpm run build && cd .. && cargo build --release
 ```
 
-测试与调试流程（门禁分层、探针套件、数据与产物规矩）见 [`Design/testing.md`](Design/testing.md)。
+测试与调试流程（门禁分层、探针套件、数据与产物规矩）随本地设计笔记维护，不在版本库内。
 
 提交前请通过门禁：
 
@@ -272,7 +272,6 @@ cd web && pnpm exec vue-tsc -b && pnpm run build
 ```
 src/            Rust 后端（api/ 路由与处理器，core/ 配置、认证、文件系统、日志）
 web/            Vue 3 前端（views/ 页面，components/ 组件，locales/ 中英文案）
-Design/         产品与系统设计文档
 .github/        发布工作流（打 v* tag 触发）
 ```
 

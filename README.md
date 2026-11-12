@@ -256,7 +256,8 @@ cargo run                                   # http://127.0.0.1:4242
 cd web && pnpm run build && cd .. && cargo build --release
 ```
 
-Test flow (gate levels, probe suite, data/artifact rules): [`Design/testing.md`](Design/testing.md).
+Test flow (gate levels, probe suite, data/artifact rules) is kept with the local
+design notes and is not part of the repository.
 
 Before submitting, run the same gates CI uses:
 
@@ -272,7 +273,6 @@ Layout:
 ```
 src/            Rust backend (api/ routes and handlers, core/ config, auth, filesystem, logging)
 web/            Vue 3 frontend (views/, components/, locales/)
-Design/         product and system design notes
 .github/        release workflow (triggered by v* tags)
 ```
 
