@@ -182,10 +182,21 @@ jobs:
           ls -la final_release/
 
       # 3. 发布。同 tag 重打时覆盖同名 release 的产物，不新开重复 entry。
+      # 正文 = 注释标签（git tag -a）的附言：发版说明（含破坏性变更迁移指引）
+      # 跟着 tag 走，不在 workflow 里硬编码。generate_release_notes 会把
+      # 自动 changelog 追加在 body 之后，两者不冲突。
+      - name: Extract tag message
+        run: |
+          git fetch --tags --force
+          git tag -l "${{ github.ref_name }}" --format='%(contents)' > release_body.md
+          echo "Release body（前 20 行）："
+          head -20 release_body.md
+
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: final_release/*
+          body_path: release_body.md
           generate_release_notes: true
           overwrite_files: true
           # v0.1.0-alpha.1 这类带预发布后缀的 tag 自动标记为 prerelease
