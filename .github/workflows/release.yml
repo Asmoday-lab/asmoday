@@ -158,6 +158,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # 0. checkout 仅为提取注释标签（git tag -a）的附言作 Release 正文；
+      #    此前该 job 只下载 artifact，git 命令在非仓库目录里必然失败
+      - name: Checkout for tag message
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       # 1. 将刚才所有构建产物拉下来
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -187,8 +194,11 @@ jobs:
       # 自动 changelog 追加在 body 之后，两者不冲突。
       - name: Extract tag message
         run: |
-          git fetch --tags --force
           git tag -l "${{ github.ref_name }}" --format='%(contents)' > release_body.md
+          if [ ! -s release_body.md ]; then
+            echo "Error: 标签 ${{ github.ref_name }} 不是注释标签或没有附言"
+            exit 1
+          fi
           echo "Release body（前 20 行）："
           head -20 release_body.md
 
