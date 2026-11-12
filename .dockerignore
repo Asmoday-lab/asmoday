@@ -11,7 +11,7 @@ dist/
 probes/
 scripts/
 .probe/
-Design/
+doc/
 
 # 运行期数据与用户配置：绝不进镜像
 config.toml
