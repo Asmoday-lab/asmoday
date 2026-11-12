@@ -1,6 +1,5 @@
 {
-  "greeting": "Welcome back, {name}",
-  "guest": "traveler",
+  "greeting": "Welcome back",
   "status": "All systems operational, media engine ready.",
   "entries": {
     "files": {

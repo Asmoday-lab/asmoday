@@ -10,7 +10,6 @@ import { RouterLink } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import type { IconName } from '../components/icons'
 import { isIconName } from '../components/icons'
-import { authApi } from '../api/auth'
 
 interface Entry {
   to: string
@@ -87,7 +86,7 @@ onMounted(async () => {
     <div class="relative">
       <p class="mb-2 text-xs font-medium tracking-[0.2em] text-accent uppercase">Asmoday</p>
       <h1 class="text-2xl font-semibold tracking-tight text-ink md:text-4xl">
-        {{ t('portal.greeting', { name: authApi.username.value ?? t('portal.guest') }) }}
+        {{ t('portal.greeting') }}
       </h1>
       <p class="mt-2 text-sm text-muted md:text-base">
         {{ t('portal.status') }}

@@ -190,7 +190,7 @@ fn authority_of(candidate: &str) -> &str {
 fn is_password_change_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/auth/password" | "/api/auth/username" | "/api/auth/me" | "/api/auth/logout"
+        "/api/auth/password" | "/api/auth/me" | "/api/auth/logout"
     )
 }
 
@@ -680,7 +680,7 @@ pub struct TotpDisableRequest {
 /// GET /api/auth/status（公开）
 pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let initialized = state.auth.user_count().unwrap_or(0) > 0;
-    let mut username: Option<String> = None;
+    let mut authenticated = false;
     let mut must_change_password = false;
 
     // 是否开了 2FA 是「这台设备的账号状态」，未登录也要如实回答（v4.9.46）：
@@ -694,13 +694,14 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         && let Some(user) = account
     {
         must_change_password = user.must_change_password;
-        username = Some(user.username);
+        authenticated = true;
     }
 
+    // 用户名不再对前端暴露（v4.9.72）：它只是数据层里那行记录的内部标识，
+    // 登录页没有用户名框，账号菜单 / 门户问候也不再显示。
     Json(json!({
         "initialized": initialized,
-        "authenticated": username.is_some(),
-        "username": username,
+        "authenticated": authenticated,
         "totp_enabled": totp_enabled,
         "must_change_password": must_change_password,
         "version": env!("CARGO_PKG_VERSION"),
@@ -932,11 +933,10 @@ pub async fn logout(
     response
 }
 
-/// GET /api/auth/me（受保护）
+/// GET /api/auth/me（受保护）：终端重连失败时探测会话是否还在（只看状态码）。
 pub async fn me(auth_user: AuthUser) -> Response {
     Json(json!({
         "id": auth_user.id,
-        "username": auth_user.username,
         "must_change_password": auth_user.must_change_password,
     }))
     .into_response()
@@ -991,69 +991,6 @@ pub async fn change_password(
     };
 
     let mut response = Json(json!({ "status": "ok" })).into_response();
-    let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
-    if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
-        &token,
-        crate::core::auth::SESSION_TTL,
-        &path,
-        secure,
-    )) {
-        response.headers_mut().insert(header::SET_COOKIE, value);
-    }
-    response
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UsernameRequest {
-    pub current: String,
-    pub username: String,
-}
-
-/// POST /api/auth/username（受保护）：改自己的用户名。
-///
-/// 对齐 Navidrome / Immich 的「账号名可改」：验当前密码 → 改名 → 该用户
-/// 全部会话失效（其他设备强制重新登录），当前浏览器补发新会话 Cookie。
-/// 一次性密码会话期间也可用（首登顺手把 admin 改成自己想要的Name）。
-pub async fn change_username(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    auth_user: AuthUser,
-    Json(body): Json<UsernameRequest>,
-) -> Response {
-    let found = match state.auth.find_user(&auth_user.username) {
-        Ok(found) => found,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    };
-
-    let Some((user, hash, _)) = found else {
-        return json_error_code(
-            StatusCode::UNAUTHORIZED,
-            "AUTH_USER_MISSING",
-            "User not found",
-        );
-    };
-
-    if !verify_password_lenient(&hash, &body.current) {
-        return json_error_code(
-            StatusCode::BAD_REQUEST,
-            "PASSWORD_WRONG",
-            "Current password is incorrect",
-        );
-    }
-
-    if let Err(err) = state.auth.rename_user(user.id, &body.username) {
-        return json_error(StatusCode::BAD_REQUEST, err);
-    }
-
-    // 改名让旧身份 everywhere 失效，当前浏览器补一个新的（含新用户名的会话）
-    let token = match state.auth.create_session() {
-        Ok(token) => token,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    };
-
-    let mut response =
-        Json(json!({ "status": "ok", "username": body.username.trim() })).into_response();
     let (path, secure) = cookie_scope(&state, &headers, Some(peer)).await;
     if let Ok(value) = header::HeaderValue::from_str(&session_cookie(
         &token,

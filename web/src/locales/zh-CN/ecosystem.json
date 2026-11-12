@@ -2,20 +2,25 @@
   "title": "生态推荐",
   "intro": "Asmoday 只做文件、媒体与终端。下面这些能力交给成熟工具，通过 WebDAV / 目录映射对接。",
   "categories": {
-    "sync": "极速同步与备份",
-    "download": "远程下载",
-    "tunnel": "公网与穿透",
+    "sync": "同步与备份",
+    "download": "下载配套",
+    "webdav": "WebDAV 客户端",
+    "tunnel": "公网与组网",
     "writing": "写作与图床"
   },
   "items": {
-    "syncthing": "点对点极速增量同步。把手机或办公电脑的文件夹，无缝同步至 Asmoday 挂载的目录中。",
+    "syncthing": "点对点增量同步。把手机或办公电脑的文件夹，无缝同步至 Asmoday 挂载的目录中。",
     "photosync": "通过 Asmoday 提供的 WebDAV 接口，实现手机相册后台上传备份。",
-    "foldersync": "强大的 Android 文件夹同步工具，支持定时通过 WebDAV 同步特定目录。",
-    "qbittorrent": "老牌且强大的 BT 下载器。把下载路径设为 Asmoday 的影视目录，下完即可在 Web 端直接播放。",
-    "aria2": "轻量级的多协议命令行下载工具，适合极客搭配 AriaNg 使用。",
-    "caddy": "想在公网访问？推荐搭配专业反向代理服务器。Asmoday 已原生支持 X-Forwarded-* 头。",
+    "foldersync": "多平台文件夹同步工具，支持定时通过 WebDAV 同步特定目录。",
+    "ariang": "内置下载引擎兼容 aria2 RPC。填入地址与下载密钥，即可获得熟悉的 Web 任务管理界面。",
+    "raidrive": "把 Asmoday 的 WebDAV 挂载为 Windows 网络盘，资源管理器里直接读写。",
+    "cyberduck": "macOS / Windows 上的图形化 WebDAV 客户端，拖拽即上传下载。",
+    "winscp": "Windows 老牌文件传输客户端，支持 WebDAV 凭证保存与脚本化操作。",
+    "caddy": "想在公网访问？用 Caddy 反向代理自动签发 HTTPS 证书，Asmoday 已原生支持 X-Forwarded-* 头。",
     "tailscale": "不想暴露公网？用组网工具建立虚拟局域网，在外网安全访问家里的设备。",
-    "picgo": "利用图床直链把 Asmoday 配成 PicGo 默认图床，配合 Typora / Obsidian 打造 Markdown 写作流。"
+    "picgo": "把 Asmoday 的图床直链配成默认图床，写作时粘贴截图即自动上传。",
+    "typora": "所见即所得的 Markdown 编辑器，图片服务对接 PicGo 即可直传 Asmoday。",
+    "obsidian": "本地优先的 Markdown 知识库，把笔记库放进同步目录即可多端共用。"
   },
   "footer": "Asmoday 的成长离不开上述优秀开源/商业工具的生态支持，点击卡片可访问其官方网站。"
 }

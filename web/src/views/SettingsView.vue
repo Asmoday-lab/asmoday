@@ -128,26 +128,15 @@ const MEDIA_DEFAULTS: MediaSettings = {
 }
 
 type Tab = 'general' | 'media' | 'security' | 'advanced'
-// 用户管理只有管理员可见（v4.9.24 多用户）；普通用户只剩安全自助页
-const allTabs: { key: Tab; label: string; icon: IconName; adminOnly?: boolean }[] = [
-  { key: 'general', label: 'settings.tabs.general', icon: 'chip', adminOnly: true },
-  { key: 'media', label: 'settings.tabs.media', icon: 'image', adminOnly: true },
+// 单用户模型（v4.9.28）：能进设置页就是设备主人，tab 不再按角色过滤。
+// 路由守卫保证 /settings 只在已登录时可达，旧的多用户 adminOnly 过滤已删。
+const tabs: { key: Tab; label: string; icon: IconName }[] = [
+  { key: 'general', label: 'settings.tabs.general', icon: 'chip' },
+  { key: 'media', label: 'settings.tabs.media', icon: 'image' },
   { key: 'security', label: 'settings.tabs.security', icon: 'lock' },
-  { key: 'advanced', label: 'settings.tabs.advanced', icon: 'terminal', adminOnly: true },
+  { key: 'advanced', label: 'settings.tabs.advanced', icon: 'terminal' },
 ]
-const tabs = computed(() =>
-  allTabs.filter((item) => !item.adminOnly || authApi.isAdmin.value),
-)
 const tab = ref<Tab>('general')
-// 登录身份变化时（登出换号），普通用户不能停在管理 Tab 上
-watch(
-  () => authApi.isAdmin.value,
-  (admin) => {
-    if (!admin && (tab.value === 'general' || tab.value === 'media' || tab.value === 'advanced')) {
-      tab.value = 'security'
-    }
-  },
-)
 
 // ---------------- 通用：主题 / 语言 ----------------
 const themes: { key: ThemeMode; label: string }[] = [
@@ -758,27 +747,6 @@ async function changePassword() {
   }
 }
 
-// ---------------- 安全：改用户名（v4.9.24 多用户，对齐 Navidrome/Immich） ----------------
-const newUsername = ref('')
-const usernameBusy = ref(false)
-
-async function changeUsername() {
-  securityError.value = ''
-  const next = newUsername.value.trim()
-  if (!next || next === authApi.username.value) return
-  usernameBusy.value = true
-  try {
-    await authApi.changeUsername(currentPassword.value, next)
-    newUsername.value = ''
-    currentPassword.value = ''
-    showToast(t('settings.security.usernameChanged'))
-  } catch (err) {
-    securityError.value = err instanceof Error ? err.message : t('settings.security.failed')
-  } finally {
-    usernameBusy.value = false
-  }
-}
-
 async function startTotp() {
   securityError.value = ''
   try {
@@ -965,7 +933,7 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <p class="mt-3 hidden truncate px-3 text-[12px] text-muted md:block">
-          {{ authApi.username.value }}
+          Asmoday
         </p>
       </nav>
 
@@ -1185,7 +1153,7 @@ onBeforeUnmount(() => {
             <input
               v-if="draft"
               v-model="draft.media.ffmpeg_path"
-              placeholder="/usr/bin/ffmpeg 或 C:/AimerFiles/ffmpeg-n9.0/bin"
+              placeholder="/usr/bin/ffmpeg 或 C:/tools/ffmpeg/bin"
               class="min-w-0 flex-1 rounded-lg h-10 border border-line bg-elevated px-3 font-mono text-xs text-ink outline-none focus:border-accent"
             />
             <button
@@ -1232,36 +1200,6 @@ onBeforeUnmount(() => {
            xl 以下回落单列——密码三连框在 2×400px 里会被挤扁。 -->
       <div class="grid gap-6 xl:grid-cols-2 xl:items-start">
       <div class="space-y-6">
-      <!-- 改用户名（v4.9.24）：验证当前密码；改名后其他设备全部重新登录 -->
-      <div class="rounded-xl border border-line p-6">
-        <div class="mb-4">
-          <p class="text-sm font-semibold text-ink">{{ t('settings.security.username') }}</p>
-          <p class="mt-0.5 text-[12px] text-muted">{{ t('settings.security.usernameHint') }}</p>
-        </div>
-        <div class="grid gap-3">
-          <input
-            v-model="newUsername"
-            type="text"
-            autocomplete="username"
-            :placeholder="authApi.username.value ?? ''"
-            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
-          />
-          <PasswordInput
-            v-model="currentPassword"
-            :placeholder="t('settings.security.current')"
-            class="h-10 rounded-lg border border-line bg-elevated px-3 text-sm text-ink outline-none focus:border-accent"
-          />
-        </div>
-        <div class="mt-3 flex justify-end">
-          <button
-            class="h-9 rounded-lg bg-accent px-4 text-xs text-white disabled:opacity-50"
-            :disabled="usernameBusy || !newUsername.trim()"
-            @click="changeUsername"
-          >
-            {{ t('settings.security.usernameSubmit') }}
-          </button>
-        </div>
-      </div>
       <div class="rounded-xl border border-line p-6">
         <div class="mb-4">
           <p class="text-sm font-semibold text-ink">{{ t('settings.security.password') }}</p>

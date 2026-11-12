@@ -160,7 +160,7 @@ error.E_BUSY.action.cancel
 |---|---|---|
 | 浏览器 SPA 读写 | Cookie `asmoday_session` | 写操作要求 `Origin` 或 `Referer` 至少一个与 Host 同源，**两者均缺失直接 403 `E_FORBIDDEN`** |
 | Bearer Token | `Authorization: Bearer asm_...` | 豁免 Origin 校验 |
-| WebDAV | Basic Auth（`token_name:asm_xxx`，或管理员账号 + 登录密码直连，v4.4.0） | 不适用 |
+| WebDAV | Basic Auth（`token_name:asm_xxx`，仅此一种；v4.9.72 起不再接受账号密码直连） | 不适用 |
 | 公开分享 | 分享 Cookie / URL token | 分享写操作（如 verify）按分享池限流 |
 
 ### 1.5 前端 store 与 composable 约定
@@ -1248,6 +1248,12 @@ GWT-SHARE-07 Given 分享已过期  When 访问  Then 403 E_FORBIDDEN
 GWT-SHARE-08 Given 分享被删除  When 访问  Then 410 E_GONE
 GWT-SHARE-09 Given 分享被删除超 30 天  When 启动  Then 该行被物理删除
 GWT-SHARE-10 Given 分享访问  When 请求任意接口  Then 响应中无物理路径字段
+GWT-SHARE-11 Given 免密分享  When 访客 GET info/raw/download  Then 200，info 只含 name/is_folder/has_password/allow_download/expires_at 五字段（探针 share_links.py A）
+GWT-SHARE-12 Given 带口令分享  When 未填 / 错误 / 正确  Then 401 SHARE_PASSWORD_REQUIRED / 401 SHARE_PASSWORD_WRONG / 200（探针 B）
+GWT-SHARE-13 Given allow_download=false 的可预览文件  When download / raw?download=1 / raw  Then 403 SHARE_DOWNLOAD_DISABLED / 403 / 200 内联（探针 C）
+GWT-SHARE-14 Given referer_allowlist 非空  When 白名单外 / 白名单子域 / 无 Referer  Then 403 / 200 / 200（探针 D）
+GWT-SHARE-15 Given 目录分享  When list?sub=../ 或访问 raw  Then 403 / 400（探针 E）
+GWT-SHARE-16 Given 分享被 DELETE / 文件被删除  When 访客访问  Then 404 / 410 E_GONE 且无物理路径（探针 F）
 ```
 
 #### 依赖红线
@@ -1552,8 +1558,8 @@ GWT-TERM-15 Given 回收定时器恰好与重连同刻唤醒  When 新连接已 
 - 协议由 `dav-server` 实现，本项目只做认证 + 挂载点路由 + 安全边界。
 - URL：`/dav/<mount_id>/<path>`；`/dav` 与 `/dav/` 虚拟根列出挂载点。
 - 路由用 `nest("/dav")` + `route("/dav/")`。
-- Basic Auth：`token_name` : `asm_xxx`；校验失败回退管理员账号 + 登录密码（全量权限，
-  待改密 / 开 2FA 拒绝；Argon2 结果带进程内缓存，改密即时失效）。
+- Basic Auth：`token_name` : `asm_xxx`，仅此一种凭证（v4.9.72 删除账号密码回退；
+  部署后先在 Web UI 建令牌）。
 - `CleanFs` 装饰层：过滤 `.part` 与系统垃圾、修 Windows 错误映射。
 
 #### GWT 验收

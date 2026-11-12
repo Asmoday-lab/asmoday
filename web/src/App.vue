@@ -89,7 +89,6 @@ useBackClose(computed(() => drawerOpen.value || accountOpen.value), () => {
 })
 
 const isPublic = computed(() => route.meta.public === true)
-const username = authApi.username
 const mustChangePassword = computed(
   () => authApi.isAuthenticated.value && authApi.status.value.must_change_password === true,
 )
@@ -222,10 +221,10 @@ const playerSpace = computed(() => {
         <div ref="accountWrap" class="relative">
           <button
             class="grid size-8 place-items-center rounded-full bg-accent text-xs font-semibold text-white"
-            :title="username ?? t('common.account.label')"
+            :title="t('common.account.label')"
             @click="accountOpen = !accountOpen"
           >
-            {{ (username ?? 'A').slice(0, 1).toUpperCase() }}
+            A
           </button>
 
           <div
@@ -234,7 +233,8 @@ const playerSpace = computed(() => {
             data-testid="account-menu"
           >
             <p class="truncate px-3 py-2 text-[12px] text-muted">
-              {{ username ?? t('common.account.notLoggedIn') }}
+              <!-- 单用户后没有可展示的用户名（v4.9.72）：固定品牌标识 -->
+              Asmoday
             </p>
 
             <!-- 主题三态（设计文档 8.2：浅色 / 深色 / 跟随系统，当前项打勾） -->

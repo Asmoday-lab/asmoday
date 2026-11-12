@@ -1,6 +1,5 @@
 {
-  "greeting": "欢迎回来，{name}",
-  "guest": "旅人",
+  "greeting": "欢迎回来",
   "status": "系统运行正常，媒体引擎已就绪。",
   "entries": {
     "files": {

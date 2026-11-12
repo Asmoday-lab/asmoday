@@ -145,6 +145,27 @@ docker logs asmoday-check | grep -E "listening on|cannot listen"
 
 ## 6. 变更记录
 
+- **v23（beta 前）**：新增 `probes/share_links.py`（35 条断言，纯 HTTP 无浏览器）——
+  分享作为唯一免鉴权公开面的鉴权边界回归：A 免密 info/raw/download 且 info 五字段
+  白名单（无物理路径）；B 口令三态（未填 REQUIRED / 错误 WRONG / 正确 200）；
+  C `allow_download=false` 的 download 403 / raw?download=1 403 / raw 200；
+  D Referer 白名单（外 403 / 子域 200 / 无 Referer 200）；E 目录分享 `sub=../` 拒绝、
+  无 raw 400；F DELETE 后 404、删文件后 tombstone 410 E_GONE。坑：verify 端点只认
+  JSON body 不认查询参数；axum 响应头是小写，Python 侧比对要用小写键。
+- **v22（v4.9.72）**：新增 `probes/dav_token_auth.py`（9 条断言，纯 HTTP 无浏览器），
+  钉死「WebDAV 只认令牌」：A 段令牌创建含 `asm_` 明文 / PROPFIND 207 / GET 落地页 /
+  只读 PUT 403；B 段账号 admin + 登录密码必须 401（防 v4.4.0 冷启动回退复活）；
+  C 段错误令牌名 / 错误密钥 401。**坑**：PROPFIND `/dav/` Depth 0 只返回根自身
+  （不含挂载点子项），挂载路径要从 GET 落地页的 `href="/dav/m0/"` 解析。
+  后端改动大（删密码直连 + 改名端点 + status/me 去 username），全门禁：
+  fmt + clippy -D warnings + `cargo test` 340 + vue-tsc + vite build +
+  `config_save` 15/15 + `services_form` 31/31 + `run_login --case=http` 29/29 +
+  `unsaved_guard` 全过 + 新探针 9/9。
+- **v21（v4.9.71）**：admin 残留清理（纯前端 + 文案，无探针新增）。设置页相关回归：
+  `vue-tsc -b` + `vite build --emptyOutDir=false` + `config_save.py` 15/15 +
+  `services_form.py` 31/31。关键查证：路由守卫保证 `/settings` 仅登录可达 →
+  `adminOnly` 过滤恒真，删除不改变任何可见行为；WebDAV 账号回退走
+  `find_user` 精确匹配用户名 → `davHint` 必须保留「用户名 admin」指引。
 - **v20（v4.9.70）**：`probes/services_form.cjs` D 段按可视化图标选择器重写，断言数 27→31。
   覆盖：D0 点触发按钮宫格展开且格子数 ≥30（每格是渲染出的图标而不是文字选项）；
   D1 点格子选中后宫格收起；D2/D3 图标写进 POST 与 GET；**D4 跳到门户 `/` 页断言

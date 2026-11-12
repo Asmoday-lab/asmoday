@@ -957,28 +957,6 @@ impl AuthStore {
         .map_err(|e| format!("查询用户失败：{e}"))
     }
 
-    /// 改名。UNIQUE 冲突返回「用户名已存在」；改名后由调用方负责让会话失效
-    /// （旧会话里缓存的用户名/身份要重新登录确认）。
-    pub fn rename_user(&self, user_id: i64, new_username: &str) -> Result<(), String> {
-        let username = new_username.trim();
-        if !valid_username(username) {
-            return Err("用户名需 2~32 个字符，可含中文、字母、数字与 _ - . @".to_string());
-        }
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE users SET username = ?1 WHERE id = ?2",
-            params![username, user_id],
-        )
-        .map_err(|e| {
-            if e.to_string().contains("UNIQUE") {
-                "用户名已存在".to_string()
-            } else {
-                format!("改名失败：{e}")
-            }
-        })?;
-        Ok(())
-    }
-
     pub fn update_password(&self, user_id: i64, password: &str) -> Result<(), String> {
         // 首尾空白不进哈希（与 verify_password_lenient 同一口径，v4.9.50）
         let password = password.trim();
@@ -1725,21 +1703,6 @@ mod tests {
         // 设了正式密码之后就不再补发
         store.update_password(admin.id, "Asmoday@2026x").unwrap();
         assert!(store.reissue_pending_password().unwrap().is_none());
-    }
-
-    #[test]
-    fn rename_rejects_bad_names() {
-        let store = temp_store("rename");
-        let admin = store.create_user("boss", "Asmoday#2026").unwrap();
-        // 非法字符（路径分隔符）与过短的名字拒绝
-        assert!(store.rename_user(admin.id, "a/b").is_err());
-        assert!(store.rename_user(admin.id, "x").is_err());
-        // 正常改名生效
-        store.rename_user(admin.id, "chief").unwrap();
-        assert_eq!(
-            store.user_by_id(admin.id).unwrap().unwrap().username,
-            "chief"
-        );
     }
 
     #[test]

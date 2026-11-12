@@ -6,7 +6,6 @@ import { ApiError, readApiError } from '../lib/errors'
 export interface AuthStatus {
   initialized: boolean
   authenticated: boolean
-  username: string | null
   totp_enabled: boolean
   /** 一次性密码（--init / --reset）登录后必须改密 */
   must_change_password?: boolean
@@ -16,7 +15,6 @@ export interface AuthStatus {
 const status = ref<AuthStatus>({
   initialized: true,
   authenticated: false,
-  username: null,
   totp_enabled: false,
 })
 const ready = ref(false)
@@ -30,10 +28,10 @@ async function refresh(): Promise<void> {
     if (res.ok) {
       status.value = (await res.json()) as AuthStatus
     } else {
-      status.value = { initialized: true, authenticated: false, username: null, totp_enabled: false }
+      status.value = { initialized: true, authenticated: false, totp_enabled: false }
     }
   } catch {
-    status.value = { initialized: true, authenticated: false, username: null, totp_enabled: false }
+    status.value = { initialized: true, authenticated: false, totp_enabled: false }
   } finally {
     ready.value = true
   }
@@ -66,14 +64,6 @@ export const authApi = {
   ready,
   busy,
   isAuthenticated: computed(() => status.value.authenticated),
-  username: computed(() => status.value.username),
-  /**
-   * 是否「设备主人」。
-   *
-   * v4.9.28 回归单用户后这件事等价于「已登录」——唯一账号就是管理员，
-   * 没有角色与权限位可判。保留这个名字是因为设置页的 tab 过滤还在用它。
-   */
-  isAdmin: computed(() => status.value.authenticated),
   initialized: computed(() => status.value.initialized),
   ensureAuth,
   refresh,
@@ -98,10 +88,6 @@ export const authApi = {
    */
   async changePassword(current: string, next: string) {
     await post('/api/auth/password', { current, next })
-  },
-  /** 改自己的用户名（改名后其他设备全部登出，当前浏览器自动续期） */
-  async changeUsername(current: string, username: string) {
-    await post('/api/auth/username', { current, username })
   },
   /**
    * 生成 TOTP 密钥。

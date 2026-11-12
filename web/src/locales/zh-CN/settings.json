@@ -40,7 +40,7 @@
     "thumbAge": "缩略图闲置保留（天）",
     "ffmpeg": "FFmpeg",
     "ffmpegPath": "FFmpeg 路径",
-    "ffmpegPathHint": "可填 ffmpeg 可执行文件，也可直接填安装目录（如 C:/AimerFiles/ffmpeg-n9.0/bin）。留空时优先读取环境变量 ASMODAY_FFMPEG_PATH，再自动探测系统 PATH。",
+    "ffmpegPathHint": "可填 ffmpeg 可执行文件，也可直接填安装目录（如 C:/tools/ffmpeg/bin）。留空时优先读取环境变量 ASMODAY_FFMPEG_PATH，再自动探测系统 PATH。",
     "ffmpegDetected": "已检测到 v{version}",
     "ffmpegMissing": "未找到 FFmpeg",
     "ffmpegSource": "来源：{source}",
@@ -96,7 +96,7 @@
     "forgotBody": "配置里没有任何「关闭认证」的开关。请在服务器终端执行",
     "forgotBody2": "获取一次性新密码，登录后再改。",
     "davUrl": "挂载地址",
-    "davHint": "请复制上方完整地址，使用任意 WebDAV 客户端连接。账号可用管理员账号 + 登录密码（全量权限），或填入下方令牌的名称 + 对应 asm_ 开头令牌（推荐：可只读、可限定挂载点、可设有效期）。只读令牌只能浏览与下载。",
+    "davHint": "请复制上方完整地址，使用任意 WebDAV 客户端连接：用户名填令牌的名称，密码填对应的 asm_ 开头令牌密钥（可只读、可限定挂载点、可设有效期，随时吊销）。只读令牌只能浏览与下载。",
     "createToken": "创建令牌",
     "tokenName": "名称，如 PhotoSync",
     "readonly": "只读",
@@ -136,11 +136,7 @@
     "verifyConfirm": "确认并下载",
     "verifyBusy": "验证中…",
     "verifyHint": "下载数据库备份前需确认一次密码；15 分钟内免重复输入。",
-    "verifyFailed": "密码验证失败",
-    "username": "用户名",
-    "usernameHint": "改名后所有设备需要重新登录（当前浏览器自动续期）",
-    "usernameSubmit": "改名",
-    "usernameChanged": "用户名已更新"
+    "verifyFailed": "密码验证失败"
   },
   "advanced": {
     "form": "可视化表单",
@@ -203,7 +199,7 @@
   },
   "safety": {
     "HOST_ALL_INTERFACES_NO_SSL": "监听地址为 0.0.0.0 且未启用 SSL：服务暴露在所有网卡上。若要暴露到公网，请前置 Caddy/Nginx 等 HTTPS 反向代理。",
-    "PROXY_TRUST_NO_TRUSTED_IPS": "auth.proxy_trust.enabled 已开启但 trusted_ips 为空：任何人都能伪造头冒充管理员，已强制关闭。",
+    "PROXY_TRUST_NO_TRUSTED_IPS": "auth.proxy_trust.enabled 已开启但 trusted_ips 为空：任何人都能伪造头冒充登录用户，已强制关闭。",
     "PROXY_HEADERS_NO_TRUSTED_IPS": "server.proxy.trust_proxy_headers 已开启但 trusted_ips 为空：所有客户端共享同一个代理 IP。",
     "PROXY_TRUST_SKIP_2FA": "auth.proxy_trust.skip_2fa 已开启：SSO 登录将跳过两步验证。",
     "SSL_DISABLED_WITH_HTTPS_BASE": "server.ssl.enabled=false 但 base_url 是 https 地址：请确认部署方式。",

@@ -73,8 +73,6 @@ pub struct AppState {
     pub share_guard: Arc<core::auth::LoginGuard>,
     /// WebDAV Basic Auth 尝试限流（与登录 / 分享池**互相隔离**，设计文档 v2.5.0 3.10）
     pub dav_guard: Arc<core::auth::LoginGuard>,
-    /// 管理员密码直连 WebDAV 的验证缓存（免掉逐请求 Argon2，见 api/tokens.rs）
-    pub dav_passwords: Arc<api::tokens::PasswordCache>,
     /// per-path 并发锁（设计文档 3.2.8）
     pub path_locks: Arc<core::locks::PathLocks>,
     /// WebDAV 协议处理器（每个挂载点一套 LocalFs + MemLs，按配置指纹缓存）
@@ -553,7 +551,6 @@ async fn run(cli: Cli) -> Result<(), String> {
         login_guard: Arc::new(core::auth::LoginGuard::new()),
         share_guard: Arc::new(core::auth::LoginGuard::new()),
         dav_guard: Arc::new(core::auth::LoginGuard::new()),
-        dav_passwords: Arc::new(api::tokens::PasswordCache::default()),
         path_locks: Arc::new(core::locks::PathLocks::new()),
         dav: Arc::new(api::webdav::DavCache::new()),
         delete_tickets: Arc::new(api::files_mutate::DeleteTickets::default()),
@@ -1206,7 +1203,6 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/api/system/test-ffmpeg", post(api::system::test_ffmpeg))
         .route("/api/auth/password", post(api::auth::change_password))
-        .route("/api/auth/username", post(api::auth::change_username))
         // 用户管理（v4.9.24 多用户）：AdminUser 提取器拦非管理员
         .route(
             "/api/auth/verify-password",

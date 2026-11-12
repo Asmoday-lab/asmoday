@@ -96,7 +96,7 @@
     "forgotBody": "There is no \"disable authentication\" switch in the config. On the server terminal run",
     "forgotBody2": "to get a one-time password, then change it after signing in.",
     "davUrl": "Mount URL",
-    "davHint": "Copy the full URL above and connect with any WebDAV client. You can sign in with your admin account and its login password (full access), or with a token below (name as username, asm_-prefixed token as password — recommended: read-only, mount scoping and expiry). Read-only tokens can only browse and download.",
+    "davHint": "Copy the full URL above and connect with any WebDAV client: use a token’s name as the username and its asm_-prefixed key as the password (read-only, mount scoping, expiry and revocation supported). Read-only tokens can only browse and download.",
     "createToken": "Create token",
     "tokenName": "Name, e.g. PhotoSync",
     "readonly": "Read-only",
@@ -136,11 +136,7 @@
     "verifyConfirm": "Confirm and download",
     "verifyBusy": "Verifying…",
     "verifyHint": "Downloading a database backup requires a one-time password check; valid for 15 minutes.",
-    "verifyFailed": "Password verification failed",
-    "username": "Username",
-    "usernameHint": "Renaming signs out every device (this browser is renewed automatically)",
-    "usernameSubmit": "Rename",
-    "usernameChanged": "Username updated"
+    "verifyFailed": "Password verification failed"
   },
   "advanced": {
     "form": "Form",
@@ -203,7 +199,7 @@
   },
   "safety": {
     "HOST_ALL_INTERFACES_NO_SSL": "Listening on 0.0.0.0 without SSL: the service is exposed on all interfaces. If you plan to expose it to the internet, please use a reverse proxy like Caddy/Nginx with HTTPS.",
-    "PROXY_TRUST_NO_TRUSTED_IPS": "auth.proxy_trust.enabled is on but trusted_ips is empty: anyone could forge headers to impersonate an admin. It has been force-disabled.",
+    "PROXY_TRUST_NO_TRUSTED_IPS": "auth.proxy_trust.enabled is on but trusted_ips is empty: anyone could forge headers to impersonate a signed-in user. It has been force-disabled.",
     "PROXY_HEADERS_NO_TRUSTED_IPS": "server.proxy.trust_proxy_headers is on but trusted_ips is empty: all clients share the same proxy IP.",
     "PROXY_TRUST_SKIP_2FA": "auth.proxy_trust.skip_2fa is enabled: 2FA is bypassed for SSO logins.",
     "SSL_DISABLED_WITH_HTTPS_BASE": "server.ssl.enabled=false but base_url looks like an https URL: please verify your deployment.",
