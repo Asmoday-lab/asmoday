@@ -27,7 +27,7 @@ jobs:
   # Job 1: 独立构建前端产物（只跑一次，三个目标共用）
   # ==========================================
   prepare-frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -74,7 +74,7 @@ jobs:
           # 产物 target 不变，换个池子更稳。
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
@@ -105,11 +105,25 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      # mlugg/setup-zig@v1 仍是 node20 action，会触发 GitHub 的
+      # "Node.js 20 is deprecated" 警告；上游已停更，改用官方 tarball 直装。
       - name: Install Zig
         if: runner.os == 'Linux'
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.13.0
+          case "$(uname -m)" in
+            x86_64)  ZIG_ARCH=x86_64 ;;
+            aarch64) ZIG_ARCH=aarch64 ;;
+            *) echo "Unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          TAR="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${TAR}" -o "${RUNNER_TEMP}/${TAR}"
+          tar -xf "${RUNNER_TEMP}/${TAR}" -C "$RUNNER_TEMP"
+          ZIG_BIN="${RUNNER_TEMP}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}"
+          echo "$ZIG_BIN" >> "$GITHUB_PATH"
+          "$ZIG_BIN/zig" version
 
       # --locked：Cargo.lock 必须能锁住整棵依赖树，发版当天不能被上游悄悄升版本
       - name: Build binary (Linux)
@@ -159,7 +173,7 @@ jobs:
     needs: build
     # 矩阵整体成功才发版：一个目标挂了就发半套产物，用户下到的是缺件版本
     if: ${{ always() && needs.build.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # 0. checkout 仅为提取注释标签（git tag -a）的附言作 Release 正文；
