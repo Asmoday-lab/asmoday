@@ -502,10 +502,10 @@ fn shell_for(_options: &ShellOptions) -> String {
 /// 会启动失败；所以只在确实有 bash 时切过去，没有就退回原 shell（不加参数）。
 #[cfg(not(windows))]
 fn shell_for(options: &ShellOptions) -> String {
-    if options.no_profile {
-        if let Some(bash) = bash_path() {
-            return bash;
-        }
+    if options.no_profile
+        && let Some(bash) = bash_path()
+    {
+        return bash;
     }
     default_shell()
 }

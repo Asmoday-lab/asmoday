@@ -3581,7 +3581,9 @@ mod tests {
         {
             let link = base.join("link.mkv");
             tokio::fs::symlink(&foreign, &link).await.unwrap();
-            let (deleted, _) = manager.delete_output_files(&[link.clone()]).await;
+            let (deleted, _) = manager
+                .delete_output_files(std::slice::from_ref(&link))
+                .await;
             assert_eq!(deleted, 0, "软链接不跟随、不删除");
             assert!(foreign.exists());
             let _ = tokio::fs::remove_file(&link).await;

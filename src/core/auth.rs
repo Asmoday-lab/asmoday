@@ -653,13 +653,11 @@ impl AuthStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&self.db_path) {
-                if meta.permissions().mode() & 0o777 != 0o600 {
-                    let _ = std::fs::set_permissions(
-                        &self.db_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
+            if let Ok(meta) = std::fs::metadata(&self.db_path)
+                && meta.permissions().mode() & 0o777 != 0o600
+            {
+                let _ =
+                    std::fs::set_permissions(&self.db_path, std::fs::Permissions::from_mode(0o600));
             }
         }
         Ok(())
