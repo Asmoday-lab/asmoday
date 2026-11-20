@@ -1068,8 +1068,18 @@ mod tests {
             supports(&[("WT_SESSION", "9d1f")], true, true),
             cfg!(windows)
         );
-        assert!(supports(&[("TERM_PROGRAM", "iTerm.app")], true, true));
-        assert!(supports(&[("TERM_PROGRAM", "vscode")], true, true));
+        // iTerm / VSCode 的 TERM_PROGRAM 本身不是判据：Unix 靠 TERM（真实终端一定带 TERM），
+        // Windows 只看 VT 闸门。带上 TERM 让断言在两平台语义一致。
+        assert!(supports(
+            &[("TERM_PROGRAM", "iTerm.app"), ("TERM", "xterm-256color")],
+            true,
+            true
+        ));
+        assert!(supports(
+            &[("TERM_PROGRAM", "vscode"), ("TERM", "xterm-256color")],
+            true,
+            true
+        ));
         // Windows 只看 VT 闸门：TERM 缺失或 `dumb`（ConPTY 包装层爱设这个值）都放行；
         // Unix 上 TERM 缺失 / dumb 说明那不是真正的终端
         assert_eq!(supports(&[], true, true), cfg!(windows));
