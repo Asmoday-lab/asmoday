@@ -285,7 +285,10 @@ fn survey_dir(dir: &Path, acc: &mut (usize, u64), cap: usize) -> bool {
         };
         acc.0 += 1;
         if file_type.is_dir() {
-            if !survey_dir(&entry.path(), acc, cap) {
+            // 只在未触及上限时才深入子目录：否则当本项恰好是目录时，递归会再
+            // 计入子项，使 acc 冲过 cap（read_dir 顺序不定 → 结果 flaky）。
+            // 当前项的字节统计不受影响，cap 仍是删除确认统计的硬上限。
+            if acc.0 < cap && !survey_dir(&entry.path(), acc, cap) {
                 return false;
             }
         } else if file_type.is_file()
