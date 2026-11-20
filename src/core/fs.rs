@@ -1016,9 +1016,16 @@ mod tests {
 
     #[test]
     fn rejects_parent_dir_traversal() {
-        for raw in ["/tmp/../etc/passwd", "..\\windows\\system32", "../secret"] {
+        // 正斜杠的 .. 两平台都按分隔符解析，通用
+        for raw in ["/tmp/../etc/passwd", "../secret"] {
             let err = parse_candidate(raw).unwrap_err();
             assert!(matches!(err, FsError::Forbidden(_)), "应拒绝 {raw}");
+        }
+        // 反斜杠只在 Windows 是分隔符；Unix 上 `..\windows\x` 是合法文件名，不能要求拒绝
+        #[cfg(windows)]
+        {
+            let err = parse_candidate("..\\windows\\system32").unwrap_err();
+            assert!(matches!(err, FsError::Forbidden(_)));
         }
     }
 

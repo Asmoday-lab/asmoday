@@ -1062,7 +1062,12 @@ mod tests {
         // 最差只是「链接不生效、看着像纯文本」，不会打乱屏幕
         assert!(supports(&[("TERM", "xterm-256color")], true, true));
         assert!(supports(&[("TERM", "xterm-kitty")], true, true));
-        assert!(supports(&[("WT_SESSION", "9d1f")], true, true));
+        // WT_SESSION 是 Windows Terminal 专属：Windows 只看 VT 闸门故放行，
+        // Unix 上不认这个变量（只看 TERM，此时 TERM 缺失）故拒绝
+        assert_eq!(
+            supports(&[("WT_SESSION", "9d1f")], true, true),
+            cfg!(windows)
+        );
         assert!(supports(&[("TERM_PROGRAM", "iTerm.app")], true, true));
         assert!(supports(&[("TERM_PROGRAM", "vscode")], true, true));
         // Windows 只看 VT 闸门：TERM 缺失或 `dumb`（ConPTY 包装层爱设这个值）都放行；

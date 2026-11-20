@@ -1004,9 +1004,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp);
         let env = prepare_env(&temp, 1);
         let path = env.history_path.unwrap();
+        // v4.9.24 起历史按用户分目录：terminal_history/u<id>/.bash_history
         assert!(
             path.replace('\\', "/")
-                .ends_with("terminal_history/.bash_history")
+                .ends_with("terminal_history/u1/.bash_history")
         );
         let _ = std::fs::remove_dir_all(&temp);
     }
