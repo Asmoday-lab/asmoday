@@ -29,7 +29,11 @@ pub fn api_error(status: StatusCode, code: &str, message: impl Into<String>) -> 
 pub fn detail(status: StatusCode, message: impl Into<String>) -> Response {
     let message = message.into();
     if status.is_server_error() {
-        return api_error(status, "E_INTERNAL", message);
+        // 5xx 只回固定英文文案：message 里常带数据库绝对路径、SQLite/IO 细节
+        // （core::auth 的 connect() 就是 "打开数据库 <path> 失败：{e}"），原样回传
+        // 既能被匿名请求（如未初始化的 login）探出服务器结构，又违反「message 仅英文」。
+        // 真实错误只进服务端日志，前端按 E_INTERNAL 查 i18n 即可。
+        return api_error(status, "E_INTERNAL", "Internal server error");
     }
     (status, Json(json!({ "message": message }))).into_response()
 }
@@ -151,5 +155,39 @@ mod tests {
             status_of(&FsError::NoSpace("x".into())),
             StatusCode::INSUFFICIENT_STORAGE
         );
+    }
+
+    #[tokio::test]
+    async fn detail_never_leaks_5xx_internals() {
+        // 5xx 的 message 常带 SQLite/路径细节（如 "打开数据库 C:\secret\db 失败..."）。
+        // 安全审查 2026-11-20：必须脱敏成固定英文文案，不能原样回给匿名请求。
+        let secret = "打开数据库 C:\\secret\\asmoday.db 失败: permission denied";
+        let resp = detail(StatusCode::INTERNAL_SERVER_ERROR, secret);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("读取 5xx 响应体");
+        let text = String::from_utf8(body.to_vec()).expect("响应体是 UTF-8");
+        assert!(!text.contains("secret"), "5xx 不得泄漏内部路径: {text}");
+        assert!(
+            !text.contains("permission denied"),
+            "5xx 不得泄漏 IO 细节: {text}"
+        );
+        assert!(text.contains("E_INTERNAL"), "应带 E_INTERNAL code: {text}");
+        assert!(
+            text.contains("Internal server error"),
+            "应为固定英文文案: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_keeps_4xx_message() {
+        // 4xx 是参数类错误，保留 msg（前端据此提示），不能一并脱敏
+        let resp = detail(StatusCode::BAD_REQUEST, "bad param");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("读取 4xx 响应体");
+        let text = String::from_utf8(body.to_vec()).expect("响应体是 UTF-8");
+        assert!(text.contains("bad param"), "4xx 应保留原始 msg: {text}");
     }
 }

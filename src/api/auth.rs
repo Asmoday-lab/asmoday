@@ -1068,7 +1068,8 @@ pub async fn reverify_password(
     .into_response()
 }
 
-/// GET /api/auth/totp/setup（受保护）：生成密钥、otpauth 链接与二维码
+/// POST /api/auth/totp/setup（受保护）：生成密钥、otpauth 链接与二维码。
+/// 用 POST 是因为它会写库（新密钥 + 关闭 2FA），必须过 CSRF 同源校验。
 pub async fn totp_setup(State(state): State<AppState>, auth_user: AuthUser) -> Response {
     let secret = totp::generate_secret();
     if let Err(err) = state.auth.set_totp(auth_user.id, &secret, false) {

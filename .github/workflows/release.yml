@@ -211,10 +211,21 @@ jobs:
       # 跟着 tag 走，不在 workflow 里硬编码。generate_release_notes 会把
       # 自动 changelog 追加在 body 之后，两者不冲突。
       - name: Extract tag message
+        # github.ref_name 绝不直接插进 run 脚本：tag 名允许 $() 等字符，
+        # 展开后会被 shell 执行（构造 v1.0$(id) 即可在 runner 上任意命令执行）。
+        # 先写进 env 再以 "$TAG" 引用，并做白名单校验。
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          git tag -l "${{ github.ref_name }}" --format='%(contents)' > release_body.md
+          set -euo pipefail
+          # 只放行安全字符（tag 触发已经是 v*，这里挡住 $() `; | 等注入字符）
+          if ! printf '%s' "$TAG" | grep -Eq '^v[A-Za-z0-9._-]+$'; then
+            echo "Error: unexpected tag name: $TAG"
+            exit 1
+          fi
+          git tag -l "$TAG" --format='%(contents)' > release_body.md
           if [ ! -s release_body.md ]; then
-            echo "Error: 标签 ${{ github.ref_name }} 不是注释标签或没有附言"
+            echo "Error: 标签 $TAG 不是注释标签或没有附言"
             exit 1
           fi
           echo "Release body（前 20 行）："

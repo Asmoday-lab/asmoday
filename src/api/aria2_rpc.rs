@@ -792,6 +792,13 @@ fn option_select_files(options: &Value) -> Option<Vec<usize>> {
                 if start == 0 || end < start {
                     continue;
                 }
+                // end 来自客户端字符串，可被填成 usize::MAX；不设上限时
+                // `start..=end` 会尝试 push 约 2^64 个元素，单请求 OOM 打挂进程。
+                // 种子文件数远超 10 万的场景不现实，超限直接跳过这一段。
+                const MAX_SELECT_RANGE: usize = 100_000;
+                if end.saturating_sub(start).saturating_add(1) > MAX_SELECT_RANGE {
+                    continue;
+                }
                 for index in start..=end {
                     files.push(index - 1);
                 }

@@ -1039,6 +1039,21 @@ impl Config {
         if self.server.port == 0 {
             return Err("server.port 必须在 1-65535 之间".to_string());
         }
+        // BT 入站监听在 HTTP listener 之前启动（main 先起 BT session 再 bind server）。
+        // 若 BT 端口范围含 server.port，BT 会先占住它，随后 HTTP 绑定报「端口被占」，
+        // 而用户看 netstat 只会看到一个 Asmoday 自己的进程——典型的自伤型假占用。
+        if let Some(range) = self.download.bt_port_range()
+            && range.contains(&self.server.port)
+        {
+            return Err(format!(
+                "server.port ({}) 落在 BT 入站端口范围 [{}, {}) 内；BT 会话会先于 Web 服务\
+                 监听并占住该端口，导致启动失败。请错开 [download] bt_listen_port_min/max 或\
+                 修改 server.port",
+                self.server.port,
+                range.start,
+                range.end.saturating_sub(1)
+            ));
+        }
         let host = self.server.host.trim();
         if !host.eq_ignore_ascii_case("auto") && host.parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
@@ -1823,6 +1838,42 @@ max_sessions = 10
         let mut blank = Config::default();
         blank.system.mounts.push(mount(Some("   "), "/mnt/a"));
         assert!(blank.validate().is_ok());
+    }
+
+    #[test]
+    fn server_port_must_not_overlap_bt_listen_range() {
+        // 默认端口 4242 与默认 BT 范围 6881..6999 不重叠，必须放行
+        assert!(Config::default().validate().is_ok());
+
+        // server.port 落在 BT 范围内 → 拒绝（BT 先启动会自占端口）
+        let mut bad = Config::default();
+        bad.server.port = 6881;
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("BT 入站端口范围"), "{err}");
+
+        // 上边界也要拦住
+        let mut upper = Config::default();
+        upper.server.port = 6999;
+        assert!(upper.validate().unwrap_err().contains("BT 入站端口范围"));
+
+        // 紧邻范围之外放行
+        let mut ok = Config::default();
+        ok.server.port = 7000;
+        assert!(ok.validate().is_ok());
+
+        // 自定义 BT 范围与 server.port 重叠同样拒绝
+        let mut custom = Config::default();
+        custom.server.port = 4242;
+        custom.download.bt_listen_port_min = 4240;
+        custom.download.bt_listen_port_max = 4250;
+        assert!(custom.validate().unwrap_err().contains("BT 入站端口范围"));
+
+        // BT 入站关闭（0..0）时不校验
+        let mut off = Config::default();
+        off.server.port = 4242;
+        off.download.bt_listen_port_min = 0;
+        off.download.bt_listen_port_max = 0;
+        assert!(off.validate().is_ok());
     }
 
     #[cfg(windows)]

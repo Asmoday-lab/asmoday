@@ -730,14 +730,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
-/// 绑定监听 socket。
-///
-/// IPv6 地址必须显式关掉 `IPV6_V6ONLY`：Windows 默认值是 on，直接
-/// `TcpListener::bind("[::]:p")` 只收 IPv6，IPv4 客户端全部拒连；
-/// Linux 默认 off 但属于系统行为，不该赌。统一走 socket2 设置后，
-/// `host = "::"` 即双栈（v4 连接的 peer 是 `::ffff:a.b.c.d`，由
-/// `auth::peer_ip` 归一回 IPv4 字面量）。IPv4 路径行为与
-/// `TcpListener::bind` 完全一致。
 /// 嵌套挂载点告警：父目录与子目录各自挂了，路径归属按最长前缀（子胜出），
 /// 于是「经父挂载点访问子目录」和「直接访问子挂载点」拿到的 readonly 可能不同。
 fn warn_nested_mounts(set: &core::path_guard::MountSet) {
@@ -944,7 +936,7 @@ fn bind_hint(err: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
     match err.kind() {
         ErrorKind::AddrInUse => {
-            "\nHint: the port is already taken by another program. Close it, or change [server] port."
+            "\nHint: another program may be listening on this port, or a just-exited Asmoday left\n             sockets in TIME_WAIT (which 'netstat -tlnp' does not show). Check with\n             'ss -tan | grep <port>' on Linux / 'netstat -ano | findstr <port>' on Windows.\n             Close the other program, wait for TIME_WAIT to clear, or change [server] port."
         }
         ErrorKind::PermissionDenied if cfg!(windows) => {
             "\nHint: on Windows \"access denied\" usually does not mean missing privileges: the port\n             sits inside the system's dynamic port range and was temporarily taken as an outbound\n             source port by another program (browser / proxy / WebView). Either:\n             - pick another port ([server] port, e.g. 42420); or\n             - as administrator, restore the default dynamic range:\n             netsh int ipv4 set dynamicport tcp start=49152 num=16384\n             netsh int ipv6 set dynamicport tcp start=49152 num=16384"
@@ -1015,29 +1007,57 @@ fn family_unavailable(err: &std::io::Error) -> bool {
 /// （「通常每个套接字地址…」），控制台要全英文就得按错误码自己写常见项。
 fn bind_error_text(err: &std::io::Error) -> String {
     match err.raw_os_error() {
+        // Windows WSAEADDRINUSE / Linux & bionic EADDRINUSE(98)：Termux 上用户看到的就是后者
         Some(10048) => "address already in use (os error 10048)".to_string(),
+        Some(98) => "address already in use (os error 98)".to_string(),
         Some(10013) => "permission denied (os error 10013)".to_string(),
         Some(10049) => "cannot assign the requested address (os error 10049)".to_string(),
         _ => err.to_string(),
     }
 }
 
-async fn bind_one(addr: SocketAddr) -> Result<tokio::net::TcpListener, (std::io::Error, String)> {
+/// 创建并绑定监听 socket，返回已配置好、尚未接入 tokio 的 `std` listener。
+///
+/// 拆成独立函数是为了能被单元测试直接检查 socket options（尤其 reuse），
+/// 而不必真的占一个端口。
+///
+/// 两个必须显式设置的选项：
+///
+/// 1. `IPV6_V6ONLY`：IPv6 通配地址必须关掉它 Windows 默认的 on，否则
+///    `host = "::"` 只收 IPv6，IPv4 客户端全部拒连；Linux 默认 off 但属于
+///    系统行为，不该赌。关掉后 `::` 即双栈（v4 peer 是 `::ffff:a.b.c.d`，
+///    由 `auth::peer_ip` 归一回 IPv4 字面量）。
+/// 2. `SO_REUSEADDR`：**这是端口占用误报的根因**。Rust 标准库的
+///    `TcpListener::bind` 在 Unix 上默认就会设置它，让监听端口能立刻重绑，
+///    不必等旧连接的 TIME_WAIT 超时。本项目为了设置上面的 V6ONLY 改用
+///    `socket2` 手动建 socket，绕开了 std 的 bind，也就把这层默认保护一起
+///    弄丢了：进程退出后 4242 上的连接进入 TIME_WAIT，重启 bind 就报
+///    `EADDRINUSE (os error 98)`，而 `netstat -tlnp` 只列 LISTEN，看不到
+///    TIME_WAIT，于是表现为「没人占用却起不来」（Termux 反馈，2026-11-20）。
+///
+///    只在 Unix 设置：Windows 的 `SO_REUSEADDR` 语义是「允许他人重复监听同一
+///    端口」，会破坏单实例保证（实例锁在 `instance_lock`），std 在 Windows 上
+///    同样不设，这里保持一致。不用 `SO_REUSEPORT`——它允许多进程同时监听，
+///    同样破坏单实例语义。
+fn create_bound_socket(addr: SocketAddr) -> Result<socket2::Socket, std::io::Error> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
-    )
-    .and_then(|socket| {
-        if addr.is_ipv6() {
-            socket.set_only_v6(false)?;
-        }
-        socket.set_nonblocking(true)?;
-        socket.bind(&addr.into())?;
-        socket.listen(1024)?;
-        Ok(socket)
-    })
-    .map_err(|e| {
+    )?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket)
+}
+
+async fn bind_one(addr: SocketAddr) -> Result<tokio::net::TcpListener, (std::io::Error, String)> {
+    let socket = create_bound_socket(addr).map_err(|e| {
         let message = format!(
             "failed to bind {addr}: {}{}",
             bind_error_text(&e),
@@ -1208,7 +1228,10 @@ fn protected_routes() -> Router<AppState> {
             "/api/auth/verify-password",
             post(api::auth::reverify_password),
         )
-        .route("/api/auth/totp/setup", get(api::auth::totp_setup))
+        // POST 而非 GET：setup 会生成新密钥并把 is_totp_enabled 置 0（关闭 2FA），
+        // 是有写副端的端点。GET 不过 Origin 校验，一次顶级导航即可被 CSRF 静默
+        // 关掉受害者的 2FA；改 POST 后自动走 origin_matches_host 同源防线。
+        .route("/api/auth/totp/setup", post(api::auth::totp_setup))
         .route("/api/auth/totp/enable", post(api::auth::totp_enable))
         .route("/api/auth/totp/disable", post(api::auth::totp_disable))
         .route("/api/files/mounts", get(api::files::mounts))
@@ -1751,6 +1774,50 @@ mod tests {
         assert!(!family_unavailable(&Error::from(
             ErrorKind::PermissionDenied
         )));
+    }
+
+    /// 端口占用误报回归（Termux 2026-11-20）：bind 的 socket 必须开 SO_REUSEADDR，
+    /// 否则重启后旧连接 TIME_WAIT 会让 `bind` 报 EADDRINUSE，而 netstat -l 看不到。
+    /// 直接读 socket option，不真正占端口——这样 CI 里不会因端口冲突而 flaky。
+    #[cfg(unix)]
+    #[test]
+    fn bound_socket_enables_reuse_address() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // 端口 0 让内核分配，避免和任何真实监听冲突
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let socket = create_bound_socket(addr).expect("bind to ephemeral port");
+        assert!(
+            socket.reuse_address().expect("read SO_REUSEADDR"),
+            "SO_REUSEADDR must be enabled so a restart is not blocked by TIME_WAIT"
+        );
+    }
+
+    /// 同上：IPv6 通配地址必须关掉 V6ONLY（双栈），且同样要开 reuse。
+    #[cfg(unix)]
+    #[test]
+    fn bound_dual_stack_socket_has_reuse_and_v6only_off() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        let socket = match create_bound_socket(addr) {
+            Ok(s) => s,
+            // 某些容器/沙箱完全没有 IPv6，跳过而不是让测试失败（family_unavailable 的同类场景）
+            Err(e) if family_unavailable(&e) => return,
+            Err(e) => panic!("bind [::]:0 failed unexpectedly: {e}"),
+        };
+        assert!(
+            socket.reuse_address().expect("read SO_REUSEADDR"),
+            "dual-stack listener must enable SO_REUSEADDR"
+        );
+    }
+
+    /// Linux errno 98 要翻成统一英文文案，不能落回本地化/通用文本。
+    #[test]
+    fn bind_error_text_covers_linux_eaddrinuse() {
+        let err = std::io::Error::from_raw_os_error(98);
+        assert_eq!(
+            bind_error_text(&err),
+            "address already in use (os error 98)"
+        );
     }
 
     /// `auto` 的链接形态与通配地址一致：本机 localhost，局域网另给一条

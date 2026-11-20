@@ -17,7 +17,7 @@
 //! Windows 大小写不敏感），RPC 传进来的 `dir` 不合法直接拒绝。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -944,6 +944,12 @@ impl DownloadManager {
             Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
             _ => roots[0].path.clone(),
         };
+        // 目录不存在时 canonicalize 会失败，随后 normalize 不折叠 `..`，
+        // 纯字符串前缀比较会把 `<root>/../evil` 误判成在根内，create_dir_all
+        // 就在挂载点外建目录并落盘。显式拒绝 ParentDir，从源头掐断逃逸。
+        if raw.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(RpcError::new(2, "dir must not contain '..' path segments"));
+        }
         let canon = std::fs::canonicalize(&raw).unwrap_or_else(|_| normalize(&raw));
         for root in &roots {
             let root_canon =
@@ -3513,6 +3519,13 @@ mod tests {
             manager
                 .resolve_dir(Some(outside.to_str().unwrap()))
                 .is_err()
+        );
+        // 根目录下的 .. 逃逸：目录可能尚不存在，canonicalize 失败后曾退化为
+        // 纯字符串前缀比较而放行。必须显式拒绝（Termux/全量审查 2026-11-20）。
+        let escape = format!("{}/../asmoday-dl-roots-evil", base.display());
+        assert!(
+            manager.resolve_dir(Some(&escape)).is_err(),
+            "dir with .. must be rejected even when the target does not exist"
         );
         // 未指定 → 默认根
         let resolved = manager.resolve_dir(None).unwrap();

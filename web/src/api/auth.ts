@@ -95,7 +95,8 @@ export const authApi = {
    * 前端不引 QR 库；服务端异常时会缺这个字段，此时退回只显示明文密钥。
    */
   async totpSetup(): Promise<{ secret: string; uri: string; qr_svg?: string | null }> {
-    const res = await fetch('/api/auth/totp/setup')
+    // POST：该端点会写库（生成密钥），后端靠 POST 触发 CSRF 同源校验。
+    const res = await fetch('/api/auth/totp/setup', { method: 'POST', body: '{}' })
     if (!res.ok) throw new ApiError(res.status, await readApiError(res))
     return (await res.json()) as { secret: string; uri: string; qr_svg?: string | null }
   },

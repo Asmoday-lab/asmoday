@@ -962,15 +962,21 @@ impl AuthStore {
         let password = password.trim();
         validate_password(password)?;
         let hash = hash_password(password)?;
-        let conn = self.connect()?;
-        conn.execute(
+        let mut conn = self.connect()?;
+        // 改密与清会话必须原子：两条独立 autocommit 之间若崩溃/断电，
+        // 会留下「密码已改但旧会话仍有效」的中间态——旧 Cookie 可继续用
+        // 到 30 天绝对上限，改密以为踢掉的设备其实没踢掉。
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("开启事务失败：{e}"))?;
+        tx.execute(
             "UPDATE users SET password_hash = ?1, must_change_password = 0 WHERE id = ?2",
             params![hash, user_id],
         )
         .map_err(|e| format!("更新密码失败：{e}"))?;
-        // 改密后强制所有会话失效
-        conn.execute("DELETE FROM sessions", [])
+        tx.execute("DELETE FROM sessions", [])
             .map_err(|e| format!("清理会话失败：{e}"))?;
+        tx.commit().map_err(|e| format!("提交改密事务失败：{e}"))?;
         Ok(())
     }
 
@@ -1459,10 +1465,16 @@ fn recovery_code_hash(code: &str) -> String {
 // 登录失败限流
 // ---------------------------------------------------------------------------
 
+/// 失败记录空闲多久后回收。只要没在封禁期，超过这个时长没再出现的 key 就删掉。
+const GUARD_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// HashMap 硬上限：防御「每次换 username/key」把表撑爆（未认证也能触发）。
+const GUARD_MAX_KEYS: usize = 10_000;
+
 #[derive(Default)]
 struct Attempt {
     failures: u32,
     blocked_until: Option<Instant>,
+    last_seen: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1481,19 +1493,21 @@ impl LoginGuard {
             Ok(map) => map,
             Err(_) => return Ok(()),
         };
+        let now = Instant::now();
         if let Some(attempt) = map.get(key)
             && let Some(until) = attempt.blocked_until
+            && until > now
         {
-            let now = Instant::now();
-            if until > now {
-                return Err((until - now).as_secs().max(1));
-            }
+            return Err((until - now).as_secs().max(1));
         }
+        // 只回收「不在封禁期 且 已空闲」的条目。封禁中的条目必须留着，
+        // 否则封禁一被回收就可立即重试，失去限流意义。
         map.retain(|_, attempt| {
-            attempt
-                .blocked_until
-                .map(|until| until > Instant::now())
-                .unwrap_or(attempt.failures > 0)
+            let banned = attempt.blocked_until.is_some_and(|until| until > now);
+            let fresh = attempt
+                .last_seen
+                .is_some_and(|seen| now.duration_since(seen) < GUARD_IDLE_TTL);
+            banned || fresh
         });
         Ok(())
     }
@@ -1503,10 +1517,25 @@ impl LoginGuard {
             Ok(map) => map,
             Err(_) => return,
         };
+        // 触到上限时清掉最旧的空闲条目，避免无界增长（WebDAV 的 key 含
+        // 攻击者可控的 username，登录的 key 含 IP|user，都能高速制造新 key）。
+        if map.len() >= GUARD_MAX_KEYS {
+            let now = Instant::now();
+            let oldest = map
+                .iter()
+                .filter(|(_, a)| !a.blocked_until.is_some_and(|until| until > now))
+                .min_by_key(|(_, a)| a.last_seen)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = oldest {
+                map.remove(&key);
+            }
+        }
+        let now = Instant::now();
         let entry = map.entry(key.to_string()).or_default();
+        entry.last_seen = Some(now);
         entry.failures += 1;
         if entry.failures >= MAX_ATTEMPTS {
-            entry.blocked_until = Some(Instant::now() + BAN_DURATION);
+            entry.blocked_until = Some(now + BAN_DURATION);
             entry.failures = 0;
         }
     }
@@ -2033,6 +2062,38 @@ mod tests {
         let blocked = guard.check("1.2.3.4");
         assert!(blocked.is_err(), "第 5 次失败后应被封锁");
         assert!(guard.check("5.6.7.8").is_ok(), "其它 IP 不受影响");
+    }
+
+    #[test]
+    fn login_guard_bounded_under_distinct_keys() {
+        // 安全审查 2026-11-20：未认证 attacker 可用不同 username 无限造 key，
+        // 旧实现只清 failures>0 之外……实际上 failures 1-4 永不清，内存无界。
+        // 新实现有硬上限：塞满后仍可插入新 key，且封禁中的条目不会被淘汰。
+        let guard = LoginGuard::new();
+        for i in 0..(GUARD_MAX_KEYS + 50) {
+            guard.record_failure(&format!("attacker-{i}"));
+        }
+        assert!(
+            guard.inner.lock().unwrap().len() <= GUARD_MAX_KEYS,
+            "key 数量必须有上限"
+        );
+
+        // 先制造一个封禁条目，再灌满其它 key；封禁条目不能被淘汰掉
+        let guard2 = LoginGuard::new();
+        for _ in 0..MAX_ATTEMPTS {
+            guard2.record_failure("banned-user");
+        }
+        assert!(
+            guard2.check("banned-user").is_err(),
+            "banned-user 应处于封禁"
+        );
+        for i in 0..(GUARD_MAX_KEYS + 50) {
+            guard2.record_failure(&format!("noise-{i}"));
+        }
+        assert!(
+            guard2.check("banned-user").is_err(),
+            "封禁条目不得被硬上限淘汰，否则封禁可绕过"
+        );
     }
 
     #[test]

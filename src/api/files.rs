@@ -1250,14 +1250,6 @@ pub async fn delete(
     Query(query): Query<PathQuery>,
 ) -> Response {
     let set = roots_for(&state).await;
-    // 只读拦截与 `POST /api/files/delete` 同口径（安全审查 2026-11-04）：
-    // 这条老口子此前绕过了 readonly —— 只读挂载不能删，与不能写是同一个承诺。
-    let mounts = mounts_for(&state).await;
-    if let Some(mount) = mounts.find_by_path_text(query.path.trim())
-        && let Err(err) = mount.ensure_writable()
-    {
-        return fs_error(err);
-    }
     // 最后一段**不跟随**：软链接本身才是删除目标。若对整条路径 canonicalize，
     // 指向目录的链接会被解析成目标实体，下面 remove_dir_all 就把目标整个删掉了
     // （设计文档 3.2.7 红线：删链接严禁递归删目标）。
@@ -1283,6 +1275,22 @@ pub async fn delete(
         return fs_error(FsError::Forbidden(
             "不能删除挂载点根目录，请先删除里面的内容".to_string(),
         ));
+    }
+
+    // 只读拦截与 `POST /api/files/delete` 同口径（安全审查 2026-11-04 / 2026-11-20）：
+    // 必须按 canonical 路径解析出真实所属挂载点再判只读。此前用 find_by_path_text
+    // 的纯字符串前缀匹配，遇到 verbatim 路径（\\?\C:\...）匹配不到挂载点就把只读
+    // 检查整个跳过，只读目录可被物理删除——与"不能写是同一个承诺"冲突。
+    // 用父目录（已 canonicalize）判归属：删的是链接本身时，归属由它所在的目录
+    // 决定，而不是它指向的（可能在挂载点外的）目标。
+    let mounts = mounts_for(&state).await;
+    let owner_path = target.parent().unwrap_or(&canonical);
+    if let Err(err) = mounts
+        .mount_of(owner_path)
+        .map(|mount| mount.ensure_writable())
+        .unwrap_or(Ok(()))
+    {
+        return fs_error(err);
     }
 
     let meta = match tokio::fs::symlink_metadata(&target).await {

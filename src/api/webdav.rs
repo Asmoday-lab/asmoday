@@ -366,6 +366,7 @@ fn guard_path(mount: &path_guard::MountEntry, rest: &str, writing: bool) -> Resu
 /// `MOVE` / `COPY` 的 `Destination` 头也要过同一道闸——
 /// 否则客户端可以用 `/dav/m0/指向外部的软链接/x.txt` 把文件写到挂载点外面。
 async fn guard_destination(
+    set: &path_guard::MountSet,
     mount: &path_guard::MountEntry,
     mount_id: &str,
     prefix: &RuntimePrefix,
@@ -392,14 +393,27 @@ async fn guard_destination(
         ));
     }
     let mount = mount.clone();
-    tokio::task::spawn_blocking(move || guard_path(&mount, &dest_rest, true))
-        .await
-        .unwrap_or_else(|err| {
-            Err(dav_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("task failed: {err}"),
-            ))
-        })
+    let set = set.clone();
+    tokio::task::spawn_blocking(move || {
+        guard_path(&mount, &dest_rest, true)?;
+        // 目标也要判只读：源在可写父挂载点、Destination 指向嵌套的只读子挂载点时，
+        // 只校验源会把文件 MOVE/COPY 进只读目录——"readonly 按路径解析"要求解析
+        // 的是被写的那一端。guard_path 不做只读判定（那条分支是死代码），必须显式算。
+        let root = mount
+            .canon_root()
+            .map_err(|err| dav_error(StatusCode::FORBIDDEN, &err.message()))?;
+        if effective_readonly(&set, &mount, root, &dest_rest) {
+            return Err(dav_error(StatusCode::FORBIDDEN, "挂载点为只读"));
+        }
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|err| {
+        Err(dav_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("task failed: {err}"),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +655,7 @@ pub async fn handle(
     }
     if matches!(method.as_str(), "MOVE" | "COPY")
         && let Err(response) =
-            guard_destination(&mount_owned, &mount_id, &prefix, req.headers()).await
+            guard_destination(&set, &mount_owned, &mount_id, &prefix, req.headers()).await
     {
         return response;
     }

@@ -408,8 +408,19 @@ async fn transfer_inner(
     let cross_mount = sources.iter().any(|source| !source.starts_with(&dest_root));
     let needs_bytes = !is_move || cross_mount;
 
-    // 先做浅层统计：选中 300 项时一秒内就能拒掉，不用等整棵树遍历完
-    let mut total_bytes = fs_ops::measure_shallow(&sources, limits)?.1;
+    // 先做浅层统计：选中 300 项时一秒内就能拒掉，不用等整棵树遍历完。
+    // 同挂载点移动（needs_bytes=false）不搬数据、不占空间，红线要求不统计字节，
+    // 所以传 max_bytes=0 的 limits，只保留"选中条目数"检查——否则单个 >2 GiB
+    // 文件在同盘移动时会被 measure_shallow 的 check_bytes 误拒。
+    let shallow_limits = if needs_bytes {
+        limits
+    } else {
+        fs_ops::BatchLimits {
+            max_bytes: 0,
+            ..limits
+        }
+    };
+    let mut total_bytes = fs_ops::measure_shallow(&sources, shallow_limits)?.1;
     // 真正要复制时才递归累加字节（删除完全不走这条路）
     if needs_bytes && !limits.unlimited() {
         total_bytes = fs_ops::measure(&sources, limits)?.1;
